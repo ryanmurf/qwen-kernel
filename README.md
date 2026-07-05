@@ -167,6 +167,47 @@ hybrid attention (gated-deltanet SSM layers + full-attention layers,
 `attn_qkv` 2048→8192, gate 2048→4096), 256 experts top-8 + 1 shared,
 expert FFN 512, vocab 248320.
 
+## Serving layer & CPU-precompute optimizations
+
+A safe Rust serving layer (`server/`, binary `qk-server`) fronts the engine:
+llama.cpp-compatible HTTP (`/completion`, `/tokenize`, `/v1/chat/completions`,
+…), a GGUF-native byte-level BPE tokenizer that reproduces llama.cpp's output
+token-for-token (verified against captured fixtures), and chat templating. All
+untrusted-input handling is safe Rust; the only `unsafe` is the one-thread
+`dlopen` FFI (`include/qk.h`) to the C++/Vulkan engine (`libqk`). See
+`server/README.md` and `docs/server-spec.md`.
+
+Two CPU-precompute optimizations, both verified token-exact against the
+llama.cpp reference:
+
+- **RoPE cos/sin table.** The NeoX partial-rope angles depend only on
+  `(pos, j)`, so `fa_prep` no longer recomputes `pow()/cos()/sin()` per element
+  — they're precomputed on CPU into an SSBO indexed by `[pos][j]`. Decode-clock
+  impact is **within noise** (5.78–5.87 vs 5.82 ms/step): the step is
+  bandwidth-bound on weight reads, not transcendental-bound (same lesson as the
+  IQ3 repack). Kept because it's the correct foundation for per-request
+  positions in a multi-slot engine (each slot indexes the table by its own
+  position). *Precomputing the quantized weights themselves would be a
+  pessimization* — it expands the ~2.5 GB of compressed reads to ~8–10 GB and
+  makes the bandwidth-bound loop slower; the quant kernels dequant-on-read for
+  exactly this reason.
+
+- **Prefix-state caching (`qk warm`).** The highest-value serving lever. A
+  shared prefix (e.g. a fixed system prompt) is prefilled once; its ~60 MB of
+  per-slot recurrent state — delta-rule `S` + conv window across 30 recurrent
+  layers, K/V caches across 10 attention layers — is snapshotted, then restored
+  (cloned) into a new request's slot instead of re-running prefill.
+
+  | shared prefix | cold prefill | warm restore | TTFT speedup | warm≡cold |
+  |---|---|---|---|---|
+  | 10 tokens | 57.9 ms | 0.3 ms | 207× | YES |
+  | 64 tokens | 340.7 ms | 0.3 ms | 1083× | YES |
+
+  Restore is O(state) (constant); prefill is O(prefix), so the win grows with
+  prefix length. Snapshot costs ~0.5–1.0 ms, paid once when a prefix is first
+  seen. The warm-decoded token stream is byte-identical to the cold stream,
+  proving the snapshot/restore preserves state exactly.
+
 ## Build & run
 
 ```bash
@@ -179,7 +220,8 @@ expert FFN 512, vocab 248320.
 ./build/qk moe [layer] [iters]      # fused MoE decode step on real weights
 ./build/qk block [layer] [tokens] [iters]  # full deltanet block, one submission
 ./build/qk ablock [layer] [tokens] [iters] # full-attention block (layers 3,7,...)
-./build/qk token <ids-file> <nGen> [tmax]  # end-to-end greedy generation (server must be scaled down)
+./build/qk token <ids-file> <nGen> [tmax] [batch]  # end-to-end greedy generation (server must be scaled down)
+./build/qk warm <ids-file> <nGen> [tmax]   # prefix-cache cold/warm-start demo (TTFT)
 ./build/qk list [filter]            # list tensors in the GGUF
 ```
 
