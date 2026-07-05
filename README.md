@@ -126,10 +126,15 @@ in one dispatch, routed & shared MoE down-projections made concurrent)
 shaders; conv+SiLU+state-shift+q/k-L2-norm fused into one dispatch).
 The optimization arc has converged: 76% of the ~230 tok/s kernel-time
 ceiling. What remains is the serial dependency chain itself (~8 barrier
-drains/layer) and cold weight streaming — closing it needs architectural
-change (multi-token batched verify, weight-layout repack for IQ3_XXS
-whose 98-byte blocks defeat aligned vector loads in place), not more
-micro-fusion.
+drains/layer) and cold weight streaming — closing it needs multi-token
+batched decode (speculative verify GEMMs), not more micro-fusion.
+
+**Negative result, measured:** repacking IQ3_XXS into dword-aligned
+25-uint blocks (d as f32 + pre-assembled aux words + grid bytes) and
+reading IQ4_XS as raw uints changed nothing — 5.81 vs 5.82 ms/token,
+outputs identical. RADV/ACO already coalesces the byte loads; the IQ
+kernels are ALU-chain-bound, not fetch-bound. The experiment was reverted
+(this repo's history has it at the commit before this note if ever needed).
 - Barrier reduction (split barriers / finer scopes), vectorized IQ3_XXS
   loads, subgroup reductions.
 - Batched (N-token) verify-pass GEMM for speculative decoding (see
