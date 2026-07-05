@@ -18,7 +18,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float q[256];
-shared float sc[1024];
+shared float sc[8192];   // per-key attention scores: caps sequence length at 8192 (32 KB LDS)
 shared float red[256];
 
 void main() {

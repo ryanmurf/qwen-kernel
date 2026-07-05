@@ -2750,7 +2750,8 @@ void qk_engine::resetSlot(uint32_t slot) {
 bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t errLen) {
     auto fail = [&](const char* m) { if (err && errLen) snprintf(err, errLen, "%s", m); return false; };
     nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
-    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 4096 || chunkN < 1 || chunkN > 32)
+    // nCtx ceiling is bounded by fa_attn_srv's sc[] shared array (8192).
+    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 8192 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
     initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
