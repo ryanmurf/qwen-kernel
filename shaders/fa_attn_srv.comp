@@ -1,0 +1,80 @@
+#version 450
+
+// Server variant of fa_attn: the number of keys to attend over comes from a
+// per-slot position buffer (slotPos[rq]) rather than a shared push constant.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQH { float qhat[]; };
+layout(std430, binding = 1) readonly  buffer BufKC { float kc[]; };
+layout(std430, binding = 2) readonly  buffer BufVC { float vc[]; };
+layout(std430, binding = 3) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 4) writeonly buffer BufA  { float att[]; };
+layout(std430, binding = 5) readonly  buffer BufPos { uint slotPos[]; };
+
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+} pc;
+
+shared float q[256];
+shared float sc[1024];
+shared float red[256];
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+    uint rq = gl_WorkGroupID.z;
+    uint n  = slotPos[rq] + 1u;
+    uint kv = h / (pc.hQ / pc.hKV);
+    uint qfo = rq * pc.hQ * 2u * dh;
+    uint kvo = rq * pc.hKV * pc.tmax * dh;
+    uint qho = rq * pc.hQ * dh;
+
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
+    barrier();
+
+    float qs = inversesqrt(float(dh));
+    for (uint p = t; p < n; p += 256u) {
+        float s = 0.0;
+        uint base = kvo + (kv * pc.tmax + p) * dh;
+        for (uint j = 0u; j < dh; ++j) s += q[j] * kc[base + j];
+        sc[p] = s * qs;
+    }
+    barrier();
+
+    float mx = -3.4e38;
+    for (uint p = t; p < n; p += 256u) mx = max(mx, sc[p]);
+    red[t] = mx;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        barrier();
+    }
+    float m = red[0];
+    barrier();
+    float sum = 0.0;
+    for (uint p = t; p < n; p += 256u) {
+        float e = exp(sc[p] - m);
+        sc[p] = e;
+        sum += e;
+    }
+    red[t] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float inv = 1.0 / red[0];
+    barrier();
+
+    if (t < dh) {
+        float o = 0.0;
+        for (uint p = 0u; p < n; ++p)
+            o += sc[p] * vc[kvo + (kv * pc.tmax + p) * dh + t];
+        o *= inv;
+        float g = qfull[qfo + h * 2u * dh + dh + t];
+        att[qho + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+    }
+}

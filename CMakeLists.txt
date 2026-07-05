@@ -13,7 +13,8 @@ find_program(GLSLC glslc REQUIRED)
 set(SHADERS gemv_f16 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs
     moe_logits moe_select moe_gateup_iq3 moe_gateup_q8 moe_down_iq4 moe_down_q6k moe_down_q8
     rmsnorm dn_ab dn_conv dn_qknorm dn_step dn_gate add_rmsnorm vec_add
-    fa_prep fa_attn argmax1 argmax2 embed_q6k add_rms3 moe_down_q8b dn_convn)
+    fa_prep fa_attn argmax1 argmax2 embed_q6k add_rms3 moe_down_q8b dn_convn
+    fa_prep_srv fa_attn_srv)
 set(SPV_FILES "")
 foreach(s ${SHADERS})
     add_custom_command(
@@ -32,3 +33,11 @@ add_custom_target(shaders ALL DEPENDS ${SPV_FILES})
 add_executable(qk src/main.cpp)
 target_link_libraries(qk PRIVATE Vulkan::Vulkan)
 add_dependencies(qk shaders)
+
+# Shared library exposing the qk.h C ABI (server links this via dlopen).
+# Same TU as the CLI, compiled with QK_LIBRARY to drop main(); OUTPUT_NAME qk -> libqk.so.
+add_library(qklib SHARED src/main.cpp)
+set_target_properties(qklib PROPERTIES OUTPUT_NAME qk)
+target_compile_definitions(qklib PRIVATE QK_LIBRARY)
+target_link_libraries(qklib PRIVATE Vulkan::Vulkan)
+add_dependencies(qklib shaders)

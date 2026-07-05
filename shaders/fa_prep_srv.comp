@@ -1,0 +1,77 @@
+#version 450
+
+// Server variant of fa_prep: identical math, but the write position for each
+// slot comes from a per-slot buffer (slotPos[rq]) instead of a shared push
+// constant, so slots at different sequence positions can be batched together.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 1) readonly  buffer BufKI { float kin[]; };
+layout(std430, binding = 2) readonly  buffer BufVI { float vin[]; };
+layout(std430, binding = 3) readonly  buffer BufQN { float qn[]; };
+layout(std430, binding = 4) readonly  buffer BufKN { float kn[]; };
+layout(std430, binding = 5) writeonly buffer BufQH { float qhat[]; };
+layout(std430, binding = 6) buffer BufKC { float kc[]; };
+layout(std430, binding = 7) buffer BufVC { float vc[]; };
+layout(std430, binding = 8) readonly buffer BufRope { float ropeCS[]; };
+layout(std430, binding = 9) readonly buffer BufPos { uint slotPos[]; };
+
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+} pc;
+
+shared float sv[256];
+shared float red[256];
+shared float scale;
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+    uint rq = gl_WorkGroupID.z;
+    uint pos = slotPos[rq];
+    uint qfo = rq * pc.hQ * 2u * dh;
+    uint kio = rq * pc.hKV * dh;
+    uint kvo = rq * pc.hKV * pc.tmax * dh;
+    uint qho = rq * pc.hQ * dh;
+
+    if (w >= pc.hQ + pc.hKV) {           // v: plain copy into cache
+        uint h = w - pc.hQ - pc.hKV;
+        if (t < dh) vc[kvo + (h * pc.tmax + pos) * dh + t] = vin[kio + h * dh + t];
+        return;
+    }
+
+    bool isQ = w < pc.hQ;
+    uint h = isQ ? w : w - pc.hQ;
+    float v = 0.0;
+    if (t < dh) v = isQ ? qfull[qfo + h * 2u * dh + t] : kin[kio + h * dh + t];
+
+    red[t] = v * v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    if (t == 0u) scale = 1.0 / sqrt(red[0] / float(dh) + pc.eps);
+    barrier();
+    if (t < dh) sv[t] = v * scale * (isQ ? qn[t] : kn[t]);
+    barrier();
+
+    uint half_ = pc.nRot / 2u;
+    if (t < dh) {
+        float outV;
+        if (t < pc.nRot) {
+            uint j = t < half_ ? t : t - half_;
+            uint ci = 2u * (pos * half_ + j);
+            float c = ropeCS[ci], s = ropeCS[ci + 1u];
+            float x0 = sv[j], x1 = sv[j + half_];
+            outV = t < half_ ? x0 * c - x1 * s : x0 * s + x1 * c;
+        } else {
+            outV = sv[t];
+        }
+        if (isQ) qhat[qho + h * dh + t] = outV;
+        else     kc[kvo + (h * pc.tmax + pos) * dh + t] = outV;
+    }
+}

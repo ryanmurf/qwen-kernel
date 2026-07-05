@@ -19,12 +19,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "gguf.h"
 #include "quants.h"
+#include "../include/qk.h"
 
 static const char* kDefaultGguf =
     "/home/ryan/intellij/ggerganov/llama.cpp/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf";
@@ -2646,6 +2648,530 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
     return true;
 }
 
+// ===================== qk.h C ABI: persistent per-slot engine =====================
+// Server-oriented engine. N slots each hold their own sequence (prompt cursor +
+// position + sampled token); one batched dispatch (z = slot) advances all of
+// them. Positions come from a per-slot buffer (fa_*_srv shaders) and the host
+// drives one step at a time, so slots at different positions — some prefilling,
+// some decoding, started/finished at different times — coexist. This is the
+// execution model a real server needs, distinct from `qk token`'s GPU-resident,
+// baked-position path.
+
+struct qk_engine {
+    VkCtx c{};
+    Gguf g;
+    uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
+    uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
+    static constexpr uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
+    static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64, nLayer = 40;
+    float eps = 1e-6f;
+
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    Pipe pRms, pGemvA, pAb, pConvN, pStep, pGate, pGemvO, pAddN, pPrep, pAttn, pMoeL,
+        pMoeS, pMoeGU, pMoeGUs, pMoeDn4, pMoeDn6, pMoeDnsB, pAdd3, pHead, pAm1, pAm2, pEmb;
+
+    struct Layer {
+        bool rec = false, downQ6 = false;
+        std::vector<Buf> bufs;
+        VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sGate, sWo, sAddN,
+            sPrep, sAttn, sMoeL, sMoeS, sMoeGU, sMoeGUs, sMoeDn, sMoeDns, sAdd3;
+        VkBuffer aNormBuf = VK_NULL_HANDLE;
+        // per-slot recurrent state (must be zeroed when a slot is reused):
+        // rec -> (conv window, delta-rule S); attn -> (K cache, V cache).
+        VkBuffer st1 = VK_NULL_HANDLE, st2 = VK_NULL_HANDLE;
+        size_t ps1 = 0, ps2 = 0;  // per-slot byte stride
+    };
+    std::vector<Layer> layers;
+
+    void resetSlot(uint32_t slot);  // zero one slot's recurrent state before reuse
+
+    Buf bXin, bXn, bBig, bMid, bKin, bVin, bGb, bConvOut, bO, bAtt, bAttnOut, bY, bXn2,
+        bML, bMH, bMSel, bMY, bMY2, bONorm, bHeadW, bLogits, bEmbdW, bRope, bAV, bAI,
+        bTok, bSlotIn, bSlotPos, bSamp, stage;
+    VkDescriptorSet sHead, sAm1, sAm2, sEmb;
+    VkCommandBuffer stepCB = VK_NULL_HANDLE;
+    uint32_t *slotInMap = nullptr, *slotPosMap = nullptr, *sampMap = nullptr;
+
+    struct Slot {
+        bool active = false;
+        std::vector<uint32_t> prompt;
+        uint32_t cursor = 0, pos = 0, gen = 0, maxGen = 0, last = 0;
+    };
+    std::vector<Slot> slots;
+
+    bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
+    int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
+    ~qk_engine();
+};
+
+qk_engine::~qk_engine() {
+    if (c.dev == VK_NULL_HANDLE) return;  // never fully opened
+    vkDeviceWaitIdle(c.dev);
+    for (auto& L : layers)
+        for (auto& b : L.bufs) destroyBuf(c, b);
+    for (Buf* b : {&bXin, &bXn, &bBig, &bMid, &bKin, &bVin, &bGb, &bConvOut, &bO, &bAtt,
+                   &bAttnOut, &bY, &bXn2, &bML, &bMH, &bMSel, &bMY, &bMY2, &bONorm, &bHeadW,
+                   &bLogits, &bEmbdW, &bRope, &bAV, &bAI, &bTok, &bSlotIn, &bSlotPos, &bSamp, &stage})
+        destroyBuf(c, *b);
+    if (dpool) vkDestroyDescriptorPool(c.dev, dpool, nullptr);
+    for (Pipe* pp : {&pRms, &pGemvA, &pAb, &pConvN, &pStep, &pGate, &pGemvO, &pAddN, &pPrep,
+                     &pAttn, &pMoeL, &pMoeS, &pMoeGU, &pMoeGUs, &pMoeDn4, &pMoeDn6, &pMoeDnsB,
+                     &pAdd3, &pHead, &pAm1, &pAm2, &pEmb})
+        destroyPipe(c, *pp);
+    if (c.pool) vkDestroyCommandPool(c.dev, c.pool, nullptr);
+    if (c.pl) vkDestroyPipelineLayout(c.dev, c.pl, nullptr);
+    if (c.dsl) vkDestroyDescriptorSetLayout(c.dev, c.dsl, nullptr);
+    vkDestroyDevice(c.dev, nullptr);
+    if (c.inst) vkDestroyInstance(c.inst, nullptr);
+    c.dev = VK_NULL_HANDLE;
+}
+
+// Zero one slot's recurrent state (delta-rule S, conv window, K/V cache) so a
+// reused slot does not inherit the previous request's state.
+void qk_engine::resetSlot(uint32_t slot) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+    for (auto& L : layers) {
+        vkCmdFillBuffer(c.cb, L.st1, (VkDeviceSize)slot * L.ps1, L.ps1, 0u);
+        vkCmdFillBuffer(c.cb, L.st2, (VkDeviceSize)slot * L.ps2, L.ps2, 0u);
+    }
+    VK_CHECK(vkEndCommandBuffer(c.cb));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &c.cb;
+    VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(c.queue));
+}
+
+bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t errLen) {
+    auto fail = [&](const char* m) { if (err && errLen) snprintf(err, errLen, "%s", m); return false; };
+    nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
+    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 4096 || chunkN < 1 || chunkN > 32)
+        return fail("qk_open: bad config");
+    initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
+    if (!g.open(path)) return fail("qk_open: cannot open GGUF");
+    const GgufTensor* tEmbd = g.find("token_embd.weight");
+    const GgufTensor* tONorm = g.find("output_norm.weight");
+    const GgufTensor* tHead = g.find("output.weight");
+    if (!tEmbd || !tONorm || !tHead || tEmbd->type != GGML_Q6_K || tHead->type != GGML_Q6_K)
+        return fail("qk_open: missing/unexpected embd/head tensors");
+    vocab = (uint32_t)tHead->ne[1];
+    const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
+    const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);
+    const uint32_t nB = nSlots, tmax = nCtx;
+
+    pRms = makePipe(c, "rmsnorm.spv", 3, 8);
+    pGemvA = makePipe(c, "gemv_q8_0.spv", 3, 8, 64);
+    pAb = makePipe(c, "dn_ab.spv", 6, 8);
+    pConvN = makePipe(c, "dn_convn.spv", 4, 16);
+    pStep = makePipe(c, "dn_step.spv", 4, 12);
+    pGate = makePipe(c, "dn_gate.spv", 4, 12);
+    pGemvO = makePipe(c, "gemv_q8_0.spv", 3, 8, 128);
+    pAddN = makePipe(c, "add_rmsnorm.spv", 5, 8);
+    pPrep = makePipe(c, "fa_prep_srv.spv", 10, 32);
+    pAttn = makePipe(c, "fa_attn_srv.spv", 6, 32);
+    pMoeL = makePipe(c, "moe_logits.spv", 3, 16);
+    pMoeS = makePipe(c, "moe_select.spv", 4, 16);
+    pMoeGU = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
+    pMoeGUs = makePipe(c, "moe_gateup_q8.spv", 4, 16);
+    pMoeDn4 = makePipe(c, "moe_down_iq4.spv", 4, 16);
+    pMoeDn6 = makePipe(c, "moe_down_q6k.spv", 4, 16);
+    pMoeDnsB = makePipe(c, "moe_down_q8b.spv", 4, 16);
+    pAdd3 = makePipe(c, "add_rms3.spv", 6, 8);
+    pHead = makePipe(c, "gemv_q6_k.spv", 3, 8, 128);
+    pAm1 = makePipe(c, "argmax1.spv", 3, 8);
+    pAm2 = makePipe(c, "argmax2.spv", 3, 4);
+    pEmb = makePipe(c, "embed_q6k.spv", 3, 12);
+
+    const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const VkBufferUsageFlags storSrc = stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bXin = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    bXn = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    bBig = createBuf(c, (size_t)nB * chQkv * 4, stor, true);
+    bMid = createBuf(c, (size_t)nB * dIn * 4, stor, true);
+    bKin = createBuf(c, (size_t)nB * hKV * dh * 4, stor, true);
+    bVin = createBuf(c, (size_t)nB * hKV * dh * 4, stor, true);
+    bGb = createBuf(c, (size_t)nB * 2 * hV * 4, stor, true);
+    bConvOut = createBuf(c, (size_t)nB * chQkv * 4, stor, true);
+    bO = createBuf(c, (size_t)nB * dIn * 4, stor, true);
+    bAtt = createBuf(c, (size_t)nB * dIn * 4, stor, true);
+    bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    bY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    bML = createBuf(c, (size_t)nB * 256 * 4, stor, true);
+    bMH = createBuf(c, (size_t)nB * 9 * 512 * 4, stor, true);
+    bMSel = createBuf(c, (size_t)nB * 128, stor, true);
+    bMY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    bMY2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    bONorm = createBuf(c, nEmbd * 4, stor, true);
+    bHeadW = createBuf(c, (size_t)vocab * rbE, stor, true);
+    bLogits = createBuf(c, (size_t)nB * vocab * 4, storSrc, true);
+    bEmbdW = createBuf(c, (size_t)vocab * rbE, stor, true);
+    bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, stor, true);
+    bAV = createBuf(c, (size_t)nB * 64 * 4, stor, true);
+    bAI = createBuf(c, (size_t)nB * 64 * 4, stor, true);
+    bTok = createBuf(c, (size_t)nB * 4, storSrc, true);
+    bSlotIn = createBuf(c, (size_t)nB * 4, stor, false);   // host-visible, host-written each step
+    bSlotPos = createBuf(c, (size_t)nB * 4, stor, false);
+    bSamp = createBuf(c, (size_t)nB * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);  // readback
+    stage = createBuf(c, 160u << 20,
+                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    VK_CHECK(vkMapMemory(c.dev, bSlotIn.mem, 0, VK_WHOLE_SIZE, 0, (void**)&slotInMap));
+    VK_CHECK(vkMapMemory(c.dev, bSlotPos.mem, 0, VK_WHOLE_SIZE, 0, (void**)&slotPosMap));
+    VK_CHECK(vkMapMemory(c.dev, bSamp.mem, 0, VK_WHOLE_SIZE, 0, (void**)&sampMap));
+    for (uint32_t s = 0; s < nB; s++) { slotInMap[s] = 0; slotPosMap[s] = 0; }
+
+    void* mapped;
+    VK_CHECK(vkMapMemory(c.dev, stage.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
+    auto begin = [&]() {
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+    };
+    auto submitWait = [&]() {
+        VK_CHECK(vkEndCommandBuffer(c.cb));
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &c.cb;
+        VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(c.queue));
+    };
+    auto upload = [&](Buf& dst, const void* src, size_t n) {
+        for (size_t off = 0; off < n; off += (140u << 20)) {
+            size_t chunk = std::min(n - off, (size_t)(140u << 20));
+            if (src) memcpy(mapped, (const uint8_t*)src + off, chunk); else memset(mapped, 0, chunk);
+            begin();
+            VkBufferCopy cp{0, off, chunk};
+            vkCmdCopyBuffer(c.cb, stage.buf, dst.buf, 1, &cp);
+            submitWait();
+        }
+    };
+    upload(bONorm, tONorm->data, nEmbd * 4);
+    {
+        const uint32_t half = nRot / 2;
+        std::vector<float> rope((size_t)tmax * half * 2);
+        for (uint32_t p = 0; p < tmax; p++)
+            for (uint32_t j = 0; j < half; j++) {
+                float th = (float)p * std::pow(kFreqBase, -2.f * (float)j / (float)nRot);
+                rope[2 * ((size_t)p * half + j)] = std::cos(th);
+                rope[2 * ((size_t)p * half + j) + 1] = std::sin(th);
+            }
+        upload(bRope, rope.data(), rope.size() * 4);
+    }
+    upload(bHeadW, tHead->data, (size_t)vocab * rbE);
+    upload(bEmbdW, tEmbd->data, (size_t)vocab * rbE);
+
+    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1024; dpci.poolSizeCount = 1; dpci.pPoolSizes = &dps;
+    VK_CHECK(vkCreateDescriptorPool(c.dev, &dpci, nullptr, &dpool));
+    auto mkSet = [&](Pipe& pp, std::vector<VkBuffer> bufs) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = dpool; ai.descriptorSetCount = 1; ai.pSetLayouts = &pp.dsl;
+        VkDescriptorSet ds;
+        VK_CHECK(vkAllocateDescriptorSets(c.dev, &ai, &ds));
+        std::vector<VkDescriptorBufferInfo> dbi(bufs.size());
+        std::vector<VkWriteDescriptorSet> wr(bufs.size());
+        for (size_t i = 0; i < bufs.size(); i++) {
+            dbi[i] = {bufs[i], 0, VK_WHOLE_SIZE};
+            wr[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wr[i].dstSet = ds; wr[i].dstBinding = (uint32_t)i; wr[i].descriptorCount = 1;
+            wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
+        }
+        vkUpdateDescriptorSets(c.dev, (uint32_t)wr.size(), wr.data(), 0, nullptr);
+        return ds;
+    };
+
+    layers.resize(nLayer);
+    char nb[128];
+    for (uint32_t il = 0; il < nLayer; il++) {
+        Layer& L = layers[il];
+        auto T = [&](const char* suffix) -> const GgufTensor* {
+            snprintf(nb, sizeof nb, "blk.%u.%s", il, suffix); return g.find(nb);
+        };
+        auto W = [&](const GgufTensor* t, size_t n) -> VkBuffer {
+            L.bufs.push_back(createBuf(c, n, stor, true));
+            upload(L.bufs.back(), t ? t->data : nullptr, n);
+            return L.bufs.back().buf;
+        };
+        MoeT moe;
+        if (!loadMoeT(g, il, moe)) return fail("qk_open: MoE tensors missing");
+        L.downQ6 = moe.downQ6;
+        L.rec = T("ssm_a") != nullptr;
+        VkBuffer aNorm = W(T("attn_norm.weight"), nEmbd * 4);
+        VkBuffer pn = W(T("post_attention_norm.weight"), nEmbd * 4);
+        L.aNormBuf = aNorm;
+        if (L.rec) {
+            VkBuffer qkvW = W(T("attn_qkv.weight"), (size_t)chQkv * rbQ8e);
+            VkBuffer zW = W(T("attn_gate.weight"), (size_t)dIn * rbQ8e);
+            VkBuffer alW = W(T("ssm_alpha.weight"), (size_t)hV * nEmbd * 4);
+            VkBuffer beW = W(T("ssm_beta.weight"), (size_t)hV * nEmbd * 4);
+            VkBuffer dt = W(T("ssm_dt.bias"), hV * 4);
+            VkBuffer av = W(T("ssm_a"), hV * 4);
+            VkBuffer ker = W(T("ssm_conv1d.weight") ? T("ssm_conv1d.weight") : T("ssm_conv1d"),
+                             (size_t)chQkv * 4 * 4);
+            VkBuffer sn = W(T("ssm_norm.weight"), dS * 4);
+            VkBuffer outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
+            VkBuffer convSt = W(nullptr, (size_t)nB * chQkv * 3 * 4);
+            VkBuffer S = W(nullptr, (size_t)nB * hV * dS * dS * 4);
+            L.st1 = convSt; L.ps1 = (size_t)chQkv * 3 * 4;
+            L.st2 = S;      L.ps2 = (size_t)hV * dS * dS * 4;
+            L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
+            L.sP1 = mkSet(pGemvA, {qkvW, bXn.buf, bBig.buf});
+            L.sP2 = mkSet(pGemvA, {zW, bXn.buf, bMid.buf});
+            L.sAb = mkSet(pAb, {bXn.buf, alW, beW, dt, av, bGb.buf});
+            L.sConv = mkSet(pConvN, {convSt, bBig.buf, ker, bConvOut.buf});
+            L.sStep = mkSet(pStep, {bConvOut.buf, bGb.buf, S, bO.buf});
+            L.sGate = mkSet(pGate, {bO.buf, sn, bMid.buf, bAtt.buf});
+            L.sWo = mkSet(pGemvO, {outW, bAtt.buf, bAttnOut.buf});
+        } else {
+            VkBuffer wq = W(T("attn_q.weight"), (size_t)chQkv * rbQ8e);
+            VkBuffer wk = W(T("attn_k.weight"), (size_t)hKV * dh * rbQ8e);
+            VkBuffer wv = W(T("attn_v.weight"), (size_t)hKV * dh * rbQ8e);
+            VkBuffer qn = W(T("attn_q_norm.weight"), dh * 4);
+            VkBuffer kn = W(T("attn_k_norm.weight"), dh * 4);
+            VkBuffer wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
+            VkBuffer kc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
+            VkBuffer vc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
+            L.st1 = kc; L.ps1 = (size_t)hKV * tmax * dh * 4;
+            L.st2 = vc; L.ps2 = (size_t)hKV * tmax * dh * 4;
+            L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
+            L.sP1 = mkSet(pGemvA, {wq, bXn.buf, bBig.buf});
+            L.sP2 = mkSet(pGemvA, {wk, bXn.buf, bKin.buf});
+            L.sP3 = mkSet(pGemvA, {wv, bXn.buf, bVin.buf});
+            L.sPrep = mkSet(pPrep, {bBig.buf, bKin.buf, bVin.buf, qn, kn, bMid.buf, kc, vc,
+                                    bRope.buf, bSlotPos.buf});
+            L.sAttn = mkSet(pAttn, {bMid.buf, kc, vc, bBig.buf, bAtt.buf, bSlotPos.buf});
+            L.sWo = mkSet(pGemvO, {wo, bAtt.buf, bAttnOut.buf});
+        }
+        VkBuffer mgi = W(moe.gi, (size_t)moe.nExp * nEmbd * 4);
+        VkBuffer mgis = W(moe.gis, nEmbd * 4);
+        VkBuffer mge = W(moe.ge, (size_t)moe.nExp * moe.nFf * moe.rbGE);
+        VkBuffer mue = W(moe.ue, (size_t)moe.nExp * moe.nFf * moe.rbGE);
+        VkBuffer mde = W(moe.de, (size_t)moe.nExp * moe.nEmbd * moe.rbDE);
+        VkBuffer mgs = W(moe.gs, (size_t)moe.nFf * moe.rbGS);
+        VkBuffer mus = W(moe.us, (size_t)moe.nFf * moe.rbGS);
+        VkBuffer mds = W(moe.ds, (size_t)moe.nEmbd * moe.rbDS);
+        L.sAddN = mkSet(pAddN, {bXin.buf, bAttnOut.buf, pn, bY.buf, bXn2.buf});
+        L.sMoeL = mkSet(pMoeL, {mgi, bXn2.buf, bML.buf});
+        L.sMoeS = mkSet(pMoeS, {bML.buf, mgis, bXn2.buf, bMSel.buf});
+        L.sMoeGU = mkSet(pMoeGU, {mge, mue, bXn2.buf, bMSel.buf, bMH.buf});
+        L.sMoeGUs = mkSet(pMoeGUs, {mgs, mus, bXn2.buf, bMH.buf});
+        L.sMoeDn = mkSet(L.downQ6 ? pMoeDn6 : pMoeDn4, {mde, bMH.buf, bMSel.buf, bMY.buf});
+        L.sMoeDns = mkSet(pMoeDnsB, {mds, bMH.buf, bMSel.buf, bMY2.buf});
+    }
+    for (uint32_t il = 0; il < nLayer; il++)
+        layers[il].sAdd3 = mkSet(pAdd3, {bY.buf, bMY.buf, bMY2.buf,
+                                         il + 1 < nLayer ? layers[il + 1].aNormBuf : bONorm.buf,
+                                         bXin.buf, bXn.buf});
+    sHead = mkSet(pHead, {bHeadW.buf, bXn.buf, bLogits.buf});
+    sAm1 = mkSet(pAm1, {bLogits.buf, bAV.buf, bAI.buf});
+    sAm2 = mkSet(pAm2, {bAV.buf, bAI.buf, bTok.buf});
+    sEmb = mkSet(pEmb, {bEmbdW.buf, bSlotIn.buf, bXin.buf});
+
+    // ---- record the single re-submittable step command buffer ----
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(c.dev, &cbai, &stepCB));
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkCommandBuffer rcb = stepCB;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    auto barrier = [&]() {
+        vkCmdPipelineBarrier(rcb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    auto disp = [&](Pipe& pp, VkDescriptorSet ds, uint32_t wgs, const void* pc, uint32_t pcSize) {
+        vkCmdBindPipeline(rcb, VK_PIPELINE_BIND_POINT_COMPUTE, pp.p);
+        vkCmdBindDescriptorSets(rcb, VK_PIPELINE_BIND_POINT_COMPUTE, pp.pl, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(rcb, pp.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pc);
+        uint32_t gx = std::min(wgs, c.props.limits.maxComputeWorkGroupCount[0]);
+        uint32_t gy = (wgs + gx - 1) / gx;
+        vkCmdDispatch(rcb, gx, gy, nB);
+    };
+    struct { uint32_t n; float e; } pcRms{nEmbd, eps};
+    struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
+        pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
+    struct { uint32_t n, h; } pcAb{nEmbd, hV};
+    struct { uint32_t ch, d, qkch; float e; } pcConvN{chQkv, dS, 2 * hK * dS, eps};
+    struct { uint32_t d, hk, hv; } pcStep{dS, hK, hV};
+    struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
+    struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
+    struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; }
+        pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase};
+    const uint32_t amWgs = (vocab + 4095) / 4096;
+    struct { uint32_t n, span; } pcAm{vocab, 4096};
+    struct { uint32_t m; } pcAm2{amWgs};
+    struct { uint32_t k, idx, pr; } pcE{nEmbd, 0, 1};  // idx0 + perReq1 -> ids[rq] = slotInput[rq]
+
+    VK_CHECK(vkBeginCommandBuffer(rcb, &cbbi));
+    barrier();
+    disp(pEmb, sEmb, 1, &pcE, 12);
+    barrier();
+    disp(pRms, layers[0].sRms, 1, &pcRms, 8);
+    barrier();
+    for (uint32_t il = 0; il < nLayer; il++) {
+        Layer& L = layers[il];
+        if (L.rec) {
+            disp(pGemvA, L.sP1, (chQkv + 3) / 4, &pcQkv, 8);
+            disp(pGemvA, L.sP2, (dIn + 3) / 4, &pcZ, 8);
+            disp(pAb, L.sAb, 2 * hV, &pcAb, 8);
+            barrier();
+            disp(pConvN, L.sConv, chQkv / dS, &pcConvN, 16);
+            barrier();
+            disp(pStep, L.sStep, hV, &pcStep, 12);
+            barrier();
+            disp(pGate, L.sGate, hV, &pcGate, 12);
+            barrier();
+            disp(pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
+        } else {
+            disp(pGemvA, L.sP1, (chQkv + 3) / 4, &pcQkv, 8);
+            disp(pGemvA, L.sP2, (hKV * dh + 3) / 4, &pcKV, 8);
+            disp(pGemvA, L.sP3, (hKV * dh + 3) / 4, &pcKV, 8);
+            barrier();
+            disp(pPrep, L.sPrep, hQ + 2 * hKV, &pcFa, 32);
+            barrier();
+            disp(pAttn, L.sAttn, hQ, &pcFa, 32);
+            barrier();
+            disp(pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
+        }
+        barrier();
+        disp(pAddN, L.sAddN, 1, &pcRms, 8);
+        barrier();
+        disp(pMoeL, L.sMoeL, 256, &pcv, 16);
+        disp(pMoeGUs, L.sMoeGUs, 512, &pcv, 16);
+        barrier();
+        disp(pMoeS, L.sMoeS, 1, &pcv, 16);
+        barrier();
+        disp(pMoeGU, L.sMoeGU, 8 * 512, &pcv, 16);
+        barrier();
+        disp(L.downQ6 ? pMoeDn6 : pMoeDn4, L.sMoeDn, nEmbd, &pcv, 16);
+        disp(pMoeDnsB, L.sMoeDns, nEmbd, &pcv, 16);
+        barrier();
+        disp(pAdd3, L.sAdd3, 1, &pcRms, 8);
+        barrier();
+    }
+    disp(pHead, sHead, (vocab + 1) / 2, &pcHead, 8);
+    barrier();
+    disp(pAm1, sAm1, amWgs, &pcAm, 8);
+    barrier();
+    disp(pAm2, sAm2, 1, &pcAm2, 4);
+    VkMemoryBarrier m2{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    m2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    m2.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(rcb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &m2, 0, nullptr, 0, nullptr);
+    VkBufferCopy ct{0, 0, (size_t)nB * 4};
+    vkCmdCopyBuffer(rcb, bTok.buf, bSamp.buf, 1, &ct);
+    VK_CHECK(vkEndCommandBuffer(rcb));
+
+    slots.resize(nSlots);
+    return true;
+}
+
+// Advance every active slot by up to chunkN steps. Returns active-at-entry.
+int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
+    for (uint32_t s = 0; s < nSlots; s++) outCnt[s] = 0;
+    *outFin = 0;
+    int activeAtEntry = 0;
+    for (uint32_t s = 0; s < nSlots; s++) if (slots[s].active) activeAtEntry++;
+    if (!activeAtEntry) return 0;
+
+    for (uint32_t step = 0; step < chunkN; step++) {
+        int nAct = 0;
+        for (uint32_t s = 0; s < nSlots; s++) {
+            Slot& sl = slots[s];
+            if (!sl.active) { slotInMap[s] = 0; slotPosMap[s] = 0; continue; }
+            nAct++;
+            if (sl.cursor < sl.prompt.size()) {         // prefill: feed prompt[cursor] at position cursor
+                slotInMap[s] = sl.prompt[sl.cursor];
+                slotPosMap[s] = sl.cursor;
+            } else {                                    // decode: feed last sampled at pos
+                slotInMap[s] = sl.last;
+                slotPosMap[s] = sl.pos;
+            }
+        }
+        if (!nAct) break;
+
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &stepCB;
+        VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(c.queue));
+
+        for (uint32_t s = 0; s < nSlots; s++) {
+            Slot& sl = slots[s];
+            if (!sl.active) continue;
+            uint32_t sampled = sampMap[s];
+            bool prefilling = sl.cursor < sl.prompt.size();
+            if (prefilling && sl.cursor + 1 < sl.prompt.size()) {
+                sl.cursor++;  // still consuming prompt; ignore this logit
+                continue;
+            }
+            // this step produced a real generated token (last prompt token, or a decode step)
+            if (prefilling) { sl.cursor = (uint32_t)sl.prompt.size(); sl.pos = (uint32_t)sl.prompt.size(); }
+            if (sampled == eosTok) {
+                sl.active = false; *outFin |= 1u << s;
+                continue;
+            }
+            outTok[s * chunkN + outCnt[s]++] = sampled;
+            sl.last = sampled;
+            sl.gen++;
+            if (!prefilling) sl.pos++;
+            if (sl.pos >= nCtx || sl.gen >= sl.maxGen) {
+                sl.active = false; *outFin |= 1u << s;
+            }
+        }
+    }
+    return activeAtEntry;
+}
+
+extern "C" {
+
+__attribute__((visibility("default")))
+qk_engine* qk_open(const char* gguf_path, const qk_config* cfg, char* err, size_t err_len) {
+    if (!gguf_path || !cfg) { if (err && err_len) snprintf(err, err_len, "qk_open: null arg"); return nullptr; }
+    qk_engine* e = new (std::nothrow) qk_engine();
+    if (!e) { if (err && err_len) snprintf(err, err_len, "qk_open: oom"); return nullptr; }
+    if (!e->open(gguf_path, *cfg, err, err_len)) { delete e; return nullptr; }
+    return e;
+}
+
+__attribute__((visibility("default"))) void qk_close(qk_engine* e) { delete e; }
+__attribute__((visibility("default"))) uint32_t qk_n_vocab(const qk_engine* e) { return e->vocab; }
+__attribute__((visibility("default"))) uint32_t qk_n_ctx(const qk_engine* e) { return e->nCtx; }
+__attribute__((visibility("default"))) uint32_t qk_n_slots(const qk_engine* e) { return e->nSlots; }
+__attribute__((visibility("default"))) uint32_t qk_chunk(const qk_engine* e) { return e->chunkN; }
+__attribute__((visibility("default"))) uint32_t qk_eos_token(const qk_engine* e) { return e->eosTok; }
+__attribute__((visibility("default"))) uint32_t qk_bos_token(const qk_engine* e) { return e->bosTok; }
+
+__attribute__((visibility("default")))
+int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt, uint32_t max_gen) {
+    if (!e || slot >= e->nSlots) return -1;
+    if (e->slots[slot].active) return -2;
+    if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
+    for (uint32_t i = 0; i < n_prompt; i++) if (prompt[i] >= e->vocab) return -4;
+    e->resetSlot(slot);  // clear any prior occupant's recurrent state
+    qk_engine::Slot& s = e->slots[slot];
+    s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
+    s.cursor = 0; s.pos = 0; s.gen = 0; s.maxGen = max_gen; s.last = 0;
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void qk_slot_cancel(qk_engine* e, uint32_t slot) {
+    if (e && slot < e->nSlots) { e->slots[slot].active = false; e->slots[slot].prompt.clear(); }
+}
+
+__attribute__((visibility("default")))
+int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint32_t* out_finished) {
+    if (!e || !out_tokens || !out_counts || !out_finished) return -1;
+    return e->stepChunk(out_tokens, out_counts, out_finished);
+}
+
+}  // extern "C"
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -2657,11 +3183,58 @@ static void listTensors(const std::string& filter) {
     }
 }
 
+#ifndef QK_LIBRARY
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "suite";
 
     if (mode == "list") {
         listTensors(argc > 2 ? argv[2] : "");
+        return 0;
+    }
+
+    if (mode == "serve-test") {
+        // Drive the qk.h C ABI in-process: every slot runs the SAME prompt, so
+        // all streams must match each other AND the external greedy reference.
+        if (argc < 4) {
+            fprintf(stderr, "usage: qk serve-test <ids-file> <nGen> [nSlots] [tmax]\n");
+            return 1;
+        }
+        std::vector<uint32_t> prompt;
+        {
+            FILE* f = fopen(argv[2], "r");
+            if (!f) { perror(argv[2]); return 1; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+            fclose(f);
+        }
+        uint32_t nGen = (uint32_t)atoi(argv[3]);
+        uint32_t nSlots = argc > 4 ? (uint32_t)atoi(argv[4]) : 1;
+        uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 128;
+        qk_config cfg{nSlots, tmax, 8};
+        char err[256] = {0};
+        qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+        for (uint32_t s = 0; s < nSlots; s++)
+            qk_slot_start(e, s, prompt.data(), (uint32_t)prompt.size(), nGen);
+        uint32_t ch = qk_chunk(e);
+        std::vector<std::vector<uint32_t>> gen(nSlots);
+        std::vector<uint32_t> outTok((size_t)nSlots * ch), outCnt(nSlots);
+        uint32_t finMask = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        while (qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask) > 0)
+            for (uint32_t s = 0; s < nSlots; s++)
+                for (uint32_t i = 0; i < outCnt[s]; i++) gen[s].push_back(outTok[s * ch + i]);
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+        bool allEq = true;
+        for (uint32_t s = 1; s < nSlots; s++) if (gen[s] != gen[0]) allEq = false;
+        printf("serve-test: %u slots x prompt %zu -> %zu tokens each in %.1f ms\n",
+               nSlots, prompt.size(), gen[0].size(), ms);
+        if (nSlots > 1) printf("all slots identical: %s\n", allEq ? "YES" : "NO");
+        printf("GEN:");
+        for (uint32_t t : gen[0]) printf(" %u", t);
+        printf("\n");
+        qk_close(e);
         return 0;
     }
 
@@ -2722,3 +3295,4 @@ int main(int argc, char** argv) {
     vkDeviceWaitIdle(c.dev);
     return ok ? 0 : 1;
 }
+#endif  // QK_LIBRARY
