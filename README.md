@@ -124,10 +124,31 @@ vkQueueSubmit — the host reads the generated ids at the end)
 in one dispatch, routed & shared MoE down-projections made concurrent)
 → **5.82** (subgroupAdd reductions replacing shared-memory trees in 12
 shaders; conv+SiLU+state-shift+q/k-L2-norm fused into one dispatch).
-The optimization arc has converged: 76% of the ~230 tok/s kernel-time
-ceiling. What remains is the serial dependency chain itself (~8 barrier
-drains/layer) and cold weight streaming — closing it needs multi-token
-batched decode (speculative verify GEMMs), not more micro-fusion.
+The single-stream optimization arc has converged: 76% of the ~230 tok/s
+kernel-time ceiling. What remains is the serial dependency chain itself
+(~8 barrier drains/layer) and cold weight streaming.
+
+**Batched multi-request decode** (`qk token <ids> <n> [tmax] [batch]`):
+every token-path shader carries a request index on the dispatch z-axis —
+weights shared across streams, activations/states/KV/logits striped per
+request. N identical greedy streams double as validation (all must emit
+the reference sequence byte-identically; they do at N=1/4/8/16).
+
+| batch | ms/step | per-stream tok/s | aggregate tok/s |
+|---|---|---|---|
+| 1 | 5.82 | 171.8 | 171.8 |
+| 2 | 8.48 | 117.9 | 235.7 |
+| 4 | 13.55 | 73.8 | 295.2 |
+| 8 | 28.86 | 34.7 | 277.2 |
+| 16 | 41.72 | 24.0 | **383.5** |
+
+Dense weights and per-step overheads amortize; what doesn't is the routed
+expert reads (union of top-8 grows with N) and the deltanet recurrent
+state (N × 2 MB × 30 layers × ~3 accesses/step — at N=16 that's ~2.9 GB/step
+of state traffic, the new bandwidth wall; note the N=8 cache-crossover
+dip). Real serving atop this needs per-stream prompts/positions (pos in a
+per-request buffer instead of push constants) and EOS handling — the
+kernel machinery is already stream-capable.
 
 **Negative result, measured:** repacking IQ3_XXS into dword-aligned
 25-uint blocks (d as f32 + pre-assembled aux words + grid bytes) and
