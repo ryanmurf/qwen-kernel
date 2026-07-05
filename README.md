@@ -177,6 +177,28 @@ untrusted-input handling is safe Rust; the only `unsafe` is the one-thread
 `dlopen` FFI (`include/qk.h`) to the C++/Vulkan engine (`libqk`). See
 `server/README.md` and `docs/server-spec.md`.
 
+The engine side (`libqk.so`) is a persistent per-slot state machine: N slots
+each carry their own sequence position and input token (sourced per-slot from a
+buffer via `fa_prep_srv`/`fa_attn_srv`), so requests of different prompt lengths
+— some prefilling, some decoding — batch into one dispatch. Run it:
+
+```bash
+/usr/bin/cmake --build build --target qklib -j     # build libqk.so
+cd server && cargo build --release
+QK_SHADER_DIR=../build/shaders ./target/release/server \
+    --model /path/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf \
+    --engine-lib ../build/libqk.so --port 8080 --slots 4 --ctx 1024 --chunk 8
+```
+
+Validated end-to-end on real GPU inference (server quiesced): tokenization
+matches llama.cpp exactly; greedy `/completion` matches the single-stream
+reference; 4 concurrent distinct prompts each reproduce their own reference
+byte-for-byte; EOS termination, SSE streaming, and chat templating all correct;
+malformed input returns structured 400s without crashing. **59 tok/s single
+stream, 206 tok/s aggregate across 4 concurrent streams** (4 slots, ctx 1024) —
+~2.5× the llama.cpp server's throughput. (`qk serve-test <ids> <n> [slots]`
+drives the same C ABI in-process for regression checks.)
+
 Two CPU-precompute optimizations, both verified token-exact against the
 llama.cpp reference:
 
@@ -222,6 +244,7 @@ llama.cpp reference:
 ./build/qk ablock [layer] [tokens] [iters] # full-attention block (layers 3,7,...)
 ./build/qk token <ids-file> <nGen> [tmax] [batch]  # end-to-end greedy generation (server must be scaled down)
 ./build/qk warm <ids-file> <nGen> [tmax]   # prefix-cache cold/warm-start demo (TTFT)
+./build/qk serve-test <ids-file> <nGen> [nSlots] [tmax]  # drive the libqk C ABI in-process
 ./build/qk list [filter]            # list tensors in the GGUF
 ```
 
