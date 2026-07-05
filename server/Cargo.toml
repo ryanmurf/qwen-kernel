@@ -1,0 +1,35 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+aho-corasick = "1.1"
+anyhow = "1.0"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["macros"] }
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+fancy-regex = "0.16"
+futures = "0.3"
+libloading = "0.8"
+memmap2 = "0.9"
+minijinja = { version = "2.12", features = ["builtins", "loader"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["full"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.18", features = ["v4"] }
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tempfile = "3.23"
+tower = { version = "0.5", features = ["util"] }
