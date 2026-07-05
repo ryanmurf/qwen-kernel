@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qk-server
+  namespace: gemma
+  labels:
+    app: qk-server
+spec:
+  replicas: 0   # starts idle; only one of {gemma-server, qk-server} may hold the GPU at a time
+  selector:
+    matchLabels:
+      app: qk-server
+  template:
+    metadata:
+      labels:
+        app: qk-server
+        gpu-llm: server   # shared label: the gemma-server Service selects this, so scaling flips traffic
+    spec:
+      containers:
+      - name: qk-server
+        image: localhost:32000/qk-server:vulkan
+        imagePullPolicy: Always
+        args:
+        - --model
+        - /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf
+        - --engine-lib
+        - /app/libqk.so
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8080"
+        - --slots
+        - "4"
+        - --ctx
+        - "2048"
+        - --chunk
+        - "8"
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: 18Gi
+          limits:
+            memory: 30Gi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /models
+          name: models
+          readOnly: true
+        - mountPath: /dev/dri
+          name: dri
+      volumes:
+      - hostPath:
+          path: /home/ryan/intellij/ggerganov/llama.cpp
+          type: Directory
+        name: models
+      - hostPath:
+          path: /dev/dri
+          type: Directory
+        name: dri
