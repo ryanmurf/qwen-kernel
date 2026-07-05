@@ -30,6 +30,9 @@ shared float pu[256];
 void main() {
     uint r   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
+    uint rq  = gl_WorkGroupID.z;
+    uint xo2 = rq * pc.n_embd;
+    uint ho  = rq * (pc.n_used + 1u) * pc.n_ff;
 
     float accG = 0.0, accU = 0.0;
     if (r < pc.n_ff) {
@@ -39,7 +42,7 @@ void main() {
             uint  xoff = b * 32u;
             float sg = 0.0, su = 0.0;
             [[unroll]] for (uint i = 0u; i < 32u; ++i) {
-                float xv = x[xoff + i];
+                float xv = x[xo2 + xoff + i];
                 sg += float(int(gw[base + b].qs[i])) * xv;
                 su += float(int(uw[base + b].qs[i])) * xv;
             }
@@ -55,6 +58,6 @@ void main() {
     if (tid == 0u && r < pc.n_ff) {
         float g = 0.0, u = 0.0;
         for (uint i = 0u; i < gl_NumSubgroups; ++i) { g += pg[i]; u += pu[i]; }
-        h[pc.n_used * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;
+        h[ho + pc.n_used * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;
     }
 }

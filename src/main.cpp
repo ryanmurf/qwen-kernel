@@ -2064,7 +2064,7 @@ static bool caseABlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
 // M6b: end-to-end greedy decode over all 40 layers + embeddings + LM head.
 // Requires the whole model in VRAM (~16.5 GB) — quiesce llama-server first.
 // usage: qk token <ids-file> <nGen> [tmax]
-static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tmax) {
+static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tmax, uint32_t nB) {
     std::vector<int> promptIds;
     {
         FILE* f = fopen(idsFile, "r");
@@ -2093,8 +2093,9 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
     const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
     const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);
-    printf("token mode: %zu prompt ids, gen %u, vocab %u, tmax %u\n",
-           promptIds.size(), nGen, vocab, tmax);
+    if (nB < 1 || nB > 64) { fprintf(stderr, "batch must be 1..64\n"); return false; }
+    printf("token mode: %zu prompt ids, gen %u, vocab %u, tmax %u, batch %u\n",
+           promptIds.size(), nGen, vocab, tmax, nB);
 
     // ---- pipes (shared across layers) ----
     Pipe pRms = makePipe(c, "rmsnorm.spv", 3, 8);
@@ -2119,42 +2120,42 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
     Pipe pHead = makePipe(c, "gemv_q6_k.spv", 3, 8, 128);
     Pipe pAm1 = makePipe(c, "argmax1.spv", 3, 8);
     Pipe pAm2 = makePipe(c, "argmax2.spv", 3, 4);
-    Pipe pEmb = makePipe(c, "embed_q6k.spv", 3, 8);
+    Pipe pEmb = makePipe(c, "embed_q6k.spv", 3, 12);
 
     // ---- shared activation buffers ----
     const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const VkBufferUsageFlags storSrc = stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    Buf bXin = createBuf(c, nEmbd * 4, stor, true);
-    Buf bXn = createBuf(c, nEmbd * 4, stor, true);
-    Buf bBig = createBuf(c, chQkv * 4, stor, true);       // qkv | qfull
-    Buf bMid = createBuf(c, dIn * 4, stor, true);         // z | qhat
-    Buf bKin = createBuf(c, hKV * dh * 4, stor, true);
-    Buf bVin = createBuf(c, hKV * dh * 4, stor, true);
-    Buf bGb = createBuf(c, 2 * hV * 4, stor, true);
-    Buf bConvOut = createBuf(c, chQkv * 4, stor, true);
-    Buf bO = createBuf(c, dIn * 4, stor, true);
-    Buf bAtt = createBuf(c, dIn * 4, stor, true);
-    Buf bAttnOut = createBuf(c, nEmbd * 4, stor, true);
-    Buf bY = createBuf(c, nEmbd * 4, stor, true);
-    Buf bXn2 = createBuf(c, nEmbd * 4, stor, true);
-    Buf bML = createBuf(c, 256 * 4, stor, true);
-    Buf bMH = createBuf(c, 9 * 512 * 4, stor, true);
-    Buf bMSel = createBuf(c, 128, stor, true);
-    Buf bMY = createBuf(c, nEmbd * 4, stor, true);
-    Buf bMY2 = createBuf(c, nEmbd * 4, stor, true);
+    Buf bXin = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    Buf bXn = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    Buf bBig = createBuf(c, (size_t)nB * chQkv * 4, stor, true);       // qkv | qfull
+    Buf bMid = createBuf(c, (size_t)nB * dIn * 4, stor, true);         // z | qhat
+    Buf bKin = createBuf(c, (size_t)nB * hKV * dh * 4, stor, true);
+    Buf bVin = createBuf(c, (size_t)nB * hKV * dh * 4, stor, true);
+    Buf bGb = createBuf(c, (size_t)nB * 2 * hV * 4, stor, true);
+    Buf bConvOut = createBuf(c, (size_t)nB * chQkv * 4, stor, true);
+    Buf bO = createBuf(c, (size_t)nB * dIn * 4, stor, true);
+    Buf bAtt = createBuf(c, (size_t)nB * dIn * 4, stor, true);
+    Buf bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    Buf bY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    Buf bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    Buf bML = createBuf(c, (size_t)nB * 256 * 4, stor, true);
+    Buf bMH = createBuf(c, (size_t)nB * 9 * 512 * 4, stor, true);
+    Buf bMSel = createBuf(c, (size_t)nB * 128, stor, true);
+    Buf bMY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    Buf bMY2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     Buf bOut = createBuf(c, nEmbd * 4, storSrc, true);
     Buf bONorm = createBuf(c, nEmbd * 4, stor, true);
     Buf bHeadW = createBuf(c, (size_t)vocab * rbE, stor, true);
-    Buf bLogits = createBuf(c, (size_t)vocab * 4, storSrc, true);
+    Buf bLogits = createBuf(c, (size_t)nB * vocab * 4, storSrc, true);
     Buf bEmbdW = createBuf(c, (size_t)vocab * rbE, stor, true);
     Buf bPids = createBuf(c, (size_t)promptIds.size() * 4, stor, true);
-    Buf bAV = createBuf(c, 64 * 4, stor, true);
-    Buf bAI = createBuf(c, 64 * 4, stor, true);
-    Buf bTok = createBuf(c, 4, storSrc, true);
+    Buf bAV = createBuf(c, (size_t)nB * 64 * 4, stor, true);
+    Buf bAI = createBuf(c, (size_t)nB * 64 * 4, stor, true);
+    Buf bTok = createBuf(c, (size_t)nB * 4, storSrc, true);
     Buf bRb;  // generated-id readback, host-cached so CPU reads are fast
     {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = (size_t)tmax * 4;
+        bci.size = (size_t)tmax * nB * 4;
         bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VK_CHECK(vkCreateBuffer(c.dev, &bci, nullptr, &bRb.buf));
@@ -2282,8 +2283,8 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
                              (size_t)chQkv * 4 * 4);
             VkBuffer sn = W(T("ssm_norm.weight"), dS * 4);
             VkBuffer outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
-            VkBuffer convSt = W(nullptr, (size_t)chQkv * 3 * 4);
-            VkBuffer S = W(nullptr, (size_t)hV * dS * dS * 4);
+            VkBuffer convSt = W(nullptr, (size_t)nB * chQkv * 3 * 4);
+            VkBuffer S = W(nullptr, (size_t)nB * hV * dS * dS * 4);
             L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
             L.sP1 = mkSet(pGemvA, {qkvW, bXn.buf, bBig.buf});
             L.sP2 = mkSet(pGemvA, {zW, bXn.buf, bMid.buf});
@@ -2299,8 +2300,8 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
             VkBuffer qn = W(T("attn_q_norm.weight"), dh * 4);
             VkBuffer kn = W(T("attn_k_norm.weight"), dh * 4);
             VkBuffer wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
-            VkBuffer kc = W(nullptr, (size_t)hKV * tmax * dh * 4);
-            VkBuffer vc = W(nullptr, (size_t)hKV * tmax * dh * 4);
+            VkBuffer kc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
+            VkBuffer vc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
             L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
             L.sP1 = mkSet(pGemvA, {wq, bXn.buf, bBig.buf});
             L.sP2 = mkSet(pGemvA, {wk, bXn.buf, bKin.buf});
@@ -2352,7 +2353,7 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         vkCmdPushConstants(rcb, pp.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pc);
         uint32_t gx = std::min(wgs, c.props.limits.maxComputeWorkGroupCount[0]);
         uint32_t gy = (wgs + gx - 1) / gx;
-        vkCmdDispatch(rcb, gx, gy, 1);
+        vkCmdDispatch(rcb, gx, gy, nB);
     };
 
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
@@ -2442,8 +2443,8 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         rcb = cbPre[p];
         VK_CHECK(vkBeginCommandBuffer(rcb, &cbbi));
         barrier();  // order against the previous CB in the queue
-        struct { uint32_t k, idx; } pcE{nEmbd, p};
-        dispatchB(pEmb, sEmbPre, 1, &pcE, 8);
+        struct { uint32_t k, idx, pr; } pcE{nEmbd, p, 0};
+        dispatchB(pEmb, sEmbPre, 1, &pcE, 12);
         barrier();
         recordToken(p, p + 1 == nPrompt);
         VK_CHECK(vkEndCommandBuffer(rcb));
@@ -2467,9 +2468,9 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         vkCmdPipelineBarrier(rcb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &m2, 0, nullptr, 0, nullptr);
-        struct { uint32_t k, idx; } pcE{nEmbd, 0};
-        dispatchB(pEmb, sEmbDec, 1, &pcE, 8);
-        VkBufferCopy ct{0, (size_t)p * 4, 4};
+        struct { uint32_t k, idx, pr; } pcE{nEmbd, 0, 1};
+        dispatchB(pEmb, sEmbDec, 1, &pcE, 12);
+        VkBufferCopy ct{0, (size_t)p * nB * 4, (size_t)nB * 4};
         vkCmdCopyBuffer(rcb, bTok.buf, bRb.buf, 1, &ct);
         barrier();
         recordToken(p, true);
@@ -2503,9 +2504,15 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
 
     std::vector<int> genIds(nGen);
     const uint32_t* rb = (const uint32_t*)rbMap;
-    for (uint32_t i = 0; i < nGen; i++) genIds[i] = (int)rb[nPrompt + i];
-    printf("decode: %u tokens in %.1f ms -> %.2f ms/token = %.1f tok/s (GPU-resident loop, one submission)\n",
-           nGen, genMs, genMs / nGen, nGen * 1000.0 / genMs);
+    bool streamsEq = true;
+    for (uint32_t i = 0; i < nGen; i++) {
+        genIds[i] = (int)rb[(size_t)(nPrompt + i) * nB];
+        for (uint32_t r = 1; r < nB; r++)
+            if (rb[(size_t)(nPrompt + i) * nB + r] != (uint32_t)genIds[i]) streamsEq = false;
+    }
+    printf("decode: %u steps x %u streams in %.1f ms -> %.2f ms/step | per-stream %.1f tok/s | aggregate %.1f tok/s\n",
+           nGen, nB, genMs, genMs / nGen, nGen * 1000.0 / genMs, (double)nGen * nB * 1000.0 / genMs);
+    if (nB > 1) printf("streams identical: %s\n", streamsEq ? "YES" : "NO");
     printf("GEN:");
     for (int id : genIds) printf(" %d", id);
     printf("\n");
@@ -2587,7 +2594,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "usage: qk token <ids-file> <nGen> [tmax]\n");
             return 1;
         }
-        ok = caseToken(c, argv[2], argU(3, 12), argU(4, 128));
+        ok = caseToken(c, argv[2], argU(3, 12), argU(4, 128), argU(5, 1));
     } else {
         fprintf(stderr, "unknown mode '%s'\n", mode.c_str());
         return 1;

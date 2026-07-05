@@ -11,11 +11,8 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufL   { float logits[]; };
 layout(std430, binding = 1) readonly buffer BufGIS { float gis[]; };
 layout(std430, binding = 2) readonly buffer BufX   { float x[]; };
-layout(std430, binding = 3) buffer Sel {
-    uint  ids[8];
-    float w[8];
-    float wShared;
-};
+struct SelT { uint ids[8]; float w[8]; float wShared; float pad[15]; };
+layout(std430, binding = 3) buffer Sel { SelT sel[]; };
 
 layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
 
@@ -25,19 +22,20 @@ shared uint  redi[256];
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
 
-    sl[t] = t < pc.n_expert ? logits[t] : -3.4e38;
+    sl[t] = t < pc.n_expert ? logits[rq * pc.n_expert + t] : -3.4e38;
 
     // shared-expert gate dot
     float sacc = 0.0;
-    for (uint k = t; k < pc.n_embd; k += 256u) sacc += gis[k] * x[k];
+    for (uint k = t; k < pc.n_embd; k += 256u) sacc += gis[k] * x[rq * pc.n_embd + k];
     red[t] = sacc;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {
         if (t < s) red[t] += red[t + s];
         barrier();
     }
-    if (t == 0u) wShared = 1.0 / (1.0 + exp(-red[0]));
+    if (t == 0u) sel[rq].wShared = 1.0 / (1.0 + exp(-red[0]));
     barrier();
 
     // top-n_used by logit: n_used rounds of parallel argmax
@@ -53,17 +51,17 @@ void main() {
             barrier();
         }
         if (t == 0u) {
-            ids[i] = redi[0];
-            w[i] = red[0];          // logit for now, softmaxed below
+            sel[rq].ids[i] = redi[0];
+            sel[rq].w[i] = red[0];          // logit for now, softmaxed below
             sl[redi[0]] = -3.4e38;
         }
         barrier();
     }
 
     if (t == 0u) {
-        float m = w[0];             // first pick has the max logit
+        float m = sel[rq].w[0];             // first pick has the max logit
         float sum = 0.0;
-        for (uint i = 0u; i < pc.n_used; ++i) { w[i] = exp(w[i] - m); sum += w[i]; }
-        for (uint i = 0u; i < pc.n_used; ++i) w[i] /= sum;
+        for (uint i = 0u; i < pc.n_used; ++i) { sel[rq].w[i] = exp(sel[rq].w[i] - m); sum += sel[rq].w[i]; }
+        for (uint i = 0u; i < pc.n_used; ++i) sel[rq].w[i] /= sum;
     }
 }

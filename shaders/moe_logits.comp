@@ -18,11 +18,12 @@ shared float partial[256];
 void main() {
     uint e   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
+    uint rq  = gl_WorkGroupID.z;
 
     float acc = 0.0;
     if (e < pc.n_expert) {
         uint base = e * pc.n_embd;
-        for (uint k = tid; k < pc.n_embd; k += 256u) acc += gi[base + k] * x[k];
+        for (uint k = tid; k < pc.n_embd; k += 256u) acc += gi[base + k] * x[rq * pc.n_embd + k];
     }
 
     float v = subgroupAdd(acc);
@@ -31,6 +32,6 @@ void main() {
     if (tid == 0u && e < pc.n_expert) {
         float s2 = 0.0;
         for (uint i = 0u; i < gl_NumSubgroups; ++i) s2 += partial[i];
-        logits[e] = s2;
+        logits[rq * pc.n_expert + e] = s2;
     }
 }

@@ -22,11 +22,8 @@ struct block_q6_K {
 
 layout(std430, binding = 0) readonly buffer BufW { block_q6_K dw[]; };
 layout(std430, binding = 1) readonly buffer BufH { float h[]; };
-layout(std430, binding = 2) readonly buffer Sel {
-    uint  ids[8];
-    float w[8];
-    float wShared;
-};
+struct SelT { uint ids[8]; float w[8]; float wShared; float pad[15]; };
+layout(std430, binding = 2) readonly buffer Sel { SelT sel[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 
 layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
@@ -36,6 +33,8 @@ shared float partial[256];
 void main() {
     uint o   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
+    uint rq  = gl_WorkGroupID.z;
+    uint ho  = rq * (pc.n_used + 1u) * pc.n_ff;
 
     uint kb = pc.n_ff / 256u;   // super-blocks per row
     uint ng = kb * 16u;         // 16-element groups per row
@@ -51,7 +50,7 @@ void main() {
             uint hh = gg >> 3u;
             uint r  = (gg & 7u) >> 1u;
             uint is = gg & 1u;
-            uint bi = (ids[s] * pc.n_embd + o) * kb + b;
+            uint bi = (sel[rq].ids[s] * pc.n_embd + o) * kb + b;
 
             float d  = float(dw[bi].d);
             float sc = float(int(dw[bi].scales[hh * 8u + r * 2u + is]));
@@ -60,7 +59,7 @@ void main() {
             uint qhBase = hh * 32u + is * 16u;
             uint shift  = r * 2u;
             bool hi     = r >= 2u;
-            uint hoff   = s * pc.n_ff + b * 256u + gg * 16u;
+            uint hoff   = ho + s * pc.n_ff + b * 256u + gg * 16u;
 
             float sacc = 0.0;
             for (uint i = 0u; i < 16u; ++i) {
@@ -70,7 +69,7 @@ void main() {
                 int  q   = int(lo | (((qhv >> shift) & 3u) << 4u)) - 32;
                 sacc += float(q) * h[hoff + i];
             }
-            acc += w[s] * d * sc * sacc;
+            acc += sel[rq].w[s] * d * sc * sacc;
         }
     }
 
@@ -80,6 +79,6 @@ void main() {
     if (tid == 0u && o < pc.n_embd) {
         float s2 = 0.0;
         for (uint i = 0u; i < gl_NumSubgroups; ++i) s2 += partial[i];
-        y[o] = s2;
+        y[rq * pc.n_embd + o] = s2;
     }
 }

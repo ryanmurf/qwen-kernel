@@ -22,11 +22,8 @@ struct block_iq3_xxs {
 layout(std430, binding = 0) readonly buffer BufG { block_iq3_xxs gw[]; };
 layout(std430, binding = 1) readonly buffer BufU { block_iq3_xxs uw[]; };
 layout(std430, binding = 2) readonly buffer BufX { float x[]; };
-layout(std430, binding = 3) readonly buffer Sel {
-    uint  ids[8];
-    float w[8];
-    float wShared;
-};
+struct SelT { uint ids[8]; float w[8]; float wShared; float pad[15]; };
+layout(std430, binding = 3) readonly buffer Sel { SelT sel[]; };
 layout(std430, binding = 4) writeonly buffer BufH { float h[]; };
 
 layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
@@ -39,12 +36,15 @@ void main() {
     uint s   = wg / pc.n_ff;
     uint r   = wg % pc.n_ff;
     uint tid = gl_LocalInvocationID.x;
+    uint rq  = gl_WorkGroupID.z;
+    uint xo2 = rq * pc.n_embd;
+    uint ho  = rq * (pc.n_used + 1u) * pc.n_ff;
 
     float accG = 0.0, accU = 0.0;
     if (s < pc.n_used) {
         uint kb   = pc.n_embd / 256u;  // super-blocks per row
         uint nu   = kb * 32u;          // 8-element groups per row
-        uint base = (ids[s] * pc.n_ff + r) * kb;
+        uint base = (sel[rq].ids[s] * pc.n_ff + r) * kb;
 
         for (uint u = tid; u < nu; u += 256u) {
             uint b    = u >> 5u;
@@ -68,8 +68,8 @@ void main() {
                 for (uint j = 0u; j < 4u; ++j) {
                     float m1 = float((g1 >> (8u * j)) & 255u);
                     float m2 = float((g2 >> (8u * j)) & 255u);
-                    sacc += ((signs & (1u << j)) != 0u ? -m1 : m1) * x[xoff + j];
-                    sacc += ((signs & (1u << (j + 4u))) != 0u ? -m2 : m2) * x[xoff + 4u + j];
+                    sacc += ((signs & (1u << j)) != 0u ? -m1 : m1) * x[xo2 + xoff + j];
+                    sacc += ((signs & (1u << (j + 4u))) != 0u ? -m2 : m2) * x[xo2 + xoff + 4u + j];
                 }
                 accG += db * sacc;
             }
@@ -86,8 +86,8 @@ void main() {
                 for (uint j = 0u; j < 4u; ++j) {
                     float m1 = float((g1 >> (8u * j)) & 255u);
                     float m2 = float((g2 >> (8u * j)) & 255u);
-                    sacc += ((signs & (1u << j)) != 0u ? -m1 : m1) * x[xoff + j];
-                    sacc += ((signs & (1u << (j + 4u))) != 0u ? -m2 : m2) * x[xoff + 4u + j];
+                    sacc += ((signs & (1u << j)) != 0u ? -m1 : m1) * x[xo2 + xoff + j];
+                    sacc += ((signs & (1u << (j + 4u))) != 0u ? -m2 : m2) * x[xo2 + xoff + 4u + j];
                 }
                 accU += db * sacc;
             }
@@ -101,6 +101,6 @@ void main() {
     if (tid == 0u && s < pc.n_used) {
         float g = 0.0, u = 0.0;
         for (uint i = 0u; i < gl_NumSubgroups; ++i) { g += pg[i]; u += pu[i]; }
-        h[s * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;   // silu(g) * u
+        h[ho + s * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;   // silu(g) * u
     }
 }

@@ -22,18 +22,21 @@ void main() {
     uint w = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
     uint chBase = w * pc.dState;
+    uint rq = gl_WorkGroupID.z;
+    uint so = rq * pc.channels * 3u;
+    uint qo = rq * pc.channels;
     uint ch = chBase + t;
 
     float v = 0.0;
     if (ch < pc.channels && t < pc.dState) {
-        float s0 = st[ch * 3u], s1 = st[ch * 3u + 1u], s2 = st[ch * 3u + 2u];
-        float xin = qkv[ch];
+        float s0 = st[so + ch * 3u], s1 = st[so + ch * 3u + 1u], s2 = st[so + ch * 3u + 2u];
+        float xin = qkv[qo + ch];
         float c = s0 * ker[ch * 4u] + s1 * ker[ch * 4u + 1u] +
                   s2 * ker[ch * 4u + 2u] + xin * ker[ch * 4u + 3u];
         v = c / (1.0 + exp(-c));
-        st[ch * 3u]      = s1;
-        st[ch * 3u + 1u] = s2;
-        st[ch * 3u + 2u] = xin;
+        st[so + ch * 3u]      = s1;
+        st[so + ch * 3u + 1u] = s2;
+        st[so + ch * 3u + 2u] = xin;
     }
 
     if (chBase < pc.qkCh) {  // q/k head: L2 normalize (uniform branch per WG)
@@ -48,5 +51,5 @@ void main() {
         barrier();
         v *= scale;
     }
-    if (ch < pc.channels && t < pc.dState) o[ch] = v;
+    if (ch < pc.channels && t < pc.dState) o[qo + ch] = v;
 }

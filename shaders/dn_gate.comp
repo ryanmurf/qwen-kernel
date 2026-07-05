@@ -21,7 +21,7 @@ shared float scale;
 void main() {
     uint h = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
-    uint base = h * pc.dState;
+    uint base = gl_WorkGroupID.z * pc.hV * pc.dState + h * pc.dState;
 
     float v = t < pc.dState ? o[base + t] : 0.0;
     float sg = subgroupAdd(v * v);

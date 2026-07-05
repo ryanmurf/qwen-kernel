@@ -30,14 +30,18 @@ void main() {
     uint dh = pc.dh;
     uint n  = pc.pos + 1u;
     uint kv = h / (pc.hQ / pc.hKV);
+    uint rq = gl_WorkGroupID.z;
+    uint qfo = rq * pc.hQ * 2u * dh;
+    uint kvo = rq * pc.hKV * pc.tmax * dh;
+    uint qho = rq * pc.hQ * dh;
 
-    if (t < dh) q[t] = qhat[h * dh + t];
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
     barrier();
 
     float qs = inversesqrt(float(dh));
     for (uint p = t; p < n; p += 256u) {
         float s = 0.0;
-        uint base = (kv * pc.tmax + p) * dh;
+        uint base = kvo + (kv * pc.tmax + p) * dh;
         for (uint j = 0u; j < dh; ++j) s += q[j] * kc[base + j];
         sc[p] = s * qs;
     }
@@ -72,9 +76,9 @@ void main() {
     if (t < dh) {
         float o = 0.0;
         for (uint p = 0u; p < n; ++p)
-            o += sc[p] * vc[(kv * pc.tmax + p) * dh + t];
+            o += sc[p] * vc[kvo + (kv * pc.tmax + p) * dh + t];
         o *= inv;
-        float g = qfull[h * 2u * dh + dh + t];
-        att[h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+        float g = qfull[qfo + h * 2u * dh + dh + t];
+        att[qho + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
     }
 }

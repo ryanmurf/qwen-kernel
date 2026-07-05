@@ -17,8 +17,9 @@ shared float scale;
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+    uint ro = gl_WorkGroupID.z * pc.n;
     float ss = 0.0;
-    for (uint i = t; i < pc.n; i += 256u) ss += x[i] * x[i];
+    for (uint i = t; i < pc.n; i += 256u) ss += x[ro + i] * x[ro + i];
     float sg = subgroupAdd(ss);
     if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = sg;
     barrier();
@@ -28,5 +29,5 @@ void main() {
         scale = 1.0 / sqrt(tot / float(pc.n) + pc.eps);
     }
     barrier();
-    for (uint i = t; i < pc.n; i += 256u) o[i] = x[i] * scale * w[i];
+    for (uint i = t; i < pc.n; i += 256u) o[ro + i] = x[ro + i] * scale * w[i];
 }

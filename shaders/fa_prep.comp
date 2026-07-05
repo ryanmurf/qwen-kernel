@@ -32,17 +32,22 @@ void main() {
     uint w = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
     uint dh = pc.dh;
+    uint rq = gl_WorkGroupID.z;
+    uint qfo = rq * pc.hQ * 2u * dh;
+    uint kio = rq * pc.hKV * dh;
+    uint kvo = rq * pc.hKV * pc.tmax * dh;
+    uint qho = rq * pc.hQ * dh;
 
     if (w >= pc.hQ + pc.hKV) {           // v: plain copy into cache
         uint h = w - pc.hQ - pc.hKV;
-        if (t < dh) vc[(h * pc.tmax + pc.pos) * dh + t] = vin[h * dh + t];
+        if (t < dh) vc[kvo + (h * pc.tmax + pc.pos) * dh + t] = vin[kio + h * dh + t];
         return;
     }
 
     bool isQ = w < pc.hQ;
     uint h = isQ ? w : w - pc.hQ;
     float v = 0.0;
-    if (t < dh) v = isQ ? qfull[h * 2u * dh + t] : kin[h * dh + t];
+    if (t < dh) v = isQ ? qfull[qfo + h * 2u * dh + t] : kin[kio + h * dh + t];
 
     red[t] = v * v;
     barrier();
@@ -68,7 +73,7 @@ void main() {
         } else {
             outV = sv[t];
         }
-        if (isQ) qhat[h * dh + t] = outV;
-        else     kc[(h * pc.tmax + pc.pos) * dh + t] = outV;
+        if (isQ) qhat[qho + h * dh + t] = outV;
+        else     kc[kvo + (h * pc.tmax + pc.pos) * dh + t] = outV;
     }
 }

@@ -21,13 +21,16 @@ shared float red[256];
 void main() {
     uint w = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+    uint xo = rq * pc.n;
+    uint go = rq * 2u * pc.hv;
     bool isBeta = w >= pc.hv;
     uint h = isBeta ? w - pc.hv : w;
     uint base = h * pc.n;
 
     float acc = 0.0;
     for (uint k = t; k < pc.n; k += 256u)
-        acc += (isBeta ? betaW[base + k] : alphaW[base + k]) * x[k];
+        acc += (isBeta ? betaW[base + k] : alphaW[base + k]) * x[xo + k];
 
     red[t] = acc;
     barrier();
@@ -38,11 +41,11 @@ void main() {
     if (t == 0u) {
         float d = red[0];
         if (isBeta) {
-            gb[pc.hv + h] = 1.0 / (1.0 + exp(-d));
+            gb[go + pc.hv + h] = 1.0 / (1.0 + exp(-d));
         } else {
             float v = d + dtBias[h];
             float sp = v > 20.0 ? v : log(1.0 + exp(v));
-            gb[h] = aVec[h] * sp;
+            gb[go + h] = aVec[h] * sp;
         }
     }
 }

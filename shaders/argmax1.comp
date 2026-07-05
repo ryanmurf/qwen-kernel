@@ -17,13 +17,15 @@ shared uint  ri[256];
 void main() {
     uint w = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+    uint lo = rq * pc.n;
     uint start = w * pc.span;
     uint end = min(start + pc.span, pc.n);
 
     float bv = -3.4e38;
     uint bi = 0u;
     for (uint i = start + t; i < end; i += 256u)
-        if (logits[i] > bv) { bv = logits[i]; bi = i; }
+        if (logits[lo + i] > bv) { bv = logits[lo + i]; bi = i; }
     rv[t] = bv;
     ri[t] = bi;
     barrier();
@@ -34,5 +36,5 @@ void main() {
         }
         barrier();
     }
-    if (t == 0u) { vals[w] = rv[0]; idxs[w] = ri[0]; }
+    if (t == 0u) { vals[rq * 64u + w] = rv[0]; idxs[rq * 64u + w] = ri[0]; }
 }

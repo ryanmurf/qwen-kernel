@@ -34,6 +34,8 @@ shared float partial[256];
 
 void main() {
     uint tid  = gl_LocalInvocationID.x;
+    uint rq   = gl_WorkGroupID.z;
+    uint xo2  = rq * pc.K;
     uint lane = tid % TPR;
     uint wg   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     uint row  = wg * (256u / TPR) + tid / TPR;
@@ -65,7 +67,7 @@ void main() {
                 uint qhv = uint(wb[base + b].qh[qhBase + i]);
                 uint lo  = hi ? (qlv >> 4u) : (qlv & 0xFu);
                 int  q   = int(lo | (((qhv >> shift) & 3u) << 4u)) - 32;
-                s += float(q) * x[xoff + i];
+                s += float(q) * x[xo2 + xoff + i];
             }
             acc += d * sc * s;
         }
@@ -80,7 +82,7 @@ void main() {
             uint base = (tid / TPR) * waves;
             float s2 = 0.0;
             for (uint i = 0u; i < waves; ++i) s2 += partial[base + i];
-            y[row] = s2;
+            y[rq * pc.M + row] = s2;
         }
     } else {
         partial[tid] = acc;
@@ -89,6 +91,6 @@ void main() {
             if (lane < s2) partial[tid] += partial[tid + s2];
             barrier();
         }
-        if (lane == 0u && row < pc.M) y[row] = partial[tid];
+        if (lane == 0u && row < pc.M) y[rq * pc.M + row] = partial[tid];
     }
 }
