@@ -2076,7 +2076,8 @@ static bool caseABlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
 // M6b: end-to-end greedy decode over all 40 layers + embeddings + LM head.
 // Requires the whole model in VRAM (~16.5 GB) — quiesce llama-server first.
 // usage: qk token <ids-file> <nGen> [tmax]
-static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tmax, uint32_t nB) {
+static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tmax, uint32_t nB,
+                      bool warmDemo = false) {
     std::vector<int> promptIds;
     {
         FILE* f = fopen(idsFile, "r");
@@ -2274,6 +2275,10 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sGate, sWo, sAddN,
             sPrep, sAttn, sMoeL, sMoeS, sMoeGU, sMoeGUs, sMoeDn, sMoeDns, sAdd3;
         VkBuffer aNormBuf = VK_NULL_HANDLE;
+        // per-slot recurrent state, snapshot-able for prefix caching:
+        // rec layer -> (conv window, delta-rule S); attn layer -> (K cache, V cache).
+        VkBuffer st1 = VK_NULL_HANDLE, st2 = VK_NULL_HANDLE;
+        size_t sz1 = 0, sz2 = 0;
     };
     std::vector<Layer> layers(nLayer);
     char nb[128];
@@ -2285,7 +2290,9 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
             return g.find(nb);
         };
         auto W = [&](const GgufTensor* t, size_t n) -> VkBuffer {
-            L.bufs.push_back(createBuf(c, n, stor, true));
+            // storSrc: every layer buffer is copy-source-capable so recurrent
+            // state can be snapshotted for prefix caching (transfer-src is free).
+            L.bufs.push_back(createBuf(c, n, storSrc, true));
             upload(L.bufs.back(), t ? t->data : nullptr, n);
             return L.bufs.back().buf;
         };
@@ -2310,6 +2317,8 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
             VkBuffer outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
             VkBuffer convSt = W(nullptr, (size_t)nB * chQkv * 3 * 4);
             VkBuffer S = W(nullptr, (size_t)nB * hV * dS * dS * 4);
+            L.st1 = convSt; L.sz1 = (size_t)nB * chQkv * 3 * 4;
+            L.st2 = S;      L.sz2 = (size_t)nB * hV * dS * dS * 4;
             L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
             L.sP1 = mkSet(pGemvA, {qkvW, bXn.buf, bBig.buf});
             L.sP2 = mkSet(pGemvA, {zW, bXn.buf, bMid.buf});
@@ -2327,6 +2336,8 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
             VkBuffer wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
             VkBuffer kc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
             VkBuffer vc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
+            L.st1 = kc; L.sz1 = (size_t)nB * hKV * tmax * dh * 4;
+            L.st2 = vc; L.sz2 = (size_t)nB * hKV * tmax * dh * 4;
             L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
             L.sP1 = mkSet(pGemvA, {wq, bXn.buf, bBig.buf});
             L.sP2 = mkSet(pGemvA, {wk, bXn.buf, bKin.buf});
@@ -2515,12 +2526,58 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         VK_CHECK(vkQueueWaitIdle(c.queue));
     };
 
+    // ---- prefix-state cache: snapshot/restore all per-slot recurrent state ----
+    // A real server computes a shared prefix's state once, then clones it into
+    // each new request's slot instead of re-running prefill. Here we demo that
+    // by snapshotting after prefill and proving a warm restore reproduces the
+    // cold token stream while skipping prefill entirely.
+    std::vector<Buf> cache1, cache2;
+    Buf cacheLogits;
+    auto copyState = [&](bool save) {
+        begin();
+        for (uint32_t il = 0; il < nLayer; il++) {
+            Layer& L = layers[il];
+            VkBufferCopy a{0, 0, L.sz1}, b{0, 0, L.sz2};
+            if (save) {
+                vkCmdCopyBuffer(c.cb, L.st1, cache1[il].buf, 1, &a);
+                vkCmdCopyBuffer(c.cb, L.st2, cache2[il].buf, 1, &b);
+            } else {
+                vkCmdCopyBuffer(c.cb, cache1[il].buf, L.st1, 1, &a);
+                vkCmdCopyBuffer(c.cb, cache2[il].buf, L.st2, 1, &b);
+            }
+        }
+        VkBufferCopy lg{0, 0, (size_t)nB * vocab * 4};
+        if (save) vkCmdCopyBuffer(c.cb, bLogits.buf, cacheLogits.buf, 1, &lg);
+        else      vkCmdCopyBuffer(c.cb, cacheLogits.buf, bLogits.buf, 1, &lg);
+        submitWait();
+    };
+    if (warmDemo) {
+        const VkBufferUsageFlags cp =
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        size_t cacheMB = 0;
+        for (uint32_t il = 0; il < nLayer; il++) {
+            cache1.push_back(createBuf(c, layers[il].sz1, cp, true));
+            cache2.push_back(createBuf(c, layers[il].sz2, cp, true));
+            cacheMB += (layers[il].sz1 + layers[il].sz2) >> 20;
+        }
+        cacheLogits = createBuf(c, (size_t)nB * vocab * 4, cp, true);
+        printf("prefix-cache: %zu MB of per-slot recurrent state (KV + delta-rule S + conv)\n", cacheMB);
+    }
+
     auto t0 = std::chrono::steady_clock::now();
     submitBatch(cbPre.data(), nPrompt);
     double prefillMs = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - t0).count();
     printf("prefill: %u tokens in %.1f ms (%.2f ms/token, one submission)\n", nPrompt,
            prefillMs, prefillMs / nPrompt);
+
+    double snapMs = 0;
+    if (warmDemo) {
+        auto ts = std::chrono::steady_clock::now();
+        copyState(true);  // snapshot state at pos = nPrompt
+        snapMs = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - ts).count();
+    }
 
     t0 = std::chrono::steady_clock::now();
     submitBatch(&cbDec[nPrompt], nGen);
@@ -2541,6 +2598,34 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
     printf("GEN:");
     for (int id : genIds) printf(" %d", id);
     printf("\n");
+
+    if (warmDemo) {
+        std::vector<int> cold = genIds;
+        auto tr2 = std::chrono::steady_clock::now();
+        copyState(false);  // restore snapshot: a "new request" reuses the prefix state
+        double restoreMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - tr2).count();
+        auto tw = std::chrono::steady_clock::now();
+        submitBatch(&cbDec[nPrompt], nGen);  // decode with NO prefill
+        double warmMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - tw).count();
+        std::vector<int> warm(nGen);
+        for (uint32_t i = 0; i < nGen; i++) warm[i] = (int)rb[(size_t)(nPrompt + i) * nB];
+        bool eq = warm == cold;
+        printf("\n--- prefix-cache warm-start demo (prompt = shared prefix) ---\n");
+        printf("cold start: prefill %u tokens = %.1f ms before first token\n", nPrompt, prefillMs);
+        printf("warm start: restore cached state = %.1f ms before first token"
+               " (snapshot %.1f ms, paid once when the prefix is first seen)\n", restoreMs, snapMs);
+        printf("setup before first token: %.1f ms -> %.1f ms  (%.0fx faster TTFT for a cached prefix)\n",
+               prefillMs, restoreMs, prefillMs / restoreMs);
+        printf("warm decode: %.1f ms for %u tokens; warm stream identical to cold: %s\n",
+               warmMs, nGen, eq ? "YES" : "NO");
+        if (!eq) {
+            printf("WARM:");
+            for (int id : warm) printf(" %d", id);
+            printf("\n");
+        }
+    }
     vkUnmapMemory(c.dev, bRb.mem);
 
     vkUnmapMemory(c.dev, stage.mem);
@@ -2551,6 +2636,9 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         destroyPipe(c, *pp);
     for (auto& L : layers)
         for (auto& b : L.bufs) destroyBuf(c, b);
+    for (auto& b : cache1) destroyBuf(c, b);
+    for (auto& b : cache2) destroyBuf(c, b);
+    if (warmDemo) destroyBuf(c, cacheLogits);
     for (Buf* b : {&bXin, &bXn, &bBig, &bMid, &bKin, &bVin, &bGb, &bConvOut, &bO, &bAtt,
                    &bAttnOut, &bY, &bXn2, &bML, &bMH, &bMSel, &bMY, &bMY2, &bOut, &bONorm,
                    &bHeadW, &bLogits, &bEmbdW, &bPids, &bAV, &bAI, &bTok, &bRb, &stage})
@@ -2616,10 +2704,16 @@ int main(int argc, char** argv) {
         ok = caseABlock(c, argU(2, 3), argU(3, 3), argU(4, 200));
     } else if (mode == "token") {
         if (argc < 4) {
-            fprintf(stderr, "usage: qk token <ids-file> <nGen> [tmax]\n");
+            fprintf(stderr, "usage: qk token <ids-file> <nGen> [tmax] [batch]\n");
             return 1;
         }
         ok = caseToken(c, argv[2], argU(3, 12), argU(4, 128), argU(5, 1));
+    } else if (mode == "warm") {
+        if (argc < 4) {
+            fprintf(stderr, "usage: qk warm <ids-file> <nGen> [tmax]  (prefix-cache cold/warm demo)\n");
+            return 1;
+        }
+        ok = caseToken(c, argv[2], argU(3, 12), argU(4, 128), 1, /*warmDemo=*/true);
     } else {
         fprintf(stderr, "unknown mode '%s'\n", mode.c_str());
         return 1;
