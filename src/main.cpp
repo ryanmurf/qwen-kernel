@@ -1709,7 +1709,7 @@ static bool caseABlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
 
     Pipe pRms   = makePipe(c, "rmsnorm.spv", 3, 8);
     Pipe pGemvA = makePipe(c, "gemv_q8_0.spv", 3, 8, 64);
-    Pipe pPrep  = makePipe(c, "fa_prep.spv", 8, 32);
+    Pipe pPrep  = makePipe(c, "fa_prep.spv", 9, 32);
     Pipe pAttn  = makePipe(c, "fa_attn.spv", 5, 32);
     Pipe pGemvO = makePipe(c, "gemv_q8_0.spv", 3, 8, 128);
     Pipe pAddN  = makePipe(c, "add_rmsnorm.spv", 5, 8);
@@ -1749,6 +1749,7 @@ static bool caseABlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     Buf bQhat = createBuf(c, atN * 4, stor, true);
     Buf bKC = createBuf(c, (size_t)hKV * tmax * dh * 4, stor, true);
     Buf bVC = createBuf(c, (size_t)hKV * tmax * dh * 4, stor, true);
+    Buf bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, stor, true);
     Buf bAtt = createBuf(c, atN * 4, stor, true);
     Buf bAttnOut = createBuf(c, nEmbd * 4, stor, true);
     Buf bY = createBuf(c, nEmbd * 4, stor, true);
@@ -1800,6 +1801,17 @@ static bool caseABlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     upload(bMGS, moe.gs->data, (size_t)moe.nFf * moe.rbGS);
     upload(bMUS, moe.us->data, (size_t)moe.nFf * moe.rbGS);
     upload(bMDS, moe.ds->data, (size_t)moe.nEmbd * moe.rbDS);
+    {   // precomputed RoPE cos/sin table (see fa_prep.comp binding 8)
+        const uint32_t half = nRot / 2;
+        std::vector<float> rope((size_t)tmax * half * 2);
+        for (uint32_t p = 0; p < tmax; p++)
+            for (uint32_t j = 0; j < half; j++) {
+                float th = (float)p * std::pow(kFreqBase, -2.f * (float)j / (float)nRot);
+                rope[2 * ((size_t)p * half + j)]     = std::cos(th);
+                rope[2 * ((size_t)p * half + j) + 1] = std::sin(th);
+            }
+        upload(bRope, rope.data(), rope.size() * 4);
+    }
 
     VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1834,7 +1846,7 @@ static bool caseABlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     VkDescriptorSet sK = mkSet(pGemvA, {bWk.buf, bXn.buf, bKin.buf});
     VkDescriptorSet sV = mkSet(pGemvA, {bWv.buf, bXn.buf, bVin.buf});
     VkDescriptorSet sPrep = mkSet(pPrep, {bQfull.buf, bKin.buf, bVin.buf, bQN.buf, bKN.buf,
-                                          bQhat.buf, bKC.buf, bVC.buf});
+                                          bQhat.buf, bKC.buf, bVC.buf, bRope.buf});
     VkDescriptorSet sAttn = mkSet(pAttn, {bQhat.buf, bKC.buf, bVC.buf, bQfull.buf, bAtt.buf});
     VkDescriptorSet sWo = mkSet(pGemvO, {bWo.buf, bAtt.buf, bAttnOut.buf});
     VkDescriptorSet sAddN = mkSet(pAddN, {bXin.buf, bAttnOut.buf, bPN.buf, bY.buf, bXn2.buf});
@@ -2107,7 +2119,7 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
     Pipe pGemvO = makePipe(c, "gemv_q8_0.spv", 3, 8, 128);
     Pipe pAddN = makePipe(c, "add_rmsnorm.spv", 5, 8);
     Pipe pAdd = makePipe(c, "vec_add.spv", 3, 4);
-    Pipe pPrep = makePipe(c, "fa_prep.spv", 8, 32);
+    Pipe pPrep = makePipe(c, "fa_prep.spv", 9, 32);
     Pipe pAttn = makePipe(c, "fa_attn.spv", 5, 32);
     Pipe pMoeL = makePipe(c, "moe_logits.spv", 3, 16);
     Pipe pMoeS = makePipe(c, "moe_select.spv", 4, 16);
@@ -2152,6 +2164,8 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
     Buf bAV = createBuf(c, (size_t)nB * 64 * 4, stor, true);
     Buf bAI = createBuf(c, (size_t)nB * 64 * 4, stor, true);
     Buf bTok = createBuf(c, (size_t)nB * 4, storSrc, true);
+    // RoPE cos/sin precomputed on CPU: [pos][nRot/2][2]; removes pow/cos/sin from fa_prep.
+    Buf bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, stor, true);
     Buf bRb;  // generated-id readback, host-cached so CPU reads are fast
     {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -2207,6 +2221,17 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         vramMB += n >> 20;
     };
     upload(bONorm, tONorm->data, nEmbd * 4);
+    {   // precompute RoPE cos/sin table (NeoX partial rope, theta = pos*base^(-2j/nRot))
+        const uint32_t half = nRot / 2;
+        std::vector<float> rope((size_t)tmax * half * 2);
+        for (uint32_t p = 0; p < tmax; p++)
+            for (uint32_t j = 0; j < half; j++) {
+                float th = (float)p * std::pow(kFreqBase, -2.f * (float)j / (float)nRot);
+                rope[2 * ((size_t)p * half + j)]     = std::cos(th);
+                rope[2 * ((size_t)p * half + j) + 1] = std::sin(th);
+            }
+        upload(bRope, rope.data(), rope.size() * 4);
+    }
     upload(bHeadW, tHead->data, (size_t)vocab * rbE);
     upload(bEmbdW, tEmbd->data, (size_t)vocab * rbE);
     {
@@ -2306,7 +2331,7 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
             L.sP1 = mkSet(pGemvA, {wq, bXn.buf, bBig.buf});
             L.sP2 = mkSet(pGemvA, {wk, bXn.buf, bKin.buf});
             L.sP3 = mkSet(pGemvA, {wv, bXn.buf, bVin.buf});
-            L.sPrep = mkSet(pPrep, {bBig.buf, bKin.buf, bVin.buf, qn, kn, bMid.buf, kc, vc});
+            L.sPrep = mkSet(pPrep, {bBig.buf, bKin.buf, bVin.buf, qn, kn, bMid.buf, kc, vc, bRope.buf});
             L.sAttn = mkSet(pAttn, {bMid.buf, kc, vc, bBig.buf, bAtt.buf});
             L.sWo = mkSet(pGemvO, {wo, bAtt.buf, bAttnOut.buf});
         }

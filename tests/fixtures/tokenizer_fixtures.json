@@ -1,0 +1,539 @@
+{
+ "tokenize": [
+  {
+   "text": "Hello, world!",
+   "tokens": [
+    9419,
+    11,
+    1814,
+    0
+   ],
+   "detok": "Hello, world!"
+  },
+  {
+   "text": "hello",
+   "tokens": [
+    14556
+   ],
+   "detok": "hello"
+  },
+  {
+   "text": " hello",
+   "tokens": [
+    23066
+   ],
+   "detok": " hello"
+  },
+  {
+   "text": "  hello  world  ",
+   "tokens": [
+    220,
+    23066,
+    220,
+    1814,
+    256
+   ],
+   "detok": "  hello  world  "
+  },
+  {
+   "text": "",
+   "tokens": [],
+   "detok": ""
+  },
+  {
+   "text": " ",
+   "tokens": [
+    220
+   ],
+   "detok": " "
+  },
+  {
+   "text": "\n",
+   "tokens": [
+    198
+   ],
+   "detok": "\n"
+  },
+  {
+   "text": "\n\n",
+   "tokens": [
+    271
+   ],
+   "detok": "\n\n"
+  },
+  {
+   "text": "\r\n",
+   "tokens": [
+    317
+   ],
+   "detok": "\r\n"
+  },
+  {
+   "text": "\t",
+   "tokens": [
+    197
+   ],
+   "detok": "\t"
+  },
+  {
+   "text": "The quick brown fox jumps over the lazy dog.",
+   "tokens": [
+    760,
+    3841,
+    13477,
+    37550,
+    33075,
+    888,
+    279,
+    15217,
+    5388,
+    13
+   ],
+   "detok": "The quick brown fox jumps over the lazy dog."
+  },
+  {
+   "text": "I'm can't won't it's we've they'll he'd I'M CAN'T",
+   "tokens": [
+    40,
+    2688,
+    628,
+    914,
+    2677,
+    914,
+    424,
+    579,
+    567,
+    2908,
+    781,
+    3172,
+    551,
+    4035,
+    353,
+    26708,
+    18916,
+    16813
+   ],
+   "detok": "I'm can't won't it's we've they'll he'd I'M CAN'T"
+  },
+  {
+   "text": "12345 3.14159 0x1F 1,000,000",
+   "tokens": [
+    16,
+    17,
+    18,
+    19,
+    20,
+    220,
+    18,
+    13,
+    16,
+    19,
+    16,
+    20,
+    24,
+    220,
+    15,
+    87,
+    16,
+    37,
+    220,
+    16,
+    11,
+    15,
+    15,
+    15,
+    11,
+    15,
+    15,
+    15
+   ],
+   "detok": "12345 3.14159 0x1F 1,000,000"
+  },
+  {
+   "text": "def foo(x):\n    return x * 2  # comment\n",
+   "tokens": [
+    727,
+    14785,
+    2007,
+    1590,
+    198,
+    262,
+    460,
+    830,
+    348,
+    220,
+    17,
+    220,
+    653,
+    3847,
+    198
+   ],
+   "detok": "def foo(x):\n    return x * 2  # comment\n"
+  },
+  {
+   "text": "héllo wörld naïve café",
+   "tokens": [
+    71,
+    17951,
+    379,
+    288,
+    9137,
+    497,
+    91603,
+    571,
+    50203
+   ],
+   "detok": "héllo wörld naïve café"
+  },
+  {
+   "text": "你好世界",
+   "tokens": [
+    109266,
+    96748
+   ],
+   "detok": "你好世界"
+  },
+  {
+   "text": "Привет мир",
+   "tokens": [
+    51844,
+    26125,
+    7921,
+    160202
+   ],
+   "detok": "Привет мир"
+  },
+  {
+   "text": "こんにちは世界",
+   "tokens": [
+    85951,
+    96748
+   ],
+   "detok": "こんにちは世界"
+  },
+  {
+   "text": "🚀 emoji 🎉🎊 test 👍🏽",
+   "tokens": [
+    9008,
+    248,
+    222,
+    40958,
+    10838,
+    236,
+    231,
+    9008,
+    236,
+    232,
+    1228,
+    59720,
+    235,
+    9008,
+    237,
+    121
+   ],
+   "detok": "🚀 emoji 🎉🎊 test 👍🏽"
+  },
+  {
+   "text": "Mixed 中文 and English 123 !@#$%^&*()",
+   "tokens": [
+    83445,
+    220,
+    99986,
+    321,
+    6163,
+    220,
+    16,
+    17,
+    18,
+    729,
+    31,
+    46474,
+    44370,
+    5,
+    9,
+    363
+   ],
+   "detok": "Mixed 中文 and English 123 !@#$%^&*()"
+  },
+  {
+   "text": "    indented\n        more indented",
+   "tokens": [
+    262,
+    1214,
+    15397,
+    198,
+    285,
+    777,
+    1214,
+    15397
+   ],
+   "detok": "    indented\n        more indented"
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "tokens": [
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    67089,
+    27528
+   ],
+   "detok": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+   "text": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+   "tokens": [
+    1119,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    3299,
+    220
+   ],
+   "detok": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word "
+  },
+  {
+   "text": "supercalifragilisticexpialidocious antidisestablishmentarianism",
+   "tokens": [
+    12410,
+    2867,
+    278,
+    331,
+    3965,
+    319,
+    4384,
+    4431,
+    518,
+    306,
+    74546,
+    3094,
+    81333,
+    32294,
+    468,
+    8555,
+    2074
+   ],
+   "detok": "supercalifragilisticexpialidocious antidisestablishmentarianism"
+  },
+  {
+   "text": "e=mc^2; ∑x_i ≈ ∫f(x)dx",
+   "tokens": [
+    68,
+    28,
+    12518,
+    61,
+    17,
+    26,
+    11654,
+    239,
+    87,
+    5150,
+    211614,
+    11654,
+    104,
+    69,
+    2007,
+    8,
+    12354
+   ],
+   "detok": "e=mc^2; ∑x_i ≈ ∫f(x)dx"
+  },
+  {
+   "text": "<html><body attr=\"val\">text</body></html>",
+   "tokens": [
+    13350,
+    1721,
+    2513,
+    6175,
+    420,
+    805,
+    731,
+    1272,
+    510,
+    2513,
+    1419,
+    1497,
+    29
+   ],
+   "detok": "<html><body attr=\"val\">text</body></html>"
+  },
+  {
+   "text": "line1\nline2\n\nline4\n\n\nline7",
+   "tokens": [
+    1021,
+    16,
+    198,
+    1021,
+    17,
+    271,
+    1021,
+    19,
+    1358,
+    1021,
+    22
+   ],
+   "detok": "line1\nline2\n\nline4\n\n\nline7"
+  },
+  {
+   "text": "¿Cómo estás? ¡Muy bien!",
+   "tokens": [
+    29197,
+    92581,
+    181456,
+    30,
+    47180,
+    44,
+    3940,
+    13958,
+    0
+   ],
+   "detok": "¿Cómo estás? ¡Muy bien!"
+  }
+ ],
+ "tokenize_special": [
+  {
+   "text": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n",
+   "parse_special": true,
+   "tokens": [
+    248045,
+    846,
+    198,
+    12675,
+    1017,
+    248046,
+    198,
+    248045,
+    74455,
+    198
+   ]
+  },
+  {
+   "text": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n",
+   "parse_special": false,
+   "tokens": [
+    27,
+    91,
+    316,
+    4747,
+    91,
+    29,
+    846,
+    198,
+    12675,
+    1017,
+    27,
+    91,
+    316,
+    6018,
+    91,
+    29,
+    198,
+    27,
+    91,
+    316,
+    4747,
+    91,
+    29,
+    74455,
+    198
+   ]
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "prompt": "<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ ],
+ "meta": {
+  "note": "captured from llama.cpp b8672 /tokenize /detokenize /apply-template for Qwen3.6-35B-A3B"
+ }
+}

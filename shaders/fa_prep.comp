@@ -18,6 +18,7 @@ layout(std430, binding = 4) readonly  buffer BufKN { float kn[]; };    // [dh]
 layout(std430, binding = 5) writeonly buffer BufQH { float qhat[]; };  // [hQ*dh]
 layout(std430, binding = 6) buffer BufKC { float kc[]; };              // [hKV][tmax][dh]
 layout(std430, binding = 7) buffer BufVC { float vc[]; };
+layout(std430, binding = 8) readonly buffer BufRope { float ropeCS[]; }; // [pos][nRot/2][2] = (cos,sin)
 
 layout(push_constant) uniform PC {
     uint pos; uint tmax; uint dh; uint nRot;
@@ -66,8 +67,9 @@ void main() {
         float outV;
         if (t < pc.nRot) {
             uint j = t < half_ ? t : t - half_;
-            float theta = float(pc.pos) * pow(pc.freqBase, -2.0 * float(j) / float(pc.nRot));
-            float c = cos(theta), s = sin(theta);
+            // precomputed on CPU: ropeCS[2*(pos*half+j)] = cos(pos*base^(-2j/nRot)), +1 = sin
+            uint ci = 2u * (pc.pos * half_ + j);
+            float c = ropeCS[ci], s = ropeCS[ci + 1u];
             float x0 = sv[j], x1 = sv[j + half_];
             outV = t < half_ ? x0 * c - x1 * s : x0 * s + x1 * c;
         } else {
