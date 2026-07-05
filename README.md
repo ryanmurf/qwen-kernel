@@ -194,10 +194,14 @@ Validated end-to-end on real GPU inference (server quiesced): tokenization
 matches llama.cpp exactly; greedy `/completion` matches the single-stream
 reference; 4 concurrent distinct prompts each reproduce their own reference
 byte-for-byte; EOS termination, SSE streaming, and chat templating all correct;
-malformed input returns structured 400s without crashing. **59 tok/s single
-stream, 206 tok/s aggregate across 4 concurrent streams** (4 slots, ctx 1024) —
-~2.5× the llama.cpp server's throughput. (`qk serve-test <ids> <n> [slots]`
-drives the same C ABI in-process for regression checks.)
+malformed input returns structured 400s without crashing. **135 tok/s single
+stream, 216 tok/s aggregate across 4 concurrent streams** (4 slots, ctx 1024) —
+single-stream beats the llama.cpp server (72–86 tok/s), aggregate ~2.7×. The
+engine pre-records one step command buffer per dispatch depth and submits the
+one matching the highest active slot, so a lone request dispatches a single
+z-slice (full 1-slot weight bandwidth) instead of paying for all four idle
+slots. (`qk serve-test <ids> <n> [slots]` drives the same C ABI in-process for
+regression checks.)
 
 Two CPU-precompute optimizations, both verified token-exact against the
 llama.cpp reference:

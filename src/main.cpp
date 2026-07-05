@@ -2689,7 +2689,10 @@ struct qk_engine {
         bML, bMH, bMSel, bMY, bMY2, bONorm, bHeadW, bLogits, bEmbdW, bRope, bAV, bAI,
         bTok, bSlotIn, bSlotPos, bSamp, stage;
     VkDescriptorSet sHead, sAm1, sAm2, sEmb;
-    VkCommandBuffer stepCB = VK_NULL_HANDLE;
+    // One pre-recorded step CB per dispatch depth: stepCBs[z-1] dispatches z
+    // slots. Submitting the one matching the highest active slot avoids paying
+    // the (bandwidth-bound) weight re-reads for idle slots on light load.
+    std::vector<VkCommandBuffer> stepCBs;
     uint32_t *slotInMap = nullptr, *slotPosMap = nullptr, *sampMap = nullptr;
 
     struct Slot {
@@ -2970,12 +2973,15 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     sAm2 = mkSet(pAm2, {bAV.buf, bAI.buf, bTok.buf});
     sEmb = mkSet(pEmb, {bEmbdW.buf, bSlotIn.buf, bXin.buf});
 
-    // ---- record the single re-submittable step command buffer ----
+    // ---- record one re-submittable step CB per dispatch depth (z = 1..nSlots) ----
+    stepCBs.resize(nSlots);
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(c.dev, &cbai, &stepCB));
+    cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = nSlots;
+    VK_CHECK(vkAllocateCommandBuffers(c.dev, &cbai, stepCBs.data()));
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    VkCommandBuffer rcb = stepCB;
+    VkCommandBuffer rcb = VK_NULL_HANDLE;  // set per z below
+    uint32_t zdim = nB;                    // dispatch depth for the current recording
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2989,7 +2995,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         vkCmdPushConstants(rcb, pp.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize, pc);
         uint32_t gx = std::min(wgs, c.props.limits.maxComputeWorkGroupCount[0]);
         uint32_t gy = (wgs + gx - 1) / gx;
-        vkCmdDispatch(rcb, gx, gy, nB);
+        vkCmdDispatch(rcb, gx, gy, zdim);
     };
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
@@ -3006,6 +3012,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     struct { uint32_t m; } pcAm2{amWgs};
     struct { uint32_t k, idx, pr; } pcE{nEmbd, 0, 1};  // idx0 + perReq1 -> ids[rq] = slotInput[rq]
 
+    for (uint32_t z = 1; z <= nSlots; z++) {
+    zdim = z;
+    rcb = stepCBs[z - 1];
     VK_CHECK(vkBeginCommandBuffer(rcb, &cbbi));
     barrier();
     disp(pEmb, sEmb, 1, &pcE, 12);
@@ -3066,6 +3075,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     VkBufferCopy ct{0, 0, (size_t)nB * 4};
     vkCmdCopyBuffer(rcb, bTok.buf, bSamp.buf, 1, &ct);
     VK_CHECK(vkEndCommandBuffer(rcb));
+    }  // for z = 1..nSlots
 
     slots.resize(nSlots);
     return true;
@@ -3081,10 +3091,11 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 
     for (uint32_t step = 0; step < chunkN; step++) {
         int nAct = 0;
+        uint32_t maxZ = 0;  // highest active slot index + 1 = needed dispatch depth
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
             if (!sl.active) { slotInMap[s] = 0; slotPosMap[s] = 0; continue; }
-            nAct++;
+            nAct++; maxZ = s + 1;
             if (sl.cursor < sl.prompt.size()) {         // prefill: feed prompt[cursor] at position cursor
                 slotInMap[s] = sl.prompt[sl.cursor];
                 slotPosMap[s] = sl.cursor;
@@ -3096,7 +3107,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         if (!nAct) break;
 
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1; si.pCommandBuffers = &stepCB;
+        si.commandBufferCount = 1; si.pCommandBuffers = &stepCBs[maxZ - 1];  // dispatch only up to the top active slot
         VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
         VK_CHECK(vkQueueWaitIdle(c.queue));
 
