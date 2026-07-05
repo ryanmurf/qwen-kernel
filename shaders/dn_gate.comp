@@ -1,0 +1,40 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Gated RMS norm of the deltanet output:
+//   att[h*dS+j] = rmsnorm(o_head_h)[j] * ssm_norm[j] * silu(z[h*dS+j])
+// One workgroup per v-head.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer BufO { float o[]; };
+layout(std430, binding = 1) readonly  buffer BufW { float w[]; };   // [dState]
+layout(std430, binding = 2) readonly  buffer BufZ { float z[]; };   // [hV*dState]
+layout(std430, binding = 3) writeonly buffer BufA { float att[]; };
+
+layout(push_constant) uniform PC { uint dState; uint hV; float eps; } pc;
+
+shared float red[128];
+shared float scale;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint base = h * pc.dState;
+
+    float v = t < pc.dState ? o[base + t] : 0.0;
+    float sg = subgroupAdd(v * v);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = sg;
+    barrier();
+    if (t == 0u) {
+        float tot = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += red[i];
+        scale = 1.0 / sqrt(tot / float(pc.dState) + pc.eps);
+    }
+    barrier();
+    if (t < pc.dState) {
+        float zv = z[base + t];
+        att[base + t] = v * scale * w[t] * (zv / (1.0 + exp(-zv)));
+    }
+}

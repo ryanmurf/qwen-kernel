@@ -1,0 +1,106 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Routed experts, gate+up in one pass: for slot s (0..n_used-1) and FFN row r,
+// h[s*n_ff + r] = silu(gate_exps[ids[s]][r]·x) * (up_exps[ids[s]][r]·x).
+// Both weight tensors are IQ3_XXS. One workgroup per (slot, row).
+
+layout(local_size_x = 256) in;
+
+#include "iq_tables.glsl"
+
+struct block_iq3_xxs {
+    float16_t d;
+    uint8_t   qs[96];
+};
+
+layout(std430, binding = 0) readonly buffer BufG { block_iq3_xxs gw[]; };
+layout(std430, binding = 1) readonly buffer BufU { block_iq3_xxs uw[]; };
+layout(std430, binding = 2) readonly buffer BufX { float x[]; };
+layout(std430, binding = 3) readonly buffer Sel {
+    uint  ids[8];
+    float w[8];
+    float wShared;
+};
+layout(std430, binding = 4) writeonly buffer BufH { float h[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float pg[256];
+shared float pu[256];
+
+void main() {
+    uint wg  = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint s   = wg / pc.n_ff;
+    uint r   = wg % pc.n_ff;
+    uint tid = gl_LocalInvocationID.x;
+
+    float accG = 0.0, accU = 0.0;
+    if (s < pc.n_used) {
+        uint kb   = pc.n_embd / 256u;  // super-blocks per row
+        uint nu   = kb * 32u;          // 8-element groups per row
+        uint base = (ids[s] * pc.n_ff + r) * kb;
+
+        for (uint u = tid; u < nu; u += 256u) {
+            uint b    = u >> 5u;
+            uint g8   = u & 31u;
+            uint ib32 = g8 >> 2u;
+            uint l    = g8 & 3u;
+            uint ao   = 64u + 4u * ib32;
+            uint qo   = ib32 * 8u + 2u * l;
+            uint xoff = b * 256u + ib32 * 32u + l * 8u;
+
+            // gate
+            {
+                uint bi = base + b;
+                uint aux = uint(gw[bi].qs[ao]) | (uint(gw[bi].qs[ao + 1u]) << 8u) |
+                           (uint(gw[bi].qs[ao + 2u]) << 16u) | (uint(gw[bi].qs[ao + 3u]) << 24u);
+                float db    = float(gw[bi].d) * (0.5 + float(aux >> 28u)) * 0.5;
+                uint  signs = iq_signbyte((aux >> (7u * l)) & 127u);
+                uint  g1 = iq3xxs_grid[uint(gw[bi].qs[qo])];
+                uint  g2 = iq3xxs_grid[uint(gw[bi].qs[qo + 1u])];
+                float sacc = 0.0;
+                for (uint j = 0u; j < 4u; ++j) {
+                    float m1 = float((g1 >> (8u * j)) & 255u);
+                    float m2 = float((g2 >> (8u * j)) & 255u);
+                    sacc += ((signs & (1u << j)) != 0u ? -m1 : m1) * x[xoff + j];
+                    sacc += ((signs & (1u << (j + 4u))) != 0u ? -m2 : m2) * x[xoff + 4u + j];
+                }
+                accG += db * sacc;
+            }
+            // up
+            {
+                uint bi = base + b;
+                uint aux = uint(uw[bi].qs[ao]) | (uint(uw[bi].qs[ao + 1u]) << 8u) |
+                           (uint(uw[bi].qs[ao + 2u]) << 16u) | (uint(uw[bi].qs[ao + 3u]) << 24u);
+                float db    = float(uw[bi].d) * (0.5 + float(aux >> 28u)) * 0.5;
+                uint  signs = iq_signbyte((aux >> (7u * l)) & 127u);
+                uint  g1 = iq3xxs_grid[uint(uw[bi].qs[qo])];
+                uint  g2 = iq3xxs_grid[uint(uw[bi].qs[qo + 1u])];
+                float sacc = 0.0;
+                for (uint j = 0u; j < 4u; ++j) {
+                    float m1 = float((g1 >> (8u * j)) & 255u);
+                    float m2 = float((g2 >> (8u * j)) & 255u);
+                    sacc += ((signs & (1u << j)) != 0u ? -m1 : m1) * x[xoff + j];
+                    sacc += ((signs & (1u << (j + 4u))) != 0u ? -m2 : m2) * x[xoff + 4u + j];
+                }
+                accU += db * sacc;
+            }
+        }
+    }
+
+    float gS = subgroupAdd(accG);
+    float uS = subgroupAdd(accU);
+    if (gl_SubgroupInvocationID == 0u) { pg[gl_SubgroupID] = gS; pu[gl_SubgroupID] = uS; }
+    barrier();
+    if (tid == 0u && s < pc.n_used) {
+        float g = 0.0, u = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) { g += pg[i]; u += pu[i]; }
+        h[s * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;   // silu(g) * u
+    }
+}

@@ -1,0 +1,72 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// y[M] = W[M,K] · x[K], W in raw ggml IQ4_XS super-blocks (136 B per 256).
+// 4.25 bpw: 8 sub-blocks of 32 with 6-bit scales and a shared nonlinear
+// 16-value codebook (kvalues_iq4nl). One 32-element sub-block per work unit.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+
+#include "iq_tables.glsl"
+
+struct block_iq4_xs {
+    float16_t d;
+    uint16_t  scales_h;
+    uint8_t   scales_l[4];
+    uint8_t   qs[128];
+};
+
+layout(std430, binding = 0) readonly  buffer BufW { block_iq4_xs wb[]; };
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint lane = tid % TPR;
+    uint wg   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row  = wg * (256u / TPR) + tid / TPR;
+
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint kb   = pc.K / 256u;  // super-blocks per row
+        uint nu   = kb * 8u;      // 32-element sub-blocks per row
+        uint base = row * kb;
+        for (uint u = lane; u < nu; u += TPR) {
+            uint b  = u >> 3u;
+            uint ib = u & 7u;
+
+            float d  = float(wb[base + b].d);
+            uint  sl = uint(wb[base + b].scales_l[ib >> 1u]);
+            uint  sh = uint(wb[base + b].scales_h);
+            int   ls = int(((sl >> (4u * (ib & 1u))) & 0xFu) |
+                           (((sh >> (2u * ib)) & 3u) << 4u)) - 32;
+            float dl = d * float(ls);
+
+            uint qoff = ib * 16u;
+            uint xoff = b * 256u + ib * 32u;
+            float s1 = 0.0, s2 = 0.0;
+            for (uint j = 0u; j < 16u; ++j) {
+                uint q = uint(wb[base + b].qs[qoff + j]);
+                s1 += float(kvalues_iq4nl[q & 0xFu]) * x[xoff + j];
+                s2 += float(kvalues_iq4nl[q >> 4u]) * x[xoff + 16u + j];
+            }
+            acc += dl * (s1 + s2);
+        }
+    }
+
+    partial[tid] = acc;
+    barrier();
+    for (uint s = TPR / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) partial[tid] += partial[tid + s];
+        barrier();
+    }
+    if (lane == 0u && row < pc.M) y[row] = partial[tid];
+}

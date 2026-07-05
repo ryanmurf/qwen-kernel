@@ -1,0 +1,58 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Shared expert down-projection, added on top of the routed result:
+//   y[o] += wShared * (down_shexp[o] · h[n_used*n_ff .. +n_ff])
+// Q8_0 rows of n_ff elements. One workgroup per output o. Runs after
+// moe_down_iq4 (barrier in between) since it read-modify-writes y.
+
+layout(local_size_x = 256) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly buffer BufW { block_q8_0 dw[]; };
+layout(std430, binding = 1) readonly buffer BufH { float h[]; };
+layout(std430, binding = 2) readonly buffer Sel {
+    uint  ids[8];
+    float w[8];
+    float wShared;
+};
+layout(std430, binding = 3) buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint o   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    if (o < pc.n_embd) {
+        uint kb   = pc.n_ff / 32u;
+        uint base = o * kb;
+        uint hbase = pc.n_used * pc.n_ff;
+        for (uint b = tid; b < kb; b += 256u) {
+            uint  hoff = hbase + b * 32u;
+            float s = 0.0;
+            [[unroll]] for (uint i = 0u; i < 32u; ++i)
+                s += float(int(dw[base + b].qs[i])) * h[hoff + i];
+            acc += float(dw[base + b].d) * s;
+        }
+    }
+
+    partial[tid] = acc;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (tid < st) partial[tid] += partial[tid + st];
+        barrier();
+    }
+    if (tid == 0u && o < pc.n_embd) y[o] += wShared * partial[0];
+}

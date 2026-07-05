@@ -1,0 +1,60 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Shared-expert down-projection writing its OWN output buffer (no
+// read-modify-write), so it can run concurrently with the routed down pass:
+//   y2[o] = wShared * (down_shexp[o] · h[n_used*n_ff .. +n_ff])
+
+layout(local_size_x = 256) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly buffer BufW { block_q8_0 dw[]; };
+layout(std430, binding = 1) readonly buffer BufH { float h[]; };
+layout(std430, binding = 2) readonly buffer Sel {
+    uint  ids[8];
+    float w[8];
+    float wShared;
+};
+layout(std430, binding = 3) writeonly buffer BufY { float y2[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint o   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    if (o < pc.n_embd) {
+        uint kb    = pc.n_ff / 32u;
+        uint base  = o * kb;
+        uint hbase = pc.n_used * pc.n_ff;
+        for (uint b = tid; b < kb; b += 256u) {
+            uint  hoff = hbase + b * 32u;
+            float s = 0.0;
+            [[unroll]] for (uint i = 0u; i < 32u; ++i)
+                s += float(int(dw[base + b].qs[i])) * h[hoff + i];
+            acc += float(dw[base + b].d) * s;
+        }
+    }
+
+    float v = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = v;
+    barrier();
+    if (tid == 0u && o < pc.n_embd) {
+        float s2 = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) s2 += partial[i];
+        y2[o] = wShared * s2;
+    }
+}

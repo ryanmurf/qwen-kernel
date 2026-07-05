@@ -1,0 +1,31 @@
+#version 450
+
+// L2-normalize q and k heads of the conv output in place (ggml_l2_norm):
+//   head *= 1 / max(sqrt(sum(head^2)), eps)
+// Workgroup w normalizes 128-dim head w; grid = 2*hK heads (q then k region).
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC { uint dState; float eps; } pc;
+
+shared float red[128];
+shared float scale;
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint base = w * pc.dState;
+
+    float v = t < pc.dState ? c[base + t] : 0.0;
+    red[t] = v * v;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    if (t == 0u) scale = 1.0 / max(sqrt(red[0]), pc.eps);
+    barrier();
+    if (t < pc.dState) c[base + t] = v * scale;
+}

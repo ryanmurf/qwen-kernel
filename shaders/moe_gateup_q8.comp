@@ -1,0 +1,60 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Shared expert, gate+up: h[n_used*n_ff + r] = silu(gate_shexp[r]·x) * (up_shexp[r]·x).
+// Both tensors Q8_0. One workgroup per FFN row r.
+
+layout(local_size_x = 256) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly buffer BufG { block_q8_0 gw[]; };
+layout(std430, binding = 1) readonly buffer BufU { block_q8_0 uw[]; };
+layout(std430, binding = 2) readonly buffer BufX { float x[]; };
+layout(std430, binding = 3) writeonly buffer BufH { float h[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float pg[256];
+shared float pu[256];
+
+void main() {
+    uint r   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    float accG = 0.0, accU = 0.0;
+    if (r < pc.n_ff) {
+        uint kb   = pc.n_embd / 32u;
+        uint base = r * kb;
+        for (uint b = tid; b < kb; b += 256u) {
+            uint  xoff = b * 32u;
+            float sg = 0.0, su = 0.0;
+            [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+                float xv = x[xoff + i];
+                sg += float(int(gw[base + b].qs[i])) * xv;
+                su += float(int(uw[base + b].qs[i])) * xv;
+            }
+            accG += float(gw[base + b].d) * sg;
+            accU += float(uw[base + b].d) * su;
+        }
+    }
+
+    float gS = subgroupAdd(accG);
+    float uS = subgroupAdd(accU);
+    if (gl_SubgroupInvocationID == 0u) { pg[gl_SubgroupID] = gS; pu[gl_SubgroupID] = uS; }
+    barrier();
+    if (tid == 0u && r < pc.n_ff) {
+        float g = 0.0, u = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) { g += pg[i]; u += pu[i]; }
+        h[pc.n_used * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;
+    }
+}

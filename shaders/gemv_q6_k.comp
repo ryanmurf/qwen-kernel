@@ -1,0 +1,94 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// y[M] = W[M,K] · x[K], W in raw ggml Q6_K super-blocks (210 B per 256).
+// One 16-element scale group per work unit; TPR threads per row.
+//
+// Per ggml dequantize_row_q6_K, for output o in 0..255: h=o/128, r=(o%128)/32,
+// l=o%32, is=l/16 ->
+//   q = lo4(ql[h*64 + (r&1)*32 + l], hi=r>=2) | ((qh[h*32+l] >> 2r) & 3) << 4, -32
+//   y[o] = d * scales[h*8 + r*2 + is] * q
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+
+struct block_q6_K {
+    uint8_t   ql[128];
+    uint8_t   qh[64];
+    int8_t    scales[16];
+    float16_t d;
+};
+
+layout(std430, binding = 0) readonly  buffer BufW { block_q6_K wb[]; };
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint lane = tid % TPR;
+    uint wg   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row  = wg * (256u / TPR) + tid / TPR;
+
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint kb   = pc.K / 256u;  // super-blocks per row
+        uint ng   = kb * 16u;     // 16-element groups per row
+        uint base = row * kb;
+        for (uint g = lane; g < ng; g += TPR) {
+            uint b  = g >> 4u;
+            uint gg = g & 15u;
+            uint h  = gg >> 3u;
+            uint r  = (gg & 7u) >> 1u;
+            uint is = gg & 1u;
+
+            float d  = float(wb[base + b].d);
+            float sc = float(int(wb[base + b].scales[h * 8u + r * 2u + is]));
+
+            uint qlBase = h * 64u + (r & 1u) * 32u + is * 16u;
+            uint qhBase = h * 32u + is * 16u;
+            uint shift  = r * 2u;
+            bool hi     = r >= 2u;
+            uint xoff   = b * 256u + gg * 16u;
+
+            float s = 0.0;
+            for (uint i = 0u; i < 16u; ++i) {
+                uint qlv = uint(wb[base + b].ql[qlBase + i]);
+                uint qhv = uint(wb[base + b].qh[qhBase + i]);
+                uint lo  = hi ? (qlv >> 4u) : (qlv & 0xFu);
+                int  q   = int(lo | (((qhv >> shift) & 3u) << 4u)) - 32;
+                s += float(q) * x[xoff + i];
+            }
+            acc += d * sc * s;
+        }
+    }
+
+    if (TPR >= gl_SubgroupSize) {  // wave-level reduce, one barrier
+        float v = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u) partial[tid / gl_SubgroupSize] = v;
+        barrier();
+        if (lane == 0u && row < pc.M) {
+            uint waves = TPR / gl_SubgroupSize;
+            uint base = (tid / TPR) * waves;
+            float s2 = 0.0;
+            for (uint i = 0u; i < waves; ++i) s2 += partial[base + i];
+            y[row] = s2;
+        }
+    } else {
+        partial[tid] = acc;
+        barrier();
+        for (uint s2 = TPR / 2u; s2 > 0u; s2 >>= 1u) {
+            if (lane < s2) partial[tid] += partial[tid + s2];
+            barrier();
+        }
+        if (lane == 0u && row < pc.M) y[row] = partial[tid];
+    }
+}

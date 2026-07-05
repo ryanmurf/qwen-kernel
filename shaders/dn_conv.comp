@@ -1,0 +1,30 @@
+#version 450
+
+// Depthwise causal conv (kernel 4) over the mixed qkv channels for one token,
+// then SiLU. Also shifts the per-channel conv state (last 3 raw inputs).
+//   win        = [st0, st1, st2, qkv[c]]
+//   convOut[c] = silu(sum_i win[i] * ker[c*4+i])
+//   state[c]   = [st1, st2, qkv[c]]
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer BufS          { float st[]; };   // [channels][3]
+layout(std430, binding = 1) readonly buffer BufI { float qkv[]; };  // [channels]
+layout(std430, binding = 2) readonly buffer BufK { float ker[]; };  // [channels][4]
+layout(std430, binding = 3) writeonly buffer BufO { float o[]; };   // [channels]
+
+layout(push_constant) uniform PC { uint channels; } pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) return;
+
+    float s0 = st[c * 3u], s1 = st[c * 3u + 1u], s2 = st[c * 3u + 2u];
+    float xin = qkv[c];
+    float v = s0 * ker[c * 4u] + s1 * ker[c * 4u + 1u] +
+              s2 * ker[c * 4u + 2u] + xin * ker[c * 4u + 3u];
+    o[c] = v / (1.0 + exp(-v));   // silu
+    st[c * 3u]      = s1;
+    st[c * 3u + 1u] = s2;
+    st[c * 3u + 2u] = xin;
+}

@@ -1,0 +1,74 @@
+#version 450
+
+// Full-attention pre-step for one token:
+//   WG w in [0,hQ):        q head w: RMS(q)·q_norm, rope, -> qhat
+//   WG w in [hQ,hQ+hKV):   k head:   RMS(k)·k_norm, rope, -> Kcache[pos]
+//   WG w in [hQ+hKV,+hKV): v head:   copy           -> Vcache[pos]
+// qfull layout: head h at [h*2*dh, +dh) = q, [+dh, +2dh) = gate (untouched).
+// Rope: NeoX pairs (j, j+nRot/2) on first nRot dims, theta = pos*base^(-2j/nRot)
+// (IMROPE with equal t/h/w positions == plain NeoX partial rope for text).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 1) readonly  buffer BufKI { float kin[]; };   // [hKV*dh]
+layout(std430, binding = 2) readonly  buffer BufVI { float vin[]; };   // [hKV*dh]
+layout(std430, binding = 3) readonly  buffer BufQN { float qn[]; };    // [dh]
+layout(std430, binding = 4) readonly  buffer BufKN { float kn[]; };    // [dh]
+layout(std430, binding = 5) writeonly buffer BufQH { float qhat[]; };  // [hQ*dh]
+layout(std430, binding = 6) buffer BufKC { float kc[]; };              // [hKV][tmax][dh]
+layout(std430, binding = 7) buffer BufVC { float vc[]; };
+
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+} pc;
+
+shared float sv[256];
+shared float red[256];
+shared float scale;
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+
+    if (w >= pc.hQ + pc.hKV) {           // v: plain copy into cache
+        uint h = w - pc.hQ - pc.hKV;
+        if (t < dh) vc[(h * pc.tmax + pc.pos) * dh + t] = vin[h * dh + t];
+        return;
+    }
+
+    bool isQ = w < pc.hQ;
+    uint h = isQ ? w : w - pc.hQ;
+    float v = 0.0;
+    if (t < dh) v = isQ ? qfull[h * 2u * dh + t] : kin[h * dh + t];
+
+    red[t] = v * v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    if (t == 0u) scale = 1.0 / sqrt(red[0] / float(dh) + pc.eps);
+    barrier();
+    if (t < dh) sv[t] = v * scale * (isQ ? qn[t] : kn[t]);
+    barrier();
+
+    // rope on pairs (j, j+nRot/2), j < nRot/2
+    uint half_ = pc.nRot / 2u;
+    if (t < dh) {
+        float outV;
+        if (t < pc.nRot) {
+            uint j = t < half_ ? t : t - half_;
+            float theta = float(pc.pos) * pow(pc.freqBase, -2.0 * float(j) / float(pc.nRot));
+            float c = cos(theta), s = sin(theta);
+            float x0 = sv[j], x1 = sv[j + half_];
+            outV = t < half_ ? x0 * c - x1 * s : x0 * s + x1 * c;
+        } else {
+            outV = sv[t];
+        }
+        if (isQ) qhat[h * dh + t] = outV;
+        else     kc[(h * pc.tmax + pc.pos) * dh + t] = outV;
+    }
+}

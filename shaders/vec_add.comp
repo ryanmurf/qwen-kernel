@@ -1,0 +1,15 @@
+#version 450
+
+// out[i] = a[i] + b[i], one workgroup.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly  buffer BufB { float b[]; };
+layout(std430, binding = 2) writeonly buffer BufO { float o[]; };
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    for (uint i = gl_LocalInvocationID.x; i < pc.n; i += 256u) o[i] = a[i] + b[i];
+}

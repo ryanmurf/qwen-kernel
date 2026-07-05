@@ -1,0 +1,61 @@
+#version 450
+
+// Gated delta rule, one token, one workgroup per v-head h (thread j = row j):
+//   S ← exp(g_h)·S;  sk_j = Σ_i S[j,i]·k_i;  d_j = β_h(v_j − sk_j)
+//   S[j,i] ← S[j,i] + k_i·d_j;  o_j = Σ_i S[j,i]·q_i · 1/√dState
+// GQA: v-head h uses q/k head (h % hK) — ggml_repeat modulo-tiling semantics.
+// conv layout: q at [0, hK*dS), k at [hK*dS, 2*hK*dS), v at [2*hK*dS, ...).
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufC  { float conv[]; };
+layout(std430, binding = 1) readonly buffer BufGB { float gb[]; };    // g[hV] then beta[hV]
+layout(std430, binding = 2) buffer BufS           { vec4 s4[]; };     // [hV][dS][dS/4]
+layout(std430, binding = 3) writeonly buffer BufO { float o[]; };     // [hV][dS]
+
+layout(push_constant) uniform PC { uint dState; uint hK; uint hV; } pc;
+
+shared vec4 qs4[64];
+shared vec4 ks4[64];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+    uint dS = pc.dState;
+    uint nv = dS / 4u;
+
+    uint kh    = h % pc.hK;
+    uint qBase = kh * dS;
+    uint kBase = pc.hK * dS + kh * dS;
+    uint vBase = 2u * pc.hK * dS + h * dS;
+
+    float qScale = inversesqrt(float(dS));
+    if (j < nv) {
+        qs4[j] = vec4(conv[qBase + 4u*j], conv[qBase + 4u*j + 1u],
+                      conv[qBase + 4u*j + 2u], conv[qBase + 4u*j + 3u]) * qScale;
+        ks4[j] = vec4(conv[kBase + 4u*j], conv[kBase + 4u*j + 1u],
+                      conv[kBase + 4u*j + 2u], conv[kBase + 4u*j + 3u]);
+    }
+    barrier();
+
+    if (j >= dS) return;
+
+    float decay = exp(gb[h]);
+    float beta  = gb[pc.hV + h];
+    float vj    = conv[vBase + j];
+    uint  row   = (h * dS + j) * nv;
+
+    float sk = 0.0;
+    for (uint i = 0u; i < nv; ++i) sk += dot(s4[row + i], ks4[i]);
+    sk *= decay;
+
+    float dj = beta * (vj - sk);
+
+    float oj = 0.0;
+    for (uint i = 0u; i < nv; ++i) {
+        vec4 sn = s4[row + i] * decay + ks4[i] * dj;
+        s4[row + i] = sn;
+        oj += dot(sn, qs4[i]);
+    }
+    o[h * dS + j] = oj;
+}

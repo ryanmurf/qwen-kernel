@@ -1,0 +1,69 @@
+#version 450
+
+// Top-n_used expert selection + weight computation, one workgroup.
+// Selection by raw logit (softmax is monotonic); weights are the softmax over
+// the selected logits only — the full-softmax denominator cancels under
+// llama.cpp's norm_w renormalization. Also computes the shared-expert
+// sigmoid gate: wShared = sigmoid(gate_inp_shexp · x).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufL   { float logits[]; };
+layout(std430, binding = 1) readonly buffer BufGIS { float gis[]; };
+layout(std430, binding = 2) readonly buffer BufX   { float x[]; };
+layout(std430, binding = 3) buffer Sel {
+    uint  ids[8];
+    float w[8];
+    float wShared;
+};
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float sl[256];
+shared float red[256];
+shared uint  redi[256];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+
+    sl[t] = t < pc.n_expert ? logits[t] : -3.4e38;
+
+    // shared-expert gate dot
+    float sacc = 0.0;
+    for (uint k = t; k < pc.n_embd; k += 256u) sacc += gis[k] * x[k];
+    red[t] = sacc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    if (t == 0u) wShared = 1.0 / (1.0 + exp(-red[0]));
+    barrier();
+
+    // top-n_used by logit: n_used rounds of parallel argmax
+    for (uint i = 0u; i < pc.n_used; ++i) {
+        red[t] = sl[t];
+        redi[t] = t;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s && red[t + s] > red[t]) {
+                red[t] = red[t + s];
+                redi[t] = redi[t + s];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            ids[i] = redi[0];
+            w[i] = red[0];          // logit for now, softmaxed below
+            sl[redi[0]] = -3.4e38;
+        }
+        barrier();
+    }
+
+    if (t == 0u) {
+        float m = w[0];             // first pick has the max logit
+        float sum = 0.0;
+        for (uint i = 0u; i < pc.n_used; ++i) { w[i] = exp(w[i] - m); sum += w[i]; }
+        for (uint i = 0u; i < pc.n_used; ++i) w[i] /= sum;
+    }
+}

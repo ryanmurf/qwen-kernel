@@ -1,0 +1,38 @@
+#version 450
+
+// Argmax pass 1: each workgroup reduces a span of the logits to (val, idx).
+// Ties resolve to the lower index (matches greedy sampling convention).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufL { float logits[]; };
+layout(std430, binding = 1) writeonly buffer BufV { float vals[]; };
+layout(std430, binding = 2) writeonly buffer BufI { uint idxs[]; };
+
+layout(push_constant) uniform PC { uint n; uint span; } pc;
+
+shared float rv[256];
+shared uint  ri[256];
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint start = w * pc.span;
+    uint end = min(start + pc.span, pc.n);
+
+    float bv = -3.4e38;
+    uint bi = 0u;
+    for (uint i = start + t; i < end; i += 256u)
+        if (logits[i] > bv) { bv = logits[i]; bi = i; }
+    rv[t] = bv;
+    ri[t] = bi;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s && (rv[t + s] > rv[t] || (rv[t + s] == rv[t] && ri[t + s] < ri[t]))) {
+            rv[t] = rv[t + s];
+            ri[t] = ri[t + s];
+        }
+        barrier();
+    }
+    if (t == 0u) { vals[w] = rv[0]; idxs[w] = ri[0]; }
+}

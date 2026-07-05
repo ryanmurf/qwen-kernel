@@ -1,0 +1,44 @@
+#version 450
+
+// y[M] = W[M,K] · x[K]
+// W: row-major fp16, packed two halves per uint (little-endian: low half first).
+//
+// TPR (spec constant 0) = threads per row, power of two ≤ 256. Each workgroup
+// handles 256/TPR consecutive rows so skinny-K shapes keep all threads busy.
+// Grid is 2D for row counts beyond maxComputeWorkGroupCount[0].
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+
+layout(std430, binding = 0) readonly  buffer BufW { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint lane = tid % TPR;
+    uint wg   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row  = wg * (256u / TPR) + tid / TPR;
+
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint kw   = pc.K / 2u;   // uints per row
+        uint base = row * kw;
+        for (uint i = lane; i < kw; i += TPR) {
+            vec2 wv = unpackHalf2x16(w[base + i]);
+            acc += wv.x * x[2u * i] + wv.y * x[2u * i + 1u];
+        }
+    }
+
+    partial[tid] = acc;
+    barrier();
+    for (uint s = TPR / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) partial[tid] += partial[tid + s];
+        barrier();
+    }
+    if (lane == 0u && row < pc.M) y[row] = partial[tid];
+}

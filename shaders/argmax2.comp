@@ -1,0 +1,29 @@
+#version 450
+
+// Argmax pass 2: reduce the per-workgroup candidates to the winning token id.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufV { float vals[]; };
+layout(std430, binding = 1) readonly  buffer BufI { uint idxs[]; };
+layout(std430, binding = 2) writeonly buffer BufT { uint tok[]; };
+
+layout(push_constant) uniform PC { uint m; } pc;
+
+shared float rv[256];
+shared uint  ri[256];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    rv[t] = t < pc.m ? vals[t] : -3.4e38;
+    ri[t] = t < pc.m ? idxs[t] : 0xFFFFFFFFu;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s && (rv[t + s] > rv[t] || (rv[t + s] == rv[t] && ri[t + s] < ri[t]))) {
+            rv[t] = rv[t + s];
+            ri[t] = ri[t + s];
+        }
+        barrier();
+    }
+    if (t == 0u) tok[0] = ri[0];
+}

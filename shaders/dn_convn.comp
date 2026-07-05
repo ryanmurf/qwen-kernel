@@ -1,0 +1,52 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Fused depthwise conv(4)+SiLU+state-shift AND per-head L2 norm of q/k.
+// One workgroup per dState(=128)-channel head; heads below qkCh get the
+// l2 normalization (q/k region), the v region passes through.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufS          { float st[]; };
+layout(std430, binding = 1) readonly buffer BufI { float qkv[]; };
+layout(std430, binding = 2) readonly buffer BufK { float ker[]; };
+layout(std430, binding = 3) writeonly buffer BufO { float o[]; };
+
+layout(push_constant) uniform PC { uint channels; uint dState; uint qkCh; float eps; } pc;
+
+shared float red[128];
+shared float scale;
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint chBase = w * pc.dState;
+    uint ch = chBase + t;
+
+    float v = 0.0;
+    if (ch < pc.channels && t < pc.dState) {
+        float s0 = st[ch * 3u], s1 = st[ch * 3u + 1u], s2 = st[ch * 3u + 2u];
+        float xin = qkv[ch];
+        float c = s0 * ker[ch * 4u] + s1 * ker[ch * 4u + 1u] +
+                  s2 * ker[ch * 4u + 2u] + xin * ker[ch * 4u + 3u];
+        v = c / (1.0 + exp(-c));
+        st[ch * 3u]      = s1;
+        st[ch * 3u + 1u] = s2;
+        st[ch * 3u + 2u] = xin;
+    }
+
+    if (chBase < pc.qkCh) {  // q/k head: L2 normalize (uniform branch per WG)
+        float sg = subgroupAdd(v * v);
+        if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = sg;
+        barrier();
+        if (t == 0u) {
+            float tot = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += red[i];
+            scale = 1.0 / max(sqrt(tot), pc.eps);
+        }
+        barrier();
+        v *= scale;
+    }
+    if (ch < pc.channels && t < pc.dState) o[ch] = v;
+}

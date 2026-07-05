@@ -1,0 +1,36 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Router logits: logits[e] = gate_inp[e] · x, F32 weights.
+// One workgroup per expert row.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufW { float gi[]; };  // [n_expert][n_embd]
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufL { float logits[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint e   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+    if (e < pc.n_expert) {
+        uint base = e * pc.n_embd;
+        for (uint k = tid; k < pc.n_embd; k += 256u) acc += gi[base + k] * x[k];
+    }
+
+    float v = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = v;
+    barrier();
+    if (tid == 0u && e < pc.n_expert) {
+        float s2 = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) s2 += partial[i];
+        logits[e] = s2;
+    }
+}

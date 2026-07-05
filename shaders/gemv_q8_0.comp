@@ -1,0 +1,69 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// y[M] = W[M,K] · x[K], W in raw ggml Q8_0 blocks (34 B per 32 weights).
+// TPR spec constant: threads per row; 256/TPR rows per workgroup.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly  buffer BufW { block_q8_0 wb[]; };
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint lane = tid % TPR;
+    uint wg   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row  = wg * (256u / TPR) + tid / TPR;
+
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint kb   = pc.K / 32u;
+        uint base = row * kb;
+        for (uint b = lane; b < kb; b += TPR) {
+            float d    = float(wb[base + b].d);
+            uint  xoff = b * 32u;
+            float s = 0.0;
+            [[unroll]] for (uint i = 0u; i < 32u; ++i)
+                s += float(int(wb[base + b].qs[i])) * x[xoff + i];
+            acc += d * s;
+        }
+    }
+
+    if (TPR >= gl_SubgroupSize) {  // wave-level reduce, one barrier
+        float v = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u) partial[tid / gl_SubgroupSize] = v;
+        barrier();
+        if (lane == 0u && row < pc.M) {
+            uint waves = TPR / gl_SubgroupSize;
+            uint base = (tid / TPR) * waves;
+            float s2 = 0.0;
+            for (uint i = 0u; i < waves; ++i) s2 += partial[base + i];
+            y[row] = s2;
+        }
+    } else {
+        partial[tid] = acc;
+        barrier();
+        for (uint s2 = TPR / 2u; s2 > 0u; s2 >>= 1u) {
+            if (lane < s2) partial[tid] += partial[tid + s2];
+            barrier();
+        }
+        if (lane == 0u && row < pc.M) y[row] = partial[tid];
+    }
+}
