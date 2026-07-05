@@ -40,7 +40,13 @@ impl ChatTemplate {
             match render_minijinja(source, messages, add_generation_prompt) {
                 Ok(rendered) => return Ok(rendered),
                 Err(err) => {
-                    tracing::warn!("chat template render failed, using builtin formatter: {err}")
+                    // Some GGUF templates (e.g. Qwen's) use Jinja features minijinja
+                    // lacks; the builtin ChatML formatter is fixture-faithful. Warn once,
+                    // not per request.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!("GGUF chat template unsupported ({err}); using builtin formatter")
+                    });
                 }
             }
         }
