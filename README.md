@@ -278,6 +278,21 @@ llama.cpp reference:
   or a `>maxB` prompt would need a `base` push constant, per-layer conv-carry
   seeding, and dropping the internal `resetSlot` (documented in-source).
 
+- **Fork mode (`QK_FORK`) — same-prompt requests share one prefill.** For internal
+  best-of-N / duplicate-prompt bursts, an opt-in mode: because batched prefill runs
+  eagerly and synchronously in `slot_start`, the first request's prompt is prefilled
+  by the time `slot_start` returns, so it snapshots that `[0,K)` prefill into the
+  prefix cache (keyed by `prompt[0:K]`). The next same-prompt request hits
+  `matchPrefix` and `restoreInto`s it (one state copy) instead of re-running the whole
+  prefill. `slot_start` is called per request on the single engine thread, so request
+  1 caches and 2..N fork — covering concurrent, not just staggered, duplicates.
+  Output is token-for-token identical to independent prefill (validated: 4 same-prompt
+  slots all identical to the serial reference); **~2.68× faster for 4 same-prompt slots**
+  (874 → 326 ms: one prefill + three forks vs four prefills). Off by default — it adds a
+  state snapshot to each fresh prompt, so it only pays off when duplicates actually
+  occur (the 30 recurrent layers' delta-rule state still diverges per sample the moment
+  generations differ, so this shares the *prefill*, not decode-time VRAM).
+
 ## Build & run
 
 ```bash
@@ -302,7 +317,8 @@ llama.cpp reference:
 Env: `QK_DEVICE=<n>` forces the Vulkan device index (default: first discrete
 GPU); `QK_SHADER_DIR` overrides the SPIR-V directory; `QK_GGUF` overrides the
 model path; `QK_NO_BATCH=1` disables batched prefill in the serving path (forces
-per-token serial prefill — used as the correctness reference).
+per-token serial prefill — used as the correctness reference); `QK_FORK=1` enables
+fork mode (same-prompt requests share one prefill via the prefix cache).
 
 ## Notes
 
