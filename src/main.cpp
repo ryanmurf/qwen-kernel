@@ -2735,7 +2735,8 @@ struct qk_engine {
 
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
-    void prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<float>& logits);
+    void prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
+                          std::vector<float>& logits, bool wantLogits = true);
     // Serial reference: drive the recorded per-token step CB over n prompt tokens on
     // `slot`, then read back that slot's raw logit row (the prediction after the last
     // prompt token). Returns the greedy argmax (robust to EOS, unlike the slot API).
@@ -3355,18 +3356,43 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 // tiled GEMM for n>=48, whose accumulation order differs from serial GEMV by ~1e-7, so
 // the handed-off state is not bit-identical to serial at large n (argmax-stable in
 // practice; review R1) — acceptable since this is a fresh, self-consistent forward.
-void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<float>& logits) {
-    if (!toks || n < 1 || n > maxB) {
-        fprintf(stderr, "prefillBatchLast: bad token count %u (max %u)\n", n, maxB);
+void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
+                                 std::vector<float>& logits, bool wantLogits) {
+    if (!toks || n < 1 || n > maxB || slot >= nSlots) {
+        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u (max %u/%u)\n", n, slot, maxB, nSlots);
         exit(1);
     }
     memcpy(bbIdsMap, toks, (size_t)n * 4);
-    logits.resize(vocab);
-    // From-empty prefill on slot 0: zero its recurrent state so dn_step's seed reads 0
+    if (wantLogits) logits.resize(vocab);
+    // From-empty prefill on `slot`: zero its recurrent state so dn_step's seed reads 0
     // and the conv window starts clean (also makes repeated calls idempotent). The
-    // batched kernels then leave slot 0's K/V + delta-rule S + conv window exactly as
+    // batched kernels then leave the slot's K/V + delta-rule S + conv window exactly as
     // n serial steps would, so serial decode can continue from position n.
-    resetSlot(0);
+    resetSlot(slot);
+    // Point the batched sets' per-slot STATE bindings at this slot's stripe (offset
+    // slot*ps). The activation bindings are shared (one prefill at a time). Prefill is
+    // synchronous, so rebinding the shared sets before re-recording the CB is safe.
+    {
+        VkDescriptorBufferInfo dbi; VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr.descriptorCount = 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr.pBufferInfo = &dbi;
+        auto rebind = [&](VkDescriptorSet ds, uint32_t binding, VkBuffer buf, size_t ps) {
+            dbi = {buf, (VkDeviceSize)slot * ps, (VkDeviceSize)ps};
+            wr.dstSet = ds; wr.dstBinding = binding;
+            vkUpdateDescriptorSets(c.dev, 1, &wr, 0, nullptr);
+        };
+        for (uint32_t il = 0; il < nLayer; il++) {
+            Layer& L = layers[il]; BLayer& BL = blayers[il];
+            if (L.rec) {                                   // st1=convSt, st2=S
+                rebind(BL.sConv, 4, L.st1, L.ps1);
+                rebind(BL.sStep, 3, L.st2, L.ps2);
+            } else {                                       // st1=kc, st2=vc
+                rebind(BL.sPrep, 6, L.st1, L.ps1);
+                rebind(BL.sPrep, 7, L.st2, L.ps2);
+                rebind(BL.sAttn, 1, L.st1, L.ps1);
+                rebind(BL.sAttn, 2, L.st2, L.ps2);
+            }
+        }
+    }
 
     VK_CHECK(vkResetCommandBuffer(c.cb, 0));
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -3475,15 +3501,20 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<f
         disp(pAdd3, BL.sAdd3, 1, &pcRms, 8);
         barrier();
     }
-    zdim = n;
-    disp(pHead, sbHead, (vocab + 1) / 2, &pcHead, 8);
-    VkMemoryBarrier m2{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    m2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    m2.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 1, &m2, 0, nullptr, 0, nullptr);
-    VkBufferCopy cp{(VkDeviceSize)(n - 1) * vocab * 4, 0, (VkDeviceSize)vocab * 4};
-    vkCmdCopyBuffer(c.cb, bbLogits.buf, stage.buf, 1, &cp);
+    // The head (last-token logits) is only needed by validation callers; when the
+    // slot is being prefilled for decode, the serial step over the final prompt token
+    // produces the first generated token, so skip the head entirely (a large save).
+    if (wantLogits) {
+        zdim = n;
+        disp(pHead, sbHead, (vocab + 1) / 2, &pcHead, 8);
+        VkMemoryBarrier m2{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        m2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        m2.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &m2, 0, nullptr, 0, nullptr);
+        VkBufferCopy cp{(VkDeviceSize)(n - 1) * vocab * 4, 0, (VkDeviceSize)vocab * 4};
+        vkCmdCopyBuffer(c.cb, bbLogits.buf, stage.buf, 1, &cp);
+    }
 
     VK_CHECK(vkEndCommandBuffer(c.cb));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -3491,7 +3522,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<f
     si.pCommandBuffers = &c.cb;
     VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
     VK_CHECK(vkQueueWaitIdle(c.queue));
-    memcpy(logits.data(), stageMap, (size_t)vocab * 4);
+    if (wantLogits) memcpy(logits.data(), stageMap, (size_t)vocab * 4);
 }
 
 uint32_t qk_engine::serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
@@ -3560,8 +3591,21 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
         uint32_t L = (uint32_t)e->pcache[cidx].tokens.size();
         s.cursor = L; s.pos = L;
     } else {
-        e->resetSlot(slot);  // clear any prior occupant's recurrent state
-        s.cursor = 0; s.pos = 0;
+        // Fast prefill: batch all but the LAST prompt token in one command buffer
+        // (~4x faster than per-token), then let the serial step feed the final token —
+        // which produces the first generated token exactly as the all-serial path does,
+        // reading the batched-filled K/V + delta-rule S + conv window. Only for a fresh,
+        // single-chunk-sized prompt (prefillBatchLast is from-empty, <= maxB); shorter
+        // prompts and >maxB prompts fall back to per-token serial prefill.
+        uint32_t K = n_prompt >= 2 ? n_prompt - 1 : 0;
+        if (K >= 16 && K <= e->maxB && !getenv("QK_NO_BATCH")) {
+            std::vector<float> unused;
+            e->prefillBatchLast(prompt, K, slot, unused, /*wantLogits=*/false);  // resets slot, fills [0,K)
+            s.cursor = K; s.pos = K;
+        } else {
+            e->resetSlot(slot);  // clear any prior occupant's recurrent state
+            s.cursor = 0; s.pos = 0;
+        }
     }
     s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
     s.genTokens.clear();
@@ -3747,13 +3791,13 @@ int main(int argc, char** argv) {
         char err[256] = {0};
         qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
         if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
-        for (uint32_t s = 0; s < nSlots; s++)
-            qk_slot_start(e, s, prompt.data(), (uint32_t)prompt.size(), nGen);
         uint32_t ch = qk_chunk(e);
         std::vector<std::vector<uint32_t>> gen(nSlots);
         std::vector<uint32_t> outTok((size_t)nSlots * ch), outCnt(nSlots);
         uint32_t finMask = 0;
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = std::chrono::steady_clock::now();  // time the FULL request incl. prefill (slot_start)
+        for (uint32_t s = 0; s < nSlots; s++)
+            qk_slot_start(e, s, prompt.data(), (uint32_t)prompt.size(), nGen);
         while (qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask) > 0)
             for (uint32_t s = 0; s < nSlots; s++)
                 for (uint32_t i = 0; i < outCnt[s]; i++) gen[s].push_back(outTok[s * ch + i]);
@@ -3860,7 +3904,7 @@ int main(int argc, char** argv) {
 
                 std::vector<float> logitsS, logitsB;
                 uint32_t tokS = e->serialPrefillLogits(toks.data(), sz, 1, logitsS);
-                e->prefillBatchLast(toks.data(), sz, logitsB);
+                e->prefillBatchLast(toks.data(), sz, 0, logitsB);
                 uint32_t tokB = (uint32_t)(std::max_element(logitsB.begin(), logitsB.end()) - logitsB.begin());
 
                 double maxAbs = 0, refMax = 1e-9;
@@ -3898,12 +3942,12 @@ int main(int argc, char** argv) {
             std::mt19937 rng(1234);
             std::vector<uint32_t> toks(N);
             for (uint32_t i = 0; i < N; i++) toks[i] = rng() % (e->vocab - 16) + 4;
-            e->prefillBatchLast(toks.data(), N, lB);   // warm
+            e->prefillBatchLast(toks.data(), N, 0, lB);   // warm
             e->serialPrefillLogits(toks.data(), N, 1, lS);
             auto t0 = std::chrono::steady_clock::now();
             e->serialPrefillLogits(toks.data(), N, 1, lS);
             auto t1 = std::chrono::steady_clock::now();
-            e->prefillBatchLast(toks.data(), N, lB);
+            e->prefillBatchLast(toks.data(), N, 0, lB);
             auto t2 = std::chrono::steady_clock::now();
             double sMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
             double bMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -3944,7 +3988,7 @@ int main(int argc, char** argv) {
 
             // Batched prefill on slot 0, then continue serial decode from the handoff.
             std::vector<float> lB;
-            e->prefillBatchLast(toks.data(), N, lB);
+            e->prefillBatchLast(toks.data(), N, 0, lB);
             uint32_t tok0 = (uint32_t)(std::max_element(lB.begin(), lB.end()) - lB.begin());
             // Follow serial's convention: a generated EOS is a terminator, not emitted.
             std::vector<uint32_t> batSeq;
