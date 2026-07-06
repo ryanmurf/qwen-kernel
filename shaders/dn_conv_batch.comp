@@ -22,7 +22,11 @@ shared float scale;
 float inputAt(uint n, uint ch, int back) {
     int m = int(n) + back;
     if (m >= 0) return qkv[uint(m) * pc.channels + ch];
-    return carry[uint(3 + m) * pc.channels + ch];
+    // carry holds the 3 tokens before the chunk in channel-major [channels][3] order
+    // (index k=0 oldest .. k=2 newest) — SAME layout as the window this kernel writes to
+    // stOut and as serial dn_convn's `st`, so a seeded chunk's carry is a plain copy of
+    // the previous chunk's conv window.
+    return carry[ch * 3u + uint(3 + m)];
 }
 
 void main() {

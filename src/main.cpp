@@ -2736,8 +2736,12 @@ struct qk_engine {
 
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
+    // base=0: from-empty (resets slot, zero conv carry). base>0: CONTINUE an existing
+    // slot at position `base` — keeps the restored state, seeds each layer's conv carry
+    // from the slot's conv window, and writes K/V at pos=base+n. Enables cache-hit suffix
+    // batching and >maxB multi-chunk prefill.
     void prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
-                          std::vector<float>& logits, bool wantLogits = true);
+                          std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0);
     // Serial reference: drive the recorded per-token step CB over n prompt tokens on
     // `slot`, then read back that slot's raw logit row (the prediction after the last
     // prompt token). Returns the greedy argmax (robust to EOS, unlike the slot API).
@@ -3047,8 +3051,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMY2 = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbLogits = createBuf(c, (size_t)cap * vocab * 4, storSrc, true);
     bbIds = createBuf(c, (size_t)cap * 4, stor, false);
-    bbCarry = createBuf(c, (size_t)chQkv * 3 * 4, stor, true);
-    upload(bbCarry, nullptr, (size_t)chQkv * 3 * 4);
+    // Per-layer conv carry (the 3 tokens before a chunk): one [chQkv*3] slice per layer,
+    // so a seeded (base>0) chunk can seed each deltanet layer's carry from its own conv
+    // window. Zero for from-empty chunks. storSrc so it can be a copy target.
+    bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, storSrc, true);
+    upload(bbCarry, nullptr, (size_t)nLayer * chQkv * 3 * 4);
     VK_CHECK(vkMapMemory(c.dev, bbIds.mem, 0, VK_WHOLE_SIZE, 0, (void**)&bbIdsMap));
 
     layers.resize(nLayer);
@@ -3061,7 +3068,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             snprintf(nb, sizeof nb, "blk.%u.%s", il, suffix); return g.find(nb);
         };
         auto W = [&](const GgufTensor* t, size_t n) -> VkBuffer {
-            L.bufs.push_back(createBuf(c, n, stor, true));
+            L.bufs.push_back(createBuf(c, n, storSrc, true));  // storSrc: state stripes are copied from
             upload(L.bufs.back(), t ? t->data : nullptr, n);
             return L.bufs.back().buf;
         };
@@ -3100,6 +3107,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             BL.sP2 = mkSet(pGemvA, {zW, bbXn.buf, bbMid.buf});
             BL.sAb = mkSet(pAbB, {bbXn.buf, alW, beW, dt, av, bbGb.buf});
             BL.sConv = mkSet(pConvB, {bbCarry.buf, bbBig.buf, ker, bbConvOut.buf, convSt});
+            {   // point this layer's conv carry at its own [chQkv*3] slice of bbCarry
+                VkDescriptorBufferInfo dbi{bbCarry.buf, (VkDeviceSize)il * chQkv * 3 * 4,
+                                           (VkDeviceSize)chQkv * 3 * 4};
+                VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                wr.dstSet = BL.sConv; wr.dstBinding = 0; wr.descriptorCount = 1;
+                wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr.pBufferInfo = &dbi;
+                vkUpdateDescriptorSets(c.dev, 1, &wr, 0, nullptr);
+            }
             BL.sStep = mkSet(pStepB, {bbConvOut.buf, bbGb.buf, bbO.buf, S});
             BL.sGate = mkSet(pGateB, {bbO.buf, sn, bbMid.buf, bbAtt.buf});
             BL.sWo = mkSet(pGemvO, {outW, bbAtt.buf, bbAttnOut.buf});
@@ -3356,26 +3371,25 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     return activeAtEntry;
 }
 
-// FROM-EMPTY SINGLE-CHUNK ONLY: prefills tokens [0, n) of slot 0 from a zero state
-// (base=0, zero conv carry, resetSlot). It is NOT valid to continue an existing slot
-// or a >maxB prompt with this — that needs a `base` push, per-layer carry seeded from
-// the slot's conv window, and dropping resetSlot (see review R2). Projections use the
-// tiled GEMM for n>=48, whose accumulation order differs from serial GEMV by ~1e-7, so
-// the handed-off state is not bit-identical to serial at large n (argmax-stable in
-// practice; review R1) — acceptable since this is a fresh, self-consistent forward.
+// Batch-prefill tokens [base, base+n) of `slot`. base=0 starts from empty (resets the
+// slot, zero conv carry); base>0 CONTINUES a slot already holding state at position
+// `base` (from a restore or a previous chunk) — the slot's delta-rule S/conv window/K/V
+// are kept, each layer's conv carry is seeded from its slot conv window, and K/V is
+// written at pos=base+n. Leaves the slot's state exactly as n serial steps from `base`
+// would, so serial decode (or the next chunk) continues from base+n. Projections use the
+// tiled GEMM for n>=48 (accumulation order differs from serial GEMV by ~1e-7, argmax-
+// stable; review R1).
 void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
-                                 std::vector<float>& logits, bool wantLogits) {
-    if (!toks || n < 1 || n > maxB || slot >= nSlots) {
-        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u (max %u/%u)\n", n, slot, maxB, nSlots);
+                                 std::vector<float>& logits, bool wantLogits, uint32_t base) {
+    if (!toks || n < 1 || n > maxB || slot >= nSlots || (size_t)base + n > nCtx) {
+        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u\n", n, slot, base);
         exit(1);
     }
     memcpy(bbIdsMap, toks, (size_t)n * 4);
     if (wantLogits) logits.resize(vocab);
-    // From-empty prefill on `slot`: zero its recurrent state so dn_step's seed reads 0
-    // and the conv window starts clean (also makes repeated calls idempotent). The
-    // batched kernels then leave the slot's K/V + delta-rule S + conv window exactly as
-    // n serial steps would, so serial decode can continue from position n.
-    resetSlot(slot);
+    // base=0: zero the slot's recurrent state so dn_step's seed reads 0 and the conv
+    // window starts clean (idempotent). base>0: keep the existing state to continue from.
+    if (base == 0) resetSlot(slot);
     // Point the batched sets' per-slot STATE bindings at this slot's stripe (offset
     // slot*ps). The activation bindings are shared (one prefill at a time). Prefill is
     // synchronous, so rebinding the shared sets before re-recording the CB is safe.
@@ -3455,9 +3469,23 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
     struct { uint32_t tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t base, Tn; }
-        pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, 0, n};
+        pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, base, n};
     struct { uint32_t k, idx, pr; } pcE{nEmbd, 0, 1};
 
+    // Seed each deltanet layer's conv carry: zero for a from-empty chunk (base=0), else
+    // the slot's conv window (the 3 tokens ending at base-1) so the causal conv is
+    // continuous across the boundary. carry and the slot conv window share [channels][3]
+    // layout, so this is a plain copy.
+    if (base == 0) {
+        vkCmdFillBuffer(c.cb, bbCarry.buf, 0, (VkDeviceSize)nLayer * chQkv * 3 * 4, 0u);
+    } else {
+        for (uint32_t il = 0; il < nLayer; il++) {
+            if (!layers[il].rec) continue;
+            VkBufferCopy cc{(VkDeviceSize)slot * layers[il].ps1, (VkDeviceSize)il * chQkv * 3 * 4,
+                            (VkDeviceSize)chQkv * 3 * 4};
+            vkCmdCopyBuffer(c.cb, layers[il].st1, bbCarry.buf, 1, &cc);
+        }
+    }
     barrier();
     disp(pEmb, sbEmb, 1, &pcE, 12);
     barrier();
@@ -3592,36 +3620,38 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     for (uint32_t i = 0; i < n_prompt; i++) if (prompt[i] >= e->vocab) return -4;
     qk_engine::Slot& s = e->slots[slot];
     int cidx = e->matchPrefix(prompt, n_prompt);
+    uint32_t start;                       // position already resident in the slot's state
     if (cidx >= 0) {
-        // Reuse a cached prefix: restore its state and prefill only the suffix.
-        e->restoreInto(slot, cidx);
-        uint32_t L = (uint32_t)e->pcache[cidx].tokens.size();
-        s.cursor = L; s.pos = L;
+        e->restoreInto(slot, cidx);       // reuse a cached prefix (restore its state)
+        start = (uint32_t)e->pcache[cidx].tokens.size();
     } else {
-        // Fast prefill: batch all but the LAST prompt token in one command buffer
-        // (~4x faster than per-token), then let the serial step feed the final token —
-        // which produces the first generated token exactly as the all-serial path does,
-        // reading the batched-filled K/V + delta-rule S + conv window. Only for a fresh,
-        // single-chunk-sized prompt (prefillBatchLast is from-empty, <= maxB); shorter
-        // prompts and >maxB prompts fall back to per-token serial prefill.
-        uint32_t K = n_prompt >= 2 ? n_prompt - 1 : 0;
-        if (K >= 16 && K <= e->maxB && !getenv("QK_NO_BATCH")) {
+        e->resetSlot(slot);               // fresh: clear any prior occupant's recurrent state
+        start = 0;
+    }
+    // Batch-prefill [start, n_prompt-1) in chunks of maxB: base=0 for a fresh prompt's
+    // first chunk, base=done to CONTINUE (cache-hit suffix, or the next chunk of a >maxB
+    // prompt). The final token is left for the serial step, which yields the first
+    // generated token reading the batched-filled K/V + delta-rule S + conv window exactly
+    // as the all-serial path would. A remaining <16-token tail prefills per-token serially.
+    uint32_t target = n_prompt >= 1 ? n_prompt - 1 : 0;
+    uint32_t done = start;
+    if (!getenv("QK_NO_BATCH")) {
+        while (target > done && target - done >= 16) {
+            uint32_t chunk = std::min(e->maxB, target - done);
             std::vector<float> unused;
-            e->prefillBatchLast(prompt, K, slot, unused, /*wantLogits=*/false);  // resets slot, fills [0,K)
-            s.cursor = K; s.pos = K;
-            // Fork mode: snapshot the shared [0,K) prefill keyed by prompt[0:K] so a
-            // concurrent/subsequent SAME-PROMPT request hits matchPrefix and restores
-            // it (~one state copy) instead of re-running the whole prefill. slot_start
-            // is called per request in sequence, so request 1 caches and 2..N fork.
-            if (e->shareFork) { s.prompt.assign(prompt, prompt + n_prompt); e->snapshotSlot(slot); }
-        } else {
-            e->resetSlot(slot);  // clear any prior occupant's recurrent state
-            s.cursor = 0; s.pos = 0;
+            e->prefillBatchLast(prompt + done, chunk, slot, unused, /*wantLogits=*/false, /*base=*/done);
+            done += chunk;
         }
     }
+    s.cursor = done; s.pos = done;
     s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
     s.genTokens.clear();
     s.gen = 0; s.maxGen = max_gen; s.last = 0;
+    // Fork mode: cache the shared prefill (keyed by prompt[0:done]) so a concurrent or
+    // subsequent SAME-PROMPT request hits matchPrefix and restores it (~one state copy)
+    // instead of re-prefilling. slot_start runs per request in sequence, so request 1
+    // caches and 2..N fork.
+    if (e->shareFork && done > start) e->snapshotSlot(slot);
     return 0;
 }
 
