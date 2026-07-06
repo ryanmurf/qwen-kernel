@@ -29,8 +29,11 @@ spec:
         - 0.0.0.0
         - --port
         - "8080"
+        # slots*ctx KV must fit VRAM beside the ~15.5 GB model: at slots=4/ctx=16384
+        # the 20 GB card overcommits and spills to GTT (PCIe) -> ~30x slowdown once
+        # long agentic sessions fill their contexts. slots=2 fits with headroom.
         - --slots
-        - "4"
+        - "2"
         - --ctx
         - "16384"
         - --chunk
