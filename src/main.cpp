@@ -3428,6 +3428,28 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     };
+    // amdgpu kills any single submission that runs past its ~10 s gfx-ring timeout
+    // (ring reset -> VK_ERROR_DEVICE_LOST). A whole-model chunk (nLayer layers x
+    // maxB tokens) in ONE submit can cross that line when the GPU is contended or
+    // thermally clamped, so flush the command buffer to the queue every
+    // QK_SUBMIT_LAYERS layers (default 8). Submission order + waitIdle + the
+    // fresh barrier keep execution and visibility identical to one big submit.
+    static const uint32_t flushEvery = [] {
+        const char* v = getenv("QK_SUBMIT_LAYERS");
+        long x = v ? atol(v) : 8;
+        return (uint32_t)(x < 1 ? 1 : x);
+    }();
+    auto flushCB = [&]() {
+        VK_CHECK(vkEndCommandBuffer(c.cb));
+        VkSubmitInfo fsi{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        fsi.commandBufferCount = 1;
+        fsi.pCommandBuffers = &c.cb;
+        VK_CHECK(vkQueueSubmit(c.queue, 1, &fsi, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(c.queue));
+        VK_CHECK(vkResetCommandBuffer(c.cb, 0));
+        VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+        barrier();
+    };
     auto disp = [&](Pipe& pp, VkDescriptorSet ds, uint32_t wgs, const void* pc, uint32_t pcSize) {
         vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pp.p);
         vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pp.pl, 0, 1, &ds, 0, nullptr);
@@ -3535,6 +3557,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         barrier();
         disp(pAdd3, BL.sAdd3, 1, &pcRms, 8);
         barrier();
+        if ((il + 1) % flushEvery == 0 && il + 1 < nLayer) flushCB();
     }
     // The head (last-token logits) is only needed by validation callers; when the
     // slot is being prefilled for decode, the serial step over the final prompt token
