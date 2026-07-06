@@ -21,6 +21,13 @@ same endpoint — whichever pod is Ready receives traffic.
 
 The switch is transparent to litellm (`http://gemma-server.gemma.svc…:8080/v1`).
 
+Anthropic clients (the `claude-qwen` wrapper → Claude CLI) hit the same
+Service directly at `POST /v1/messages` — qk-server speaks the Anthropic
+Messages API natively, so litellm is not in that path. (litellm's own
+`/v1/messages` translates to the OpenAI *Responses* API, which no local
+backend implements.) Note this endpoint only exists on qk-server, not on
+gemma-server/llama.cpp.
+
 ## Rebuild the image after code changes
 
 ```bash
