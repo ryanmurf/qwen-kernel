@@ -35,6 +35,9 @@ spec:
         - "16384"
         - --chunk
         - "8"
+        env:
+        - name: QK_FORK           # same-prompt requests share one prefill (fork mode)
+          value: "1"
         ports:
         - containerPort: 8080
         resources:
