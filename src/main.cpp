@@ -2918,6 +2918,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pStepB = makePipe(c, "dn_step_batch.spv", 4, 16);   // +delta-rule S seed/persist (decode handoff)
     pGateB = makePipe(c, "dn_gate_batch.spv", 4, 16);
     pGemmB = makePipe(c, "gemm_q8_0.spv", 3, 12);  // batched projections (weight reads amortized)
+    static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 vec4s; dState must be <= 128");
 
     const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const VkBufferUsageFlags storSrc = stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -3347,6 +3348,13 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     return activeAtEntry;
 }
 
+// FROM-EMPTY SINGLE-CHUNK ONLY: prefills tokens [0, n) of slot 0 from a zero state
+// (base=0, zero conv carry, resetSlot). It is NOT valid to continue an existing slot
+// or a >maxB prompt with this — that needs a `base` push, per-layer carry seeded from
+// the slot's conv window, and dropping resetSlot (see review R2). Projections use the
+// tiled GEMM for n>=48, whose accumulation order differs from serial GEMV by ~1e-7, so
+// the handed-off state is not bit-identical to serial at large n (argmax-stable in
+// practice; review R1) — acceptable since this is a fresh, self-consistent forward.
 void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<float>& logits) {
     if (!toks || n < 1 || n > maxB) {
         fprintf(stderr, "prefillBatchLast: bad token count %u (max %u)\n", n, maxB);

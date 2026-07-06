@@ -28,7 +28,7 @@ void main() {
     // Seed each thread's state row from the slot buffer (0 for a fresh slot), so the
     // chunk continues exactly where serial left off; persisted back after the loop.
     uint srowBase = (h * dS + j) * nv;
-    vec4 srow[32];
+    vec4 srow[32];  // holds nv = dState/4 vec4s; assumes dState <= 128 (this model: 128)
     for (uint i = 0u; i < nv; ++i) srow[i] = (j < dS) ? s4[srowBase + i] : vec4(0.0);
 
     for (uint t = 0u; t < pc.Tn; ++t) {
