@@ -6,11 +6,10 @@
 #extension GL_EXT_control_flow_attributes : enable
 
 // Batched (prefill) GEMM: Y[N,M] = X[N,K] · W[M,K]^T, W in raw ggml Q8_0 blocks.
-// Register-blocked 64x64 tile: 16x16 threads, each accumulating a 4x4 micro-tile
-// of outputs. Per K-block it stages 64 dequantized weight rows + 64 token vectors
-// into shared, then every thread does 4*4*32 = 512 FMAs from shared — so the
-// barrier is amortized over real compute, and both operands are read from VRAM
-// once per output tile. Grid: x = ceil(M/64), z = ceil(N/64).
+// GRID: x=ceil(M/BM), z=ceil(N/BN), BM=128, BN=64
+// Batched-prefill tile: 16x16 threads, each accumulating an 8x4 micro-tile.
+// Two Q8_0 K-blocks are staged per barrier (BK=64). Shared rows use a +1 stride
+// to avoid the 32-bank stride conflicts that dominate the original 64x64 kernel.
 
 layout(local_size_x = 256) in;
 
@@ -25,9 +24,10 @@ layout(std430, binding = 2) writeonly buffer BufY { float y[]; };   // [N][M] ro
 
 layout(push_constant) uniform PC { uint M; uint K; uint N; } pc;
 
-const uint BM = 64u, BN = 64u, RM = 4u, RN = 4u;
-shared float Wsh[BM * 32u];   // 64 dequantized weight rows, one K-block wide
-shared float Xsh[BN * 32u];   // 64 token vectors, one K-block wide
+const uint BM = 128u, BN = 64u, RM = 8u, RN = 4u;
+const uint BK_BLOCKS = 2u, BK = 64u, SK = BK + 1u;
+shared float Wsh[BM * SK];    // 128 dequantized weight rows, two K-blocks wide
+shared float Xsh[BN * SK];    // 64 token vectors, two K-blocks wide
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -35,40 +35,57 @@ void main() {
     uint tc = tid & 15u;         // 0..15
     uint rowBase = gl_WorkGroupID.x * BM;
     uint tokBase = gl_WorkGroupID.z * BN;
-    uint kb = pc.K / 32u;
+    uint kb = pc.K >> 5;
 
     float acc[RM][RN];
     [[unroll]] for (uint i = 0u; i < RM; ++i)
         [[unroll]] for (uint j = 0u; j < RN; ++j) acc[i][j] = 0.0;
 
-    for (uint b = 0u; b < kb; ++b) {
-        // each thread reads ONE Q8_0 block whole (scale once) and dequantizes its 32 lanes
-        if (tid < BM) {
-            uint wr = rowBase + tid;
-            if (wr < pc.M) {
-                block_q8_0 blk = wb[wr * kb + b];
-                float d = float(blk.d);
-                [[unroll]] for (uint i = 0u; i < 32u; ++i) Wsh[tid * 32u + i] = d * float(int(blk.qs[i]));
-            } else {
-                [[unroll]] for (uint i = 0u; i < 32u; ++i) Wsh[tid * 32u + i] = 0.0;
-            }
-        } else if (tid < BM + BN) {
-            uint tt = tid - BM, xt = tokBase + tt;
-            if (xt < pc.N) {
-                uint xb = xt * pc.K + b * 32u;
-                [[unroll]] for (uint i = 0u; i < 32u; ++i) Xsh[tt * 32u + i] = x[xb + i];
-            } else {
-                [[unroll]] for (uint i = 0u; i < 32u; ++i) Xsh[tt * 32u + i] = 0.0;
-            }
+    for (uint b0 = 0u; b0 < kb; b0 += BK_BLOCKS) {
+        // One thread owns one Q8_0 block: all 256 lanes load 128 rows x 2 blocks.
+        uint wrLocal = tid & (BM - 1u);
+        uint wbLocal = tid >> 7;
+        uint wr = rowBase + wrLocal;
+        uint b = b0 + wbLocal;
+        uint woff = wrLocal * SK + wbLocal * 32u;
+        if (wr < pc.M && b < kb) {
+            block_q8_0 blk = wb[wr * kb + b];
+            float d = float(blk.d);
+            [[unroll]] for (uint i = 0u; i < 32u; ++i) Wsh[woff + i] = d * float(int(blk.qs[i]));
+        } else {
+            [[unroll]] for (uint i = 0u; i < 32u; ++i) Wsh[woff + i] = 0.0;
+        }
+
+        // Cooperatively stage the 64x64 activation tile. The +1 stride removes
+        // stride-64 LDS bank aliasing when tc selects neighboring token rows.
+        for (uint idx = tid; idx < BN * BK; idx += 256u) {
+            uint tt = idx / BK;
+            uint kk = idx - tt * BK;
+            uint xt = tokBase + tt;
+            uint xk = (b0 << 5) + kk;
+            Xsh[tt * SK + kk] = (xt < pc.N && xk < pc.K) ? x[xt * pc.K + xk] : 0.0;
         }
         barrier();
-        [[unroll]] for (uint mi = 0u; mi < RM; ++mi) {
-            uint wo = (tr * RM + mi) * 32u;
-            [[unroll]] for (uint mj = 0u; mj < RN; ++mj) {
-                uint xo = (tc * RN + mj) * 32u;
-                float s = 0.0;
-                [[unroll]] for (uint i = 0u; i < 32u; ++i) s += Wsh[wo + i] * Xsh[xo + i];
-                acc[mi][mj] += s;
+
+        [[unroll]] for (uint bb = 0u; bb < BK_BLOCKS; ++bb) {
+            [[unroll]] for (uint mi = 0u; mi < RM; ++mi) {
+                uint wo = (tr * RM + mi) * SK + bb * 32u;
+                uint xo0 = (tc * RN + 0u) * SK + bb * 32u;
+                uint xo1 = (tc * RN + 1u) * SK + bb * 32u;
+                uint xo2 = (tc * RN + 2u) * SK + bb * 32u;
+                uint xo3 = (tc * RN + 3u) * SK + bb * 32u;
+                float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+                [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+                    float wv = Wsh[wo + i];
+                    s0 += wv * Xsh[xo0 + i];
+                    s1 += wv * Xsh[xo1 + i];
+                    s2 += wv * Xsh[xo2 + i];
+                    s3 += wv * Xsh[xo3 + i];
+                }
+                acc[mi][0] += s0;
+                acc[mi][1] += s1;
+                acc[mi][2] += s2;
+                acc[mi][3] += s3;
             }
         }
         barrier();
