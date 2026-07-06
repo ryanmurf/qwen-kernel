@@ -3314,6 +3314,115 @@ int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint
 
 }  // extern "C"
 
+// Batched-prefill GEMM validation: Y[N,M] = X[N,K]·W[M,K]^T vs a CPU reference.
+static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N) {
+    printf("\n== batched GEMM  Y[%u,%u] = X[%u,%u] . W[%u,%u]^T  (Q8_0, 16x16 tile) ==\n",
+           N, M, N, K, M, K);
+    if (K % 32) { fprintf(stderr, "K must be a multiple of 32\n"); return false; }
+    size_t nb = (size_t)M * (K / 32);
+    std::vector<block_q8_0> W(nb);
+    std::mt19937 rng(7);
+    for (auto& b : W) {
+        b.d = qk_f32_to_f16(0.005f + 0.02f * (rng() & 0xFFFF) / 65536.0f);
+        for (auto& q : b.qs) q = (int8_t)((int)(rng() % 255) - 127);
+    }
+    std::vector<float> X((size_t)N * K);
+    for (auto& v : X) v = -1.f + 2.f * (rng() & 0xFFFF) / 65536.0f;
+
+    std::vector<float> Yref((size_t)N * M), tmp(K);
+    for (uint32_t m = 0; m < M; m++) {
+        dequant_row_q8_0(&W[(size_t)m * (K / 32)], tmp.data(), K);
+        for (uint32_t n = 0; n < N; n++) {
+            double a = 0;
+            const float* xr = &X[(size_t)n * K];
+            for (uint32_t k = 0; k < K; k++) a += (double)tmp[k] * xr[k];
+            Yref[(size_t)n * M + m] = (float)a;
+        }
+    }
+
+    Pipe p = makePipe(c, "gemm_q8_0.spv", 3, 12);
+    const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    Buf bW = createBuf(c, nb * sizeof(block_q8_0), stor, true);
+    Buf bX = createBuf(c, (size_t)N * K * 4, stor, true);
+    Buf bY = createBuf(c, (size_t)N * M * 4, stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    size_t maxN = std::max({nb * sizeof(block_q8_0), (size_t)N * K * 4, (size_t)N * M * 4});
+    Buf stage = createBuf(c, maxN, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+
+    auto begin = [&]() {
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+    };
+    auto submitWait = [&]() {
+        VK_CHECK(vkEndCommandBuffer(c.cb));
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &c.cb;
+        VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(c.queue));
+    };
+    void* mapped;
+    VK_CHECK(vkMapMemory(c.dev, stage.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
+    auto upload = [&](Buf& dst, const void* src, size_t n) {
+        memcpy(mapped, src, n);
+        begin();
+        VkBufferCopy cp{0, 0, n};
+        vkCmdCopyBuffer(c.cb, stage.buf, dst.buf, 1, &cp);
+        submitWait();
+    };
+    upload(bW, W.data(), nb * sizeof(block_q8_0));
+    upload(bX, X.data(), (size_t)N * K * 4);
+
+    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &dps;
+    VkDescriptorPool pool;
+    VK_CHECK(vkCreateDescriptorPool(c.dev, &dpci, nullptr, &pool));
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &p.dsl;
+    VkDescriptorSet ds;
+    VK_CHECK(vkAllocateDescriptorSets(c.dev, &ai, &ds));
+    VkBuffer bufs[3] = {bW.buf, bX.buf, bY.buf};
+    VkDescriptorBufferInfo dbi[3];
+    VkWriteDescriptorSet wr[3];
+    for (int i = 0; i < 3; i++) {
+        dbi[i] = {bufs[i], 0, VK_WHOLE_SIZE};
+        wr[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr[i].dstSet = ds; wr[i].dstBinding = (uint32_t)i; wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
+    }
+    vkUpdateDescriptorSets(c.dev, 3, wr, 0, nullptr);
+
+    struct { uint32_t M, K, N; } pc{M, K, N};
+    begin();
+    vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.p);
+    vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pl, 0, 1, &ds, 0, nullptr);
+    vkCmdPushConstants(c.cb, p.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pc);
+    auto t0 = std::chrono::steady_clock::now();
+    vkCmdDispatch(c.cb, (M + 15) / 16, 1, (N + 15) / 16);
+    submitWait();
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    begin();
+    VkBufferCopy cp{0, 0, (size_t)N * M * 4};
+    vkCmdCopyBuffer(c.cb, bY.buf, stage.buf, 1, &cp);
+    submitWait();
+    const float* Y = (const float*)mapped;
+    double maxErr = 0, sumsq = 0;
+    for (size_t i = 0; i < (size_t)N * M; i++) {
+        maxErr = std::max(maxErr, std::fabs((double)Y[i] - Yref[i]));
+        sumsq += (double)Yref[i] * Yref[i];
+    }
+    double rms = std::sqrt(sumsq / ((size_t)N * M));
+    bool ok = maxErr < 1e-3 * rms;  // fp32 kernel vs double reference, scale-relative
+    printf("  %u tokens in one batched pass: %.2f ms | max abs err %.3g / rms %.3g = %.2g -> %s\n",
+           N, ms, maxErr, rms, maxErr / rms, ok ? "PASS" : "FAIL");
+    vkUnmapMemory(c.dev, stage.mem);
+    vkDestroyDescriptorPool(c.dev, pool, nullptr);
+    destroyPipe(c, p);
+    for (Buf* b : {&bW, &bX, &bY, &stage}) destroyBuf(c, *b);
+    return ok;
+}
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -3461,6 +3570,8 @@ int main(int argc, char** argv) {
         ok = caseIQ4XS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "iq3_xxs") {
         ok = caseIQ3XXS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+    } else if (mode == "bgemm") {
+        ok = caseBGemm(c, argU(2, 8192), argU(3, 2048), argU(4, 256));  // batched-prefill GEMM
     } else if (mode == "gguf") {
         if (argc < 3) {
             fprintf(stderr, "usage: qk gguf <tensor> [iters]\n");
