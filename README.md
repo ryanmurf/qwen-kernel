@@ -273,10 +273,19 @@ llama.cpp reference:
   | full request + 8 gen (`serve-test`, prefill included) | 867 ms | 284 ms | **3.05×** |
 
   ~447 tok/s prefill throughput at a 128-token chunk (vs serial ~107); the GEMM
-  itself sustains ~6.3 TFLOP/s (3.6–4.8× a serial GEMV at N = 64–256). Caveat:
-  `prefillBatchLast` is from-empty single-chunk only — continuing an existing slot
-  or a `>maxB` prompt would need a `base` push constant, per-layer conv-carry
-  seeding, and dropping the internal `resetSlot` (documented in-source).
+  itself sustains ~6.3 TFLOP/s (3.6–4.8× a serial GEMV at N = 64–256).
+
+  `prefillBatchLast(…, base)` also **continues** a slot (base > 0): it keeps the
+  restored/prior state, seeds each deltanet layer's conv carry from that layer's slot
+  conv window, and writes K/V at `pos = base + n` (`dn_step_batch` already
+  seeds/persists `S`; `dn_conv_batch` reads carry in the same `[channels][3]` layout it
+  writes, so seeding is a plain copy). So `slot_start` batch-prefills any prompt as a
+  chunked loop — base = 0 for a fresh prompt's first chunk, base = done to continue a
+  **cache-hit suffix** (a prefix-cache restore now prefills only the divergent tail, and
+  it's batched, not per-token) or the **next chunk of a `>maxB` prompt** (no 128-token
+  cap). Validated token-exact vs serial: cache-hit warm output == cold (and warm no
+  longer regresses below cold — the suffix is batched now); a 200-token prompt (two
+  chunks) is token-for-token identical to serial, **3.3× faster** (1325 → 398 ms).
 
 - **Fork mode (`QK_FORK`) — same-prompt requests share one prefill.** For internal
   best-of-N / duplicate-prompt bursts, an opt-in mode: because batched prefill runs
