@@ -2697,13 +2697,34 @@ struct qk_engine {
 
     struct Slot {
         bool active = false;
-        std::vector<uint32_t> prompt;
+        std::vector<uint32_t> prompt;      // full prompt of the current request
+        std::vector<uint32_t> genTokens;   // tokens generated so far (for the cache key)
         uint32_t cursor = 0, pos = 0, gen = 0, maxGen = 0, last = 0;
     };
     std::vector<Slot> slots;
 
+    // Prefix cache: after a request finishes, its recurrent state (delta-rule S +
+    // conv + K/V for positions [0,pos)) is snapshotted to a host-resident buffer
+    // keyed by the full token sequence. A new request whose prompt starts with a
+    // cached sequence restores it and prefills only the divergent suffix — so a
+    // multi-turn conversation re-processes only each new turn, not the whole history.
+    struct CacheEntry {
+        std::vector<uint32_t> tokens;  // full processed sequence (prompt + generated)
+        Buf snap;                      // host-visible copy of all st1/st2 slot stripes
+        uint64_t lru = 0;
+        bool valid = false;
+    };
+    std::vector<CacheEntry> pcache;
+    std::vector<size_t> snapOff1, snapOff2;  // per-layer byte offset of st1/st2 in the snapshot
+    size_t snapSize = 0;
+    uint64_t lruClock = 0;
+
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
+    void snapshotSlot(uint32_t slot);           // save slot state -> LRU cache entry
+    int matchPrefix(const uint32_t* prompt, uint32_t n);  // longest cached prefix, or -1
+    void restoreInto(uint32_t slot, int cacheIdx);        // cache entry -> slot state
+    void copyStripes(uint32_t slot, VkBuffer snapBuf, bool save);  // stripes <-> snapshot
     ~qk_engine();
 };
 
@@ -2712,6 +2733,7 @@ qk_engine::~qk_engine() {
     vkDeviceWaitIdle(c.dev);
     for (auto& L : layers)
         for (auto& b : L.bufs) destroyBuf(c, b);
+    for (auto& e : pcache) destroyBuf(c, e.snap);
     for (Buf* b : {&bXin, &bXn, &bBig, &bMid, &bKin, &bVin, &bGb, &bConvOut, &bO, &bAtt,
                    &bAttnOut, &bY, &bXn2, &bML, &bMH, &bMSel, &bMY, &bMY2, &bONorm, &bHeadW,
                    &bLogits, &bEmbdW, &bRope, &bAV, &bAI, &bTok, &bSlotIn, &bSlotPos, &bSamp, &stage})
@@ -2745,6 +2767,81 @@ void qk_engine::resetSlot(uint32_t slot) {
     si.pCommandBuffers = &c.cb;
     VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
     VK_CHECK(vkQueueWaitIdle(c.queue));
+}
+
+// Copy every layer's per-slot state stripe between the slot and a snapshot
+// buffer (save=true: slot -> snapshot; save=false: snapshot -> slot).
+void qk_engine::copyStripes(uint32_t slot, VkBuffer snapBuf, bool save) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+    for (uint32_t il = 0; il < nLayer; il++) {
+        Layer& L = layers[il];
+        VkBufferCopy a, b;
+        if (save) {
+            a = {(VkDeviceSize)slot * L.ps1, snapOff1[il], L.ps1};
+            b = {(VkDeviceSize)slot * L.ps2, snapOff2[il], L.ps2};
+            vkCmdCopyBuffer(c.cb, L.st1, snapBuf, 1, &a);
+            vkCmdCopyBuffer(c.cb, L.st2, snapBuf, 1, &b);
+        } else {
+            a = {snapOff1[il], (VkDeviceSize)slot * L.ps1, L.ps1};
+            b = {snapOff2[il], (VkDeviceSize)slot * L.ps2, L.ps2};
+            vkCmdCopyBuffer(c.cb, snapBuf, L.st1, 1, &a);
+            vkCmdCopyBuffer(c.cb, snapBuf, L.st2, 1, &b);
+        }
+    }
+    VK_CHECK(vkEndCommandBuffer(c.cb));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &c.cb;
+    VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(c.queue));
+}
+
+// Snapshot a finished slot's state into an LRU cache entry, keyed by its full
+// token sequence (prompt + generated).
+void qk_engine::snapshotSlot(uint32_t slot) {
+    if (pcache.empty()) return;
+    Slot& sl = slots[slot];
+    // The state reflects exactly `pos` processed tokens: prompt + the generated
+    // tokens that have been fed back in (all but the last, unless a decode-step
+    // EOS fed it). Key the snapshot by exactly those `pos` tokens.
+    size_t fedGen = sl.pos > sl.prompt.size() ? sl.pos - sl.prompt.size() : 0;
+    if (fedGen > sl.genTokens.size()) fedGen = sl.genTokens.size();
+    if (sl.pos < 8 || sl.pos > nCtx) return;  // too short to cache, or beyond capacity
+    int idx = 0;
+    for (uint32_t i = 0; i < pcache.size(); i++) {
+        if (!pcache[i].valid) { idx = (int)i; break; }
+        if (pcache[i].lru < pcache[idx].lru) idx = (int)i;
+    }
+    CacheEntry& e = pcache[idx];
+    e.tokens = sl.prompt;
+    e.tokens.insert(e.tokens.end(), sl.genTokens.begin(), sl.genTokens.begin() + fedGen);
+    e.lru = ++lruClock;
+    e.valid = true;
+    copyStripes(slot, e.snap.buf, /*save=*/true);
+}
+
+// Longest cached sequence that is a strict prefix of prompt[0,n); -1 if none.
+int qk_engine::matchPrefix(const uint32_t* prompt, uint32_t n) {
+    int best = -1;
+    uint32_t bestLen = 8;  // require at least 8 shared tokens to bother
+    for (uint32_t i = 0; i < pcache.size(); i++) {
+        if (!pcache[i].valid) continue;
+        const auto& tk = pcache[i].tokens;
+        uint32_t L = (uint32_t)tk.size();
+        if (L >= n || L <= bestLen) continue;  // need L < n (>=1 to prefill) and longer than best
+        bool ok = true;
+        for (uint32_t j = 0; j < L; j++)
+            if (tk[j] != prompt[j]) { ok = false; break; }
+        if (ok) { best = (int)i; bestLen = L; }
+    }
+    return best;
+}
+
+void qk_engine::restoreInto(uint32_t slot, int cacheIdx) {
+    pcache[cacheIdx].lru = ++lruClock;
+    copyStripes(slot, pcache[cacheIdx].snap.buf, /*save=*/false);
 }
 
 bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t errLen) {
@@ -2975,6 +3072,24 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     sAm2 = mkSet(pAm2, {bAV.buf, bAI.buf, bTok.buf});
     sEmb = mkSet(pEmb, {bEmbdW.buf, bSlotIn.buf, bXin.buf});
 
+    // ---- prefix cache: host-resident snapshots of the per-slot state stripes ----
+    {
+        snapOff1.resize(nLayer);
+        snapOff2.resize(nLayer);
+        size_t off = 0;
+        for (uint32_t il = 0; il < nLayer; il++) {
+            snapOff1[il] = off; off += layers[il].ps1;
+            snapOff2[il] = off; off += layers[il].ps2;
+        }
+        snapSize = off;
+        const uint32_t PCACHE_N = 3;  // conversation snapshots kept (LRU)
+        pcache.resize(PCACHE_N);
+        for (auto& e : pcache)
+            e.snap = createBuf(c, snapSize,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               false);  // host-visible
+    }
+
     // ---- record one re-submittable step CB per dispatch depth (z = 1..nSlots) ----
     stepCBs.resize(nSlots);
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -3125,14 +3240,18 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
             // this step produced a real generated token (last prompt token, or a decode step)
             if (prefilling) { sl.cursor = (uint32_t)sl.prompt.size(); sl.pos = (uint32_t)sl.prompt.size(); }
             if (sampled == eosTok) {
+                if (!prefilling) sl.pos++;  // a decode-step EOS still fed a token (its K/V is written)
+                snapshotSlot(s);            // cache before the next step overwrites this slot
                 sl.active = false; *outFin |= 1u << s;
                 continue;
             }
             outTok[s * chunkN + outCnt[s]++] = sampled;
+            sl.genTokens.push_back(sampled);
             sl.last = sampled;
             sl.gen++;
             if (!prefilling) sl.pos++;
             if (sl.pos >= nCtx || sl.gen >= sl.maxGen) {
+                snapshotSlot(s);
                 sl.active = false; *outFin |= 1u << s;
             }
         }
@@ -3165,10 +3284,20 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     if (e->slots[slot].active) return -2;
     if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
     for (uint32_t i = 0; i < n_prompt; i++) if (prompt[i] >= e->vocab) return -4;
-    e->resetSlot(slot);  // clear any prior occupant's recurrent state
     qk_engine::Slot& s = e->slots[slot];
+    int cidx = e->matchPrefix(prompt, n_prompt);
+    if (cidx >= 0) {
+        // Reuse a cached prefix: restore its state and prefill only the suffix.
+        e->restoreInto(slot, cidx);
+        uint32_t L = (uint32_t)e->pcache[cidx].tokens.size();
+        s.cursor = L; s.pos = L;
+    } else {
+        e->resetSlot(slot);  // clear any prior occupant's recurrent state
+        s.cursor = 0; s.pos = 0;
+    }
     s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
-    s.cursor = 0; s.pos = 0; s.gen = 0; s.maxGen = max_gen; s.last = 0;
+    s.genTokens.clear();
+    s.gen = 0; s.maxGen = max_gen; s.last = 0;
     return 0;
 }
 
@@ -3248,6 +3377,62 @@ int main(int argc, char** argv) {
         for (uint32_t t : gen[0]) printf(" %u", t);
         printf("\n");
         qk_close(e);
+        return 0;
+    }
+
+    if (mode == "cachetest") {
+        // Turn 1 populates the prefix cache; turn 2 (prompt = turn1 seq + more)
+        // should hit the cache. Compare its output to a cold fresh-engine run of
+        // the same turn-2 prompt: they must be token-identical.
+        if (argc < 4) { fprintf(stderr, "usage: qk cachetest <ids-file> <nGen> [tmax]\n"); return 1; }
+        std::vector<uint32_t> prompt;
+        {
+            FILE* f = fopen(argv[2], "r");
+            if (!f) { perror(argv[2]); return 1; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+            fclose(f);
+        }
+        uint32_t nGen = (uint32_t)atoi(argv[3]);
+        uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 4096;
+        auto run = [&](qk_engine* e, const std::vector<uint32_t>& ids, uint32_t g, double& ms) {
+            std::vector<uint32_t> out;
+            qk_slot_start(e, 0, ids.data(), (uint32_t)ids.size(), g);
+            uint32_t ch = qk_chunk(e);
+            std::vector<uint32_t> ot((size_t)ch), oc(1);
+            uint32_t fin = 0;
+            auto t0 = std::chrono::steady_clock::now();
+            while (qk_step_chunk(e, ot.data(), oc.data(), &fin) > 0)
+                for (uint32_t i = 0; i < oc[0]; i++) out.push_back(ot[i]);
+            ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            return out;
+        };
+        char err[256] = {0};
+        qk_config cfg{1, tmax, 8};
+        qk_engine* eA = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!eA) { fprintf(stderr, "open: %s\n", err); return 1; }
+        double t1;
+        auto R = run(eA, prompt, nGen, t1);                       // turn 1 -> caches [prompt+R]
+        std::vector<uint32_t> p2 = prompt;
+        p2.insert(p2.end(), R.begin(), R.end());
+        p2.insert(p2.end(), prompt.begin(), prompt.end());        // turn 2 = prompt + R + prompt
+        double tw;
+        auto warm = run(eA, p2, nGen, tw);                        // cache hit
+        qk_close(eA);
+        qk_engine* eB = qk_open(ggufPath(), &cfg, err, sizeof err);  // fresh engine, empty cache
+        double tc;
+        auto cold = run(eB, p2, nGen, tc);                        // full cold prefill
+        qk_close(eB);
+        printf("cachetest: turn-2 prompt %zu tokens, gen %u\n", p2.size(), nGen);
+        printf("  cold (full prefill) %.1f ms  |  warm (cached prefix) %.1f ms  |  %.2fx faster\n",
+               tc, tw, tw > 0 ? tc / tw : 0.0);
+        bool eq = warm == cold;
+        printf("  warm output identical to cold: %s\n", eq ? "YES" : "NO");
+        if (!eq) {
+            size_t d = 0;
+            while (d < warm.size() && d < cold.size() && warm[d] == cold[d]) d++;
+            printf("  first divergence at token %zu\n", d);
+        }
         return 0;
     }
 
