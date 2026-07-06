@@ -6,14 +6,13 @@
 #extension GL_EXT_control_flow_attributes : enable
 
 // Batched (prefill) GEMM: Y[N,M] = X[N,K] · W[M,K]^T, W in raw ggml Q8_0 blocks.
-// Tiled 16x16: each workgroup computes a 16-row × 16-token output block. Per
-// K-block it stages 16 dequantized weight rows and 16 token vectors into shared
-// memory, then every thread does its 16-long dot from shared. So each weight
-// element AND each activation element is read from VRAM once per output tile and
-// reused 16×, instead of the whole weight matrix being re-read per token (serial)
-// or the activations being re-read per row (naive). Grid: x=ceil(M/16), z=ceil(N/16).
+// Register-blocked 64x64 tile: 16x16 threads, each accumulating a 4x4 micro-tile
+// of outputs. Per K-block it stages 64 dequantized weight rows + 64 token vectors
+// into shared, then every thread does 4*4*32 = 512 FMAs from shared — so the
+// barrier is amortized over real compute, and both operands are read from VRAM
+// once per output tile. Grid: x = ceil(M/64), z = ceil(N/64).
 
-layout(local_size_x = 256) in;   // 16 rows × 16 tokens = 256 threads, one output each
+layout(local_size_x = 256) in;
 
 struct block_q8_0 {
     float16_t d;
@@ -26,34 +25,60 @@ layout(std430, binding = 2) writeonly buffer BufY { float y[]; };   // [N][M] ro
 
 layout(push_constant) uniform PC { uint M; uint K; uint N; } pc;
 
-shared float Wsh[16 * 32];   // 16 dequantized weight rows, one K-block wide
-shared float Xsh[16 * 32];   // 16 token vectors, one K-block wide
+const uint BM = 64u, BN = 64u, RM = 4u, RN = 4u;
+shared float Wsh[BM * 32u];   // 64 dequantized weight rows, one K-block wide
+shared float Xsh[BN * 32u];   // 64 token vectors, one K-block wide
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint r = tid >> 4;          // 0..15  row within the tile
-    uint t = tid & 15u;         // 0..15  token within the tile
-    uint rowBase = gl_WorkGroupID.x * 16u;
-    uint tokBase = gl_WorkGroupID.z * 16u;
+    uint tr = tid >> 4;          // 0..15
+    uint tc = tid & 15u;         // 0..15
+    uint rowBase = gl_WorkGroupID.x * BM;
+    uint tokBase = gl_WorkGroupID.z * BN;
     uint kb = pc.K / 32u;
 
-    float acc = 0.0;
+    float acc[RM][RN];
+    [[unroll]] for (uint i = 0u; i < RM; ++i)
+        [[unroll]] for (uint j = 0u; j < RN; ++j) acc[i][j] = 0.0;
+
     for (uint b = 0u; b < kb; ++b) {
-        // stage 16 weight rows (dequantized) and 16 token blocks: 512 elems each, 2 per thread
-        for (uint e = tid; e < 16u * 32u; e += 256u) {
-            uint rr = e >> 5, ii = e & 31u;
-            uint wr = rowBase + rr;
-            Wsh[e] = wr < pc.M ? float(wb[wr * kb + b].d) * float(int(wb[wr * kb + b].qs[ii])) : 0.0;
-            uint xt = tokBase + rr;
-            Xsh[e] = xt < pc.N ? x[xt * pc.K + b * 32u + ii] : 0.0;
+        // each thread reads ONE Q8_0 block whole (scale once) and dequantizes its 32 lanes
+        if (tid < BM) {
+            uint wr = rowBase + tid;
+            if (wr < pc.M) {
+                block_q8_0 blk = wb[wr * kb + b];
+                float d = float(blk.d);
+                [[unroll]] for (uint i = 0u; i < 32u; ++i) Wsh[tid * 32u + i] = d * float(int(blk.qs[i]));
+            } else {
+                [[unroll]] for (uint i = 0u; i < 32u; ++i) Wsh[tid * 32u + i] = 0.0;
+            }
+        } else if (tid < BM + BN) {
+            uint tt = tid - BM, xt = tokBase + tt;
+            if (xt < pc.N) {
+                uint xb = xt * pc.K + b * 32u;
+                [[unroll]] for (uint i = 0u; i < 32u; ++i) Xsh[tt * 32u + i] = x[xb + i];
+            } else {
+                [[unroll]] for (uint i = 0u; i < 32u; ++i) Xsh[tt * 32u + i] = 0.0;
+            }
         }
         barrier();
-        float s = 0.0;
-        [[unroll]] for (uint i = 0u; i < 32u; ++i) s += Wsh[r * 32u + i] * Xsh[t * 32u + i];
-        acc += s;
+        [[unroll]] for (uint mi = 0u; mi < RM; ++mi) {
+            uint wo = (tr * RM + mi) * 32u;
+            [[unroll]] for (uint mj = 0u; mj < RN; ++mj) {
+                uint xo = (tc * RN + mj) * 32u;
+                float s = 0.0;
+                [[unroll]] for (uint i = 0u; i < 32u; ++i) s += Wsh[wo + i] * Xsh[xo + i];
+                acc[mi][mj] += s;
+            }
+        }
         barrier();
     }
 
-    uint row = rowBase + r, tok = tokBase + t;
-    if (row < pc.M && tok < pc.N) y[tok * pc.M + row] = acc;
+    [[unroll]] for (uint mi = 0u; mi < RM; ++mi) {
+        uint row = rowBase + tr * RM + mi;
+        [[unroll]] for (uint mj = 0u; mj < RN; ++mj) {
+            uint tok = tokBase + tc * RN + mj;
+            if (row < pc.M && tok < pc.N) y[tok * pc.M + row] = acc[mi][mj];
+        }
+    }
 }

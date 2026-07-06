@@ -3398,7 +3398,7 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N) {
     vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pl, 0, 1, &ds, 0, nullptr);
     vkCmdPushConstants(c.cb, p.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pc);
     auto t0 = std::chrono::steady_clock::now();
-    vkCmdDispatch(c.cb, (M + 15) / 16, 1, (N + 15) / 16);
+    vkCmdDispatch(c.cb, (M + 63) / 64, 1, (N + 63) / 64);
     submitWait();
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
