@@ -2669,7 +2669,7 @@ struct qk_engine {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pGate, pGemvO, pAddN, pPrep, pAttn, pMoeL,
         pMoeS, pMoeGU, pMoeGUs, pMoeDn4, pMoeDn6, pMoeDnsB, pAdd3, pHead, pAm1, pAm2, pEmb;
-    Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB;
+    Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
 
     struct Layer {
         bool rec = false, downQ6 = false;
@@ -2766,7 +2766,7 @@ qk_engine::~qk_engine() {
     for (Pipe* pp : {&pRms, &pGemvA, &pAb, &pConvN, &pStep, &pGate, &pGemvO, &pAddN, &pPrep,
                      &pAttn, &pMoeL, &pMoeS, &pMoeGU, &pMoeGUs, &pMoeDn4, &pMoeDn6, &pMoeDnsB,
                      &pAdd3, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB, &pAbB, &pConvB,
-                     &pStepB, &pGateB})
+                     &pStepB, &pGateB, &pGemmB})
         destroyPipe(c, *pp);
     if (c.pool) vkDestroyCommandPool(c.dev, c.pool, nullptr);
     if (c.pl) vkDestroyPipelineLayout(c.dev, c.pl, nullptr);
@@ -2917,6 +2917,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pConvB = makePipe(c, "dn_conv_batch.spv", 4, 20);
     pStepB = makePipe(c, "dn_step_batch.spv", 3, 16);
     pGateB = makePipe(c, "dn_gate_batch.spv", 4, 16);
+    pGemmB = makePipe(c, "gemm_q8_0.spv", 3, 12);  // batched projections (weight reads amortized)
 
     const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const VkBufferUsageFlags storSrc = stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -3375,6 +3376,28 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<f
         uint32_t gy = (wgs + gx - 1) / gx;
         vkCmdDispatch(c.cb, gx, gy, zdim);
     };
+    // Batched Q8_0 GEMM for the dense projections: Y[n][M] = X[n][K] . W[M][K]^T.
+    // Reuses the gemv projection sets ({W,X,Y} storage buffers) — layout-compatible.
+    // Reads each weight ONCE for all n tokens (vs gemv's n re-reads). K%32==0 (holds
+    // for nEmbd=2048, dIn=4096). grid (ceil(M/128),1,ceil(n/64)) per gemm_q8_0.comp.
+    auto gemmProj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K) {
+        struct { uint32_t M, K, N; } pcg{M, K, n};
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pGemmB.p);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pGemmB.pl, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(c.cb, pGemmB.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pcg);
+        vkCmdDispatch(c.cb, (M + 127) / 128, 1, (n + 63) / 64);
+    };
+    // Optimal projection per chunk width: the 128x64-tiled GEMM amortizes weight
+    // reads and wins for wide chunks, but wastes work when n fills <1 N-tile; the
+    // per-token GEMV (dispatched z=n) is faster below the measured ~48-token
+    // crossover. isOut picks the wo pipe (tpr=128) vs the qkv/kv pipe (tpr=64).
+    struct { uint32_t m, k; } pcProj;
+    auto proj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K, bool isOut) {
+        if (n >= 48) { gemmProj(ds, M, K); return; }
+        pcProj = {M, K};
+        if (isOut) disp(pGemvO, ds, (M + 1) / 2, &pcProj, 8);
+        else       disp(pGemvA, ds, (M + 3) / 4, &pcProj, 8);
+    };
 
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
@@ -3399,8 +3422,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<f
         BLayer& BL = blayers[il];
         zdim = n;
         if (L.rec) {
-            disp(pGemvA, BL.sP1, (chQkv + 3) / 4, &pcQkv, 8);
-            disp(pGemvA, BL.sP2, (dIn + 3) / 4, &pcZ, 8);
+            proj(BL.sP1, chQkv, nEmbd, false);
+            proj(BL.sP2, dIn, nEmbd, false);
             disp(pAbB, BL.sAb, 2 * hV, &pcAbB, 12);
             barrier();
             disp(pConvB, BL.sConv, chQkv / dS, &pcConvB, 20);
@@ -3411,17 +3434,17 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<f
             barrier();
             disp(pGateB, BL.sGate, hV, &pcGateB, 16);
             barrier();
-            disp(pGemvO, BL.sWo, (nEmbd + 1) / 2, &pcWo, 8);
+            proj(BL.sWo, nEmbd, dIn, true);
         } else {
-            disp(pGemvA, BL.sP1, (chQkv + 3) / 4, &pcQkv, 8);
-            disp(pGemvA, BL.sP2, (hKV * dh + 3) / 4, &pcKV, 8);
-            disp(pGemvA, BL.sP3, (hKV * dh + 3) / 4, &pcKV, 8);
+            proj(BL.sP1, chQkv, nEmbd, false);
+            proj(BL.sP2, hKV * dh, nEmbd, false);
+            proj(BL.sP3, hKV * dh, nEmbd, false);
             barrier();
             disp(pPrepB, BL.sPrep, hQ + 2 * hKV, &pcFaB, 36);
             barrier();
             disp(pAttnB, BL.sAttn, hQ, &pcFaB, 36);
             barrier();
-            disp(pGemvO, BL.sWo, (nEmbd + 1) / 2, &pcWo, 8);
+            proj(BL.sWo, nEmbd, dIn, true);
         }
         barrier();
         disp(pAddN, BL.sAddN, 1, &pcRms, 8);
@@ -3845,6 +3868,36 @@ int main(int argc, char** argv) {
                nPass, nCase, worstRel, allOk ? "PREFILL TOKEN-EXACT" : "PREFILL DIVERGENCE");
         qk_close(e);
         return allOk ? 0 : 1;
+    }
+
+    if (mode == "prefillbench") {
+        uint32_t ctx = argc > 2 ? (uint32_t)atoi(argv[2]) : 2048;
+        qk_config cfg{2, ctx, 8};
+        char err[256] = {0};
+        qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+        uint32_t cap = std::min<uint32_t>(128, ctx - 1);
+        std::vector<float> lS, lB;
+        printf("prefillbench: serial (N per-token forwards) vs batched (1 forward), ctx=%u\n", ctx);
+        printf("  %-6s %10s %10s %8s %10s\n", "N", "serial_ms", "batch_ms", "speedup", "tok/s_bat");
+        for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u}) {
+            if (N > cap) continue;
+            std::mt19937 rng(1234);
+            std::vector<uint32_t> toks(N);
+            for (uint32_t i = 0; i < N; i++) toks[i] = rng() % (e->vocab - 16) + 4;
+            e->prefillBatchLast(toks.data(), N, lB);   // warm
+            e->serialPrefillLogits(toks.data(), N, 1, lS);
+            auto t0 = std::chrono::steady_clock::now();
+            e->serialPrefillLogits(toks.data(), N, 1, lS);
+            auto t1 = std::chrono::steady_clock::now();
+            e->prefillBatchLast(toks.data(), N, lB);
+            auto t2 = std::chrono::steady_clock::now();
+            double sMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double bMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            printf("  %-6u %10.2f %10.2f %7.2fx %10.0f\n", N, sMs, bMs, sMs / bMs, N / (bMs / 1000.0));
+        }
+        qk_close(e);
+        return 0;
     }
 
     VkCtx c;
