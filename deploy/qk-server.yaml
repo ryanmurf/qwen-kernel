@@ -41,6 +41,13 @@ spec:
         env:
         - name: QK_FORK           # same-prompt requests share one prefill (fork mode)
           value: "1"
+        # Batched prefill records a whole chunk (<=128 tokens x full forward) into
+        # ONE vkQueueSubmit; under load that crosses amdgpu's 10 s gfx-ring timeout
+        # -> ring reset -> VK_ERROR_DEVICE_LOST crash loop (8 pod restarts on
+        # 2026-07-06). Serial prefill submits per-step and cannot hit the timeout.
+        # Remove once the engine splits batched-prefill command buffers.
+        - name: QK_NO_BATCH
+          value: "1"
         ports:
         - containerPort: 8080
         resources:
