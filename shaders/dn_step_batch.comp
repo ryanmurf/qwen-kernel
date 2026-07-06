@@ -1,0 +1,65 @@
+#version 450
+
+// Batched gated delta rule for one slot.
+// One workgroup per v-head h. Each thread j owns one state row and carries it
+// in registers across all Tn tokens in the chunk.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer BufC  { float conv[]; };
+layout(std430, binding = 1) readonly  buffer BufGB { float gb[]; };    // [Tn][g[hV], beta[hV]]
+layout(std430, binding = 2) writeonly buffer BufO  { float o[]; };     // [Tn][hV][dS]
+
+layout(push_constant) uniform PC { uint dState; uint hK; uint hV; uint Tn; } pc;
+
+shared vec4 qs4[64];
+shared vec4 ks4[64];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+    uint dS = pc.dState;
+    uint nv = dS / 4u;
+
+    uint kh = h % pc.hK;
+    float qScale = inversesqrt(float(dS));
+
+    vec4 srow[32];
+    for (uint i = 0u; i < 32u; ++i) srow[i] = vec4(0.0);
+
+    for (uint t = 0u; t < pc.Tn; ++t) {
+        uint co = t * (2u * pc.hK + pc.hV) * dS;
+        uint qBase = co + kh * dS;
+        uint kBase = co + pc.hK * dS + kh * dS;
+        uint vBase = co + 2u * pc.hK * dS + h * dS;
+
+        if (j < nv) {
+            qs4[j] = vec4(conv[qBase + 4u*j], conv[qBase + 4u*j + 1u],
+                          conv[qBase + 4u*j + 2u], conv[qBase + 4u*j + 3u]) * qScale;
+            ks4[j] = vec4(conv[kBase + 4u*j], conv[kBase + 4u*j + 1u],
+                          conv[kBase + 4u*j + 2u], conv[kBase + 4u*j + 3u]);
+        }
+        barrier();
+
+        if (j < dS) {
+            float decay = exp(gb[t * 2u * pc.hV + h]);
+            float beta  = gb[t * 2u * pc.hV + pc.hV + h];
+            float vj    = conv[vBase + j];
+
+            float sk = 0.0;
+            for (uint i = 0u; i < nv; ++i) sk += dot(srow[i], ks4[i]);
+            sk *= decay;
+
+            float dj = beta * (vj - sk);
+
+            float oj = 0.0;
+            for (uint i = 0u; i < nv; ++i) {
+                vec4 sn = srow[i] * decay + ks4[i] * dj;
+                srow[i] = sn;
+                oj += dot(sn, qs4[i]);
+            }
+            o[t * pc.hV * dS + h * dS + j] = oj;
+        }
+        barrier();
+    }
+}

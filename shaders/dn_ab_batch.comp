@@ -1,0 +1,49 @@
+#version 450
+
+// Batched deltanet per-head decay + write strength for one slot.
+// One workgroup per output per token: w < hv -> alpha head w; else beta head w-hv.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufX  { float x[]; };
+layout(std430, binding = 1) readonly  buffer BufA  { float alphaW[]; };  // [hv][n]
+layout(std430, binding = 2) readonly  buffer BufB  { float betaW[]; };   // [hv][n]
+layout(std430, binding = 3) readonly  buffer BufDT { float dtBias[]; };  // [hv]
+layout(std430, binding = 4) readonly  buffer BufAV { float aVec[]; };    // [hv]
+layout(std430, binding = 5) writeonly buffer BufGB { float gb[]; };      // [Tn][2*hv]
+
+layout(push_constant) uniform PC { uint n; uint hv; uint Tn; } pc;
+
+shared float red[256];
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint n = gl_WorkGroupID.z;
+    uint xo = n * pc.n;
+    uint go = n * 2u * pc.hv;
+    bool isBeta = w >= pc.hv;
+    uint h = isBeta ? w - pc.hv : w;
+    uint base = h * pc.n;
+
+    float acc = 0.0;
+    for (uint k = t; k < pc.n; k += 256u)
+        acc += (isBeta ? betaW[base + k] : alphaW[base + k]) * x[xo + k];
+
+    red[t] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    if (t == 0u) {
+        float d = red[0];
+        if (isBeta) {
+            gb[go + pc.hv + h] = 1.0 / (1.0 + exp(-d));
+        } else {
+            float v = d + dtBias[h];
+            float sp = v > 20.0 ? v : log(1.0 + exp(v));
+            gb[go + h] = aVec[h] * sp;
+        }
+    }
+}

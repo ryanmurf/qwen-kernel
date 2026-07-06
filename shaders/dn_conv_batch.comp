@@ -1,0 +1,57 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Batched causal depthwise conv(4)+SiLU and per-head L2 norm of q/k.
+// One workgroup per dState-channel head per token; carry holds the 3 tokens
+// before this chunk in [3][channels] order.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer BufCarry { float carry[]; };
+layout(std430, binding = 1) readonly  buffer BufI     { float qkv[]; };
+layout(std430, binding = 2) readonly  buffer BufK     { float ker[]; };
+layout(std430, binding = 3) writeonly buffer BufO     { float o[]; };
+
+layout(push_constant) uniform PC { uint channels; uint dState; uint qkCh; float eps; uint Tn; } pc;
+
+shared float red[128];
+shared float scale;
+
+float inputAt(uint n, uint ch, int back) {
+    int m = int(n) + back;
+    if (m >= 0) return qkv[uint(m) * pc.channels + ch];
+    return carry[uint(3 + m) * pc.channels + ch];
+}
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint chBase = w * pc.dState;
+    uint n = gl_WorkGroupID.z;
+    uint qo = n * pc.channels;
+    uint ch = chBase + t;
+
+    float v = 0.0;
+    if (ch < pc.channels && t < pc.dState) {
+        float c = inputAt(n, ch, -3) * ker[ch * 4u] +
+                  inputAt(n, ch, -2) * ker[ch * 4u + 1u] +
+                  inputAt(n, ch, -1) * ker[ch * 4u + 2u] +
+                  qkv[qo + ch]       * ker[ch * 4u + 3u];
+        v = c / (1.0 + exp(-c));
+    }
+
+    if (chBase < pc.qkCh) {  // q/k head: L2 normalize (uniform branch per WG)
+        float sg = subgroupAdd(v * v);
+        if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = sg;
+        barrier();
+        if (t == 0u) {
+            float tot = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += red[i];
+            scale = 1.0 / max(sqrt(tot), pc.eps);
+        }
+        barrier();
+        v *= scale;
+    }
+    if (ch < pc.channels && t < pc.dState) o[qo + ch] = v;
+}
