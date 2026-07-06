@@ -122,6 +122,114 @@ async fn malformed_and_bad_ids_are_structured_errors() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn anthropic_messages_non_streaming() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let model = write_toy_gguf(&dir.path().join("toy.gguf"))?;
+    let server = spawn_server(&model, 8, 2).await?;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&json!({
+            "model": "claude-test",
+            "max_tokens": 4,
+            "system": "be brief",
+            "messages": [{"role": "user", "content": "abc"}]
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert_eq!(body["model"], "claude-test");
+    assert_eq!(body["stop_reason"], "max_tokens");
+    assert!(body["content"].is_array());
+    assert!(body["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(body["usage"]["output_tokens"], 4);
+
+    let count: Value = client
+        .post(format!("{}/v1/messages/count_tokens", server.base_url))
+        .json(&json!({
+            "model": "claude-test",
+            "messages": [{"role": "user", "content": "abc"}]
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(count["input_tokens"].as_u64().unwrap() > 0);
+
+    let bad = client
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&json!({"model": "claude-test", "max_tokens": 4, "messages": []}))
+        .send()
+        .await?;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let bad_body: Value = bad.json().await?;
+    assert_eq!(bad_body["type"], "error");
+    assert_eq!(bad_body["error"]["type"], "invalid_request_error");
+    Ok(())
+}
+
+#[tokio::test]
+async fn anthropic_messages_streaming_protocol() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let model = write_toy_gguf(&dir.path().join("toy.gguf"))?;
+    let server = spawn_server(&model, 8, 2).await?;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{}/v1/messages", server.base_url))
+        .json(&json!({
+            "model": "claude-test",
+            "max_tokens": 4,
+            "stream": true,
+            "messages": [{"role": "user", "content": "abc"}]
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/event-stream")
+    );
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        body.extend(chunk?);
+    }
+    let text = String::from_utf8(body)?;
+    let events: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("event: "))
+        .collect();
+    assert_eq!(events.first(), Some(&"message_start"));
+    assert!(events.contains(&"message_delta"));
+    assert_eq!(events.last(), Some(&"message_stop"));
+    let start_data = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("first data line");
+    let start: Value = serde_json::from_str(start_data)?;
+    assert_eq!(start["type"], "message_start");
+    assert!(start["message"]["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    let delta_data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<Value>(data).unwrap())
+        .find(|value| value["type"] == "message_delta")
+        .expect("message_delta event");
+    assert_eq!(delta_data["delta"]["stop_reason"], "max_tokens");
+    assert_eq!(delta_data["usage"]["output_tokens"], 4);
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_requests_do_not_mix_tokens() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let model = write_toy_gguf(&dir.path().join("toy.gguf"))?;

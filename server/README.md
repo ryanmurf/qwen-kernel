@@ -39,6 +39,8 @@ Tensor data is handled only by the engine library.
 - `POST /completions`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
+- `POST /v1/messages` (Anthropic Messages API)
+- `POST /v1/messages/count_tokens`
 
 All request bodies must use `Content-Type: application/json`. Error responses
 use the llama.cpp-style JSON shape:
@@ -46,6 +48,21 @@ use the llama.cpp-style JSON shape:
 ```json
 {"error":{"code":400,"message":"...","type":"invalid_request_error"}}
 ```
+
+### Anthropic Messages (`/v1/messages`)
+
+Speaks enough of the Anthropic Messages API for the Claude CLI: `system`
+(string or text blocks), `messages` with `text`/`tool_use`/`tool_result`
+content blocks, `tools`, `stop_sequences`, assistant prefill, and SSE
+streaming (`message_start` / `content_block_*` / `message_delta` /
+`message_stop`). Requests are rendered into the Qwen3 ChatML format (tools as
+a hermes-style `<tools>` system block, tool results as `<tool_response>`);
+generated `<tool_call>` JSON blocks are parsed back into Anthropic `tool_use`
+content blocks, and stray `<think>` blocks are dropped. `stop_reason` maps to
+`end_turn` / `max_tokens` / `stop_sequence` / `tool_use`. Errors from this
+endpoint use the Anthropic error shape
+(`{"type":"error","error":{"type":"...","message":"..."}}`). Image content is
+rejected.
 
 ## Engine Library Contract
 

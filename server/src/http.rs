@@ -43,6 +43,8 @@ pub fn router(state: AppState) -> Router {
         .route("/completions", post(completion))
         .route("/v1/completions", post(openai_completion))
         .route("/v1/chat/completions", post(openai_chat_completion))
+        .route("/v1/messages", post(crate::anthropic::messages))
+        .route("/v1/messages/count_tokens", post(crate::anthropic::count_tokens))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
         .with_state(state)
@@ -142,7 +144,7 @@ struct CompletionReq {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum Prompt {
+pub(crate) enum Prompt {
     Text(String),
     Tokens(Vec<u32>),
 }
@@ -299,28 +301,28 @@ async fn openai_chat_completion(
 }
 
 #[derive(Clone)]
-struct Generation {
-    prompt_ids: Vec<u32>,
-    max_gen: u32,
+pub(crate) struct Generation {
+    pub(crate) prompt_ids: Vec<u32>,
+    pub(crate) max_gen: u32,
     started: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FinishKind {
+pub(crate) enum FinishKind {
     Eos,
     Limit,
     Word,
 }
 
-struct Completed {
-    content: String,
-    tokens: Vec<u32>,
-    finish: FinishKind,
-    stopping_word: String,
+pub(crate) struct Completed {
+    pub(crate) content: String,
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) finish: FinishKind,
+    pub(crate) stopping_word: String,
     predicted_ms: f64,
 }
 
-fn prepare_generation(
+pub(crate) fn prepare_generation(
     state: &AppState,
     prompt: Prompt,
     requested: Option<u32>,
@@ -358,7 +360,7 @@ fn prepare_generation(
     })
 }
 
-fn submit_generation(
+pub(crate) fn submit_generation(
     state: &AppState,
     prompt_ids: &[u32],
     max_gen: u32,
@@ -381,7 +383,7 @@ fn submit_generation(
     Ok(rx)
 }
 
-async fn collect_generation(
+pub(crate) async fn collect_generation(
     state: &AppState,
     mut rx: tokio_mpsc::Receiver<SlotEvent>,
     stops: &[String],
@@ -575,7 +577,7 @@ fn llama_completion_body(
     body
 }
 
-fn decode_tokens_lossless(state: &AppState, ids: &[u32]) -> Result<String> {
+pub(crate) fn decode_tokens_lossless(state: &AppState, ids: &[u32]) -> Result<String> {
     let mut out = String::new();
     for id in ids {
         if let Ok(piece) = state.tokenizer.token_piece(*id, false) {
@@ -585,7 +587,7 @@ fn decode_tokens_lossless(state: &AppState, ids: &[u32]) -> Result<String> {
     Ok(out)
 }
 
-struct StopDetector {
+pub(crate) struct StopDetector {
     stops: Vec<String>,
     held: String,
     ready: String,
@@ -593,7 +595,7 @@ struct StopDetector {
 }
 
 impl StopDetector {
-    fn new(stops: &[String]) -> Self {
+    pub(crate) fn new(stops: &[String]) -> Self {
         let hold_chars = stops
             .iter()
             .map(|stop| stop.chars().count().saturating_sub(1))
@@ -611,7 +613,7 @@ impl StopDetector {
         }
     }
 
-    fn push(&mut self, text: &str) -> Option<String> {
+    pub(crate) fn push(&mut self, text: &str) -> Option<String> {
         self.held.push_str(text);
         for stop in &self.stops {
             if let Some(pos) = self.held.find(stop) {
@@ -635,17 +637,17 @@ impl StopDetector {
         None
     }
 
-    fn take_ready(&mut self) -> String {
+    pub(crate) fn take_ready(&mut self) -> String {
         std::mem::take(&mut self.ready)
     }
 
-    fn finish(mut self) -> String {
+    pub(crate) fn finish(mut self) -> String {
         self.ready.push_str(&self.held);
         self.ready
     }
 }
 
-fn require_json(headers: &HeaderMap) -> Result<()> {
+pub(crate) fn require_json(headers: &HeaderMap) -> Result<()> {
     let Some(value) = headers.get(header::CONTENT_TYPE) else {
         return Err(ServerError::bad_request(
             "Content-Type must be application/json",
@@ -664,7 +666,7 @@ fn require_json(headers: &HeaderMap) -> Result<()> {
     Ok(())
 }
 
-fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T> {
+pub(crate) fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T> {
     serde_json::from_slice(body)
         .map_err(|err| ServerError::bad_request(format!("malformed JSON: {err}")))
 }

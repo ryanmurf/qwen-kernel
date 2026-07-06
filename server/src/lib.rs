@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod engine;
 pub mod ffi;
 pub mod gguf;
