@@ -17,7 +17,9 @@ libloading = "0.8"
 memmap2 = "0.9"
 minijinja = { version = "2.12", features = ["builtins", "loader"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# preserve_order: tool-call arguments must round-trip through /v1/messages in
+# their original key order, or the model imitates the reordered history shape.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = "0.1"

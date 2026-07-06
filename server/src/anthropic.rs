@@ -98,6 +98,84 @@ struct ToolDef {
     input_schema: Option<Value>,
 }
 
+/// Serializes JSON the way Python's `json.dumps` does (`", "` and `": "`
+/// separators). The Qwen chat template renders tools and past tool calls with
+/// `| tojson`, so this is the shape the model saw in training and the shape it
+/// emits inside `<tool_call>` — history must round-trip byte-identically or
+/// the model starts imitating the degraded shape mid-session.
+struct SpacedFormatter;
+
+impl serde_json::ser::Formatter for SpacedFormatter {
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first { Ok(()) } else { writer.write_all(b", ") }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
+
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first { Ok(()) } else { writer.write_all(b", ") }
+    }
+}
+
+fn spaced_json(value: &Value) -> String {
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, SpacedFormatter);
+    serde::Serialize::serialize(value, &mut ser).expect("serializing Value cannot fail");
+    String::from_utf8(out).expect("serde_json output is UTF-8")
+}
+
+/// Tool name plus its top-level input-schema property names, used to recover
+/// a generated tool call whose JSON is missing the `name` field.
+#[derive(Clone)]
+pub struct ToolSpec {
+    name: String,
+    keys: Vec<String>,
+}
+
+fn tool_specs(tools: &[ToolDef]) -> Vec<ToolSpec> {
+    tools
+        .iter()
+        .map(|tool| ToolSpec {
+            name: tool.name.clone(),
+            keys: tool
+                .input_schema
+                .as_ref()
+                .and_then(|schema| schema.get("properties"))
+                .and_then(Value::as_object)
+                .map(|props| props.keys().cloned().collect())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// If every argument key belongs to exactly one advertised tool's schema
+/// (or only one tool is advertised at all), that tool must be the target.
+fn infer_tool_name(input: &Value, tools: &[ToolSpec]) -> Option<String> {
+    if let [only] = tools {
+        return Some(only.name.clone());
+    }
+    let args = input.as_object()?;
+    if args.is_empty() {
+        return None;
+    }
+    let mut matches = tools
+        .iter()
+        .filter(|tool| args.keys().all(|key| tool.keys.contains(key)));
+    let hit = matches.next()?;
+    matches.next().is_none().then(|| hit.name.clone())
+}
+
 /// Render the Anthropic request into the Qwen3 ChatML prompt, following the
 /// upstream Qwen chat template: tools advertised in the system turn inside
 /// `<tools>` tags, assistant tool calls as `<tool_call>` JSON, and tool
@@ -135,17 +213,14 @@ fn render_prompt(req: &MessagesReq) -> Result<String> {
         );
         for tool in &req.tools {
             out.push('\n');
-            out.push_str(
-                &json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description.as_deref().unwrap_or(""),
-                        "parameters": tool.input_schema.clone().unwrap_or_else(|| json!({})),
-                    }
-                })
-                .to_string(),
-            );
+            out.push_str(&spaced_json(&json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description.as_deref().unwrap_or(""),
+                    "parameters": tool.input_schema.clone().unwrap_or_else(|| json!({})),
+                }
+            })));
         }
         out.push_str(
             "\n</tools>\n\nFor each function call, return a json object with function name and \
@@ -248,13 +323,23 @@ fn render_assistant_content(content: &AnthropicContent) -> Result<String> {
         match block.kind.as_str() {
             "text" => out.push_str(block.text.as_deref().unwrap_or("")),
             "tool_use" => {
-                let call = json!({
-                    "name": block.name.as_deref().unwrap_or(""),
-                    "arguments": block.input.clone().unwrap_or_else(|| json!({})),
-                });
-                out.push_str("\n<tool_call>\n");
-                out.push_str(&call.to_string());
-                out.push_str("\n</tool_call>");
+                // Byte-shape-identical to the emission format the <tools>
+                // preamble demands: `{"name": ..., "arguments": ...}` with
+                // `name` FIRST. (A serde_json map would sort keys and put
+                // `arguments` first — the model then imitates that degraded
+                // history shape and eventually drops `name` entirely.)
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str("<tool_call>\n{\"name\": ");
+                out.push_str(&spaced_json(&Value::String(
+                    block.name.clone().unwrap_or_default(),
+                )));
+                out.push_str(", \"arguments\": ");
+                out.push_str(&spaced_json(
+                    &block.input.clone().unwrap_or_else(|| json!({})),
+                ));
+                out.push_str("}\n</tool_call>");
             }
             // thinking / redacted_thinking are not replayable into the prompt
             _ => {}
@@ -266,10 +351,14 @@ fn render_assistant_content(content: &AnthropicContent) -> Result<String> {
 /// Incremental parser for generated text: passes plain text through, extracts
 /// `<tool_call>{...}</tool_call>` blocks, and drops `<think>...</think>`
 /// blocks. Text that could be the start of a tag is held back until resolved,
-/// so it never emits a partial tag as text.
+/// so it never emits a partial tag as text. A `<tool_call>` block that cannot
+/// be parsed (even after repair/inference against the advertised tools)
+/// surfaces as `ParsedEvent::Malformed` so the caller can retry generation
+/// instead of ending the turn.
 pub struct OutputParser {
     buf: String,
     state: ParseState,
+    tools: Vec<ToolSpec>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -282,19 +371,21 @@ enum ParseState {
 pub enum ParsedEvent {
     Text(String),
     ToolCall { name: String, input: Value },
+    Malformed { raw: String, error: String },
 }
 
 impl Default for OutputParser {
     fn default() -> Self {
-        Self::new()
+        Self::new(&[])
     }
 }
 
 impl OutputParser {
-    pub fn new() -> Self {
+    pub fn new(tools: &[ToolSpec]) -> Self {
         Self {
             buf: String::new(),
             state: ParseState::Text,
+            tools: tools.to_vec(),
         }
     }
 
@@ -340,7 +431,7 @@ impl OutputParser {
                         let raw = self.buf[..pos].trim().to_owned();
                         self.buf.drain(..pos + TOOL_CLOSE.len());
                         self.state = ParseState::Text;
-                        out.push(parse_tool_call(&raw));
+                        out.push(parse_tool_call(&raw, &self.tools));
                         continue;
                     }
                     break;
@@ -356,7 +447,7 @@ impl OutputParser {
             ParseState::Text | ParseState::Think => Vec::new(),
             // Generation ended (token limit) inside an unterminated tool call;
             // salvage it if the JSON happens to be complete.
-            ParseState::Tool => vec![parse_tool_call(self.buf.trim())],
+            ParseState::Tool => vec![parse_tool_call(self.buf.trim(), &self.tools)],
         }
     }
 }
@@ -381,28 +472,77 @@ fn holdback_len(buf: &str, markers: &[&str]) -> usize {
     0
 }
 
-fn parse_tool_call(raw: &str) -> ParsedEvent {
+/// Repair JSON corruptions Qwen has been observed to emit inside
+/// `<tool_call>` blocks — a dropped `":"` after a key, as in
+/// `{"arguments{"command": ...}, "name": "Bash"}`.
+fn repair_tool_json(raw: &str) -> String {
+    raw.replace("\"arguments\"{", "\"arguments\": {")
+        .replace("\"arguments{", "\"arguments\": {")
+        .replace("\"name\"{", "\"name\": {")
+        .replace("\"name{", "\"name\": {")
+}
+
+fn parse_tool_call(raw: &str, tools: &[ToolSpec]) -> ParsedEvent {
     #[derive(Deserialize)]
     struct Call {
-        name: String,
+        name: Option<String>,
         #[serde(default)]
         arguments: Value,
     }
-    if let Ok(call) = serde_json::from_str::<Call>(raw) {
-        // Some models emit arguments as a JSON-encoded string.
-        let input = match call.arguments {
-            Value::Null => json!({}),
-            Value::String(text) => {
-                serde_json::from_str(&text).unwrap_or(Value::String(text))
-            }
-            other => other,
-        };
-        return ParsedEvent::ToolCall {
-            name: call.name,
-            input,
-        };
+    let call = serde_json::from_str::<Call>(raw)
+        .or_else(|_| serde_json::from_str::<Call>(&repair_tool_json(raw)));
+    let call = match call {
+        Ok(call) => call,
+        Err(err) => {
+            return ParsedEvent::Malformed {
+                raw: raw.to_owned(),
+                error: format!("the content between <tool_call> tags is not valid JSON ({err})"),
+            };
+        }
+    };
+    // Some models emit arguments as a JSON-encoded string.
+    let input = match call.arguments {
+        Value::Null => json!({}),
+        Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        other => other,
+    };
+    let name = call.name.filter(|name| !name.is_empty()).or_else(|| {
+        let inferred = infer_tool_name(&input, tools);
+        if let Some(name) = &inferred {
+            tracing::warn!("tool call missing \"name\"; inferred {name:?} from argument keys");
+        }
+        inferred
+    });
+    match name {
+        Some(name) => ParsedEvent::ToolCall { name, input },
+        None => ParsedEvent::Malformed {
+            raw: raw.to_owned(),
+            error: "the JSON object is missing the required \"name\" field".to_owned(),
+        },
     }
-    ParsedEvent::Text(format!("{TOOL_OPEN}\n{raw}\n{TOOL_CLOSE}"))
+}
+
+/// Last-resort passthrough when a malformed tool call cannot be retried.
+fn malformed_fallback(raw: &str) -> String {
+    format!("{TOOL_OPEN}\n{raw}\n{TOOL_CLOSE}")
+}
+
+/// How many times one request may re-prompt the model after it emitted an
+/// unusable `<tool_call>` (no valid call alongside it).
+const MAX_TOOL_RETRIES: usize = 2;
+
+/// Feed a malformed tool call back to the model as a synthetic error
+/// `<tool_response>` and reopen the assistant turn — the same shape as a real
+/// tool round-trip — so the agentic loop continues instead of the turn ending
+/// with the raw `<tool_call>` text.
+fn continuation_prompt(prompt: &str, generated: &str, error: &str) -> String {
+    format!(
+        "{prompt}{generated}<|im_end|>\n<|im_start|>user\n<tool_response>\n\
+         ERROR: your tool call was malformed and was NOT executed: {error}. \
+         Re-emit the corrected tool call as a single JSON object with both fields, exactly:\n\
+         <tool_call>\n{{\"name\": \"<function-name>\", \"arguments\": {{<args-json-object>}}}}\n</tool_call>\n\
+         </tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
 }
 
 fn stop_reason(finish: FinishKind, tool_calls: usize) -> &'static str {
@@ -454,18 +594,74 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
     }
     let model = req.model.clone().unwrap_or_else(|| state.model_alias.clone());
     let prompt = render_prompt(&req)?;
-    let generation = prepare_generation(&state, Prompt::Text(prompt), req.max_tokens)?;
+    let specs = tool_specs(&req.tools);
+    let generation = prepare_generation(&state, Prompt::Text(prompt.clone()), req.max_tokens)?;
     let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
     if req.stream {
-        let stream = stream_messages(state, rx, generation, req.stop_sequences, model);
+        let job = StreamJob {
+            generation,
+            prompt,
+            specs,
+            max_tokens: req.max_tokens,
+            stops: req.stop_sequences,
+            model,
+        };
+        let stream = stream_messages(state, rx, job);
         return Ok(Sse::new(stream)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
             .into_response());
     }
-    let completed = collect_generation(&state, rx, &req.stop_sequences).await?;
-    let mut parser = OutputParser::new();
-    let mut events = parser.push(&completed.content);
-    events.extend(parser.finish());
+
+    let input_tokens = generation.prompt_ids.len();
+    let mut rx = rx;
+    let mut prompt_text = prompt;
+    let mut attempts = 0usize;
+    let mut output_tokens = 0usize;
+    let mut events: Vec<ParsedEvent> = Vec::new();
+    let (finish, stopping_word) = loop {
+        let completed = collect_generation(&state, rx, &req.stop_sequences).await?;
+        output_tokens += completed.tokens.len();
+        let mut parser = OutputParser::new(&specs);
+        let mut batch = parser.push(&completed.content);
+        batch.extend(parser.finish());
+        let has_tool_call = batch
+            .iter()
+            .any(|event| matches!(event, ParsedEvent::ToolCall { .. }));
+        let malformed_error = batch.iter().find_map(|event| match event {
+            ParsedEvent::Malformed { error, .. } => Some(error.clone()),
+            _ => None,
+        });
+        // A malformed tool call with no valid one alongside would end the
+        // turn as plain text; retry generation with a synthetic error result
+        // instead. (On a token-limit finish there is no budget to retry.)
+        if let Some(error) = malformed_error
+            && !has_tool_call
+            && completed.finish == FinishKind::Eos
+            && attempts < MAX_TOOL_RETRIES
+        {
+            let next_prompt = continuation_prompt(&prompt_text, &completed.content, &error);
+            let resubmit =
+                prepare_generation(&state, Prompt::Text(next_prompt.clone()), req.max_tokens)
+                    .and_then(|next| submit_generation(&state, &next.prompt_ids, next.max_gen));
+            if let Ok(next_rx) = resubmit {
+                tracing::warn!(
+                    "malformed <tool_call> ({error}); re-prompting (retry {})",
+                    attempts + 1
+                );
+                attempts += 1;
+                prompt_text = next_prompt;
+                rx = next_rx;
+                events.extend(
+                    batch
+                        .into_iter()
+                        .filter(|event| !matches!(event, ParsedEvent::Malformed { .. })),
+                );
+                continue;
+            }
+        }
+        events.extend(batch);
+        break (completed.finish, completed.stopping_word);
+    };
 
     let mut content = Vec::new();
     let mut tool_calls = 0usize;
@@ -487,6 +683,11 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
                     "input": input,
                 }));
             }
+            // Retries exhausted (or a valid call rode alongside): pass the
+            // raw block through as text so nothing is silently lost.
+            ParsedEvent::Malformed { raw, .. } => {
+                content.push(json!({ "type": "text", "text": malformed_fallback(&raw) }));
+            }
         }
     }
     // Drop whitespace-only text blocks (spacing around tool calls) and trim a
@@ -501,9 +702,9 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
         block.insert("text".to_owned(), Value::String(trimmed));
     }
 
-    let reason = stop_reason(completed.finish, tool_calls);
-    let stop_sequence = if completed.finish == FinishKind::Word {
-        Value::String(completed.stopping_word.clone())
+    let reason = stop_reason(finish, tool_calls);
+    let stop_sequence = if finish == FinishKind::Word {
+        Value::String(stopping_word)
     } else {
         Value::Null
     };
@@ -516,8 +717,8 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
         "stop_reason": reason,
         "stop_sequence": stop_sequence,
         "usage": {
-            "input_tokens": generation.prompt_ids.len(),
-            "output_tokens": completed.tokens.len(),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         }
     }))
     .into_response())
@@ -602,6 +803,11 @@ impl BlockEmitter {
                 self.index += 1;
                 events
             }
+            // Callers hold Malformed events back for the retry path; if one
+            // reaches the emitter anyway, pass it through as text.
+            ParsedEvent::Malformed { raw, .. } => {
+                self.on_event(ParsedEvent::Text(malformed_fallback(&raw)))
+            }
         }
     }
 
@@ -638,12 +844,22 @@ fn block_stop(index: usize) -> Event {
     )
 }
 
-fn stream_messages(
-    state: AppState,
-    mut rx: tokio::sync::mpsc::Receiver<crate::engine::SlotEvent>,
+/// Everything `stream_messages` needs beyond the state and the first
+/// generation's event channel; `prompt`/`max_tokens` allow re-prompting after
+/// a malformed tool call.
+struct StreamJob {
     generation: Generation,
+    prompt: String,
+    specs: Vec<ToolSpec>,
+    max_tokens: Option<u32>,
     stops: Vec<String>,
     model: String,
+}
+
+fn stream_messages(
+    state: AppState,
+    rx: tokio::sync::mpsc::Receiver<crate::engine::SlotEvent>,
+    job: StreamJob,
 ) -> impl Stream<Item = std::result::Result<Event, axum::Error>> {
     stream! {
         let msg_id = format!("msg_{}", Uuid::new_v4().simple());
@@ -653,55 +869,121 @@ fn stream_messages(
                 "id": msg_id,
                 "type": "message",
                 "role": "assistant",
-                "model": model,
+                "model": job.model.clone(),
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": { "input_tokens": generation.prompt_ids.len(), "output_tokens": 0 }
+                "usage": { "input_tokens": job.generation.prompt_ids.len(), "output_tokens": 0 }
             }
         })));
         yield Ok(sse("ping", json!({ "type": "ping" })));
 
-        let mut stop = StopDetector::new(&stops);
-        let mut parser = OutputParser::new();
+        let mut rx = rx;
+        let mut prompt_text = job.prompt;
+        let mut attempts = 0usize;
         let mut emitter = BlockEmitter::new();
-        let mut finish = FinishKind::Limit;
+        let mut finish;
         let mut stopping_word = String::new();
         let mut output_tokens = 0usize;
-        while let Some(event) = rx.recv().await {
-            match event {
-                crate::engine::SlotEvent::Tokens(ids) => {
-                    output_tokens += ids.len();
-                    let text = decode_tokens_lossless(&state, &ids).unwrap_or_default();
-                    if let Some(hit) = stop.push(&text) {
-                        finish = FinishKind::Word;
-                        stopping_word = hit;
+        // Raw text of malformed tool calls that could not be retried away;
+        // emitted as plain text at the end so nothing is silently lost.
+        let mut leftover: Vec<String> = Vec::new();
+        loop {
+            let mut stop = StopDetector::new(&job.stops);
+            let mut parser = OutputParser::new(&job.specs);
+            let mut raw_text = String::new();
+            let mut malformed: Vec<(String, String)> = Vec::new();
+            finish = FinishKind::Limit;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    crate::engine::SlotEvent::Tokens(ids) => {
+                        output_tokens += ids.len();
+                        let text = decode_tokens_lossless(&state, &ids).unwrap_or_default();
+                        if let Some(hit) = stop.push(&text) {
+                            finish = FinishKind::Word;
+                            stopping_word = hit;
+                            break;
+                        }
+                        let ready = stop.take_ready();
+                        raw_text.push_str(&ready);
+                        for parsed in parser.push(&ready) {
+                            match parsed {
+                                ParsedEvent::Malformed { raw, error } => malformed.push((raw, error)),
+                                other => {
+                                    for event in emitter.on_event(other) {
+                                        yield Ok(event);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    crate::engine::SlotEvent::Done { reason } => {
+                        finish = if reason == FinishReason::Eos { FinishKind::Eos } else { FinishKind::Limit };
                         break;
                     }
-                    for parsed in parser.push(&stop.take_ready()) {
-                        for event in emitter.on_event(parsed) {
+                    crate::engine::SlotEvent::Error(message) => {
+                        yield Ok(sse("error", json!({
+                            "type": "error",
+                            "error": { "type": "api_error", "message": message }
+                        })));
+                        return;
+                    }
+                }
+            }
+
+            let ready = stop.finish();
+            raw_text.push_str(&ready);
+            let mut tail = parser.push(&ready);
+            tail.extend(parser.finish());
+            for parsed in tail {
+                match parsed {
+                    ParsedEvent::Malformed { raw, error } => malformed.push((raw, error)),
+                    other => {
+                        for event in emitter.on_event(other) {
                             yield Ok(event);
                         }
                     }
                 }
-                crate::engine::SlotEvent::Done { reason } => {
-                    finish = if reason == FinishReason::Eos { FinishKind::Eos } else { FinishKind::Limit };
-                    break;
-                }
-                crate::engine::SlotEvent::Error(message) => {
-                    yield Ok(sse("error", json!({
-                        "type": "error",
-                        "error": { "type": "api_error", "message": message }
-                    })));
-                    return;
+            }
+
+            // Same retry rule as the non-streaming path: a malformed tool
+            // call with no valid one alongside gets a synthetic error result
+            // and another chance, instead of ending the turn.
+            if !malformed.is_empty()
+                && emitter.tool_calls == 0
+                && finish == FinishKind::Eos
+                && attempts < MAX_TOOL_RETRIES
+            {
+                let error = malformed[0].1.clone();
+                let next_prompt = continuation_prompt(&prompt_text, &raw_text, &error);
+                let resubmit =
+                    prepare_generation(&state, Prompt::Text(next_prompt.clone()), job.max_tokens)
+                        .and_then(|next| submit_generation(&state, &next.prompt_ids, next.max_gen));
+                match resubmit {
+                    Ok(next_rx) => {
+                        tracing::warn!(
+                            "malformed <tool_call> ({error}); re-prompting (retry {})",
+                            attempts + 1
+                        );
+                        attempts += 1;
+                        prompt_text = next_prompt;
+                        rx = next_rx;
+                        continue;
+                    }
+                    Err(_) => {
+                        leftover = malformed.into_iter().map(|(raw, _)| raw).collect();
+                        break;
+                    }
                 }
             }
+            if emitter.tool_calls == 0 {
+                leftover = malformed.into_iter().map(|(raw, _)| raw).collect();
+            }
+            break;
         }
 
-        let mut tail = parser.push(&stop.finish());
-        tail.extend(parser.finish());
-        for parsed in tail {
-            for event in emitter.on_event(parsed) {
+        for raw in leftover {
+            for event in emitter.on_event(ParsedEvent::Text(malformed_fallback(&raw))) {
                 yield Ok(event);
             }
         }
@@ -775,12 +1057,13 @@ mod tests {
         }));
         let prompt = render_prompt(&req).expect("renders");
         assert!(prompt.starts_with("<|im_start|>system\nBe brief.\n\n# Tools"));
-        assert!(prompt.contains("<tools>\n{"));
-        assert!(prompt.contains("\"name\":\"get_weather\""));
+        assert!(prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""));
         assert!(prompt.contains("\n</tools>\n\nFor each function call"));
-        assert!(prompt.contains("<|im_start|>assistant\nChecking.\n<tool_call>\n{"));
-        assert!(prompt.contains("\"city\":\"Paris\""));
-        assert!(prompt.contains("}\n</tool_call><|im_end|>\n"));
+        assert!(prompt.contains(
+            "<|im_start|>assistant\nChecking.\n<tool_call>\n\
+             {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n\
+             </tool_call><|im_end|>\n"
+        ));
         assert!(prompt.contains(
             "<|im_start|>user\n<tool_response>\n18C, sunny\n</tool_response><|im_end|>\n"
         ));
@@ -824,13 +1107,33 @@ mod tests {
             .map(|event| match event {
                 ParsedEvent::Text(text) => ("text".to_owned(), text),
                 ParsedEvent::ToolCall { name, input } => (name, input.to_string()),
+                ParsedEvent::Malformed { raw, .. } => ("malformed".to_owned(), raw),
             })
             .collect()
     }
 
+    fn cli_like_specs() -> Vec<ToolSpec> {
+        let tools: Vec<ToolDef> = serde_json::from_value(json!([
+            {
+                "name": "Bash",
+                "input_schema": { "type": "object", "properties": {
+                    "command": {}, "description": {}, "timeout": {}
+                }}
+            },
+            {
+                "name": "Read",
+                "input_schema": { "type": "object", "properties": {
+                    "file_path": {}, "offset": {}, "limit": {}
+                }}
+            }
+        ]))
+        .expect("tools parse");
+        tool_specs(&tools)
+    }
+
     #[test]
     fn parser_passes_plain_text() {
-        let mut parser = OutputParser::new();
+        let mut parser = OutputParser::new(&[]);
         let mut events = parser.push("hello ");
         events.extend(parser.push("world"));
         events.extend(parser.finish());
@@ -849,7 +1152,7 @@ mod tests {
             if !output.is_char_boundary(split) {
                 continue;
             }
-            let mut parser = OutputParser::new();
+            let mut parser = OutputParser::new(&[]);
             let mut events = parser.push(&output[..split]);
             events.extend(parser.push(&output[split..]));
             events.extend(parser.finish());
@@ -869,19 +1172,97 @@ mod tests {
     }
 
     #[test]
-    fn parser_falls_back_on_malformed_tool_json() {
-        let mut parser = OutputParser::new();
+    fn parser_reports_malformed_tool_json() {
+        let mut parser = OutputParser::new(&[]);
         let mut events = parser.push("<tool_call>\nnot json\n</tool_call>");
         events.extend(parser.finish());
         let got = collect(events);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, "text");
+        assert_eq!(got[0].0, "malformed");
         assert!(got[0].1.contains("not json"));
     }
 
     #[test]
+    fn tool_use_round_trip_matches_emission_shape() {
+        // The re-rendered history must be byte-identical to the shape the
+        // <tools> preamble demands: "name" FIRST, json.dumps-style spacing,
+        // and argument keys in their original (non-alphabetical) order.
+        let req = req_from_json(json!({
+            "max_tokens": 8,
+            "messages": [
+                { "role": "user", "content": "write it" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Write",
+                      "input": { "file_path": "/tmp/x", "content": "hi" } }
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "t1", "content": "ok" }
+                ]}
+            ]
+        }));
+        let prompt = render_prompt(&req).expect("renders");
+        assert!(prompt.contains(
+            "<|im_start|>assistant\n<tool_call>\n\
+             {\"name\": \"Write\", \"arguments\": {\"file_path\": \"/tmp/x\", \"content\": \"hi\"}}\n\
+             </tool_call><|im_end|>\n"
+        ));
+    }
+
+    #[test]
+    fn parser_infers_missing_name_from_argument_keys() {
+        let specs = cli_like_specs();
+        let mut parser = OutputParser::new(&specs);
+        let mut events = parser.push(
+            "<tool_call>\n{\"arguments\": {\"command\": \"ls\", \"description\": \"x\"}}\n</tool_call>",
+        );
+        events.extend(parser.finish());
+        let got = collect(events);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "Bash");
+        assert_eq!(got[0].1, "{\"command\":\"ls\",\"description\":\"x\"}");
+    }
+
+    #[test]
+    fn parser_reports_ambiguous_missing_name_as_malformed() {
+        // Empty arguments match every tool: no unique candidate, no guess.
+        let specs = cli_like_specs();
+        let mut parser = OutputParser::new(&specs);
+        let mut events = parser.push("<tool_call>{\"arguments\": {}}</tool_call>");
+        events.extend(parser.finish());
+        let got = collect(events);
+        assert_eq!(got[0].0, "malformed");
+    }
+
+    #[test]
+    fn parser_repairs_missing_colon_corruption() {
+        // Observed in the wild: {"arguments{"command": ...}, "name": "Bash"}
+        let specs = cli_like_specs();
+        let mut parser = OutputParser::new(&specs);
+        let mut events = parser.push(
+            "<tool_call>\n{\"arguments{\"command\":\"unzip -p x.jar\",\"description\":\"Read\"},\"name\":\"Bash\"}\n</tool_call>",
+        );
+        events.extend(parser.finish());
+        let got = collect(events);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "Bash");
+        assert!(got[0].1.contains("unzip -p x.jar"));
+    }
+
+    #[test]
+    fn continuation_prompt_reopens_assistant_turn() {
+        let prompt = continuation_prompt(
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "<tool_call>\n{\"arguments\": {}}\n</tool_call>",
+            "the JSON object is missing the required \"name\" field",
+        );
+        assert!(prompt.contains("<tool_call>\n{\"arguments\": {}}\n</tool_call><|im_end|>\n"));
+        assert!(prompt.contains("<tool_response>\nERROR: your tool call was malformed"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
     fn parser_salvages_unterminated_tool_call() {
-        let mut parser = OutputParser::new();
+        let mut parser = OutputParser::new(&[]);
         let mut events =
             parser.push("<tool_call>\n{\"name\": \"ls\", \"arguments\": {\"dir\": \"/\"}}");
         events.extend(parser.finish());
@@ -892,7 +1273,7 @@ mod tests {
 
     #[test]
     fn parser_unwraps_string_encoded_arguments() {
-        let mut parser = OutputParser::new();
+        let mut parser = OutputParser::new(&[]);
         let mut events = parser.push(
             "<tool_call>{\"name\": \"ls\", \"arguments\": \"{\\\"dir\\\": \\\"/tmp\\\"}\"}</tool_call>",
         );
