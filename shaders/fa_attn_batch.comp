@@ -1,0 +1,97 @@
+#version 450
+
+// Batched prefill variant of fa_attn_srv: each z workgroup is a token offset
+// within one prompt chunk for a single slot, attending causally through pos.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQH { float qhat[]; };
+layout(std430, binding = 1) readonly  buffer BufKC { float kc[]; };
+layout(std430, binding = 2) readonly  buffer BufVC { float vc[]; };
+layout(std430, binding = 3) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 4) writeonly buffer BufA  { float att[]; };
+
+layout(push_constant) uniform PC {
+    // Host field order: tmax, dh, nRot, hQ, hKV, eps, freqBase, base, Tn.
+    uint tmax; uint dh; uint nRot; uint hQ;
+    uint hKV; float eps; float freqBase; uint base;
+    uint Tn;
+} pc;
+
+shared float q[256];
+shared float sc[256];
+shared float red[256];
+shared float m;
+shared float l;
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+    uint n  = gl_WorkGroupID.z;
+    uint pos = pc.base + n;
+    uint nk = pos + 1u;
+    uint kv = h / (pc.hQ / pc.hKV);
+    uint qfo = n * pc.hQ * 2u * dh;
+    uint qho = n * pc.hQ * dh;
+
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
+    if (t == 0u) {
+        m = -3.4e38;
+        l = 0.0;
+    }
+    barrier();
+
+    float qs = inversesqrt(float(dh));
+    float acc = 0.0;
+    for (uint p0 = 0u; p0 < nk; p0 += 256u) {
+        uint ts = min(256u, nk - p0);
+
+        if (t < ts) {
+            float score = 0.0;
+            uint base = (kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kc[base + j];
+            sc[t] = score * qs;
+        }
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : -3.4e38;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] = max(red[t], red[t + s]);
+            barrier();
+        }
+
+        float oldm = m;
+        float newm = max(oldm, red[0]);
+        float corr = exp(oldm - newm);
+
+        acc *= corr;
+        if (t < ts) sc[t] = exp(sc[t] - newm);
+        if (t == 0u) l *= corr;
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : 0.0;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] += red[t + s];
+            barrier();
+        }
+
+        if (t < dh) {
+            for (uint j = 0u; j < ts; ++j)
+                acc += sc[j] * vc[(kv * pc.tmax + (p0 + j)) * dh + t];
+        }
+        if (t == 0u) {
+            l += red[0];
+            m = newm;
+        }
+        barrier();
+    }
+
+    if (t < dh) {
+        float o = acc / l;
+        float g = qfull[qfo + h * 2u * dh + dh + t];
+        att[qho + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+    }
+}
