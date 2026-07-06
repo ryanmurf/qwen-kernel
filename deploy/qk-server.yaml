@@ -32,7 +32,7 @@ spec:
         - --slots
         - "4"
         - --ctx
-        - "8192"
+        - "16384"
         - --chunk
         - "8"
         ports:

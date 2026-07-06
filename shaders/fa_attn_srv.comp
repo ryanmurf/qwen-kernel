@@ -18,8 +18,10 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float q[256];
-shared float sc[8192];   // per-key attention scores: caps sequence length at 8192 (32 KB LDS)
+shared float sc[256];
 shared float red[256];
+shared float m;
+shared float l;
 
 void main() {
     uint h  = gl_WorkGroupID.x;
@@ -33,47 +35,61 @@ void main() {
     uint qho = rq * pc.hQ * dh;
 
     if (t < dh) q[t] = qhat[qho + h * dh + t];
+    if (t == 0u) {
+        m = -3.4e38;
+        l = 0.0;
+    }
     barrier();
 
     float qs = inversesqrt(float(dh));
-    for (uint p = t; p < n; p += 256u) {
-        float s = 0.0;
-        uint base = kvo + (kv * pc.tmax + p) * dh;
-        for (uint j = 0u; j < dh; ++j) s += q[j] * kc[base + j];
-        sc[p] = s * qs;
-    }
-    barrier();
+    float acc = 0.0;
+    for (uint p0 = 0u; p0 < n; p0 += 256u) {
+        uint ts = min(256u, n - p0);
 
-    float mx = -3.4e38;
-    for (uint p = t; p < n; p += 256u) mx = max(mx, sc[p]);
-    red[t] = mx;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (t < s) red[t] = max(red[t], red[t + s]);
+        if (t < ts) {
+            float score = 0.0;
+            uint base = kvo + (kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kc[base + j];
+            sc[t] = score * qs;
+        }
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : -3.4e38;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] = max(red[t], red[t + s]);
+            barrier();
+        }
+
+        float oldm = m;
+        float newm = max(oldm, red[0]);
+        float corr = exp(oldm - newm);
+
+        acc *= corr;
+        if (t < ts) sc[t] = exp(sc[t] - newm);
+        if (t == 0u) l *= corr;
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : 0.0;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] += red[t + s];
+            barrier();
+        }
+
+        if (t < dh) {
+            for (uint j = 0u; j < ts; ++j)
+                acc += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+        }
+        if (t == 0u) {
+            l += red[0];
+            m = newm;
+        }
         barrier();
     }
-    float m = red[0];
-    barrier();
-    float sum = 0.0;
-    for (uint p = t; p < n; p += 256u) {
-        float e = exp(sc[p] - m);
-        sc[p] = e;
-        sum += e;
-    }
-    red[t] = sum;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (t < s) red[t] += red[t + s];
-        barrier();
-    }
-    float inv = 1.0 / red[0];
-    barrier();
 
     if (t < dh) {
-        float o = 0.0;
-        for (uint p = 0u; p < n; ++p)
-            o += sc[p] * vc[kvo + (kv * pc.tmax + p) * dh + t];
-        o *= inv;
+        float o = acc / l;
         float g = qfull[qfo + h * 2u * dh + dh + t];
         att[qho + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
     }
