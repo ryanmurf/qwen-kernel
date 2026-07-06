@@ -234,6 +234,50 @@ llama.cpp reference:
   seen. The warm-decoded token stream is byte-identical to the cold stream,
   proving the snapshot/restore preserves state exactly.
 
+- **Batched prefill (`qk prefillcmp` / `prefillbench` / `prefilldecode`).** The
+  serial engine prefills a prompt one token at a time — each a full forward,
+  including the 248k-row LM head whose logits are then discarded. Batched prefill
+  processes the whole prompt chunk in ONE command buffer with the token index on
+  the dispatch z-axis: the dense projections become a register-blocked Q8_0 GEMM
+  that reads each weight once for all N tokens (vs N re-reads by the per-token
+  GEMV); the 30 gated-deltanet layers run the recurrence as one workgroup-per-head
+  kernel that loops the chunk internally with the delta-rule state `S` resident in
+  registers (the sequential dependency collapsed into one dispatch); the 10
+  attention layers use batched flash-attention writing K/V at `pos=base+n`; and
+  the MoE / embed / norm / residual ops reuse the per-token kernels dispatched
+  z=N. Below a measured ~48-token crossover the projections fall back to per-token
+  GEMV (the 128×64 GEMM tile wastes work when N fills under one tile), so the path
+  is optimal at every chunk width.
+
+  `qk_slot_start` uses it automatically: a fresh (prefix-cache-miss) prompt of
+  17–129 tokens is batch-prefilled for all but its last token (LM head skipped
+  entirely), then the existing serial step feeds the final token — producing the
+  first generated token exactly as the all-serial path does, reading the
+  batched-filled K/V + delta-rule `S` + conv window. Shorter prompts, `>maxB`
+  prompts, and prefix-cache hits fall back to per-token serial prefill;
+  `QK_NO_BATCH=1` forces serial. Any slot can be targeted (the per-slot state
+  bindings are rebound before recording), so multi-slot concurrency is preserved.
+
+  Correctness is proven at three levels, all token-for-token identical to serial:
+  the batched forward's last-token logits are **bit-identical** (`max|Δlogit| = 0`,
+  GEMV path) across chunk sizes 1–128 × 3 seeds (`prefillcmp`); the state handoff
+  reproduces all-serial generation exactly (`prefilldecode`, N = 16–100); and the
+  wired server emits identical tokens on 40/100/128-token prompts (GEMV & GEMM
+  paths) and the 12-token serial fallback (`serve-test` vs `QK_NO_BATCH=1`). The
+  GEMM path (N ≥ 48) differs from serial by ~7e-7 rel (tiled accumulation order) —
+  argmax-stable. Independently correctness-reviewed (no bug found).
+
+  | prefill, 128-token prompt | serial | batched | speedup |
+  |---|---|---|---|
+  | isolated forward (`prefillbench`) | 1196 ms | 286 ms | **4.18×** |
+  | full request + 8 gen (`serve-test`, prefill included) | 867 ms | 284 ms | **3.05×** |
+
+  ~447 tok/s prefill throughput at a 128-token chunk (vs serial ~107); the GEMM
+  itself sustains ~6.3 TFLOP/s (3.6–4.8× a serial GEMV at N = 64–256). Caveat:
+  `prefillBatchLast` is from-empty single-chunk only — continuing an existing slot
+  or a `>maxB` prompt would need a `base` push constant, per-layer conv-carry
+  seeding, and dropping the internal `resetSlot` (documented in-source).
+
 ## Build & run
 
 ```bash
@@ -249,12 +293,16 @@ llama.cpp reference:
 ./build/qk token <ids-file> <nGen> [tmax] [batch]  # end-to-end greedy generation (server must be scaled down)
 ./build/qk warm <ids-file> <nGen> [tmax]   # prefix-cache cold/warm-start demo (TTFT)
 ./build/qk serve-test <ids-file> <nGen> [nSlots] [tmax]  # drive the libqk C ABI in-process
+./build/qk prefillcmp [N<=128] [ctx]       # batched-prefill logits vs serial (token-exact sweep)
+./build/qk prefillbench [ctx]              # batched vs serial prefill timing
+./build/qk prefilldecode [N] [M] [ctx]     # batched prefill -> serial decode == all-serial (handoff)
 ./build/qk list [filter]            # list tensors in the GGUF
 ```
 
 Env: `QK_DEVICE=<n>` forces the Vulkan device index (default: first discrete
 GPU); `QK_SHADER_DIR` overrides the SPIR-V directory; `QK_GGUF` overrides the
-model path.
+model path; `QK_NO_BATCH=1` disables batched prefill in the serving path (forces
+per-token serial prefill — used as the correctness reference).
 
 ## Notes
 
