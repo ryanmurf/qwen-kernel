@@ -3315,9 +3315,8 @@ int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint
 }  // extern "C"
 
 // Batched-prefill GEMM validation: Y[N,M] = X[N,K]·W[M,K]^T vs a CPU reference.
-static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N) {
-    printf("\n== batched GEMM  Y[%u,%u] = X[%u,%u] . W[%u,%u]^T  (Q8_0, 16x16 tile) ==\n",
-           N, M, N, K, M, K);
+static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t iters) {
+    printf("\n== batched GEMM  Y[%u,%u] = X[%u,%u] . W[%u,%u]^T  (Q8_0) ==\n", N, M, N, K, M, K);
     if (K % 32) { fprintf(stderr, "K must be a multiple of 32\n"); return false; }
     size_t nb = (size_t)M * (K / 32);
     std::vector<block_q8_0> W(nb);
@@ -3393,14 +3392,26 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N) {
     vkUpdateDescriptorSets(c.dev, 3, wr, 0, nullptr);
 
     struct { uint32_t M, K, N; } pc{M, K, N};
+    uint32_t gx = (M + 127) / 128, gz = (N + 63) / 64;  // BM=128, BN=64 (see gemm_q8_0.comp GRID)
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    auto bindDisp = [&]() {
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.p);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pl, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(c.cb, p.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pc);
+    };
+    begin(); bindDisp(); vkCmdDispatch(c.cb, gx, 1, gz); submitWait();  // warm-up + produce Y
     begin();
-    vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.p);
-    vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pl, 0, 1, &ds, 0, nullptr);
-    vkCmdPushConstants(c.cb, p.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pc);
+    bindDisp();
+    for (uint32_t it = 0; it < iters; it++) {
+        vkCmdDispatch(c.cb, gx, 1, gz);
+        vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
     auto t0 = std::chrono::steady_clock::now();
-    vkCmdDispatch(c.cb, (M + 127) / 128, 1, (N + 63) / 64);  // BM=128, BN=64 (see gemm_q8_0.comp GRID)
     submitWait();
-    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / iters;
 
     begin();
     VkBufferCopy cp{0, 0, (size_t)N * M * 4};
@@ -3414,8 +3425,11 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N) {
     }
     double rms = std::sqrt(sumsq / ((size_t)N * M));
     bool ok = maxErr < 1e-3 * rms;  // fp32 kernel vs double reference, scale-relative
-    printf("  %u tokens in one batched pass: %.2f ms | max abs err %.3g / rms %.3g = %.2g -> %s\n",
-           N, ms, maxErr, rms, maxErr / rms, ok ? "PASS" : "FAIL");
+    double tflops = 2.0 * M * N * K / (ms * 1e9);
+    double peak = 52.0;                                             // RX 7900 XT ~52 TFLOP/s FP32
+    double serialMs = (double)N * ((double)M * K / 32.0 * 34.0) / 938e6;  // N GEMVs at ~938 GB/s
+    printf("  N=%-5u %7.3f ms | %5.1f TFLOP/s (%2.0f%% peak) | vs serial %6.1f ms = %.2fx | err/rms %.1g -> %s\n",
+           N, ms, tflops, tflops / peak * 100, serialMs, serialMs / ms, maxErr / rms, ok ? "PASS" : "FAIL");
     vkUnmapMemory(c.dev, stage.mem);
     vkDestroyDescriptorPool(c.dev, pool, nullptr);
     destroyPipe(c, p);
@@ -3571,7 +3585,7 @@ int main(int argc, char** argv) {
     } else if (mode == "iq3_xxs") {
         ok = caseIQ3XXS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "bgemm") {
-        ok = caseBGemm(c, argU(2, 8192), argU(3, 2048), argU(4, 256));  // batched-prefill GEMM
+        ok = caseBGemm(c, argU(2, 8192), argU(3, 2048), argU(4, 256), argU(5, 40));  // batched-prefill GEMM
     } else if (mode == "gguf") {
         if (argc < 3) {
             fprintf(stderr, "usage: qk gguf <tensor> [iters]\n");
