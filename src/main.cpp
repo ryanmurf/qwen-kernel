@@ -2914,8 +2914,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pPrepB = makePipe(c, "fa_prep_batch.spv", 9, 36);
     pAttnB = makePipe(c, "fa_attn_batch.spv", 5, 36);
     pAbB = makePipe(c, "dn_ab_batch.spv", 6, 12);
-    pConvB = makePipe(c, "dn_conv_batch.spv", 4, 20);
-    pStepB = makePipe(c, "dn_step_batch.spv", 3, 16);
+    pConvB = makePipe(c, "dn_conv_batch.spv", 5, 20);   // +conv-window state out (decode handoff)
+    pStepB = makePipe(c, "dn_step_batch.spv", 4, 16);   // +delta-rule S seed/persist (decode handoff)
     pGateB = makePipe(c, "dn_gate_batch.spv", 4, 16);
     pGemmB = makePipe(c, "gemm_q8_0.spv", 3, 12);  // batched projections (weight reads amortized)
 
@@ -3090,8 +3090,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             BL.sP1 = mkSet(pGemvA, {qkvW, bbXn.buf, bbBig.buf});
             BL.sP2 = mkSet(pGemvA, {zW, bbXn.buf, bbMid.buf});
             BL.sAb = mkSet(pAbB, {bbXn.buf, alW, beW, dt, av, bbGb.buf});
-            BL.sConv = mkSet(pConvB, {bbCarry.buf, bbBig.buf, ker, bbConvOut.buf});
-            BL.sStep = mkSet(pStepB, {bbConvOut.buf, bbGb.buf, bbO.buf});
+            BL.sConv = mkSet(pConvB, {bbCarry.buf, bbBig.buf, ker, bbConvOut.buf, convSt});
+            BL.sStep = mkSet(pStepB, {bbConvOut.buf, bbGb.buf, bbO.buf, S});
             BL.sGate = mkSet(pGateB, {bbO.buf, sn, bbMid.buf, bbAtt.buf});
             BL.sWo = mkSet(pGemvO, {outW, bbAtt.buf, bbAttnOut.buf});
         } else {
@@ -3354,6 +3354,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, std::vector<f
     }
     memcpy(bbIdsMap, toks, (size_t)n * 4);
     logits.resize(vocab);
+    // From-empty prefill on slot 0: zero its recurrent state so dn_step's seed reads 0
+    // and the conv window starts clean (also makes repeated calls idempotent). The
+    // batched kernels then leave slot 0's K/V + delta-rule S + conv window exactly as
+    // n serial steps would, so serial decode can continue from position n.
+    resetSlot(0);
 
     VK_CHECK(vkResetCommandBuffer(c.cb, 0));
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -3898,6 +3903,71 @@ int main(int argc, char** argv) {
         }
         qk_close(e);
         return 0;
+    }
+
+    if (mode == "prefilldecode") {
+        // End-to-end decode-handoff test: batched-prefill a prompt on slot 0, continue
+        // GREEDY decode from the handed-off state, and require the full generated
+        // sequence to match an all-serial run of the same prompt token-for-token.
+        uint32_t N = argc > 2 ? (uint32_t)atoi(argv[2]) : 32;
+        uint32_t M = argc > 3 ? (uint32_t)atoi(argv[3]) : 24;
+        uint32_t ctx = argc > 4 ? (uint32_t)atoi(argv[4]) : 2048;
+        if (N < 1 || N > 128 || N + M > ctx) { fprintf(stderr, "usage: qk prefilldecode [N<=128] [M] [ctx]\n"); return 1; }
+        qk_config cfg{2, ctx, 8};
+        char err[256] = {0};
+        qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+        uint32_t ch = qk_chunk(e);
+        uint32_t nSl = qk_n_slots(e);
+        std::vector<uint32_t> outTok((size_t)nSl * ch), outCnt(nSl);
+        uint32_t fin = 0;
+
+        bool allOk = true;
+        for (uint32_t seed : {1234u, 7u, 99u}) {
+            std::mt19937 rng(seed);
+            std::vector<uint32_t> toks(N);
+            for (uint32_t i = 0; i < N; i++) toks[i] = rng() % (e->vocab - 16) + 4;
+
+            // Reference: all-serial prefill+decode on slot 1.
+            std::vector<uint32_t> refSeq;
+            qk_slot_start(e, 1, toks.data(), N, M);
+            while (e->stepChunk(outTok.data(), outCnt.data(), &fin) > 0)
+                for (uint32_t i = 0; i < outCnt[1]; i++) refSeq.push_back(outTok[(size_t)1 * ch + i]);
+
+            // Batched prefill on slot 0, then continue serial decode from the handoff.
+            std::vector<float> lB;
+            e->prefillBatchLast(toks.data(), N, lB);
+            uint32_t tok0 = (uint32_t)(std::max_element(lB.begin(), lB.end()) - lB.begin());
+            // Follow serial's convention: a generated EOS is a terminator, not emitted.
+            std::vector<uint32_t> batSeq;
+            qk_engine::Slot& s0 = e->slots[0];
+            s0.prompt.assign(toks.begin(), toks.end());
+            if (tok0 != e->eosTok) {
+                batSeq.push_back(tok0);
+                s0.genTokens.assign(1, tok0);
+                s0.cursor = N; s0.pos = N; s0.gen = 1; s0.maxGen = M; s0.last = tok0; s0.active = true;
+                while (e->stepChunk(outTok.data(), outCnt.data(), &fin) > 0)
+                    for (uint32_t i = 0; i < outCnt[0]; i++) batSeq.push_back(outTok[(size_t)0 * ch + i]);
+            } else {
+                s0.active = false;  // immediate EOS: serial swallows it too -> both emit nothing
+            }
+
+            size_t cmp = std::min(refSeq.size(), batSeq.size());
+            size_t match = 0;
+            while (match < cmp && refSeq[match] == batSeq[match]) match++;
+            bool ok = (refSeq.size() == batSeq.size()) && (match == refSeq.size());
+            allOk &= ok;
+            printf("  seed=%-5u N=%u M=%u serial=%zu tok, batched=%zu tok, matched %zu -> %s\n",
+                   seed, N, M, refSeq.size(), batSeq.size(), match, ok ? "OK" : "**DIVERGE**");
+            if (!ok) {
+                printf("    serial :"); for (uint32_t t : refSeq) printf(" %u", t); printf("\n");
+                printf("    batched:"); for (uint32_t t : batSeq) printf(" %u", t); printf("\n");
+            }
+        }
+        printf("prefilldecode: %s\n", allOk ? "HANDOFF EXACT (batched prefill -> serial decode == all-serial)"
+                                            : "HANDOFF DIVERGENCE");
+        qk_close(e);
+        return allOk ? 0 : 1;
     }
 
     VkCtx c;

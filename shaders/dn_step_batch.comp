@@ -9,6 +9,7 @@ layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly  buffer BufC  { float conv[]; };
 layout(std430, binding = 1) readonly  buffer BufGB { float gb[]; };    // [Tn][g[hV], beta[hV]]
 layout(std430, binding = 2) writeonly buffer BufO  { float o[]; };     // [Tn][hV][dS]
+layout(std430, binding = 3)          buffer BufS  { vec4 s4[]; };      // slot state [hV][dS][dS/4]
 
 layout(push_constant) uniform PC { uint dState; uint hK; uint hV; uint Tn; } pc;
 
@@ -24,8 +25,11 @@ void main() {
     uint kh = h % pc.hK;
     float qScale = inversesqrt(float(dS));
 
+    // Seed each thread's state row from the slot buffer (0 for a fresh slot), so the
+    // chunk continues exactly where serial left off; persisted back after the loop.
+    uint srowBase = (h * dS + j) * nv;
     vec4 srow[32];
-    for (uint i = 0u; i < 32u; ++i) srow[i] = vec4(0.0);
+    for (uint i = 0u; i < nv; ++i) srow[i] = (j < dS) ? s4[srowBase + i] : vec4(0.0);
 
     for (uint t = 0u; t < pc.Tn; ++t) {
         uint co = t * (2u * pc.hK + pc.hV) * dS;
@@ -62,4 +66,8 @@ void main() {
         }
         barrier();
     }
+
+    // Persist the final state so serial decode continues from position Tn.
+    if (j < dS)
+        for (uint i = 0u; i < nv; ++i) s4[srowBase + i] = srow[i];
 }

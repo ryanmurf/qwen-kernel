@@ -12,6 +12,7 @@ layout(std430, binding = 0) readonly  buffer BufCarry { float carry[]; };
 layout(std430, binding = 1) readonly  buffer BufI     { float qkv[]; };
 layout(std430, binding = 2) readonly  buffer BufK     { float ker[]; };
 layout(std430, binding = 3) writeonly buffer BufO     { float o[]; };
+layout(std430, binding = 4) writeonly buffer BufSt    { float stOut[]; };  // slot conv window [channels][3]
 
 layout(push_constant) uniform PC { uint channels; uint dState; uint qkCh; float eps; uint Tn; } pc;
 
@@ -54,4 +55,13 @@ void main() {
         v *= scale;
     }
     if (ch < pc.channels && t < pc.dState) o[qo + ch] = v;
+
+    // The last token seeds the slot's 3-tap conv window with the raw inputs ending at
+    // this chunk (newest at index 2); inputAt() pulls from carry for pre-chunk indices,
+    // so this is correct for any Tn and continues serial decode from position Tn.
+    if (n + 1u == pc.Tn && ch < pc.channels && t < pc.dState) {
+        stOut[ch * 3u + 0u] = inputAt(n, ch, -2);
+        stOut[ch * 3u + 1u] = inputAt(n, ch, -1);
+        stOut[ch * 3u + 2u] = inputAt(n, ch, 0);
+    }
 }
