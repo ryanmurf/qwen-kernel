@@ -58,7 +58,16 @@ streaming (`message_start` / `content_block_*` / `message_delta` /
 `message_stop`). Requests are rendered into the Qwen3 ChatML format (tools as
 a hermes-style `<tools>` system block, tool results as `<tool_response>`);
 generated `<tool_call>` JSON blocks are parsed back into Anthropic `tool_use`
-content blocks, and stray `<think>` blocks are dropped. `stop_reason` maps to
+content blocks, and stray `<think>` blocks are dropped. Past `tool_use` blocks
+re-render byte-identically to the emission format the `<tools>` preamble
+demands (`{"name": ..., "arguments": ...}`, `json.dumps`-style spacing,
+original argument-key order) so the model never sees a degraded shape to
+imitate. Malformed generated `<tool_call>` blocks are recovered instead of
+ending the turn: a missing `"name"` is inferred when the argument keys match
+exactly one advertised tool, known JSON corruptions are repaired, and anything
+still unusable triggers an internal retry — the server feeds the model a
+synthetic error `<tool_response>` and lets it re-emit the call (up to 2
+retries) before falling back to passing the raw block through as text. `stop_reason` maps to
 `end_turn` / `max_tokens` / `stop_sequence` / `tool_use`. Errors from this
 endpoint use the Anthropic error shape
 (`{"type":"error","error":{"type":"...","message":"..."}}`). Image content is

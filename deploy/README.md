@@ -46,4 +46,4 @@ kubectl patch svc gemma-server -n gemma --type json \
   -p '[{"op":"replace","path":"/spec/selector","value":{"gpu-llm":"server"}}]'
 ```
 
-Note: qk-server runs `--ctx 2048` (engine cap 4096); gemma runs 262144.
+Note: qk-server runs `--ctx 16384`; gemma runs 262144.
