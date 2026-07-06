@@ -2661,6 +2661,7 @@ struct qk_engine {
     VkCtx c{};
     Gguf g;
     uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
+    bool shareFork = false;  // QK_FORK: cache each fresh prompt's prefill so same-prompt requests fork it
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
     static constexpr uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
     static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64, nLayer = 40;
@@ -2841,7 +2842,12 @@ void qk_engine::snapshotSlot(uint32_t slot) {
         if (pcache[i].lru < pcache[idx].lru) idx = (int)i;
     }
     CacheEntry& e = pcache[idx];
-    e.tokens = sl.prompt;
+    // Key by exactly the `pos` processed tokens: the first min(pos, |prompt|) prompt
+    // tokens plus the fedGen generated tokens. (For an on-finish snapshot pos >= |prompt|
+    // so this is the whole prompt + fed gens; for a prefill-boundary snapshot pos < |prompt|
+    // so it is the prefilled prefix — which stays consistent with the captured state.)
+    size_t pp = std::min((size_t)sl.pos, sl.prompt.size());
+    e.tokens.assign(sl.prompt.begin(), sl.prompt.begin() + pp);
     e.tokens.insert(e.tokens.end(), sl.genTokens.begin(), sl.genTokens.begin() + fedGen);
     e.lru = ++lruClock;
     e.valid = true;
@@ -2873,6 +2879,7 @@ void qk_engine::restoreInto(uint32_t slot, int cacheIdx) {
 bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t errLen) {
     auto fail = [&](const char* m) { if (err && errLen) snprintf(err, errLen, "%s", m); return false; };
     nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
+    shareFork = getenv("QK_FORK") != nullptr;
     // fa_attn_srv is flash-attention (tiled) now, so nCtx is bounded by KV-cache
     // VRAM (~32K at 4 slots on a 20 GB card), not shared memory.
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 32768 || chunkN < 1 || chunkN > 32)
@@ -3602,6 +3609,11 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
             std::vector<float> unused;
             e->prefillBatchLast(prompt, K, slot, unused, /*wantLogits=*/false);  // resets slot, fills [0,K)
             s.cursor = K; s.pos = K;
+            // Fork mode: snapshot the shared [0,K) prefill keyed by prompt[0:K] so a
+            // concurrent/subsequent SAME-PROMPT request hits matchPrefix and restores
+            // it (~one state copy) instead of re-running the whole prefill. slot_start
+            // is called per request in sequence, so request 1 caches and 2..N fork.
+            if (e->shareFork) { s.prompt.assign(prompt, prompt + n_prompt); e->snapshotSlot(slot); }
         } else {
             e->resetSlot(slot);  // clear any prior occupant's recurrent state
             s.cursor = 0; s.pos = 0;
