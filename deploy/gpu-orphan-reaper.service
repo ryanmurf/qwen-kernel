@@ -1,0 +1,9 @@
+[Unit]
+Description=Reap orphaned local qk dev-server processes holding the GPU
+After=multi-user.target
+
+[Service]
+Type=oneshot
+# Path assumes the repo lives here; adjust if relocated.
+ExecStart=/home/ryan/IdeaProjects/qwen-kernel/deploy/gpu-orphan-reaper.sh
+Environment=AGE_MIN=15
