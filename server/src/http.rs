@@ -370,7 +370,9 @@ pub(crate) fn submit_generation(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ServerError::QueueFull("request queue is full".to_owned()))?;
-    let (tx, rx) = tokio_mpsc::channel(16);
+    // Headroom so a briefly-busy SSE consumer doesn't force the engine onto
+    // its buffered-retry path; a stalled consumer is handled there regardless.
+    let (tx, rx) = tokio_mpsc::channel(64);
     state
         .engine
         .submit(Job {
