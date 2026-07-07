@@ -50,7 +50,8 @@ void main() {
             uint hh = gg >> 3u;
             uint r  = (gg & 7u) >> 1u;
             uint is = gg & 1u;
-            uint bi = (sel[rq].ids[s] * pc.n_embd + o) * kb + b;
+            uint eid = min(sel[rq].ids[s], pc.n_expert - 1u);  // guard vs OOB weight read
+            uint bi = (eid * pc.n_embd + o) * kb + b;
 
             float d  = float(dw[bi].d);
             float sc = float(int(dw[bi].scales[hh * 8u + r * 2u + is]));

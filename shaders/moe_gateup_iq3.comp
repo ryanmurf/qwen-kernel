@@ -44,7 +44,8 @@ void main() {
     if (s < pc.n_used) {
         uint kb   = pc.n_embd / 256u;  // super-blocks per row
         uint nu   = kb * 32u;          // 8-element groups per row
-        uint base = (sel[rq].ids[s] * pc.n_ff + r) * kb;
+        uint eid  = min(sel[rq].ids[s], pc.n_expert - 1u);  // guard vs OOB weight read
+        uint base = (eid * pc.n_ff + r) * kb;
 
         for (uint u = tid; u < nu; u += 256u) {
             uint b    = u >> 5u;

@@ -24,7 +24,13 @@ void main() {
     uint t = gl_LocalInvocationID.x;
     uint rq = gl_WorkGroupID.z;
 
-    sl[t] = t < pc.n_expert ? logits[rq * pc.n_expert + t] : -3.4e38;
+    // Sanitize: a NaN/Inf router logit (numerical blowup deep into a long
+    // prefill) must not win the argmax below — otherwise a padding lane
+    // (t >= n_expert) can be selected and yield an out-of-range expert id, an
+    // OOB expert-weight read, and a GPU page fault. Map non-finite logits to
+    // the padding floor so real experts always win ties over padding lanes.
+    float lv = t < pc.n_expert ? logits[rq * pc.n_expert + t] : -3.4e38;
+    sl[t] = (isnan(lv) || isinf(lv)) ? -3.4e38 : lv;
 
     // shared-expert gate dot
     float sacc = 0.0;
@@ -51,7 +57,10 @@ void main() {
             barrier();
         }
         if (t == 0u) {
-            sel[rq].ids[i] = redi[0];
+            // Clamp: guarantee a valid expert id even if the argmax degenerated
+            // (all-nonfinite logits) and a padding lane slipped through.
+            uint id = min(redi[0], pc.n_expert - 1u);
+            sel[rq].ids[i] = id;
             sel[rq].w[i] = red[0];          // logit for now, softmaxed below
             sl[redi[0]] = -3.4e38;
         }
