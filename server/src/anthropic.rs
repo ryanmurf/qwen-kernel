@@ -290,6 +290,72 @@ fn render_prompt(req: &MessagesReq) -> Result<String> {
     Ok(out)
 }
 
+// Cap any single rendered tool_result. A giant tool dump (whole POM, dependency
+// tree, tarball/file listing) is the usual cause of context overflow, and it is
+// safe to truncate to head+tail — the agent keeps its own earlier findings and
+// can re-query narrowly. ~12k chars ≈ 3–4k tokens: generous for a focused real
+// output, decisive against a whole-file dump. Tunable via QK_MAX_TOOL_CHARS.
+fn max_tool_result_chars() -> usize {
+    std::env::var("QK_MAX_TOOL_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1024)
+        .unwrap_or(12_000)
+}
+
+fn floor_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn cap_tool_output(s: String) -> String {
+    let max = max_tool_result_chars();
+    if s.len() <= max {
+        return s;
+    }
+    let half = max / 2;
+    let head = &s[..floor_boundary(&s, half)];
+    let tail = &s[ceil_boundary(&s, s.len().saturating_sub(half))..];
+    format!(
+        "{head}\n\n[tool output truncated to fit context — {} of {} chars shown; \
+         re-query more narrowly (grep/jq/head) if you need the rest]\n\n{tail}",
+        max,
+        s.len()
+    )
+}
+
+// Render the conversation so it fits n_ctx. Stage-1 tool-result capping (above)
+// usually suffices; if a long session still overflows, drop the OLDEST droppable
+// turn — never messages[0] (the task) and never the most recent KEEP_RECENT (the
+// agent's own findings, which it needs to emit its final JSON) — and retry. This
+// is a graceful last resort: a server that trims to fit beats hard-erroring the
+// whole item after minutes of work ("Prompt is too long").
+fn fit_to_context(state: &AppState, req: &mut MessagesReq) -> Result<String> {
+    const KEEP_RECENT: usize = 6;
+    const CTX_RESERVE: u32 = 512; // leave room for at least a short generation
+    let budget = state.engine.n_ctx.saturating_sub(CTX_RESERVE);
+    loop {
+        let prompt = render_prompt(req)?;
+        let len = state.tokenizer.tokenize(&prompt, true)?.len() as u32;
+        if len <= budget || req.messages.len() <= 1 + KEEP_RECENT {
+            return Ok(prompt); // fits, or nothing safe left to drop
+        }
+        req.messages.remove(1); // drop the oldest turn after the task
+    }
+}
+
 fn render_user_content(content: &AnthropicContent) -> Result<String> {
     let blocks = match content {
         AnthropicContent::Text(text) => return Ok(text.clone()),
@@ -301,7 +367,7 @@ fn render_user_content(content: &AnthropicContent) -> Result<String> {
             "text" => parts.push(block.text.clone().unwrap_or_default()),
             "tool_result" => parts.push(format!(
                 "<tool_response>\n{}\n</tool_response>",
-                tool_result_text(block.content.as_ref())?
+                cap_tool_output(tool_result_text(block.content.as_ref())?)
             )),
             "image" => {
                 return Err(ServerError::bad_request(
@@ -611,12 +677,12 @@ pub async fn messages(
 
 async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Result<Response> {
     require_json(&headers)?;
-    let req: MessagesReq = parse_json(&body)?;
+    let mut req: MessagesReq = parse_json(&body)?;
     if req.messages.is_empty() {
         return Err(ServerError::bad_request("messages must not be empty"));
     }
     let model = req.model.clone().unwrap_or_else(|| state.model_alias.clone());
-    let prompt = render_prompt(&req)?;
+    let prompt = fit_to_context(&state, &mut req)?;
     let specs = tool_specs(&req.tools);
     let mut generation = prepare_generation(&state, Prompt::Text(prompt.clone()), req.max_tokens)?;
     generation.snap_prefix = history_boundary(&state, &prompt);
