@@ -3194,7 +3194,20 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             snapOff2[il] = off; off += layers[il].ps2;
         }
         snapSize = off;
-        const uint32_t PCACHE_N = 3;  // conversation snapshots kept (LRU)
+        // Conversation snapshots kept (LRU), HOST-visible buffers. NOTE: raising
+        // this does NOT help agentic multi-turn throughput — measured 0% hit at
+        // both 3 and 16. Cross-turn reuse misses for a different reason: the
+        // snapshot is keyed by the full rendered prompt, which ends with the
+        // generation scaffold "<|im_start|>assistant\n<think></think>", so turn
+        // N's snapshot is never a prefix of turn N+1 (the scaffold is replaced by
+        // the real reply). The real fix is to snapshot at the history boundary
+        // before that cue (see cross-turn-reuse task). Cache size only helps the
+        // identical-prompt fork case. QK_PCACHE tunable kept for experiments.
+        uint32_t PCACHE_N = 3;
+        if (const char* pcn = getenv("QK_PCACHE")) {
+            long v = strtol(pcn, nullptr, 10);
+            if (v >= 1 && v <= 256) PCACHE_N = (uint32_t)v;
+        }
         pcache.resize(PCACHE_N);
         for (auto& e : pcache)
             e.snap = createBuf(c, snapSize,
@@ -3692,6 +3705,15 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
             e->prefillBatchLast(prompt + done, chunk, slot, unused, /*wantLogits=*/false, /*base=*/done);
             done += chunk;
         }
+    }
+    // Prefix-cache hit-rate + prefill-cost instrumentation (QK_PCACHE_LOG).
+    // reuse = tokens restored from a cached prefix; prefill = tokens actually
+    // (re)computed this request. A collapsing hit-rate under concurrency is the
+    // signature of LRU thrashing (see QK_PCACHE above).
+    if (getenv("QK_PCACHE_LOG")) {
+        fprintf(stderr, "[pcache] slot=%u prompt=%u reuse=%u prefill=%u hit=%d\n",
+                slot, n_prompt, start, done - start, cidx >= 0 ? 1 : 0);
+        fflush(stderr);
     }
     s.cursor = done; s.pos = done;
     s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
