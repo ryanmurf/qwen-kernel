@@ -3676,7 +3676,8 @@ __attribute__((visibility("default"))) uint32_t qk_eos_token(const qk_engine* e)
 __attribute__((visibility("default"))) uint32_t qk_bos_token(const qk_engine* e) { return e->bosTok; }
 
 __attribute__((visibility("default")))
-int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt, uint32_t max_gen) {
+int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt,
+                  uint32_t max_gen, uint32_t snap_prefix) {
     if (!e || slot >= e->nSlots) return -1;
     if (e->slots[slot].active) return -2;
     if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
@@ -3698,32 +3699,50 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     // as the all-serial path would. A remaining <16-token tail prefills per-token serially.
     uint32_t target = n_prompt >= 1 ? n_prompt - 1 : 0;
     uint32_t done = start;
-    if (!getenv("QK_NO_BATCH")) {
-        while (target > done && target - done >= 16) {
-            uint32_t chunk = std::min(e->maxB, target - done);
+    auto batch_to = [&](uint32_t limit) {
+        while (limit > done && limit - done >= 16) {
+            uint32_t chunk = std::min(e->maxB, limit - done);
             std::vector<float> unused;
             e->prefillBatchLast(prompt + done, chunk, slot, unused, /*wantLogits=*/false, /*base=*/done);
             done += chunk;
         }
+    };
+    // Cross-turn reuse: snapshot the conversation-HISTORY prefix (before the
+    // generation scaffold), not the whole prompt. snap_prefix is the caller's
+    // history-boundary token count; keying the snapshot there makes it a genuine
+    // prefix of the NEXT turn's prompt (which appends the reply + new turn after
+    // the same history), so that turn restores it and prefills only its delta.
+    // Keying by the full prompt — which ends in "...assistant\n<think></think>" —
+    // never matches the next turn (that scaffold is replaced by the real reply).
+    uint32_t snapAt = (snap_prefix > start && snap_prefix < target) ? snap_prefix : 0;
+    uint32_t snapPos = 0;
+    if (!getenv("QK_NO_BATCH")) {
+        if (snapAt) {
+            batch_to(snapAt);
+            if (e->shareFork && done > start) {
+                s.pos = done; s.prompt.assign(prompt, prompt + n_prompt);
+                e->snapshotSlot(slot);    // keyed by prompt[0:done] = history prefix
+                snapPos = done;
+            }
+        }
+        batch_to(target);
     }
     // Prefix-cache hit-rate + prefill-cost instrumentation (QK_PCACHE_LOG).
-    // reuse = tokens restored from a cached prefix; prefill = tokens actually
-    // (re)computed this request. A collapsing hit-rate under concurrency is the
-    // signature of LRU thrashing (see QK_PCACHE above).
+    // reuse = tokens restored from a cached prefix; prefill = tokens (re)computed
+    // this request; snap = history-boundary position cached for the next turn.
     if (getenv("QK_PCACHE_LOG")) {
-        fprintf(stderr, "[pcache] slot=%u prompt=%u reuse=%u prefill=%u hit=%d\n",
-                slot, n_prompt, start, done - start, cidx >= 0 ? 1 : 0);
+        fprintf(stderr, "[pcache] slot=%u prompt=%u reuse=%u prefill=%u hit=%d snap=%u\n",
+                slot, n_prompt, start, done - start, cidx >= 0 ? 1 : 0, snapPos);
         fflush(stderr);
     }
     s.cursor = done; s.pos = done;
     s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
     s.genTokens.clear();
     s.gen = 0; s.maxGen = max_gen; s.last = 0;
-    // Fork mode: cache the shared prefill (keyed by prompt[0:done]) so a concurrent or
-    // subsequent SAME-PROMPT request hits matchPrefix and restores it (~one state copy)
-    // instead of re-prefilling. slot_start runs per request in sequence, so request 1
-    // caches and 2..N fork.
-    if (e->shareFork && done > start) e->snapshotSlot(slot);
+    // If we did not take a history snapshot (snap_prefix disabled / prompt too
+    // short), fall back to caching the full prefill so identical-prompt requests
+    // still fork off it.
+    if (e->shareFork && snapPos == 0 && done > start) e->snapshotSlot(slot);
     return 0;
 }
 
@@ -3915,13 +3934,13 @@ int main(int argc, char** argv) {
         uint32_t finMask = 0;
         auto t0 = std::chrono::steady_clock::now();
         fprintf(stderr, "[t2] slot_start 0 (%zu toks)\n", p1.size());
-        if (qk_slot_start(e, 0, p1.data(), (uint32_t)p1.size(), nGen)) { fprintf(stderr, "start0 failed\n"); return 1; }
+        if (qk_slot_start(e, 0, p1.data(), (uint32_t)p1.size(), nGen, 0)) { fprintf(stderr, "start0 failed\n"); return 1; }
         uint32_t steps = 0;
         bool started2 = false;
         while (true) {
             if (!started2 && steps >= delay) {
                 fprintf(stderr, "[t2] slot_start 1 (%zu toks) at step %u\n", p2.size(), steps);
-                if (qk_slot_start(e, 1, p2.data(), (uint32_t)p2.size(), nGen)) { fprintf(stderr, "start1 failed\n"); return 1; }
+                if (qk_slot_start(e, 1, p2.data(), (uint32_t)p2.size(), nGen, 0)) { fprintf(stderr, "start1 failed\n"); return 1; }
                 started2 = true;
             }
             int active = qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask);
@@ -3969,7 +3988,7 @@ int main(int argc, char** argv) {
         uint32_t finMask = 0;
         auto t0 = std::chrono::steady_clock::now();  // time the FULL request incl. prefill (slot_start)
         for (uint32_t s = 0; s < nSlots; s++)
-            qk_slot_start(e, s, prompt.data(), (uint32_t)prompt.size(), nGen);
+            qk_slot_start(e, s, prompt.data(), (uint32_t)prompt.size(), nGen, 0);
         while (qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask) > 0)
             for (uint32_t s = 0; s < nSlots; s++)
                 for (uint32_t i = 0; i < outCnt[s]; i++) gen[s].push_back(outTok[s * ch + i]);
@@ -4004,7 +4023,7 @@ int main(int argc, char** argv) {
         uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 4096;
         auto run = [&](qk_engine* e, const std::vector<uint32_t>& ids, uint32_t g, double& ms) {
             std::vector<uint32_t> out;
-            qk_slot_start(e, 0, ids.data(), (uint32_t)ids.size(), g);
+            qk_slot_start(e, 0, ids.data(), (uint32_t)ids.size(), g, 0);
             uint32_t ch = qk_chunk(e);
             std::vector<uint32_t> ot((size_t)ch), oc(1);
             uint32_t fin = 0;
@@ -4154,7 +4173,7 @@ int main(int argc, char** argv) {
 
             // Reference: all-serial prefill+decode on slot 1.
             std::vector<uint32_t> refSeq;
-            qk_slot_start(e, 1, toks.data(), N, M);
+            qk_slot_start(e, 1, toks.data(), N, M, 0);
             while (e->stepChunk(outTok.data(), outCnt.data(), &fin) > 0)
                 for (uint32_t i = 0; i < outCnt[1]; i++) refSeq.push_back(outTok[(size_t)1 * ch + i]);
 

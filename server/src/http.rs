@@ -158,7 +158,7 @@ async fn completion(
     let req: CompletionReq = parse_json(&body)?;
     let generation = prepare_generation(&state, req.prompt, req.n_predict.or(req.max_tokens))?;
     if req.stream {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
         Ok(sse_response(stream_llama(
             state,
             rx,
@@ -168,7 +168,7 @@ async fn completion(
         ))
         .into_response())
     } else {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
         let completed = collect_generation(&state, rx, &req.stop).await?;
         Ok(Json(llama_completion_body(
             &state,
@@ -189,10 +189,10 @@ async fn openai_completion(
     let req: CompletionReq = parse_json(&body)?;
     let generation = prepare_generation(&state, req.prompt, req.n_predict.or(req.max_tokens))?;
     if req.stream {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
         Ok(sse_response(stream_openai_completion(state, rx, generation)).into_response())
     } else {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
         let completed = collect_generation(&state, rx, &req.stop).await?;
         let finish = if completed.finish == FinishKind::Limit {
             "length"
@@ -266,7 +266,7 @@ async fn openai_chat_completion(
         req.n_predict.or(req.max_tokens),
     )?;
     if req.stream {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
         let include_usage = req
             .stream_options
             .as_ref()
@@ -274,7 +274,7 @@ async fn openai_chat_completion(
             .unwrap_or(false);
         Ok(sse_response(stream_openai_chat(state, rx, generation, include_usage)).into_response())
     } else {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
         let completed = collect_generation(&state, rx, &req.stop).await?;
         let finish = if completed.finish == FinishKind::Limit {
             "length"
@@ -304,6 +304,10 @@ async fn openai_chat_completion(
 pub(crate) struct Generation {
     pub(crate) prompt_ids: Vec<u32>,
     pub(crate) max_gen: u32,
+    // Conversation-history boundary (token count before the generation scaffold)
+    // for the cross-turn KV snapshot; 0 = cache the full prefill. The Anthropic
+    // path sets this from the rendered prompt; other paths leave it 0.
+    pub(crate) snap_prefix: u32,
     started: Instant,
 }
 
@@ -356,6 +360,7 @@ pub(crate) fn prepare_generation(
     Ok(Generation {
         prompt_ids,
         max_gen,
+        snap_prefix: 0,
         started: Instant::now(),
     })
 }
@@ -364,6 +369,7 @@ pub(crate) fn submit_generation(
     state: &AppState,
     prompt_ids: &[u32],
     max_gen: u32,
+    snap_prefix: u32,
 ) -> Result<tokio_mpsc::Receiver<SlotEvent>> {
     let permit = state
         .queue
@@ -378,6 +384,7 @@ pub(crate) fn submit_generation(
         .submit(Job {
             prompt_ids: prompt_ids.to_vec(),
             max_gen,
+            snap_prefix,
             events: tx,
             permit,
         })

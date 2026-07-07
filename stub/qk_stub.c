@@ -66,7 +66,9 @@ uint32_t qk_eos_token(const qk_engine *e){ (void)e; return QK_EOS; }
 uint32_t qk_bos_token(const qk_engine *e){ (void)e; return QK_BOS; }
 
 int qk_slot_start(qk_engine *e, uint32_t slot,
-                  const uint32_t *prompt, uint32_t n_prompt, uint32_t max_gen) {
+                  const uint32_t *prompt, uint32_t n_prompt, uint32_t max_gen,
+                  uint32_t snap_prefix) {
+    (void)snap_prefix;
     if (!e || slot >= e->cfg.n_slots) return -1;
     if (e->slots[slot].active) return -2;
     if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->cfg.n_ctx) return -3;

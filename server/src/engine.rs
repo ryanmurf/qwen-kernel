@@ -25,6 +25,8 @@ pub struct EngineThread {
 pub struct Job {
     pub prompt_ids: Vec<u32>,
     pub max_gen: u32,
+    // History-boundary token count for the cross-turn KV snapshot (0 = disabled).
+    pub snap_prefix: u32,
     pub events: tokio_mpsc::Sender<SlotEvent>,
     pub permit: OwnedSemaphorePermit,
 }
@@ -222,7 +224,7 @@ fn admit_jobs(engine: &mut Engine, queue: &mut VecDeque<Job>, slots: &mut [Optio
             break;
         };
         let events = job.events.clone();
-        match engine.slot_start(slot as u32, &job.prompt_ids, job.max_gen) {
+        match engine.slot_start(slot as u32, &job.prompt_ids, job.max_gen, job.snap_prefix) {
             Ok(()) => {
                 *state = Some(SlotState {
                     events,

@@ -21,7 +21,8 @@ type QkOpen =
     unsafe extern "C" fn(*const c_char, *const QkConfig, *mut c_char, usize) -> *mut QkEngineOpaque;
 type QkClose = unsafe extern "C" fn(*mut QkEngineOpaque);
 type QkGetter = unsafe extern "C" fn(*const QkEngineOpaque) -> u32;
-type QkSlotStart = unsafe extern "C" fn(*mut QkEngineOpaque, u32, *const u32, u32, u32) -> c_int;
+type QkSlotStart =
+    unsafe extern "C" fn(*mut QkEngineOpaque, u32, *const u32, u32, u32, u32) -> c_int;
 type QkSlotCancel = unsafe extern "C" fn(*mut QkEngineOpaque, u32);
 type QkStepChunk = unsafe extern "C" fn(*mut QkEngineOpaque, *mut u32, *mut u32, *mut u32) -> c_int;
 
@@ -107,7 +108,16 @@ impl Engine {
         })
     }
 
-    pub fn slot_start(&mut self, slot: u32, prompt: &[u32], max_gen: u32) -> Result<()> {
+    /// `snap_prefix` is the conversation-history boundary (token count before the
+    /// generation scaffold) at which to cache the KV state for cross-turn reuse;
+    /// 0 disables it (falls back to caching the full prefill).
+    pub fn slot_start(
+        &mut self,
+        slot: u32,
+        prompt: &[u32],
+        max_gen: u32,
+        snap_prefix: u32,
+    ) -> Result<()> {
         if prompt.is_empty() {
             bail!("prompt must not be empty");
         }
@@ -118,6 +128,7 @@ impl Engine {
                 prompt.as_ptr(),
                 u32::try_from(prompt.len()).context("prompt too long")?,
                 max_gen,
+                snap_prefix,
             )
         };
         if rc < 0 {

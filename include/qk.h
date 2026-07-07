@@ -42,8 +42,12 @@ uint32_t qk_bos_token(const qk_engine *e);
  * ("prefill") advances inside qk_step_chunk, one token per step, emitting
  * nothing until the prompt is consumed.
  * Returns 0 on success, negative on error (slot busy / bounds). */
+/* snap_prefix: conversation-history boundary (token count before the generation
+ * scaffold) at which to cache the KV state for cross-turn reuse; 0 caches the
+ * full prefill instead. */
 int qk_slot_start(qk_engine *e, uint32_t slot,
-                  const uint32_t *prompt, uint32_t n_prompt, uint32_t max_gen);
+                  const uint32_t *prompt, uint32_t n_prompt, uint32_t max_gen,
+                  uint32_t snap_prefix);
 
 /* Free a slot immediately (client disconnect, stop string hit).
  * Safe on an already-free slot. */

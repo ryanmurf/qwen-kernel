@@ -29,6 +29,29 @@ const TOOL_CLOSE: &str = "</tool_call>";
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
+/// The generation scaffold `render_prompt` appends after the conversation (see
+/// its final `push_str`). It must stay byte-identical to that suffix.
+const GEN_CUE: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+/// Token offset of the conversation-history boundary — the prompt with the
+/// trailing [`GEN_CUE`] scaffold stripped. Snapshotting the KV there (rather
+/// than after the whole prompt) makes turn N's cache entry a genuine prefix of
+/// turn N+1, which appends the reply + next turn *after the same history*, so
+/// N+1 restores it and prefills only its delta. Returns 0 (disabled) when the
+/// prompt doesn't end in the scaffold (e.g. an assistant-prefill continuation),
+/// which is always safe: matchPrefix verifies tokens before reusing, so an
+/// off/zero boundary only forgoes reuse, never corrupts output.
+fn history_boundary(state: &AppState, prompt: &str) -> u32 {
+    match prompt.strip_suffix(GEN_CUE) {
+        Some(history) => state
+            .tokenizer
+            .tokenize(history, true)
+            .map(|ids| ids.len() as u32)
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
 #[derive(Deserialize)]
 pub struct MessagesReq {
     model: Option<String>,
@@ -595,8 +618,14 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
     let model = req.model.clone().unwrap_or_else(|| state.model_alias.clone());
     let prompt = render_prompt(&req)?;
     let specs = tool_specs(&req.tools);
-    let generation = prepare_generation(&state, Prompt::Text(prompt.clone()), req.max_tokens)?;
-    let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen)?;
+    let mut generation = prepare_generation(&state, Prompt::Text(prompt.clone()), req.max_tokens)?;
+    generation.snap_prefix = history_boundary(&state, &prompt);
+    let rx = submit_generation(
+        &state,
+        &generation.prompt_ids,
+        generation.max_gen,
+        generation.snap_prefix,
+    )?;
     if req.stream {
         let job = StreamJob {
             generation,
@@ -642,7 +671,10 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
             let next_prompt = continuation_prompt(&prompt_text, &completed.content, &error);
             let resubmit =
                 prepare_generation(&state, Prompt::Text(next_prompt.clone()), req.max_tokens)
-                    .and_then(|next| submit_generation(&state, &next.prompt_ids, next.max_gen));
+                    .and_then(|mut next| {
+                        next.snap_prefix = history_boundary(&state, &next_prompt);
+                        submit_generation(&state, &next.prompt_ids, next.max_gen, next.snap_prefix)
+                    });
             if let Ok(next_rx) = resubmit {
                 tracing::warn!(
                     "malformed <tool_call> ({error}); re-prompting (retry {})",
@@ -958,7 +990,10 @@ fn stream_messages(
                 let next_prompt = continuation_prompt(&prompt_text, &raw_text, &error);
                 let resubmit =
                     prepare_generation(&state, Prompt::Text(next_prompt.clone()), job.max_tokens)
-                        .and_then(|next| submit_generation(&state, &next.prompt_ids, next.max_gen));
+                        .and_then(|mut next| {
+                            next.snap_prefix = history_boundary(&state, &next_prompt);
+                            submit_generation(&state, &next.prompt_ids, next.max_gen, next.snap_prefix)
+                        });
                 match resubmit {
                     Ok(next_rx) => {
                         tracing::warn!(
