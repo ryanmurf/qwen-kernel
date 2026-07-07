@@ -16,10 +16,10 @@ layout(std430, binding = 7) buffer BufVC { float vc[]; };
 layout(std430, binding = 8) readonly buffer BufRope { float ropeCS[]; };
 
 layout(push_constant) uniform PC {
-    // Host field order: tmax, dh, nRot, hQ, hKV, eps, freqBase, base, Tn.
+    // Host field order: tmax, dh, nRot, hQ, hKV, eps, freqBase, base, Tn, qbase.
     uint tmax; uint dh; uint nRot; uint hQ;
     uint hKV; float eps; float freqBase; uint base;
-    uint Tn;
+    uint Tn; uint qbase;
 } pc;
 
 shared float sv[256];

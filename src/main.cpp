@@ -2923,8 +2923,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAm1 = makePipe(c, "argmax1.spv", 3, 8);
     pAm2 = makePipe(c, "argmax2.spv", 3, 4);
     pEmb = makePipe(c, "embed_q6k.spv", 3, 12);
-    pPrepB = makePipe(c, "fa_prep_batch.spv", 9, 36);
-    pAttnB = makePipe(c, "fa_attn_batch.spv", 5, 36);
+    pPrepB = makePipe(c, "fa_prep_batch.spv", 9, 40);
+    pAttnB = makePipe(c, "fa_attn_batch.spv", 5, 40);
     pAbB = makePipe(c, "dn_ab_batch.spv", 6, 12);
     pConvB = makePipe(c, "dn_conv_batch.spv", 5, 20);   // +conv-window state out (decode handoff)
     pStepB = makePipe(c, "dn_step_batch.spv", 4, 16);   // +delta-rule S seed/persist (decode handoff)
@@ -3439,6 +3439,17 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         long x = v ? atol(v) : 8;
         return (uint32_t)(x < 1 ? 1 : x);
     }();
+    // Per-dispatch attention-work ceiling (queries * keys). fa_attn_batch cost is
+    // n*(base+n); at a long base a single full-chunk attention dispatch exceeds
+    // amdgpu's ~10 s gfx-ring timeout -> VK_ERROR_DEVICE_LOST. Tile the (fully
+    // independent) query axis so each attention dispatch stays under this budget.
+    // 128k leaves margin for a contended/thermally-clamped GPU (empirically ~256k
+    // is the single-slot hard limit). Tunable via env.
+    static const uint64_t attnBudget = [] {
+        const char* v = getenv("QK_ATTN_BUDGET");
+        long x = v ? atol(v) : 131072;
+        return (uint64_t)(x < 4096 ? 4096 : x);
+    }();
     auto flushCB = [&]() {
         VK_CHECK(vkEndCommandBuffer(c.cb));
         VkSubmitInfo fsi{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -3490,8 +3501,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     struct { uint32_t dState, hK_, hV_, Tn; } pcStepB{dS, hK, hV, n};
     struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
-    struct { uint32_t tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t base, Tn; }
-        pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, base, n};
+    struct { uint32_t tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t base, Tn, qbase; }
+        pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, base, n, 0};
     struct { uint32_t k, idx, pr; } pcE{nEmbd, 0, 1};
 
     // Seed each deltanet layer's conv carry: zero for a from-empty chunk (base=0), else
@@ -3536,9 +3547,25 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             proj(BL.sP2, hKV * dh, nEmbd, false);
             proj(BL.sP3, hKV * dh, nEmbd, false);
             barrier();
-            disp(pPrepB, BL.sPrep, hQ + 2 * hKV, &pcFaB, 36);
+            disp(pPrepB, BL.sPrep, hQ + 2 * hKV, &pcFaB, 40);
             barrier();
-            disp(pAttnB, BL.sAttn, hQ, &pcFaB, 36);
+            // Attention over the full [0, base+n) key range, but tiled along the
+            // independent query axis so no single dispatch exceeds attnBudget.
+            // Each tile flushes (submit + waitIdle) to bound its ring occupancy;
+            // queries carry no cross-tile state so this is exact.
+            {
+                uint32_t qt = (uint32_t)std::max<uint64_t>(1, attnBudget / (uint64_t)(base + n));
+                qt = std::min(qt, n);
+                for (uint32_t qo = 0; qo < n; qo += qt) {
+                    uint32_t tile = std::min(qt, n - qo);
+                    pcFaB.qbase = qo;
+                    zdim = tile;
+                    disp(pAttnB, BL.sAttn, hQ, &pcFaB, 40);
+                    if (qo + tile < n) { barrier(); flushCB(); }
+                }
+                pcFaB.qbase = 0;
+                zdim = n;
+            }
             barrier();
             proj(BL.sWo, nEmbd, dIn, true);
         }
@@ -3831,6 +3858,64 @@ int main(int argc, char** argv) {
 
     if (mode == "list") {
         listTensors(argc > 2 ? argv[2] : "");
+        return 0;
+    }
+
+    if (mode == "serve-test2") {
+        // Two slots, DIFFERENT prompts, admitted at a configurable step offset —
+        // the serving shape that wedges the GPU with >=2 active slots. Prompt 2
+        // is admitted after `delay` step_chunk calls (0 = simultaneous admission,
+        // like two requests arriving together).
+        if (argc < 5) {
+            fprintf(stderr, "usage: qk serve-test2 <ids1> <ids2> <nGen> [tmax] [delay]\n");
+            return 1;
+        }
+        auto readIds = [](const char* path, std::vector<uint32_t>& out) {
+            FILE* f = fopen(path, "r");
+            if (!f) { perror(path); return false; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) out.push_back((uint32_t)v);
+            fclose(f);
+            return true;
+        };
+        std::vector<uint32_t> p1, p2;
+        if (!readIds(argv[2], p1) || !readIds(argv[3], p2)) return 1;
+        uint32_t nGen = (uint32_t)atoi(argv[4]);
+        uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 4096;
+        uint32_t delay = argc > 6 ? (uint32_t)atoi(argv[6]) : 0;
+        qk_config cfg{2, tmax, 8};
+        char err[256] = {0};
+        qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+        uint32_t ch = qk_chunk(e);
+        std::vector<uint32_t> outTok((size_t)2 * ch), outCnt(2);
+        std::vector<std::vector<uint32_t>> gen(2);
+        uint32_t finMask = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        fprintf(stderr, "[t2] slot_start 0 (%zu toks)\n", p1.size());
+        if (qk_slot_start(e, 0, p1.data(), (uint32_t)p1.size(), nGen)) { fprintf(stderr, "start0 failed\n"); return 1; }
+        uint32_t steps = 0;
+        bool started2 = false;
+        while (true) {
+            if (!started2 && steps >= delay) {
+                fprintf(stderr, "[t2] slot_start 1 (%zu toks) at step %u\n", p2.size(), steps);
+                if (qk_slot_start(e, 1, p2.data(), (uint32_t)p2.size(), nGen)) { fprintf(stderr, "start1 failed\n"); return 1; }
+                started2 = true;
+            }
+            int active = qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask);
+            if (active < 0) { fprintf(stderr, "step error\n"); return 1; }
+            if (active == 0 && started2) break;
+            steps++;
+            for (uint32_t s = 0; s < 2; s++)
+                for (uint32_t i = 0; i < outCnt[s]; i++) gen[s].push_back(outTok[s * ch + i]);
+            if (steps % 64 == 0)
+                fprintf(stderr, "[t2] step %u gen0=%zu gen1=%zu\n", steps, gen[0].size(), gen[1].size());
+        }
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+        printf("serve-test2: OK gen0=%zu gen1=%zu tokens in %.1f ms (%u steps)\n",
+               gen[0].size(), gen[1].size(), ms, steps);
+        qk_close(e);
         return 0;
     }
 
