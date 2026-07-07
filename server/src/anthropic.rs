@@ -296,11 +296,14 @@ fn render_prompt(req: &MessagesReq) -> Result<String> {
 // can re-query narrowly. ~12k chars ≈ 3–4k tokens: generous for a focused real
 // output, decisive against a whole-file dump. Tunable via QK_MAX_TOOL_CHARS.
 fn max_tool_result_chars() -> usize {
+    // ~5k chars ≈ 1.3k tokens: enough for a focused tool output (package.json, a
+    // targeted grep/jq), small enough that many turns accumulate slowly and stay
+    // under the 16k window so the prefix cache keeps working without any trimming.
     std::env::var("QK_MAX_TOOL_CHARS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n >= 1024)
-        .unwrap_or(12_000)
+        .unwrap_or(5_000)
 }
 
 fn floor_boundary(s: &str, mut idx: usize) -> usize {
@@ -344,14 +347,37 @@ fn cap_tool_output(s: String) -> String {
 // whole item after minutes of work ("Prompt is too long").
 fn fit_to_context(state: &AppState, req: &mut MessagesReq) -> Result<String> {
     const KEEP_RECENT: usize = 6;
-    const CTX_RESERVE: u32 = 512; // leave room for at least a short generation
-    let budget = state.engine.n_ctx.saturating_sub(CTX_RESERVE);
+    const CTX_RESERVE: u32 = 512; // room for at least a short generation
+    let n_ctx = state.engine.n_ctx;
+    let hard = n_ctx.saturating_sub(CTX_RESERVE); // the server would reject beyond this
+    // When we MUST trim, cut down to a lower target so the session has headroom to
+    // grow a few more turns with its prefix cache intact — instead of pinning at
+    // the ceiling and cold-prefilling ~n_ctx tokens EVERY turn (each trim that
+    // drops a turn shifts the prefix and forces a full re-prefill that also blocks
+    // the single engine thread). Trims then happen every few turns, not every one.
+    let target = (n_ctx as f32 * 0.72) as u32;
+    let mut trimming = false;
     loop {
         let prompt = render_prompt(req)?;
         let len = state.tokenizer.tokenize(&prompt, true)?.len() as u32;
-        if len <= budget || req.messages.len() <= 1 + KEEP_RECENT {
-            return Ok(prompt); // fits, or nothing safe left to drop
+        let limit = if trimming { target } else { hard };
+        if len <= limit {
+            return Ok(prompt); // fits (with headroom once we started trimming)
         }
+        if req.messages.len() <= 1 + KEEP_RECENT {
+            // Can't drop more. If still over the HARD cap, the task + a few recent
+            // turns alone exceed the window — genuinely unfittable. Fail FAST (a
+            // clean error in ~one turn, seconds) rather than submit a giant prefill
+            // that grinds to the 2400s timeout and blocks the engine thread.
+            if len > hard {
+                return Err(ServerError::bad_request(
+                    "conversation exceeds the context window even after trimming; \
+                     keep tool outputs small (grep/jq/head)",
+                ));
+            }
+            return Ok(prompt); // between target and hard: acceptable, no more to drop
+        }
+        trimming = true;
         req.messages.remove(1); // drop the oldest turn after the task
     }
 }
