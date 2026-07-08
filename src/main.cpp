@@ -3626,6 +3626,23 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
 uint32_t qk_engine::serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
                                         std::vector<float>& logits) {
     logits.resize(vocab);
+    // This single-slot debug/harness helper steps via stepCBs[slot], which
+    // dispatches slots 0..slot *together*; the lower slots get stepped with the
+    // zeroed input below (token 0 at pos 0), which writes their K/V + recurrent
+    // state and corrupts any active session there. The recorded step CBs can't
+    // dispatch one arbitrary slot, so refuse rather than silently trample a live
+    // lower slot. (Callers use slot with all lower slots idle, so this never trips
+    // in practice — it only forecloses the landmine.)
+    for (uint32_t s = 0; s < slot; s++) {
+        if (slots[s].active) {
+            fprintf(stderr,
+                    "serialPrefillLogits(slot=%u): lower slot %u is active; refusing "
+                    "(would trample its state)\n",
+                    slot, s);
+            std::fill(logits.begin(), logits.end(), 0.0f);
+            return 0;
+        }
+    }
     resetSlot(slot);
     for (uint32_t s = 0; s < nSlots; s++) { slotInMap[s] = 0; slotPosMap[s] = 0; }
     // Feed each prompt token at its own position through the recorded serial step CB
