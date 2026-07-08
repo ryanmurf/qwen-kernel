@@ -3029,7 +3029,16 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         return ds;
     };
 
-    const uint32_t cap = 128;
+    // QK_MAXB: batch-prefill chunk width (tokens per prefillBatchLast submit).
+    // Every bb* activation buffer below scales linearly with it — bbLogits
+    // dominates at vocab*4 ≈ 1 MB per token of width — so the default stays 128;
+    // raise via env for experiments.
+    uint32_t cap = 128;
+    if (const char* v = getenv("QK_MAXB")) {
+        long x = atol(v);
+        if (x >= 16 && x <= 1024) cap = (uint32_t)x;
+        else fprintf(stderr, "QK_MAXB=%s out of range [16,1024]; using %u\n", v, cap);
+    }
     maxB = cap;
     bbXin = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbXn = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
@@ -4082,8 +4091,8 @@ int main(int argc, char** argv) {
     if (mode == "prefillcmp") {
         uint32_t N = argc > 2 ? (uint32_t)atoi(argv[2]) : 32;
         uint32_t ctx = argc > 3 ? (uint32_t)atoi(argv[3]) : 2048;
-        if (N < 1 || N > 128 || N + 1 > ctx) {
-            fprintf(stderr, "usage: qk prefillcmp [N<=128] [ctx]  (requires N+1 <= ctx)\n");
+        if (N < 1 || N > 1024 || N + 1 > ctx) {
+            fprintf(stderr, "usage: qk prefillcmp [N<=maxB] [ctx]  (requires N+1 <= ctx)\n");
             return 1;
         }
         qk_config cfg{2, ctx, 8};
@@ -4094,9 +4103,9 @@ int main(int argc, char** argv) {
         // Sweep a matrix of chunk sizes x seeds in one process (model load dominates).
         // For each: serial reference logits (robust to EOS) vs batched-prefill logits;
         // require argmax(last-token) to match AND report the logit-vector max abs diff.
-        uint32_t cap = std::min<uint32_t>(128, ctx - 1);
+        uint32_t cap = std::min<uint32_t>(e->maxB, ctx - 1);
         std::vector<uint32_t> sizes;
-        for (uint32_t s : {1u, 2u, 8u, 15u, 16u, 17u, 32u, 48u, 64u, 96u, 127u, 128u})
+        for (uint32_t s : {1u, 2u, 8u, 15u, 16u, 17u, 32u, 48u, 64u, 96u, 127u, 128u, 192u, 256u})
             if (s <= cap) sizes.push_back(s);
         if (N <= cap && std::find(sizes.begin(), sizes.end(), N) == sizes.end()) sizes.push_back(N);
         std::vector<uint32_t> seeds{1234u, 42u, 2026u};
@@ -4141,11 +4150,11 @@ int main(int argc, char** argv) {
         char err[256] = {0};
         qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
         if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
-        uint32_t cap = std::min<uint32_t>(128, ctx - 1);
+        uint32_t cap = std::min<uint32_t>(e->maxB, ctx - 1);
         std::vector<float> lS, lB;
         printf("prefillbench: serial (N per-token forwards) vs batched (1 forward), ctx=%u\n", ctx);
         printf("  %-6s %10s %10s %8s %10s\n", "N", "serial_ms", "batch_ms", "speedup", "tok/s_bat");
-        for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u}) {
+        for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u, 192u, 256u}) {
             if (N > cap) continue;
             std::mt19937 rng(1234);
             std::vector<uint32_t> toks(N);
@@ -4172,11 +4181,12 @@ int main(int argc, char** argv) {
         uint32_t N = argc > 2 ? (uint32_t)atoi(argv[2]) : 32;
         uint32_t M = argc > 3 ? (uint32_t)atoi(argv[3]) : 24;
         uint32_t ctx = argc > 4 ? (uint32_t)atoi(argv[4]) : 2048;
-        if (N < 1 || N > 128 || N + M > ctx) { fprintf(stderr, "usage: qk prefilldecode [N<=128] [M] [ctx]\n"); return 1; }
+        if (N < 1 || N > 1024 || N + M > ctx) { fprintf(stderr, "usage: qk prefilldecode [N<=maxB] [M] [ctx]\n"); return 1; }
         qk_config cfg{2, ctx, 8};
         char err[256] = {0};
         qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
         if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+        if (N > e->maxB) { fprintf(stderr, "N=%u > maxB=%u (raise QK_MAXB)\n", N, e->maxB); return 1; }
         uint32_t ch = qk_chunk(e);
         uint32_t nSl = qk_n_slots(e);
         std::vector<uint32_t> outTok((size_t)nSl * ch), outCnt(nSl);
