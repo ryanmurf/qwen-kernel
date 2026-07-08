@@ -6,7 +6,10 @@ scaled up. The `gemma-server` Service selects the shared label `gpu-llm: server`
 (carried by both backends' pods), so litellm and all clients keep hitting the
 same endpoint — whichever pod is Ready receives traffic.
 
-- `gemma-server` — llama.cpp Vulkan, `localhost:32000/llama-server:vulkan`
+- `gemma-server` — llama.cpp Vulkan, `localhost:32000/llama-server:vulkan-anthropic`
+  (master `25eec6f32`, built 2026-07-08, has the Anthropic `/v1/messages`
+  endpoint; the older `:vulkan` tag (b8671, OpenAI API only) is kept in the
+  registry for rollback)
 - `qk-server`    — this repo's engine, `localhost:32000/qk-server:vulkan`
   (safe-Rust HTTP server over `libqk.so`; privileged + `/dev/dri`, model from
   the same `/models` hostPath)
@@ -19,14 +22,17 @@ same endpoint — whichever pod is Ready receives traffic.
 ./deploy/switch.sh status
 ```
 
-The switch is transparent to litellm (`http://gemma-server.gemma.svc…:8080/v1`).
+Anthropic clients (the `claude-qwen` wrapper → Claude CLI) hit the Service
+directly at `POST /v1/messages`. Both backends speak the Anthropic Messages
+API natively (qk-server since 2026-07-06; gemma-server since the
+`:vulkan-anthropic` image), so the switch is transparent to the CLI as well.
+litellm is therefore unused and scaled to 0 — revive with
+`kubectl scale deploy/litellm -n gemma --replicas=1` if something needs its
+OpenAI-proxy path again.
 
-Anthropic clients (the `claude-qwen` wrapper → Claude CLI) hit the same
-Service directly at `POST /v1/messages` — qk-server speaks the Anthropic
-Messages API natively, so litellm is not in that path. (litellm's own
-`/v1/messages` translates to the OpenAI *Responses* API, which no local
-backend implements.) Note this endpoint only exists on qk-server, not on
-gemma-server/llama.cpp.
+CLI-path performance comparison of the two backends: see `bench/README.md`
+(2026-07-08: qk-server ~4–6× faster across single-shot, tool-call, and
+multi-turn scenarios).
 
 ## Rebuild the image after code changes
 
