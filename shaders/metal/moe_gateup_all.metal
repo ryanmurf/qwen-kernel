@@ -1,8 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Gate+up for routed AND shared experts in ONE dispatch (barriers cost
-// ~8 µs each on Apple GPUs — see PORT.md M3):
+// Gate+up for routed AND shared experts in ONE dispatch (the shared
+// expert rides in slot n_used; a dedicated dispatch would cost a barrier):
+// NOTE an inline-reselect variant (moe_pick_all per simdgroup, no select
+// stage) measured 39% SLOWER — the +30 register footprint collapses
+// occupancy on this DRAM-bound kernel. Selection stays a separate stage.
 //   slot s < n_used:  h[s*n_ff + r]      = silu(gE[ids[s]][r]·x) * (uE[ids[s]][r]·x)   (IQ3_XXS)
 //   slot s == n_used: h[n_used*n_ff + r] = silu(gS[r]·x) * (uS[r]·x)                    (Q8_0)
 // One SIMDGROUP per (slot, row) output; a simdgroup sees exactly one slot,

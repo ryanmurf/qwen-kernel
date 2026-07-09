@@ -13,14 +13,20 @@ struct block_q6_K {
 };
 static_assert(sizeof(block_q6_K) == 210, "q6_K block size");
 
-struct EmbPC { uint kdim; uint idx; uint perReq; };
+struct EmbPC { uint kdim; uint idx; uint perReq; float eps; };
 
+// Dequantizes the row AND applies the first layer's attn_norm in the same
+// threadgroup (saves a 1-tg rmsnorm stage per token).
 kernel void embed_q6k(device const block_q6_K* wb  [[buffer(0)]],
                       device const uint*       ids [[buffer(1)]],
                       device float*            x   [[buffer(2)]],
-                      constant EmbPC&          pc  [[buffer(3)]],
+                      device const float*      nw  [[buffer(3)]],
+                      device float*            xn  [[buffer(4)]],
+                      constant EmbPC&          pc  [[buffer(5)]],
                       uint3 tid3  [[thread_position_in_threadgroup]],
-                      uint3 tgpig [[threadgroup_position_in_grid]])
+                      uint3 tgpig [[threadgroup_position_in_grid]],
+                      uint  sgid  [[simdgroup_index_in_threadgroup]],
+                      uint  slid  [[thread_index_in_simdgroup]])
 {
     const uint t  = tid3.x;
     const uint kb = pc.kdim / 256u;
@@ -47,4 +53,22 @@ kernel void embed_q6k(device const block_q6_K* wb  [[buffer(0)]],
             x[ro + xo + i] = d * sc * float(q);
         }
     }
+
+    // first-layer RMS norm in the same threadgroup: make x visible, then
+    // reduce and scale
+    threadgroup float red[8];
+    threadgroup float bc;
+    threadgroup_barrier(mem_flags::mem_device);
+    float ss = 0.0f;
+    for (uint i = t; i < pc.kdim; i += 256u) ss += x[ro + i] * x[ro + i];
+    const float sg = simd_sum(ss);
+    if (slid == 0u) red[sgid] = sg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0u) {
+        float tot = 0.0f;
+        for (uint i = 0u; i < 8u; ++i) tot += red[i];
+        bc = 1.0f / sqrt(tot / float(pc.kdim) + pc.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = t; i < pc.kdim; i += 256u) xn[ro + i] = x[ro + i] * bc * nw[i];
 }
