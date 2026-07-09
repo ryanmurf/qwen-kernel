@@ -136,14 +136,21 @@ static id<MTLComputePipelineState> getPipe(MtlCtx& c, const char* file,
         c.libs[file] = lib;
     }
 
-    MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
-    [fc setConstantValue:&tpr type:MTLDataTypeUInt atIndex:0];
+    // tpr == 0: kernel has no function constants (mirrors makePipe's if (tpr))
     NSError* err = nil;
-    id<MTLFunction> f = [lib newFunctionWithName:[NSString stringWithUTF8String:fn]
-                                  constantValues:fc
-                                           error:&err];
+    id<MTLFunction> f = nil;
+    if (tpr) {
+        MTLFunctionConstantValues* fc = [MTLFunctionConstantValues new];
+        [fc setConstantValue:&tpr type:MTLDataTypeUInt atIndex:0];
+        f = [lib newFunctionWithName:[NSString stringWithUTF8String:fn]
+                      constantValues:fc
+                               error:&err];
+    } else {
+        f = [lib newFunctionWithName:[NSString stringWithUTF8String:fn]];
+    }
     if (!f) {
-        fprintf(stderr, "function %s: %s\n", fn, err.localizedDescription.UTF8String);
+        fprintf(stderr, "function %s: %s\n", fn,
+                err ? err.localizedDescription.UTF8String : "not found");
         exit(1);
     }
     id<MTLComputePipelineState> pso = [c.dev newComputePipelineStateWithFunction:f error:&err];
@@ -156,10 +163,16 @@ static id<MTLComputePipelineState> getPipe(MtlCtx& c, const char* file,
 }
 
 // UMA buffer: shared storage, host pointer == GPU memory. No staging.
-static id<MTLBuffer> createBuf(MtlCtx& c, size_t size, const void* init = nullptr) {
+// untracked=true opts out of automatic hazard tracking — the caller owns
+// ordering via explicit memoryBarrier (the Vulkan model; cuts driver
+// bookkeeping in multi-dispatch chains).
+static id<MTLBuffer> createBuf(MtlCtx& c, size_t size, const void* init = nullptr,
+                               bool untracked = false) {
+    MTLResourceOptions opt = MTLResourceStorageModeShared;
+    if (untracked) opt |= MTLResourceHazardTrackingModeUntracked;
     id<MTLBuffer> b = init
-        ? [c.dev newBufferWithBytes:init length:size options:MTLResourceStorageModeShared]
-        : [c.dev newBufferWithLength:size options:MTLResourceStorageModeShared];
+        ? [c.dev newBufferWithBytes:init length:size options:opt]
+        : [c.dev newBufferWithLength:size options:opt];
     if (!b) {
         fprintf(stderr, "buffer alloc failed (%zu MiB)\n", size >> 20);
         exit(1);
@@ -497,6 +510,262 @@ static bool caseGguf(MtlCtx& c, const std::string& tensorName, uint32_t iters) {
                    units, 1e-2, fixedNr0v, tgMem);
 }
 
+// ---------- fused MoE decode step (M3) ----------
+// Six dispatches, ONE command buffer per iteration; Metal hazard tracking
+// reproduces the Vulkan barrier ordering ({logits ∥ shared-gateup} ->
+// select -> routed-gateup -> routed-down -> shared-down).
+
+static bool caseMoe(MtlCtx& c, uint32_t layer, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    char nb[128];
+    auto T = [&](const char* suffix) -> const GgufTensor* {
+        snprintf(nb, sizeof nb, "blk.%u.%s", layer, suffix);
+        const GgufTensor* t = g.find(nb);
+        if (!t) fprintf(stderr, "missing tensor %s\n", nb);
+        return t;
+    };
+    const GgufTensor* tGI  = T("ffn_gate_inp.weight");
+    const GgufTensor* tGIS = T("ffn_gate_inp_shexp.weight");
+    const GgufTensor* tGE  = T("ffn_gate_exps.weight");
+    const GgufTensor* tUE  = T("ffn_up_exps.weight");
+    const GgufTensor* tDE  = T("ffn_down_exps.weight");
+    const GgufTensor* tGS  = T("ffn_gate_shexp.weight");
+    const GgufTensor* tUS  = T("ffn_up_shexp.weight");
+    const GgufTensor* tDS  = T("ffn_down_shexp.weight");
+    if (!tGI || !tGIS || !tGE || !tUE || !tDE || !tGS || !tUS || !tDS) return false;
+    if (tGI->type != GGML_F32 || tGIS->type != GGML_F32 ||
+        tGE->type != GGML_IQ3_XXS || tUE->type != GGML_IQ3_XXS ||
+        (tDE->type != GGML_IQ4_XS && tDE->type != GGML_Q6_K) ||
+        tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0 || tDS->type != GGML_Q8_0) {
+        fprintf(stderr, "layer %u tensor types don't match the compiled kernels\n", layer);
+        return false;
+    }
+    const bool downQ6 = tDE->type == GGML_Q6_K;  // layers 34/38/39 in this GGUF
+
+    const uint32_t nEmbd = (uint32_t)tGE->ne[0];
+    const uint32_t nFf   = (uint32_t)tGE->ne[1];
+    const uint32_t nExp  = (uint32_t)tGE->ne[2];
+    const uint32_t nUsed = 8;
+    if (nExp > 256) {
+        fprintf(stderr, "n_expert %u > 256 not supported by moe_select\n", nExp);
+        return false;
+    }
+    printf("\n== moe blk.%u  n_embd=%u n_ff=%u experts=%u top-%u + shared ==\n",
+           layer, nEmbd, nFf, nExp, nUsed);
+
+    auto x = randomX(nEmbd);
+    const size_t rbGE = ggmlRowBytes(GGML_IQ3_XXS, nEmbd);
+    const size_t rbDE = ggmlRowBytes(tDE->type, nFf);
+    const size_t rbGS = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t rbDS = ggmlRowBytes(GGML_Q8_0, nFf);
+
+    // ---- CPU reference (mirrors llama.cpp build_moe_ffn semantics) ----
+    printf("cpu reference...\n");
+    const float* gi  = (const float*)tGI->data;
+    const float* gis = (const float*)tGIS->data;
+    std::vector<double> logit(nExp);
+    for (uint32_t e = 0; e < nExp; e++) {
+        double a = 0;
+        for (uint32_t k = 0; k < nEmbd; k++) a += (double)gi[(size_t)e * nEmbd + k] * x[k];
+        logit[e] = a;
+    }
+    uint32_t ids[8];
+    double wsel[8];
+    {
+        std::vector<uint32_t> order(nExp);
+        for (uint32_t e = 0; e < nExp; e++) order[e] = e;
+        std::partial_sort(order.begin(), order.begin() + nUsed, order.end(),
+                          [&](uint32_t a, uint32_t b) { return logit[a] > logit[b]; });
+        double m = logit[order[0]], sum = 0;
+        for (uint32_t i = 0; i < nUsed; i++) {
+            ids[i] = order[i];
+            wsel[i] = std::exp(logit[order[i]] - m);
+            sum += wsel[i];
+        }
+        for (uint32_t i = 0; i < nUsed; i++) wsel[i] /= sum;
+    }
+    double sgDot = 0;
+    for (uint32_t k = 0; k < nEmbd; k++) sgDot += (double)gis[k] * x[k];
+    const double wShared = 1.0 / (1.0 + std::exp(-sgDot));
+
+    auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };
+    std::vector<float> yref(nEmbd, 0.f), tmpE(nEmbd), tmpF(nFf), hrow(nFf);
+    for (uint32_t s = 0; s < nUsed; s++) {
+        uint32_t e = ids[s];
+        for (uint32_t r = 0; r < nFf; r++) {
+            dequant_row_iq3_xxs((const block_iq3_xxs*)(tGE->data + ((size_t)e * nFf + r) * rbGE),
+                                tmpE.data(), nEmbd);
+            double ga = 0;
+            for (uint32_t k = 0; k < nEmbd; k++) ga += (double)tmpE[k] * x[k];
+            dequant_row_iq3_xxs((const block_iq3_xxs*)(tUE->data + ((size_t)e * nFf + r) * rbGE),
+                                tmpE.data(), nEmbd);
+            double ua = 0;
+            for (uint32_t k = 0; k < nEmbd; k++) ua += (double)tmpE[k] * x[k];
+            hrow[r] = (float)(silu(ga) * ua);
+        }
+        for (uint32_t o = 0; o < nEmbd; o++) {
+            const uint8_t* drow = tDE->data + ((size_t)e * nEmbd + o) * rbDE;
+            if (downQ6) dequant_row_q6_K((const block_q6_K*)drow, tmpF.data(), nFf);
+            else        dequant_row_iq4_xs((const block_iq4_xs*)drow, tmpF.data(), nFf);
+            double a = 0;
+            for (uint32_t k = 0; k < nFf; k++) a += (double)tmpF[k] * hrow[k];
+            yref[o] += (float)(wsel[s] * a);
+        }
+    }
+    for (uint32_t r = 0; r < nFf; r++) {
+        dequant_row_q8_0((const block_q8_0*)(tGS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
+        double ga = 0;
+        for (uint32_t k = 0; k < nEmbd; k++) ga += (double)tmpE[k] * x[k];
+        dequant_row_q8_0((const block_q8_0*)(tUS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
+        double ua = 0;
+        for (uint32_t k = 0; k < nEmbd; k++) ua += (double)tmpE[k] * x[k];
+        hrow[r] = (float)(silu(ga) * ua);
+    }
+    for (uint32_t o = 0; o < nEmbd; o++) {
+        dequant_row_q8_0((const block_q8_0*)(tDS->data + (size_t)o * rbDS), tmpF.data(), nFf);
+        double a = 0;
+        for (uint32_t k = 0; k < nFf; k++) a += (double)tmpF[k] * hrow[k];
+        yref[o] += (float)(wShared * a);
+    }
+
+    // ---- GPU setup ----
+    // one simdgroup per output row everywhere; NSG simdgroups per threadgroup.
+    // Four dispatches / three barriers: each barrier drains the GPU for
+    // ~8 µs, so shared-expert work rides inside the routed dispatches.
+    const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
+    id<MTLComputePipelineState> pLogits = getPipe(c, "moe_logits", "moe_logits", nsg);
+    id<MTLComputePipelineState> pSelect = getPipe(c, "moe_select", "moe_select", 0);
+    id<MTLComputePipelineState> pGu     = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    id<MTLComputePipelineState> pDn     = downQ6 ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
+                                                 : getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
+
+    const size_t szGI = (size_t)nExp * nEmbd * 4, szGIS = (size_t)nEmbd * 4;
+    const size_t szGE = (size_t)nExp * nFf * rbGE, szDE = (size_t)nExp * nEmbd * rbDE;
+    const size_t szGS = (size_t)nFf * rbGS, szDS = (size_t)nEmbd * rbDS;
+    const size_t szX = (size_t)nEmbd * 4, szY = (size_t)nEmbd * 4;
+    const size_t szH = (size_t)(nUsed + 1) * nFf * 4, szSel = 128, szL = (size_t)(nExp + 1) * 4;
+
+    id<MTLBuffer> bGI = createBuf(c, szGI, tGI->data, true), bGIS = createBuf(c, szGIS, tGIS->data, true);
+    id<MTLBuffer> bGE = createBuf(c, szGE, tGE->data, true), bUE = createBuf(c, szGE, tUE->data, true);
+    id<MTLBuffer> bDE = createBuf(c, szDE, tDE->data, true);
+    id<MTLBuffer> bGS = createBuf(c, szGS, tGS->data, true), bUS = createBuf(c, szGS, tUS->data, true);
+    id<MTLBuffer> bDS = createBuf(c, szDS, tDS->data, true);
+    id<MTLBuffer> bX = createBuf(c, szX, x.data(), true);
+    id<MTLBuffer> bL = createBuf(c, szL, nullptr, true), bH = createBuf(c, szH, nullptr, true);
+    id<MTLBuffer> bSel = createBuf(c, szSel, nullptr, true), bY = createBuf(c, szY, nullptr, true);
+
+    struct { uint32_t nEmbd, nFf, nExp, nUsed; } pcv{nEmbd, nFf, nExp, nUsed};
+    auto dispatchP = [&](id<MTLComputeCommandEncoder> enc,
+                         id<MTLComputePipelineState> pso,
+                         std::initializer_list<id<MTLBuffer>> bufs,
+                         uint32_t nOut, uint32_t outPerTg) {
+        [enc setComputePipelineState:pso];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:&pcv length:16 atIndex:i];
+        uint32_t wgs = (nOut + outPerTg - 1) / outPerTg;
+        uint32_t thr = outPerTg == 1 ? 32 : nsg * 32;
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+    };
+    // concurrent dispatch type: dispatches overlap unless explicitly
+    // barriered — the exact Vulkan semantics ({logits ∥ shared-gateup} ->
+    // barrier -> select -> ...). The default serial encoder drains the GPU
+    // between every dispatch, which costs ~17 µs per stage on this chain.
+    auto barrier = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    };
+    const int only = getenv("QK_MOE_ONLY") ? atoi(getenv("QK_MOE_ONLY")) : -1;
+    auto sequence = [&](id<MTLComputeCommandEncoder> enc) {
+        if (only >= 0) {  // stage isolation for profiling
+            switch (only) {
+                case 0: dispatchP(enc, pLogits, {bGI, bGIS, bX, bL}, nExp + 1, nsg); break;
+                case 1: dispatchP(enc, pSelect, {bL, bSel}, 1, 1); break;
+                case 2: dispatchP(enc, pGu, {bGE, bUE, bGS, bUS, bX, bSel, bH},
+                                  (nUsed + 1) * nFf, nsg); break;
+                case 3: dispatchP(enc, pDn, {bDE, bDS, bH, bSel, bY}, nEmbd, nsg); break;
+            }
+            return;
+        }
+        dispatchP(enc, pLogits, {bGI, bGIS, bX, bL}, nExp + 1, nsg);
+        barrier(enc);
+        dispatchP(enc, pSelect, {bL, bSel}, 1, 1);
+        barrier(enc);
+        dispatchP(enc, pGu, {bGE, bUE, bGS, bUS, bX, bSel, bH}, (nUsed + 1) * nFf, nsg);
+        barrier(enc);
+        dispatchP(enc, pDn, {bDE, bDS, bH, bSel, bY}, nEmbd, nsg);
+    };
+
+    // ---- correctness ----
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc =
+            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        sequence(enc);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+
+    std::vector<float> ygpu(nEmbd);
+    memcpy(ygpu.data(), bY.contents, szY);
+    struct SelOut { uint32_t ids[8]; float w[8]; float wShared; } selGpu;
+    memcpy(&selGpu, bSel.contents, sizeof(selGpu));
+
+    bool selOk = true;
+    for (uint32_t i = 0; i < nUsed; i++)
+        if (selGpu.ids[i] != ids[i] || std::fabs(selGpu.w[i] - wsel[i]) > 1e-4) selOk = false;
+    if (std::fabs(selGpu.wShared - wShared) > 1e-4) selOk = false;
+    printf("router: experts [");
+    for (uint32_t i = 0; i < nUsed; i++) printf("%u%s", selGpu.ids[i], i + 1 < nUsed ? " " : "");
+    printf("] shared_gate=%.4f  ->  %s\n", selGpu.wShared, selOk ? "MATCH" : "MISMATCH");
+
+    double rms = 0;
+    for (uint32_t o = 0; o < nEmbd; o++) rms += (double)yref[o] * yref[o];
+    rms = std::sqrt(rms / nEmbd);
+    double denomFloor = std::max(1e-3, 1e-3 * rms);
+    double maxRel = 0;
+    uint32_t bad = 0;
+    for (uint32_t o = 0; o < nEmbd; o++) {
+        double rel = std::fabs((double)ygpu[o] - yref[o]) /
+                     std::max(denomFloor, (double)std::fabs(yref[o]));
+        maxRel = std::max(maxRel, rel);
+        if (rel > 1e-2 && bad++ < 5) printf("  y[%u]: gpu=%g ref=%g\n", o, ygpu[o], yref[o]);
+    }
+    bool pass = selOk && bad == 0;
+    printf("correctness: max_rel_err = %.3g  ->  %s\n", maxRel, pass ? "PASS" : "FAIL");
+
+    // ---- benchmark ----
+    if ((pass || only >= 0) && iters > 0) {
+        auto runBench = [&]() -> double {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc =
+                    [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                for (uint32_t i = 0; i < iters; i++) {
+                    sequence(enc);
+                    barrier(enc);
+                }
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                return (cb.GPUEndTime - cb.GPUStartTime) * 1e9 / iters;
+            }
+        };
+        runBench();
+        double ns = runBench();
+        // weights actually touched per token (selected experts only)
+        double bytes = (double)szGI + szGIS +
+                       (double)nUsed * (2.0 * nFf * rbGE + (double)nEmbd * rbDE) +
+                       2.0 * (double)nFf * rbGS + (double)nEmbd * rbDS;
+        printf("gpu: %8.1f µs/layer-moe | %6.1f GB/s (active weights %.1f MiB) | 4 dispatches, 1 submit\n",
+               ns / 1e3, bytes / ns, bytes / (1 << 20));
+        printf("     40 layers -> %.2f ms/token MoE-FFN share\n", ns * 40 / 1e6);
+    }
+    return pass;
+}
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -548,6 +817,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             ok = caseGguf(c, argv[2], argU(3, 100));
+        } else if (mode == "moe") {
+            ok = caseMoe(c, argU(2, 0), argU(3, 200));
         } else {
             fprintf(stderr, "mode '%s' not ported to Metal yet "
                             "(M2: q8_0/q6_k/iq4_xs/iq3_xxs; M3: moe/block/ablock; "
