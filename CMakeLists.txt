@@ -7,6 +7,27 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+if(APPLE)
+    # Metal port: ObjC++ host, MSL compiled at runtime from shaders/metal/
+    # (no offline metal toolchain required). Vulkan/glslc not needed here.
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 17)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+
+    add_custom_target(metal_shaders ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${CMAKE_SOURCE_DIR}/shaders/metal ${CMAKE_BINARY_DIR}/shaders/metal
+        COMMENT "copy shaders/metal")
+
+    add_executable(qk src/main_metal.mm)
+    target_compile_options(qk PRIVATE -fobjc-arc)
+    target_link_libraries(qk PRIVATE "-framework Metal" "-framework Foundation")
+    add_dependencies(qk metal_shaders)
+
+    # libqk (qk.h C ABI) for the Rust server lands with M5.
+    return()
+endif()
+
 find_package(Vulkan REQUIRED)
 find_program(GLSLC glslc REQUIRED)
 

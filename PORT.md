@@ -97,7 +97,66 @@ the measured-bandwidth ceiling). RDNA3-parity extraction (this engine gets
   available, "tensor API" (M5+) not available, unified memory + residency
   sets in use.
 
-### Method notes
+## M1 — Metal harness + f16 GEMV (2026-07-08)
+
+**Delivered:** Metal host skeleton + the `qk` CLI on macOS + `gemv_f16`
+validated against the CPU reference and measured at **94–95% of theoretical
+DRAM bandwidth** on big tensors (515 GB/s on the 971 MiB output-head shape;
+the streaming-microbench ceiling from M0 was 494, so the GEMV beats the
+naive streamer).
+
+New files: `src/main_metal.mm` (ObjC++ TU mirroring `src/main.cpp`
+one-to-one: same CLI, same scale-aware validation, same output format),
+`shaders/metal/gemv_f16.metal`. CMake grows an `if(APPLE)` branch; the
+Vulkan/Linux path is untouched. MSL is JIT-compiled at runtime from
+`shaders/metal/` (mirrors the `loadSpv` flow, `QK_SHADER_DIR` wins; no
+offline metal toolchain needed — relevant on macOS 26 where `xcrun metal`
+is a separate download). Buffers are `storageModeShared`: upload/readback
+are plain memcpy on UMA, no staging path exists. Spec constant → function
+constant (TPR); push constants → `setBytes`; `subgroupAdd` → `simd_sum` /
+`simd_shuffle_down`; the Vulkan bench's barrier-serialized dispatch loop →
+one encoder whose Y write-after-write hazard serializes dispatches;
+timing via `MTLCommandBuffer` GPUStart/EndTime.
+
+f16 GEMV, correctness PASS on every shape (max_rel_err ≤ 2.5e-4, tol 1e-2):
+
+| shape (M×K) | W | tpr | GB/s | note |
+|---|---|---|---|---|
+| 16384×8192 | 256 MiB | 256 | 510.5 | suite default |
+| 8192×8192 | 128 MiB | 256 | 518–546 | run-to-run spread, partial SLC |
+| 248320×2048 | 971 MiB | 64 | **515.5** | output-head shape, cleanest DRAM number |
+| 8192×2048 | 32 MiB | 64 | 611 | **fits SLC — inflated, see below** |
+| 8192×512 | 8 MiB | 32 | 298 | launch-bound (~6 µs/dispatch floor) |
+| 4096×128 | 1 MiB | 16 | 70 | latency-bound; simd_shuffle path exercised |
+
+Findings, in port-note form:
+
+- **The RDNA3 TPR heuristic left 40% of bandwidth on the table** for
+  M-huge/K-small shapes: at tpr 256 the head GEMV gives each thread a
+  single 16 B load (315 GB/s); tpr 32–128 → 517–523 GB/s. New rule: after
+  the Vulkan skinny-row shrink, keep halving TPR while per-thread work
+  < 4 units and ≥1024 threadgroups remain. `QK_TPR=<n>` overrides for
+  crossover experiments (M6).
+- **M4 Max SLC (~48 MB) inflates small-W benches:** the 32 MiB shape
+  "streams" at 611–754 GB/s because iterations re-hit cache. Real decode
+  streams 2.5 GB/token through the SLC, so per-layer GEMVs in a token step
+  run at DRAM speed — bench conclusions must come from big or rotating
+  weights (M6 must re-check crossovers against real steady-state). Flip
+  side: activations/state are small and can live in SLC essentially free —
+  fused blocks (M3+) should lean on that.
+- Per-dispatch overhead floor is ~6 µs at small sizes — visible on the
+  8 MiB expert-shaped GEMV (298 GB/s). The full-layer fusion strategy
+  (pre-recorded command buffers, few submits) matters on Metal exactly as
+  it did on Vulkan.
+- `qk list`/`qk gguf` are wired; this model has no F16 tensors, so
+  real-tensor GEMV validation starts when the quant kernels land (M2).
+
+Blocker note (per charter cadence): `git push` of `metal-port` fails — the
+stored `gh` token is invalid (`gh auth status`: "token in default is
+invalid"; re-auth is interactive). Commits are local until Ryan runs
+`gh auth login -h github.com`. Retrying at each milestone.
+
+### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);
   `cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON
