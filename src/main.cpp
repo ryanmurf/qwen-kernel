@@ -2750,9 +2750,26 @@ struct qk_engine {
     // argmaxOut (optional): also run the z-batched argmax over ALL n logit rows and
     // write the n greedy ids (the prediction FOLLOWING toks[i]) — the spec-decode
     // verify primitive. Costs one head pass over n rows + two small reductions.
+    // scratchState: run the gated-DeltaNet layers against the SCRATCH stripe
+    // (index nSlots) instead of the slot's live stripe, leaving the live recurrent
+    // state untouched at `base` — the spec-decode verify mode. The caller seeds
+    // scratch (copyDnStripes) first; K/V writes still go to the live cache, which
+    // is safe under rejection (causal reads never pass the committed position).
     void prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
                           std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0,
-                          uint32_t* argmaxOut = nullptr);
+                          uint32_t* argmaxOut = nullptr, bool scratchState = false);
+    // Copy the 30 gated-DeltaNet layers' (conv window, delta-rule S) stripes
+    // between stripe indices (a slot, or the scratch stripe = nSlots). ~63 MB,
+    // one submit.
+    void copyDnStripes(uint32_t fromStripe, uint32_t toStripe);
+    // One spec-decode verify round: batched forward of n draft tokens from `base`
+    // on the scratch stripe + per-position greedy ids into outIds. Live state
+    // stays at `base`; K/V beyond the eventually-accepted prefix is garbage that
+    // is never read. Caller then either promotes (full accept) or re-runs the
+    // accepted prefix in live mode (commit pass).
+    void verifyRound(const uint32_t* toks, uint32_t n, uint32_t slot, uint32_t base,
+                     uint32_t* outIds);
+    void promoteScratch(uint32_t slot) { copyDnStripes(nSlots, slot); }
     // Serial reference: drive the recorded per-token step CB over n prompt tokens on
     // `slot`, then read back that slot's raw logit row (the prediction after the last
     // prompt token). Returns the greedy argmax (robust to EOS, unlike the slot API).
@@ -2838,6 +2855,33 @@ void qk_engine::copyStripes(uint32_t slot, VkBuffer snapBuf, bool save) {
     si.pCommandBuffers = &c.cb;
     VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
     VK_CHECK(vkQueueWaitIdle(c.queue));
+}
+
+void qk_engine::copyDnStripes(uint32_t fromStripe, uint32_t toStripe) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+    for (auto& L : layers) {
+        if (!L.rec) continue;
+        VkBufferCopy a{(VkDeviceSize)fromStripe * L.ps1, (VkDeviceSize)toStripe * L.ps1, L.ps1};
+        VkBufferCopy b{(VkDeviceSize)fromStripe * L.ps2, (VkDeviceSize)toStripe * L.ps2, L.ps2};
+        vkCmdCopyBuffer(c.cb, L.st1, L.st1, 1, &a);
+        vkCmdCopyBuffer(c.cb, L.st2, L.st2, 1, &b);
+    }
+    VK_CHECK(vkEndCommandBuffer(c.cb));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &c.cb;
+    VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(c.queue));
+}
+
+void qk_engine::verifyRound(const uint32_t* toks, uint32_t n, uint32_t slot, uint32_t base,
+                            uint32_t* outIds) {
+    copyDnStripes(slot, nSlots);  // seed scratch = live state at `base`
+    std::vector<float> dummy;
+    prefillBatchLast(toks, n, slot, dummy, /*wantLogits=*/false, base, outIds,
+                     /*scratchState=*/true);
 }
 
 // Snapshot a finished slot's state into an LRU cache entry, keyed by its full
@@ -3115,8 +3159,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                              (size_t)chQkv * 4 * 4);
             VkBuffer sn = W(T("ssm_norm.weight"), dS * 4);
             VkBuffer outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
-            VkBuffer convSt = W(nullptr, (size_t)nB * chQkv * 3 * 4);
-            VkBuffer S = W(nullptr, (size_t)nB * hV * dS * dS * 4);
+            // +1 stripe: the spec-decode verify scratch (stripe index nSlots).
+            // Verify rounds are engine-thread-serial, so one shared scratch
+            // stripe serves every slot (~63 MB total across the 30 rec layers).
+            VkBuffer convSt = W(nullptr, (size_t)(nB + 1) * chQkv * 3 * 4);
+            VkBuffer S = W(nullptr, (size_t)(nB + 1) * hV * dS * dS * 4);
             L.st1 = convSt; L.ps1 = (size_t)chQkv * 3 * 4;
             L.st2 = S;      L.ps2 = (size_t)hV * dS * dS * 4;
             L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
@@ -3421,7 +3468,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 // stable; review R1).
 void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
                                  std::vector<float>& logits, bool wantLogits, uint32_t base,
-                                 uint32_t* argmaxOut) {
+                                 uint32_t* argmaxOut, bool scratchState) {
     if (!toks || n < 1 || n > maxB || slot >= nSlots || (size_t)base + n > nCtx) {
         fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u\n", n, slot, base);
         exit(1);
@@ -3437,21 +3484,25 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     {
         VkDescriptorBufferInfo dbi; VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr.descriptorCount = 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr.pBufferInfo = &dbi;
-        auto rebind = [&](VkDescriptorSet ds, uint32_t binding, VkBuffer buf, size_t ps) {
-            dbi = {buf, (VkDeviceSize)slot * ps, (VkDeviceSize)ps};
+        auto rebind = [&](VkDescriptorSet ds, uint32_t binding, VkBuffer buf, size_t ps, uint32_t stripe) {
+            dbi = {buf, (VkDeviceSize)stripe * ps, (VkDeviceSize)ps};
             wr.dstSet = ds; wr.dstBinding = binding;
             vkUpdateDescriptorSets(c.dev, 1, &wr, 0, nullptr);
         };
+        // Verify mode: the DeltaNet scan seeds from and persists to the scratch
+        // stripe (pre-seeded by the caller); the live stripe keeps the state at
+        // `base`. K/V stays on the live slot — rejected positions are never read.
+        uint32_t dnStripe = scratchState ? nSlots : slot;
         for (uint32_t il = 0; il < nLayer; il++) {
             Layer& L = layers[il]; BLayer& BL = blayers[il];
             if (L.rec) {                                   // st1=convSt, st2=S
-                rebind(BL.sConv, 4, L.st1, L.ps1);
-                rebind(BL.sStep, 3, L.st2, L.ps2);
+                rebind(BL.sConv, 4, L.st1, L.ps1, dnStripe);
+                rebind(BL.sStep, 3, L.st2, L.ps2, dnStripe);
             } else {                                       // st1=kc, st2=vc
-                rebind(BL.sPrep, 6, L.st1, L.ps1);
-                rebind(BL.sPrep, 7, L.st2, L.ps2);
-                rebind(BL.sAttn, 1, L.st1, L.ps1);
-                rebind(BL.sAttn, 2, L.st2, L.ps2);
+                rebind(BL.sPrep, 6, L.st1, L.ps1, slot);
+                rebind(BL.sPrep, 7, L.st2, L.ps2, slot);
+                rebind(BL.sAttn, 1, L.st1, L.ps1, slot);
+                rebind(BL.sAttn, 2, L.st2, L.ps2, slot);
             }
         }
     }
@@ -4121,6 +4172,148 @@ int main(int argc, char** argv) {
             printf("  first divergence at token %zu\n", d);
         }
         return 0;
+    }
+
+    if (mode == "speccmp") {
+        // Spec-decode P1 harness: the full accept / reject / rollback state
+        // machine vs the serial stream. Drafts are taken from the serial
+        // reference (oracle) with every C-th drafted position corrupted, forcing
+        // partial accepts at controlled spots: C=0 pure oracle (always full
+        // accept + promote), C=1 every draft wrong (worst case: k=1 rounds, a
+        // commit pass each round). The reconstructed output must be
+        // token-identical to serial in EVERY mode — that is the rollback proof.
+        if (argc < 4) {
+            fprintf(stderr, "usage: qk speccmp <ids-file> <nGen> [K] [C,C,...]\n");
+            return 1;
+        }
+        std::vector<uint32_t> prompt;
+        {
+            FILE* f = fopen(argv[2], "r");
+            if (!f) { perror(argv[2]); return 1; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+            fclose(f);
+        }
+        uint32_t nGen = (uint32_t)atoi(argv[3]);
+        uint32_t K = argc > 4 ? (uint32_t)atoi(argv[4]) : 8;
+        std::vector<uint32_t> Cs{0, 4, 2, 1};
+        if (argc > 5) {
+            Cs.clear();
+            for (const char* p = argv[5]; *p;) {
+                Cs.push_back((uint32_t)strtoul(p, (char**)&p, 10));
+                if (*p == ',') p++;
+            }
+        }
+        qk_config cfg{1, 4096, 8};
+        char err[256] = {0};
+        qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+        if (K < 2 || K > e->maxB) { fprintf(stderr, "K must be in [2, maxB]\n"); return 1; }
+
+        // serial reference
+        std::vector<uint32_t> S = prompt;
+        double serialMsTok = 0;
+        {
+            qk_slot_start(e, 0, prompt.data(), (uint32_t)prompt.size(), nGen, 0);
+            uint32_t ch = qk_chunk(e), fin = 0;
+            std::vector<uint32_t> ot(ch), oc(1);
+            double decodeMs = 0;
+            uint32_t decodeTok = 0;
+            bool prefilled = false;
+            while (true) {
+                auto t0 = std::chrono::steady_clock::now();
+                int act = qk_step_chunk(e, ot.data(), oc.data(), &fin);
+                double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+                if (act <= 0) break;
+                for (uint32_t i = 0; i < oc[0]; i++) S.push_back(ot[i]);
+                if (prefilled) { decodeMs += ms; decodeTok += oc[0]; }
+                if (oc[0] > 0) prefilled = true;
+                if (fin & 1u) break;
+            }
+            serialMsTok = decodeTok ? decodeMs / decodeTok : 0;
+        }
+        uint32_t np = (uint32_t)prompt.size();
+        uint32_t sGen = (uint32_t)S.size() - np;
+        if (sGen < 4) { fprintf(stderr, "stream too short (early EOS?)\n"); return 1; }
+        printf("speccmp: prompt %u, serial %u gen tokens at %.2f ms/tok, K=%u\n",
+               np, sGen, serialMsTok, K);
+        printf("  %-8s %7s %7s %7s %9s %8s %10s   %s\n",
+               "corrupt", "rounds", "avg_k", "full%", "commits", "ms/tok", "vs_serial", "exact");
+
+        bool allOk = true;
+        std::vector<float> dummy;
+        std::vector<uint32_t> am(e->maxB), toks(e->maxB);
+        for (uint32_t C : Cs) {
+            // fresh live state: batch-prefill the prompt from empty; final chunk's
+            // argmax gives the first generated token
+            uint32_t next = 0;
+            for (uint32_t off = 0; off < np;) {
+                uint32_t n = std::min(e->maxB, np - off);
+                bool last = off + n >= np;
+                e->prefillBatchLast(prompt.data() + off, n, 0, dummy, false, off,
+                                    last ? am.data() : nullptr);
+                if (last) next = am[n - 1];
+                off += n;
+            }
+            std::vector<uint32_t> out{next};
+            uint32_t pos = np, rounds = 0, fullAcc = 0, commits = 0;
+            uint64_t sumK = 0;
+            double specMs = 0;
+            bool hitEos = false;
+            while (out.size() < sGen && !hitEos) {
+                uint32_t Kr = std::min(K, (uint32_t)S.size() - pos);
+                if (Kr < 1) break;
+                toks[0] = next;
+                for (uint32_t i = 1; i < Kr; i++) {
+                    toks[i] = S[pos + i];
+                    if (C > 0 && i % C == 0) toks[i] = toks[i] == 5 ? 6 : 5;  // guaranteed wrong
+                }
+                auto t0 = std::chrono::steady_clock::now();
+                e->verifyRound(toks.data(), Kr, 0, pos, am.data());
+                uint32_t k = 1;
+                while (k < Kr && toks[k] == am[k - 1]) k++;
+                if (k == Kr) {
+                    e->promoteScratch(0);
+                    fullAcc++;
+                } else {
+                    // rollback: live state is still at `pos`; re-run the k accepted
+                    // tokens in live mode to commit recurrent state + K/V
+                    e->prefillBatchLast(toks.data(), k, 0, dummy, false, pos);
+                    commits++;
+                }
+                specMs += std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+                rounds++;
+                sumK += k;
+                // emit: the accepted drafts (toks[1..k) == am[0..k-1)) plus the
+                // round's new token am[k-1]. Only am[k-1] can be EOS (accepted
+                // drafts come from S, which contains none).
+                for (uint32_t i = 1; i < k; i++) out.push_back(toks[i]);
+                if (am[k - 1] == qk_eos_token(e)) hitEos = true;
+                else out.push_back(am[k - 1]);
+                next = am[k - 1];
+                pos += k;
+            }
+            if (out.size() > sGen) out.resize(sGen);
+            bool ok = out.size() == sGen && std::equal(out.begin(), out.end(), S.begin() + np);
+            allOk = allOk && ok;
+            printf("  C=%-6u %7u %7.2f %6.0f%% %9u %8.2f %9.2fx   %s\n",
+                   C, rounds, rounds ? (double)sumK / rounds : 0,
+                   rounds ? 100.0 * fullAcc / rounds : 0, commits,
+                   out.empty() ? 0 : specMs / out.size(),
+                   specMs > 0 ? serialMsTok * out.size() / specMs : 0,
+                   ok ? "EXACT" : "**MISMATCH**");
+            if (!ok) {
+                size_t d = 0;
+                while (d < out.size() && d < sGen && out[d] == S[np + d]) d++;
+                printf("      first divergence at gen token %zu/%u\n", d, sGen);
+            }
+        }
+        printf("speccmp: %s\n", allOk ? "ROLLBACK TOKEN-EXACT (all corruption modes)"
+                                      : "DIVERGENCE (see above)");
+        qk_close(e);
+        return allOk ? 0 : 1;
     }
 
     if (mode == "verify") {
