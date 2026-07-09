@@ -24,7 +24,13 @@ if(APPLE)
     target_link_libraries(qk PRIVATE "-framework Metal" "-framework Foundation")
     add_dependencies(qk metal_shaders)
 
-    # libqk (qk.h C ABI) for the Rust server lands with M5.
+    # libqk.dylib: the qk.h C ABI for the Rust server (same TU, no main()).
+    add_library(qklib SHARED src/main_metal.mm)
+    set_target_properties(qklib PROPERTIES OUTPUT_NAME qk)
+    target_compile_definitions(qklib PRIVATE QK_LIBRARY)
+    target_compile_options(qklib PRIVATE -fobjc-arc)
+    target_link_libraries(qklib PRIVATE "-framework Metal" "-framework Foundation")
+    add_dependencies(qklib metal_shaders)
     return()
 endif()
 
