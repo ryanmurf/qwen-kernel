@@ -248,6 +248,52 @@ Q6_K = output head + token_embd (row lookup) + ffn_down_exps in blk
 (80 tensors, 8.2 GB stored); IQ4_XS = routed down experts in the other 37
 layers. F32 = norms, routers, ssm small tensors.
 
+## M3 — fused blocks: MoE step, DeltaNet block, attention block (2026-07-09)
+
+**Delivered:** the three fused decode structures, each validated against the
+CPU reference and timed. `qk moe`, `qk block`, `qk ablock` all run on Metal.
+
+| structure | correctness | µs (this GPU) | note |
+|---|---|---|---|
+| MoE step (`qk moe 0`) | PASS 1.2e-5, router MATCH | **64.2 µs/layer** | 4 dispatches, was 148.5 as a naive port |
+| MoE step, q6k downs (`qk moe 34`) | PASS 7.0e-6 | 87.1 | blk 34/38/39 variant |
+| DeltaNet block (`qk block 0`) | PASS ≤9.3e-5 ×3 tokens; state drift 6e-8 | **178.4 µs** | 14 dispatches incl. MoE |
+| attention block (`qk ablock 3`) | PASS ≤8.3e-5 ×3 tokens | **170.2 µs** (pos=2) | 13 dispatches incl. MoE |
+
+Projected decode from block timings: 30×178.4 + 10×170.2 + head 0.84 ms +
+embed/argmax ≈ **8.0 ms/token ≈ 126 tok/s ≈ 1.50× llama.cpp** — above the
+1.3× DoD line before M4 glue and M6 tuning. (Stretch 150 needs ~1.3 ms more
+off the blocks; see the overhead notes below.)
+
+Structural findings that drove the design (measured by
+`bench/metal_barrier_cost.swift`):
+
+- **memoryBarrier between dispatches costs ~3.5 µs** (not the problem);
+  **threadgroup launch throughput ~150 tgs/µs is the real tax** — a
+  2048-threadgroup dispatch takes ~14 µs even empty. Kernels therefore use
+  one SIMDGROUP per output row (not one 256-thread group), NSG=4 simds per
+  threadgroup, which cut the MoE chain 148.5 → 82 µs.
+- **A lone simdgroup doing a 2048-element dot is latency-bound (~20 µs)**
+  — no other warps hide DRAM latency. moe_select's shared-gate dot moved
+  into the parallel moe_logits dispatch (virtual row n_expert): 84 → 64 µs.
+- Merging the shared expert INTO the routed gateup/down dispatches (4
+  dispatches, 3 barriers, single y write) simplifies ordering; hazard
+  tracking is off (untracked buffers) and ordering is explicit
+  memoryBarrier in a concurrent-dispatch encoder — the Vulkan model.
+- dn_qknorm is FUSED into dn_step's staging pass (the head is resident in
+  threadgroup memory; norm = one simd_sum) — one dispatch + one device
+  barrier saved; k-head norms recompute per v-head, cheaper than the
+  barrier.
+- Remaining per-block time is ~76 µs genuine serial work (qkv GEMV ~30,
+  delta state R/W 8.4 MB ~21, ssm_out GEMV ~16) + ~40 µs stage overhead
+  (launch + barrier + single-tg latency kernels: rms/addN/add/select).
+  M6 leads: merge rms into the preceding residual add (add_rmsnorm
+  pattern engine-wide), atomic last-tg-standing logits→select fusion,
+  nr0=2 row pairs in the MoE kernels, f16 h/activations.
+
+Kernel inventory after M3: 19 MSL kernels; every decode-path operation of
+the hybrid architecture now has a validated Metal implementation.
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);

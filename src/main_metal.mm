@@ -766,6 +766,785 @@ static bool caseMoe(MtlCtx& c, uint32_t layer, uint32_t iters) {
     return pass;
 }
 
+
+// ---------- MoE tensor set + CPU reference (shared by moe/block modes) ----------
+
+struct MoeT {
+    const GgufTensor *gi, *gis, *ge, *ue, *de, *gs, *us, *ds;
+    uint32_t nEmbd, nFf, nExp, nUsed;
+    bool downQ6;
+    size_t rbGE, rbDE, rbGS, rbDS;
+};
+
+static bool loadMoeT(Gguf& g, uint32_t layer, MoeT& m) {
+    char nb[128];
+    auto T = [&](const char* suffix) -> const GgufTensor* {
+        snprintf(nb, sizeof nb, "blk.%u.%s", layer, suffix);
+        return g.find(nb);
+    };
+    m.gi = T("ffn_gate_inp.weight");
+    m.gis = T("ffn_gate_inp_shexp.weight");
+    m.ge = T("ffn_gate_exps.weight");
+    m.ue = T("ffn_up_exps.weight");
+    m.de = T("ffn_down_exps.weight");
+    m.gs = T("ffn_gate_shexp.weight");
+    m.us = T("ffn_up_shexp.weight");
+    m.ds = T("ffn_down_shexp.weight");
+    if (!m.gi || !m.gis || !m.ge || !m.ue || !m.de || !m.gs || !m.us || !m.ds) {
+        fprintf(stderr, "layer %u: missing MoE tensors\n", layer);
+        return false;
+    }
+    if (m.gi->type != GGML_F32 || m.gis->type != GGML_F32 ||
+        m.ge->type != GGML_IQ3_XXS || m.ue->type != GGML_IQ3_XXS ||
+        (m.de->type != GGML_IQ4_XS && m.de->type != GGML_Q6_K) ||
+        m.gs->type != GGML_Q8_0 || m.us->type != GGML_Q8_0 || m.ds->type != GGML_Q8_0) {
+        fprintf(stderr, "layer %u: unexpected MoE tensor types\n", layer);
+        return false;
+    }
+    m.nEmbd = (uint32_t)m.ge->ne[0];
+    m.nFf = (uint32_t)m.ge->ne[1];
+    m.nExp = (uint32_t)m.ge->ne[2];
+    m.nUsed = 8;
+    m.downQ6 = m.de->type == GGML_Q6_K;
+    m.rbGE = ggmlRowBytes(GGML_IQ3_XXS, m.nEmbd);
+    m.rbDE = ggmlRowBytes(m.de->type, m.nFf);
+    m.rbGS = ggmlRowBytes(GGML_Q8_0, m.nEmbd);
+    m.rbDS = ggmlRowBytes(GGML_Q8_0, m.nFf);
+    return true;
+}
+
+struct MoeRefSel {
+    uint32_t ids[8];
+    double w[8];
+    double wShared;
+};
+
+static void moeCpuRef(const MoeT& m, const float* x, float* yout, MoeRefSel* selOut) {
+    std::vector<double> logit(m.nExp);
+    const float* gi = (const float*)m.gi->data;
+    const float* gis = (const float*)m.gis->data;
+    for (uint32_t e = 0; e < m.nExp; e++) {
+        double a = 0;
+        for (uint32_t k = 0; k < m.nEmbd; k++) a += (double)gi[(size_t)e * m.nEmbd + k] * x[k];
+        logit[e] = a;
+    }
+    MoeRefSel sel;
+    {
+        std::vector<uint32_t> order(m.nExp);
+        for (uint32_t e = 0; e < m.nExp; e++) order[e] = e;
+        std::partial_sort(order.begin(), order.begin() + m.nUsed, order.end(),
+                          [&](uint32_t a, uint32_t b) { return logit[a] > logit[b]; });
+        double mx = logit[order[0]], sum = 0;
+        for (uint32_t i = 0; i < m.nUsed; i++) {
+            sel.ids[i] = order[i];
+            sel.w[i] = std::exp(logit[order[i]] - mx);
+            sum += sel.w[i];
+        }
+        for (uint32_t i = 0; i < m.nUsed; i++) sel.w[i] /= sum;
+    }
+    double sg = 0;
+    for (uint32_t k = 0; k < m.nEmbd; k++) sg += (double)gis[k] * x[k];
+    sel.wShared = 1.0 / (1.0 + std::exp(-sg));
+
+    auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };
+    std::vector<float> tmpE(m.nEmbd), tmpF(m.nFf), hrow(m.nFf);
+    for (uint32_t o = 0; o < m.nEmbd; o++) yout[o] = 0.f;
+    for (uint32_t s = 0; s < m.nUsed; s++) {
+        uint32_t e = sel.ids[s];
+        for (uint32_t r = 0; r < m.nFf; r++) {
+            dequant_row_iq3_xxs((const block_iq3_xxs*)(m.ge->data + ((size_t)e * m.nFf + r) * m.rbGE),
+                                tmpE.data(), m.nEmbd);
+            double ga = 0;
+            for (uint32_t k = 0; k < m.nEmbd; k++) ga += (double)tmpE[k] * x[k];
+            dequant_row_iq3_xxs((const block_iq3_xxs*)(m.ue->data + ((size_t)e * m.nFf + r) * m.rbGE),
+                                tmpE.data(), m.nEmbd);
+            double ua = 0;
+            for (uint32_t k = 0; k < m.nEmbd; k++) ua += (double)tmpE[k] * x[k];
+            hrow[r] = (float)(silu(ga) * ua);
+        }
+        for (uint32_t o = 0; o < m.nEmbd; o++) {
+            const uint8_t* drow = m.de->data + ((size_t)e * m.nEmbd + o) * m.rbDE;
+            if (m.downQ6) dequant_row_q6_K((const block_q6_K*)drow, tmpF.data(), m.nFf);
+            else          dequant_row_iq4_xs((const block_iq4_xs*)drow, tmpF.data(), m.nFf);
+            double a = 0;
+            for (uint32_t k = 0; k < m.nFf; k++) a += (double)tmpF[k] * hrow[k];
+            yout[o] += (float)(sel.w[s] * a);
+        }
+    }
+    for (uint32_t r = 0; r < m.nFf; r++) {
+        dequant_row_q8_0((const block_q8_0*)(m.gs->data + (size_t)r * m.rbGS), tmpE.data(), m.nEmbd);
+        double ga = 0;
+        for (uint32_t k = 0; k < m.nEmbd; k++) ga += (double)tmpE[k] * x[k];
+        dequant_row_q8_0((const block_q8_0*)(m.us->data + (size_t)r * m.rbGS), tmpE.data(), m.nEmbd);
+        double ua = 0;
+        for (uint32_t k = 0; k < m.nEmbd; k++) ua += (double)tmpE[k] * x[k];
+        hrow[r] = (float)(silu(ga) * ua);
+    }
+    for (uint32_t o = 0; o < m.nEmbd; o++) {
+        dequant_row_q8_0((const block_q8_0*)(m.ds->data + (size_t)o * m.rbDS), tmpF.data(), m.nFf);
+        double a = 0;
+        for (uint32_t k = 0; k < m.nFf; k++) a += (double)tmpF[k] * hrow[k];
+        yout[o] += (float)(sel.wShared * a);
+    }
+    if (selOut) *selOut = sel;
+}
+
+// ---------- gated-DeltaNet decode block (M3) ----------
+// attn_norm -> qkv/z/alpha/beta -> conv+silu -> l2norm -> delta rule ->
+// gated norm -> ssm_out -> residual/post-norm -> MoE-FFN -> residual, as
+// ONE command buffer of 15 dispatches. Conv and delta states persist on-GPU
+// across tokens, mirrored on CPU for validation.
+
+static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    char nb[128];
+    auto T = [&](const char* suffix) -> const GgufTensor* {
+        snprintf(nb, sizeof nb, "blk.%u.%s", layer, suffix);
+        return g.find(nb);
+    };
+    const GgufTensor* tAv = T("ssm_a");
+    if (!tAv) {
+        fprintf(stderr, "blk.%u is a full-attention layer (every 4th); pick a deltanet layer\n", layer);
+        return false;
+    }
+    const GgufTensor* tANorm = T("attn_norm.weight");
+    const GgufTensor* tQkvW  = T("attn_qkv.weight");
+    const GgufTensor* tZW    = T("attn_gate.weight");
+    const GgufTensor* tAl    = T("ssm_alpha.weight");
+    const GgufTensor* tBe    = T("ssm_beta.weight");
+    const GgufTensor* tDt    = T("ssm_dt.bias");
+    const GgufTensor* tKer   = T("ssm_conv1d.weight");
+    if (!tKer) tKer = T("ssm_conv1d");
+    const GgufTensor* tSN    = T("ssm_norm.weight");
+    const GgufTensor* tOutW  = T("ssm_out.weight");
+    const GgufTensor* tPN    = T("post_attention_norm.weight");
+    if (!tANorm || !tQkvW || !tZW || !tAl || !tBe || !tDt || !tKer || !tSN || !tOutW || !tPN) {
+        fprintf(stderr, "blk.%u: missing deltanet tensors\n", layer);
+        return false;
+    }
+    if (tQkvW->type != GGML_Q8_0 || tZW->type != GGML_Q8_0 || tOutW->type != GGML_Q8_0) {
+        fprintf(stderr, "blk.%u: unexpected projection types\n", layer);
+        return false;
+    }
+    MoeT moe;
+    if (!loadMoeT(g, layer, moe)) return false;
+
+    const uint32_t nEmbd = (uint32_t)tANorm->ne[0];
+    const uint32_t chQkv = (uint32_t)tQkvW->ne[1];
+    const uint32_t dIn   = (uint32_t)tZW->ne[1];
+    const uint32_t hV    = (uint32_t)tAv->ne[0];
+    const uint32_t dS    = (uint32_t)tSN->ne[0];
+    const uint32_t hK    = (chQkv - dIn) / dS / 2;
+    const float eps = 1e-6f;
+    printf("\n== block blk.%u (deltanet)  n_embd=%u qkv=%u d_inner=%u v-heads=%u k-heads=%u d_state=%u ==\n",
+           layer, nEmbd, chQkv, dIn, hV, hK, dS);
+    if (moe.nEmbd != nEmbd || dIn != hV * dS) {
+        fprintf(stderr, "dimension mismatch\n");
+        return false;
+    }
+
+    const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
+
+    // ---- pipes ----
+    const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
+    id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
+    id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);   // K = n_embd
+    id<MTLComputePipelineState> pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
+    id<MTLComputePipelineState> pConv  = getPipe(c, "dn_conv", "dn_conv", 0);
+    id<MTLComputePipelineState> pStep  = getPipe(c, "dn_step", "dn_step", 0);
+    id<MTLComputePipelineState> pGate  = getPipe(c, "dn_gate", "dn_gate", nsg);
+    id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);  // K = d_inner
+    id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
+    id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
+    id<MTLComputePipelineState> pMoeL  = getPipe(c, "moe_logits", "moe_logits", nsg);
+    id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
+    id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    id<MTLComputePipelineState> pMoeDn = moe.downQ6
+        ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
+        : getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
+
+    // ---- buffers (untracked; explicit barriers order the chain) ----
+    const size_t szMGE = (size_t)moe.nExp * moe.nFf * moe.rbGE;
+    const size_t szMDE = (size_t)moe.nExp * moe.nEmbd * moe.rbDE;
+    id<MTLBuffer> bANorm = createBuf(c, nEmbd * 4, tANorm->data, true);
+    id<MTLBuffer> bQkvW = createBuf(c, (size_t)chQkv * rbQ8e, tQkvW->data, true);
+    id<MTLBuffer> bZW = createBuf(c, (size_t)dIn * rbQ8e, tZW->data, true);
+    id<MTLBuffer> bAlW = createBuf(c, (size_t)hV * nEmbd * 4, tAl->data, true);
+    id<MTLBuffer> bBeW = createBuf(c, (size_t)hV * nEmbd * 4, tBe->data, true);
+    id<MTLBuffer> bDt = createBuf(c, hV * 4, tDt->data, true);
+    id<MTLBuffer> bAv = createBuf(c, hV * 4, tAv->data, true);
+    id<MTLBuffer> bKer = createBuf(c, (size_t)chQkv * 4 * 4, tKer->data, true);
+    id<MTLBuffer> bSN = createBuf(c, dS * 4, tSN->data, true);
+    id<MTLBuffer> bOutW = createBuf(c, (size_t)nEmbd * rbQ8i, tOutW->data, true);
+    id<MTLBuffer> bPN = createBuf(c, nEmbd * 4, tPN->data, true);
+    id<MTLBuffer> bMGI = createBuf(c, (size_t)moe.nExp * nEmbd * 4, moe.gi->data, true);
+    id<MTLBuffer> bMGIS = createBuf(c, nEmbd * 4, moe.gis->data, true);
+    id<MTLBuffer> bMGE = createBuf(c, szMGE, moe.ge->data, true);
+    id<MTLBuffer> bMUE = createBuf(c, szMGE, moe.ue->data, true);
+    id<MTLBuffer> bMDE = createBuf(c, szMDE, moe.de->data, true);
+    id<MTLBuffer> bMGS = createBuf(c, (size_t)moe.nFf * moe.rbGS, moe.gs->data, true);
+    id<MTLBuffer> bMUS = createBuf(c, (size_t)moe.nFf * moe.rbGS, moe.us->data, true);
+    id<MTLBuffer> bMDS = createBuf(c, (size_t)moe.nEmbd * moe.rbDS, moe.ds->data, true);
+
+    id<MTLBuffer> bXin = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bXn = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bQkv = createBuf(c, chQkv * 4, nullptr, true);
+    id<MTLBuffer> bZ = createBuf(c, dIn * 4, nullptr, true);
+    id<MTLBuffer> bGb = createBuf(c, 2 * hV * 4, nullptr, true);
+    id<MTLBuffer> bConvSt = createBuf(c, (size_t)chQkv * 3 * 4, nullptr, true);
+    id<MTLBuffer> bConvOut = createBuf(c, chQkv * 4, nullptr, true);
+    id<MTLBuffer> bS = createBuf(c, (size_t)hV * dS * dS * 4, nullptr, true);
+    id<MTLBuffer> bO = createBuf(c, dIn * 4, nullptr, true);
+    id<MTLBuffer> bAtt = createBuf(c, dIn * 4, nullptr, true);
+    id<MTLBuffer> bAttnOut = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bY = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bXn2 = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bML = createBuf(c, (moe.nExp + 1) * 4, nullptr, true);
+    id<MTLBuffer> bMH = createBuf(c, (size_t)(moe.nUsed + 1) * moe.nFf * 4, nullptr, true);
+    id<MTLBuffer> bMSel = createBuf(c, 128, nullptr, true);
+    id<MTLBuffer> bMY = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bOut = createBuf(c, nEmbd * 4, nullptr, true);
+    memset(bConvSt.contents, 0, (size_t)chQkv * 3 * 4);
+    memset(bS.contents, 0, (size_t)hV * dS * dS * 4);
+
+    struct { uint32_t n; float e; } pcRms{nEmbd, eps};
+    struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcOut{nEmbd, dIn};
+    struct { uint32_t n, h; } pcAb{nEmbd, hV};
+    struct { uint32_t ch; } pcConv{chQkv};
+    struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
+    struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
+    struct { uint32_t n; } pcAdd{nEmbd};
+    struct { uint32_t a, b, cc, d; } pcv{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed};
+
+    auto dsp = [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
+                   std::initializer_list<id<MTLBuffer>> bufs,
+                   const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr) {
+        [enc setComputePipelineState:pso];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:pc length:pcSize atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+    };
+    auto bar = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    };
+    const uint32_t thrN = nsg * 32;
+
+    auto sequence = [&](id<MTLComputeCommandEncoder> enc) {
+        dsp(enc, pRms, {bXin, bANorm, bXn}, &pcRms, 8, 1, 256);
+        bar(enc);
+        dsp(enc, pGemvA, {bQkvW, bXn, bQkv}, &pcQkv, 8, chQkv / 4, 256);
+        dsp(enc, pGemvA, {bZW, bXn, bZ}, &pcZ, 8, dIn / 4, 256);
+        dsp(enc, pAb, {bXn, bAlW, bBeW, bDt, bAv, bGb}, &pcAb, 8, (2 * hV + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pConv, {bConvSt, bQkv, bKer, bConvOut}, &pcConv, 4, (chQkv + 255) / 256, 256);
+        bar(enc);
+        dsp(enc, pStep, {bConvOut, bGb, bS, bO}, &pcStep, 16, hV, 128);
+        bar(enc);
+        dsp(enc, pGate, {bO, bSN, bZ, bAtt}, &pcGate, 12, (hV + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pGemvO, {bOutW, bAtt, bAttnOut}, &pcOut, 8, nEmbd / 2, 256);
+        bar(enc);
+        dsp(enc, pAddN, {bXin, bAttnOut, bPN, bY, bXn2}, &pcRms, 8, 1, 256);
+        bar(enc);
+        dsp(enc, pMoeL, {bMGI, bMGIS, bXn2, bML}, &pcv, 16, (moe.nExp + 1 + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
+        bar(enc);
+        dsp(enc, pMoeGu, {bMGE, bMUE, bMGS, bMUS, bXn2, bMSel, bMH}, &pcv, 16,
+            ((moe.nUsed + 1) * moe.nFf + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pMoeDn, {bMDE, bMDS, bMH, bMSel, bMY}, &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pAdd, {bY, bMY, bOut}, &pcAdd, 4, 1, 256);
+    };
+
+    // ---- CPU mirror state ----
+    std::vector<float> convSt((size_t)chQkv * 3, 0.f);
+    std::vector<float> S((size_t)hV * dS * dS, 0.f);
+    const float* anW = (const float*)tANorm->data;
+    const float* pnW = (const float*)tPN->data;
+    const float* alW = (const float*)tAl->data;
+    const float* beW = (const float*)tBe->data;
+    const float* dtB = (const float*)tDt->data;
+    const float* aV = (const float*)tAv->data;
+    const float* ker = (const float*)tKer->data;
+    const float* snW = (const float*)tSN->data;
+
+    std::vector<float> x(nEmbd), xn(nEmbd), qkv(chQkv), z(dIn), gvec(hV), bvec(hV),
+        convOut(chQkv), o(dIn), att(dIn), attnOut(nEmbd), y(nEmbd), xn2(nEmbd),
+        moeOut(nEmbd), refOut(nEmbd), gpuOut(nEmbd), tmpK(std::max(nEmbd, dIn));
+    auto q8Gemv = [&](const GgufTensor* t, const std::vector<float>& xin,
+                      std::vector<float>& out, uint32_t M, uint32_t K) {
+        size_t rb = ggmlRowBytes(GGML_Q8_0, K);
+        for (uint32_t r = 0; r < M; r++) {
+            dequant_row_q8_0((const block_q8_0*)(t->data + (size_t)r * rb), tmpK.data(), K);
+            double a = 0;
+            for (uint32_t k = 0; k < K; k++) a += (double)tmpK[k] * xin[k];
+            out[r] = (float)a;
+        }
+    };
+    auto rmsRef = [&](const std::vector<float>& in, const float* w, std::vector<float>& out) {
+        double ss = 0;
+        for (uint32_t i = 0; i < nEmbd; i++) ss += (double)in[i] * in[i];
+        double sc = 1.0 / std::sqrt(ss / nEmbd + eps);
+        for (uint32_t i = 0; i < nEmbd; i++) out[i] = (float)(in[i] * sc * w[i]);
+    };
+
+    std::mt19937 xr(123);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    bool pass = true;
+
+    printf("cpu reference + gpu, %u tokens...\n", nTok);
+    for (uint32_t t = 0; t < nTok; t++) {
+        for (auto& v : x) v = nd(xr);
+
+        // --- CPU reference ---
+        rmsRef(x, anW, xn);
+        q8Gemv(tQkvW, xn, qkv, chQkv, nEmbd);
+        q8Gemv(tZW, xn, z, dIn, nEmbd);
+        for (uint32_t h = 0; h < hV; h++) {
+            double da = 0, db = 0;
+            for (uint32_t k = 0; k < nEmbd; k++) {
+                da += (double)alW[(size_t)h * nEmbd + k] * xn[k];
+                db += (double)beW[(size_t)h * nEmbd + k] * xn[k];
+            }
+            double v = da + dtB[h];
+            double sp = v > 20.0 ? v : std::log1p(std::exp(v));
+            gvec[h] = (float)(aV[h] * sp);
+            bvec[h] = (float)(1.0 / (1.0 + std::exp(-db)));
+        }
+        for (uint32_t ch = 0; ch < chQkv; ch++) {
+            float* st = &convSt[(size_t)ch * 3];
+            double v = (double)st[0] * ker[ch * 4] + (double)st[1] * ker[ch * 4 + 1] +
+                       (double)st[2] * ker[ch * 4 + 2] + (double)qkv[ch] * ker[ch * 4 + 3];
+            convOut[ch] = (float)(v / (1.0 + std::exp(-v)));
+            st[0] = st[1];
+            st[1] = st[2];
+            st[2] = qkv[ch];
+        }
+        for (uint32_t w = 0; w < 2 * hK; w++) {
+            double ss = 0;
+            for (uint32_t i = 0; i < dS; i++) {
+                double v = convOut[(size_t)w * dS + i];
+                ss += v * v;
+            }
+            double sc = 1.0 / std::max(std::sqrt(ss), (double)eps);
+            for (uint32_t i = 0; i < dS; i++) convOut[(size_t)w * dS + i] *= (float)sc;
+        }
+        for (uint32_t h = 0; h < hV; h++) {
+            uint32_t kh = h % hK;
+            const float* qh = &convOut[(size_t)kh * dS];
+            const float* khp = &convOut[(size_t)(hK + kh) * dS];
+            const float* vh = &convOut[(size_t)(2 * hK) * dS + (size_t)h * dS];
+            float decay = std::exp(gvec[h]);
+            float beta = bvec[h];
+            float qsc = 1.0f / std::sqrt((float)dS);
+            for (uint32_t j = 0; j < dS; j++) {
+                float* row = &S[((size_t)h * dS + j) * dS];
+                double sk = 0;
+                for (uint32_t i = 0; i < dS; i++) sk += (double)row[i] * khp[i];
+                sk *= decay;
+                float dj = beta * (vh[j] - (float)sk);
+                double oj = 0;
+                for (uint32_t i = 0; i < dS; i++) {
+                    float sn = row[i] * decay + khp[i] * dj;
+                    row[i] = sn;
+                    oj += (double)sn * (qh[i] * qsc);
+                }
+                o[(size_t)h * dS + j] = (float)oj;
+            }
+        }
+        for (uint32_t h = 0; h < hV; h++) {
+            double ss = 0;
+            for (uint32_t j = 0; j < dS; j++) {
+                double v = o[(size_t)h * dS + j];
+                ss += v * v;
+            }
+            double sc = 1.0 / std::sqrt(ss / dS + eps);
+            for (uint32_t j = 0; j < dS; j++) {
+                double zv = z[(size_t)h * dS + j];
+                att[(size_t)h * dS + j] =
+                    (float)(o[(size_t)h * dS + j] * sc * snW[j] * (zv / (1.0 + std::exp(-zv))));
+            }
+        }
+        q8Gemv(tOutW, att, attnOut, nEmbd, dIn);
+        for (uint32_t i = 0; i < nEmbd; i++) y[i] = x[i] + attnOut[i];
+        rmsRef(y, pnW, xn2);
+        moeCpuRef(moe, xn2.data(), moeOut.data(), nullptr);
+        for (uint32_t i = 0; i < nEmbd; i++) refOut[i] = y[i] + moeOut[i];
+
+        // --- GPU ---
+        memcpy(bXin.contents, x.data(), nEmbd * 4);
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc =
+                [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            sequence(enc);
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        memcpy(gpuOut.data(), bOut.contents, nEmbd * 4);
+
+        double rms = 0;
+        for (uint32_t i = 0; i < nEmbd; i++) rms += (double)refOut[i] * refOut[i];
+        rms = std::sqrt(rms / nEmbd);
+        double floorD = std::max(1e-3, 1e-3 * rms);
+        double maxRel = 0;
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < nEmbd; i++) {
+            double rel = std::fabs((double)gpuOut[i] - refOut[i]) /
+                         std::max(floorD, (double)std::fabs(refOut[i]));
+            maxRel = std::max(maxRel, rel);
+            if (rel > 1e-2 && bad++ < 3)
+                printf("  tok%u y[%u]: gpu=%g ref=%g\n", t, i, gpuOut[i], refOut[i]);
+        }
+        pass &= bad == 0;
+        printf("token %u: max_rel_err = %.3g  ->  %s\n", t, maxRel, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    // delta state drift check after nTok tokens
+    {
+        const float* sg = (const float*)bS.contents;
+        double maxAbs = 0, rmsS = 0;
+        for (size_t i = 0; i < S.size(); i++) {
+            maxAbs = std::max(maxAbs, (double)std::fabs(sg[i] - S[i]));
+            rmsS += (double)S[i] * S[i];
+        }
+        rmsS = std::sqrt(rmsS / S.size());
+        printf("delta state after %u tokens: max_abs_diff = %.3g (state rms %.3g)\n", nTok, maxAbs, rmsS);
+    }
+
+    if (pass && iters > 0) {
+        auto runBench = [&]() -> double {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc =
+                    [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                for (uint32_t i = 0; i < iters; i++) {
+                    sequence(enc);
+                    bar(enc);
+                }
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                return (cb.GPUEndTime - cb.GPUStartTime) * 1e9 / iters;
+            }
+        };
+        runBench();
+        double ns = runBench();
+        printf("gpu: %8.1f µs/block | 14 dispatches, 1 submit\n", ns / 1e3);
+        printf("     30 deltanet blocks -> %.2f ms/token\n", ns * 30 / 1e6);
+    }
+    return pass;
+}
+
+
+// ---------- full-attention decode block (M3) ----------
+// attn_norm -> q(+gate)/k/v projections -> per-head RMS + partial NeoX rope
+// -> KV-cache attention + sigmoid gate -> wo -> residual/post-norm -> MoE ->
+// residual. KV cache persists on GPU.
+static const float kFreqBase = 1e7f;  // qwen35moe.rope.freq_base
+
+static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    char nb[128];
+    auto T = [&](const char* suffix) -> const GgufTensor* {
+        snprintf(nb, sizeof nb, "blk.%u.%s", layer, suffix);
+        return g.find(nb);
+    };
+    if (T("ssm_a")) {
+        fprintf(stderr, "blk.%u is a deltanet layer; use `qk block`\n", layer);
+        return false;
+    }
+    const GgufTensor* tANorm = T("attn_norm.weight");
+    const GgufTensor* tWq = T("attn_q.weight");
+    const GgufTensor* tWk = T("attn_k.weight");
+    const GgufTensor* tWv = T("attn_v.weight");
+    const GgufTensor* tQN = T("attn_q_norm.weight");
+    const GgufTensor* tKN = T("attn_k_norm.weight");
+    const GgufTensor* tWo = T("attn_output.weight");
+    const GgufTensor* tPN = T("post_attention_norm.weight");
+    if (!tANorm || !tWq || !tWk || !tWv || !tQN || !tKN || !tWo || !tPN) {
+        fprintf(stderr, "blk.%u: missing attention tensors\n", layer);
+        return false;
+    }
+    MoeT moe;
+    if (!loadMoeT(g, layer, moe)) return false;
+
+    const uint32_t nEmbd = (uint32_t)tANorm->ne[0];
+    const uint32_t dh    = (uint32_t)tQN->ne[0];            // 256
+    const uint32_t hQ    = (uint32_t)tWq->ne[1] / (2 * dh); // 16 (q+gate interleaved)
+    const uint32_t hKV   = (uint32_t)tWk->ne[1] / dh;       // 2
+    const uint32_t nRot  = 64;
+    const uint32_t qfN   = hQ * 2 * dh, kvN = hKV * dh, atN = hQ * dh;
+    const uint32_t tmax  = 128;
+    const float eps = 1e-6f;
+    printf("\n== ablock blk.%u (full attn)  n_embd=%u heads=%ux%u kv=%u rot=%u ==\n",
+           layer, nEmbd, hQ, dh, hKV, nRot);
+
+    const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t rbQ8a = ggmlRowBytes(GGML_Q8_0, atN);
+
+    const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
+    id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
+    id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
+    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", 0);
+    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", 0);
+    id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
+    id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
+    id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
+    id<MTLComputePipelineState> pMoeL  = getPipe(c, "moe_logits", "moe_logits", nsg);
+    id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
+    id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    id<MTLComputePipelineState> pMoeDn = moe.downQ6
+        ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
+        : getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
+
+    const size_t szMGE = (size_t)moe.nExp * moe.nFf * moe.rbGE;
+    const size_t szMDE = (size_t)moe.nExp * moe.nEmbd * moe.rbDE;
+    id<MTLBuffer> bANorm = createBuf(c, nEmbd * 4, tANorm->data, true);
+    id<MTLBuffer> bWq = createBuf(c, (size_t)qfN * rbQ8e, tWq->data, true);
+    id<MTLBuffer> bWk = createBuf(c, (size_t)kvN * rbQ8e, tWk->data, true);
+    id<MTLBuffer> bWv = createBuf(c, (size_t)kvN * rbQ8e, tWv->data, true);
+    id<MTLBuffer> bQN = createBuf(c, dh * 4, tQN->data, true);
+    id<MTLBuffer> bKN = createBuf(c, dh * 4, tKN->data, true);
+    id<MTLBuffer> bWo = createBuf(c, (size_t)nEmbd * rbQ8a, tWo->data, true);
+    id<MTLBuffer> bPN = createBuf(c, nEmbd * 4, tPN->data, true);
+    id<MTLBuffer> bMGI = createBuf(c, (size_t)moe.nExp * nEmbd * 4, moe.gi->data, true);
+    id<MTLBuffer> bMGIS = createBuf(c, nEmbd * 4, moe.gis->data, true);
+    id<MTLBuffer> bMGE = createBuf(c, szMGE, moe.ge->data, true);
+    id<MTLBuffer> bMUE = createBuf(c, szMGE, moe.ue->data, true);
+    id<MTLBuffer> bMDE = createBuf(c, szMDE, moe.de->data, true);
+    id<MTLBuffer> bMGS = createBuf(c, (size_t)moe.nFf * moe.rbGS, moe.gs->data, true);
+    id<MTLBuffer> bMUS = createBuf(c, (size_t)moe.nFf * moe.rbGS, moe.us->data, true);
+    id<MTLBuffer> bMDS = createBuf(c, (size_t)moe.nEmbd * moe.rbDS, moe.ds->data, true);
+
+    id<MTLBuffer> bXin = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bXn = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bQfull = createBuf(c, qfN * 4, nullptr, true);
+    id<MTLBuffer> bKin = createBuf(c, kvN * 4, nullptr, true);
+    id<MTLBuffer> bVin = createBuf(c, kvN * 4, nullptr, true);
+    id<MTLBuffer> bQhat = createBuf(c, atN * 4, nullptr, true);
+    id<MTLBuffer> bKC = createBuf(c, (size_t)hKV * tmax * dh * 4, nullptr, true);
+    id<MTLBuffer> bVC = createBuf(c, (size_t)hKV * tmax * dh * 4, nullptr, true);
+    id<MTLBuffer> bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
+    id<MTLBuffer> bAtt = createBuf(c, atN * 4, nullptr, true);
+    id<MTLBuffer> bAttnOut = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bY = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bXn2 = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bML = createBuf(c, (moe.nExp + 1) * 4, nullptr, true);
+    id<MTLBuffer> bMH = createBuf(c, (size_t)(moe.nUsed + 1) * moe.nFf * 4, nullptr, true);
+    id<MTLBuffer> bMSel = createBuf(c, 128, nullptr, true);
+    id<MTLBuffer> bMY = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bOut = createBuf(c, nEmbd * 4, nullptr, true);
+    {   // precomputed RoPE cos/sin table (see fa_prep binding 8)
+        const uint32_t half = nRot / 2;
+        float* rope = (float*)bRope.contents;
+        for (uint32_t p = 0; p < tmax; p++)
+            for (uint32_t j = 0; j < half; j++) {
+                float th = (float)p * std::pow(kFreqBase, -2.f * (float)j / (float)nRot);
+                rope[2 * ((size_t)p * half + j)]     = std::cos(th);
+                rope[2 * ((size_t)p * half + j) + 1] = std::sin(th);
+            }
+    }
+
+    struct { uint32_t n; float e; } pcRms{nEmbd, eps};
+    struct { uint32_t m, k; } pcQf{qfN, nEmbd}, pcK{kvN, nEmbd}, pcWo{nEmbd, atN};
+    struct FaPc { uint32_t pos, tmax, dh, nRot, hQ, hKV; float eps, fb; }
+        pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase};
+    struct { uint32_t n; } pcAdd{nEmbd};
+    struct { uint32_t a, b, cc, d; } pcv{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed};
+
+    auto dsp = [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
+                   std::initializer_list<id<MTLBuffer>> bufs,
+                   const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr) {
+        [enc setComputePipelineState:pso];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:pc length:pcSize atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+    };
+    auto bar = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    };
+    const uint32_t thrN = nsg * 32;
+
+    auto sequence = [&](id<MTLComputeCommandEncoder> enc, uint32_t pos) {
+        pcFa.pos = pos;
+        dsp(enc, pRms, {bXin, bANorm, bXn}, &pcRms, 8, 1, 256);
+        bar(enc);
+        dsp(enc, pGemvA, {bWq, bXn, bQfull}, &pcQf, 8, qfN / 4, 256);
+        dsp(enc, pGemvA, {bWk, bXn, bKin}, &pcK, 8, kvN / 4, 256);
+        dsp(enc, pGemvA, {bWv, bXn, bVin}, &pcK, 8, kvN / 4, 256);
+        bar(enc);
+        dsp(enc, pPrep, {bQfull, bKin, bVin, bQN, bKN, bQhat, bKC, bVC, bRope},
+            &pcFa, 32, hQ + 2 * hKV, 256);
+        bar(enc);
+        dsp(enc, pAttn, {bQhat, bKC, bVC, bQfull, bAtt}, &pcFa, 32, hQ, 256);
+        bar(enc);
+        dsp(enc, pGemvO, {bWo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+        bar(enc);
+        dsp(enc, pAddN, {bXin, bAttnOut, bPN, bY, bXn2}, &pcRms, 8, 1, 256);
+        bar(enc);
+        dsp(enc, pMoeL, {bMGI, bMGIS, bXn2, bML}, &pcv, 16, (moe.nExp + 1 + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
+        bar(enc);
+        dsp(enc, pMoeGu, {bMGE, bMUE, bMGS, bMUS, bXn2, bMSel, bMH}, &pcv, 16,
+            ((moe.nUsed + 1) * moe.nFf + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pMoeDn, {bMDE, bMDS, bMH, bMSel, bMY}, &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN);
+        bar(enc);
+        dsp(enc, pAdd, {bY, bMY, bOut}, &pcAdd, 4, 1, 256);
+    };
+
+    // ---- CPU mirror ----
+    const float* anW = (const float*)tANorm->data;
+    const float* pnW = (const float*)tPN->data;
+    const float* qnW = (const float*)tQN->data;
+    const float* knW = (const float*)tKN->data;
+    std::vector<float> kcCpu((size_t)hKV * tmax * dh, 0.f), vcCpu((size_t)hKV * tmax * dh, 0.f);
+    std::vector<float> x(nEmbd), xn(nEmbd), qfull(qfN), kin(kvN), vin(kvN), qhat(atN),
+        att(atN), attnOut(nEmbd), y(nEmbd), xn2(nEmbd), moeOut(nEmbd), refOut(nEmbd),
+        gpuOut(nEmbd), tmpK(std::max(nEmbd, atN));
+    auto q8Gemv = [&](const GgufTensor* t, const std::vector<float>& xin,
+                      std::vector<float>& out, uint32_t M, uint32_t K) {
+        size_t rb = ggmlRowBytes(GGML_Q8_0, K);
+        for (uint32_t r = 0; r < M; r++) {
+            dequant_row_q8_0((const block_q8_0*)(t->data + (size_t)r * rb), tmpK.data(), K);
+            double a = 0;
+            for (uint32_t k = 0; k < K; k++) a += (double)tmpK[k] * xin[k];
+            out[r] = (float)a;
+        }
+    };
+    auto rmsRef = [&](const float* in, const float* w, float* out, uint32_t n) {
+        double ss = 0;
+        for (uint32_t i = 0; i < n; i++) ss += (double)in[i] * in[i];
+        double sc = 1.0 / std::sqrt(ss / n + eps);
+        for (uint32_t i = 0; i < n; i++) out[i] = (float)(in[i] * sc * w[i]);
+    };
+    auto ropeRef = [&](float* v, uint32_t pos) {
+        for (uint32_t j = 0; j < nRot / 2; j++) {
+            float th = pos * std::pow(kFreqBase, -2.f * j / nRot);
+            float cs = std::cos(th), sn = std::sin(th);
+            float x0 = v[j], x1 = v[j + nRot / 2];
+            v[j] = x0 * cs - x1 * sn;
+            v[j + nRot / 2] = x0 * sn + x1 * cs;
+        }
+    };
+
+    std::mt19937 xr(123);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    bool pass = true;
+    printf("cpu reference + gpu, %u tokens...\n", nTok);
+    for (uint32_t t = 0; t < nTok; t++) {
+        for (auto& v : x) v = nd(xr);
+        // CPU
+        rmsRef(x.data(), anW, xn.data(), nEmbd);
+        q8Gemv(tWq, xn, qfull, qfN, nEmbd);
+        q8Gemv(tWk, xn, kin, kvN, nEmbd);
+        q8Gemv(tWv, xn, vin, kvN, nEmbd);
+        for (uint32_t h = 0; h < hQ; h++) {
+            rmsRef(&qfull[(size_t)h * 2 * dh], qnW, &qhat[(size_t)h * dh], dh);
+            ropeRef(&qhat[(size_t)h * dh], t);
+        }
+        for (uint32_t h = 0; h < hKV; h++) {
+            float* kd = &kcCpu[((size_t)h * tmax + t) * dh];
+            rmsRef(&kin[(size_t)h * dh], knW, kd, dh);
+            ropeRef(kd, t);
+            memcpy(&vcCpu[((size_t)h * tmax + t) * dh], &vin[(size_t)h * dh], dh * 4);
+        }
+        for (uint32_t h = 0; h < hQ; h++) {
+            uint32_t kv = h / (hQ / hKV);
+            std::vector<double> sc(t + 1);
+            double mx = -1e300;
+            for (uint32_t p = 0; p <= t; p++) {
+                double s = 0;
+                for (uint32_t j = 0; j < dh; j++)
+                    s += (double)qhat[(size_t)h * dh + j] * kcCpu[((size_t)kv * tmax + p) * dh + j];
+                sc[p] = s / std::sqrt((double)dh);
+                mx = std::max(mx, sc[p]);
+            }
+            double sum = 0;
+            for (uint32_t p = 0; p <= t; p++) {
+                sc[p] = std::exp(sc[p] - mx);
+                sum += sc[p];
+            }
+            for (uint32_t j = 0; j < dh; j++) {
+                double o = 0;
+                for (uint32_t p = 0; p <= t; p++)
+                    o += sc[p] * vcCpu[((size_t)kv * tmax + p) * dh + j];
+                o /= sum;
+                double gate = 1.0 / (1.0 + std::exp(-(double)qfull[(size_t)h * 2 * dh + dh + j]));
+                att[(size_t)h * dh + j] = (float)(o * gate);
+            }
+        }
+        q8Gemv(tWo, att, attnOut, nEmbd, atN);
+        for (uint32_t i = 0; i < nEmbd; i++) y[i] = x[i] + attnOut[i];
+        rmsRef(y.data(), pnW, xn2.data(), nEmbd);
+        moeCpuRef(moe, xn2.data(), moeOut.data(), nullptr);
+        for (uint32_t i = 0; i < nEmbd; i++) refOut[i] = y[i] + moeOut[i];
+
+        // GPU
+        memcpy(bXin.contents, x.data(), nEmbd * 4);
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc =
+                [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            sequence(enc, t);
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        memcpy(gpuOut.data(), bOut.contents, nEmbd * 4);
+
+        double rms = 0;
+        for (uint32_t i = 0; i < nEmbd; i++) rms += (double)refOut[i] * refOut[i];
+        rms = std::sqrt(rms / nEmbd);
+        double floorD = std::max(1e-3, 1e-3 * rms);
+        double maxRel = 0;
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < nEmbd; i++) {
+            double rel = std::fabs((double)gpuOut[i] - refOut[i]) /
+                         std::max(floorD, (double)std::fabs(refOut[i]));
+            maxRel = std::max(maxRel, rel);
+            if (rel > 1e-2 && bad++ < 3)
+                printf("  tok%u y[%u]: gpu=%g ref=%g\n", t, i, gpuOut[i], refOut[i]);
+        }
+        pass &= bad == 0;
+        printf("token %u: max_rel_err = %.3g  ->  %s\n", t, maxRel, bad == 0 ? "PASS" : "FAIL");
+    }
+
+    if (pass && iters > 0) {
+        auto runBench = [&]() -> double {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc =
+                    [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                for (uint32_t i = 0; i < iters; i++) {
+                    sequence(enc, nTok - 1);
+                    bar(enc);
+                }
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                return (cb.GPUEndTime - cb.GPUStartTime) * 1e9 / iters;
+            }
+        };
+        runBench();
+        double ns = runBench();
+        printf("gpu: %8.1f µs/block (pos=%u) | 13 dispatches, 1 submit\n", ns / 1e3, nTok - 1);
+    }
+    return pass;
+}
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -819,6 +1598,10 @@ int main(int argc, char** argv) {
             ok = caseGguf(c, argv[2], argU(3, 100));
         } else if (mode == "moe") {
             ok = caseMoe(c, argU(2, 0), argU(3, 200));
+        } else if (mode == "block") {
+            ok = caseBlock(c, argU(2, 0), argU(3, 3), argU(4, 200));
+        } else if (mode == "ablock") {
+            ok = caseABlock(c, argU(2, 3), argU(3, 3), argU(4, 200));
         } else {
             fprintf(stderr, "mode '%s' not ported to Metal yet "
                             "(M2: q8_0/q6_k/iq4_xs/iq3_xxs; M3: moe/block/ablock; "
