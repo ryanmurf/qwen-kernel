@@ -93,6 +93,7 @@ qk gguf <tensor>         # GEMV on real weights          qk moe|block|ablock [la
 qk token <ids> <n> [tmax] [batch]   # end-to-end greedy generation
 qk warm <ids> <n>        # prefix-cache TTFT demo        qk serve-test <ids> <n> [slots]
 qk prefillcmp|prefillbench|prefilldecode   # batched-prefill exactness / timing / handoff
+qk verify <ids> <n> [K,..]   # spec-decode verify rounds (oracle draft): exactness + c(K)
 qk list [filter]         # tensors in the GGUF
 ```
 
@@ -101,6 +102,7 @@ Env knobs:
 | var | meaning |
 |---|---|
 | `QK_GGUF`, `QK_DEVICE`, `QK_SHADER_DIR` | model path, Vulkan device index, SPIR-V dir |
+| | (`QK_GGUF`/`--model` also accept the first shard of an llama.cpp-style split model, `…-00001-of-NNNNN.gguf`) |
 | `QK_FORK=1` | prefix cache: same-prefix requests restore instead of re-prefilling |
 | `QK_PCACHE`, `QK_PCACHE_LOG=1` | prefix-cache LRU depth (default 3), per-request stats |
 | `QK_NO_BATCH=1` | force serial prefill (correctness reference) |
