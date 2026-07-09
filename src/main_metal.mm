@@ -1545,6 +1545,315 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     return pass;
 }
 
+
+// ---------- end-to-end greedy decode (M4) ----------
+// Embeds from GPU-resident ids, runs all 40 layers (30 deltanet + 10 full
+// attention), LM head + two-pass argmax on GPU; the sampled token feeds the
+// next step's embedding without host involvement. Prefill = one command
+// buffer; the whole greedy generation = one more.
+static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tmax) {
+    std::vector<int> promptIds;
+    {
+        FILE* f = fopen(idsFile, "r");
+        if (!f) { perror(idsFile); return false; }
+        int v;
+        while (fscanf(f, "%d%*[, \n]", &v) == 1) promptIds.push_back(v);
+        fclose(f);
+    }
+    if (promptIds.empty() || promptIds.size() + nGen > tmax || tmax > 1024) {
+        fprintf(stderr, "bad prompt (%zu ids, tmax %u)\n", promptIds.size(), tmax);
+        return false;
+    }
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    const GgufTensor* tEmbd = g.find("token_embd.weight");
+    const GgufTensor* tONorm = g.find("output_norm.weight");
+    const GgufTensor* tHead = g.find("output.weight");
+    if (!tEmbd || !tONorm || !tHead || tEmbd->type != GGML_Q6_K || tHead->type != GGML_Q6_K) {
+        fprintf(stderr, "missing/unexpected embd/head tensors\n");
+        return false;
+    }
+    const uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
+    const uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64, nLayer = 40;
+    const uint32_t vocab = (uint32_t)tHead->ne[1];
+    const float eps = 1e-6f;
+    const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
+    const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);
+    printf("token mode: %zu prompt ids, gen %u, vocab %u, tmax %u\n",
+           promptIds.size(), nGen, vocab, tmax);
+
+    const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
+    id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
+    id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
+    id<MTLComputePipelineState> pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
+    id<MTLComputePipelineState> pConv  = getPipe(c, "dn_conv", "dn_conv", 0);
+    id<MTLComputePipelineState> pStep  = getPipe(c, "dn_step", "dn_step", 0);
+    id<MTLComputePipelineState> pGate  = getPipe(c, "dn_gate", "dn_gate", nsg);
+    id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
+    id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
+    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", 0);
+    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", 0);
+    id<MTLComputePipelineState> pMoeL  = getPipe(c, "moe_logits", "moe_logits", nsg);
+    id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
+    id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    id<MTLComputePipelineState> pMoeD4 = getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
+    id<MTLComputePipelineState> pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
+    id<MTLComputePipelineState> pHead  = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
+    id<MTLComputePipelineState> pAm1   = getPipe(c, "argmax", "argmax1", 0);
+    id<MTLComputePipelineState> pAm2   = getPipe(c, "argmax", "argmax2", 0);
+    id<MTLComputePipelineState> pEmb   = getPipe(c, "embed_q6k", "embed_q6k", 0);
+
+    // shared activation buffers
+    id<MTLBuffer> bXin = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bXn = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bBig = createBuf(c, chQkv * 4, nullptr, true);       // qkv | qfull
+    id<MTLBuffer> bMid = createBuf(c, dIn * 4, nullptr, true);         // z | qhat
+    id<MTLBuffer> bKin = createBuf(c, hKV * dh * 4, nullptr, true);
+    id<MTLBuffer> bVin = createBuf(c, hKV * dh * 4, nullptr, true);
+    id<MTLBuffer> bGb = createBuf(c, 2 * hV * 4, nullptr, true);
+    id<MTLBuffer> bConvOut = createBuf(c, chQkv * 4, nullptr, true);
+    id<MTLBuffer> bO = createBuf(c, dIn * 4, nullptr, true);
+    id<MTLBuffer> bAtt = createBuf(c, dIn * 4, nullptr, true);
+    id<MTLBuffer> bAttnOut = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bY = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bXn2 = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bML = createBuf(c, 257 * 4, nullptr, true);
+    id<MTLBuffer> bMH = createBuf(c, 9 * 512 * 4, nullptr, true);
+    id<MTLBuffer> bMSel = createBuf(c, 128, nullptr, true);
+    id<MTLBuffer> bMY = createBuf(c, nEmbd * 4, nullptr, true);
+    id<MTLBuffer> bONorm = createBuf(c, nEmbd * 4, tONorm->data, true);
+    id<MTLBuffer> bHeadW = createBuf(c, (size_t)vocab * rbE, tHead->data, true);
+    id<MTLBuffer> bLogits = createBuf(c, (size_t)vocab * 4, nullptr, true);
+    id<MTLBuffer> bEmbdW = createBuf(c, (size_t)vocab * rbE, tEmbd->data, true);
+    id<MTLBuffer> bAV = createBuf(c, 64 * 4, nullptr, true);
+    id<MTLBuffer> bAI = createBuf(c, 64 * 4, nullptr, true);
+    id<MTLBuffer> bTok = createBuf(c, 4, nullptr, true);
+    id<MTLBuffer> bRb = createBuf(c, (size_t)tmax * 4, nullptr, true);
+    id<MTLBuffer> bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
+    id<MTLBuffer> bPids = createBuf(c, promptIds.size() * 4, nullptr, true);
+    {
+        uint32_t* pi = (uint32_t*)bPids.contents;
+        for (size_t i = 0; i < promptIds.size(); i++) pi[i] = (uint32_t)promptIds[i];
+        const uint32_t half = nRot / 2;
+        float* rope = (float*)bRope.contents;
+        for (uint32_t p = 0; p < tmax; p++)
+            for (uint32_t j = 0; j < half; j++) {
+                float th = (float)p * std::pow(kFreqBase, -2.f * (float)j / (float)nRot);
+                rope[2 * ((size_t)p * half + j)]     = std::cos(th);
+                rope[2 * ((size_t)p * half + j) + 1] = std::sin(th);
+            }
+    }
+
+    struct Layer {
+        bool rec = false, downQ6 = false;
+        id<MTLBuffer> aNorm, pn;
+        id<MTLBuffer> qkvW, zW, alW, beW, dt, av, ker, sn, outW, convSt, S;   // rec
+        id<MTLBuffer> wq, wk, wv, qn, kn, wo, kc, vc;                          // attn
+        id<MTLBuffer> mgi, mgis, mge, mue, mde, mgs, mus, mds;                 // moe
+    };
+    std::vector<Layer> layers(nLayer);
+    char nb[128];
+    size_t umaMB = 0;
+    auto W = [&](const GgufTensor* t, size_t n) -> id<MTLBuffer> {
+        umaMB += n >> 20;
+        return createBuf(c, n, t ? (const void*)t->data : nullptr, true);
+    };
+    for (uint32_t il = 0; il < nLayer; il++) {
+        Layer& L = layers[il];
+        auto T = [&](const char* suffix) -> const GgufTensor* {
+            snprintf(nb, sizeof nb, "blk.%u.%s", il, suffix);
+            return g.find(nb);
+        };
+        MoeT moe;
+        if (!loadMoeT(g, il, moe)) return false;
+        L.downQ6 = moe.downQ6;
+        L.rec = T("ssm_a") != nullptr;
+        L.aNorm = W(T("attn_norm.weight"), nEmbd * 4);
+        L.pn = W(T("post_attention_norm.weight"), nEmbd * 4);
+        if (L.rec) {
+            L.qkvW = W(T("attn_qkv.weight"), (size_t)chQkv * rbQ8e);
+            L.zW = W(T("attn_gate.weight"), (size_t)dIn * rbQ8e);
+            L.alW = W(T("ssm_alpha.weight"), (size_t)hV * nEmbd * 4);
+            L.beW = W(T("ssm_beta.weight"), (size_t)hV * nEmbd * 4);
+            L.dt = W(T("ssm_dt.bias"), hV * 4);
+            L.av = W(T("ssm_a"), hV * 4);
+            L.ker = W(T("ssm_conv1d.weight") ? T("ssm_conv1d.weight") : T("ssm_conv1d"),
+                      (size_t)chQkv * 4 * 4);
+            L.sn = W(T("ssm_norm.weight"), dS * 4);
+            L.outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
+            L.convSt = W(nullptr, (size_t)chQkv * 3 * 4);
+            L.S = W(nullptr, (size_t)hV * dS * dS * 4);
+            memset(L.convSt.contents, 0, (size_t)chQkv * 3 * 4);
+            memset(L.S.contents, 0, (size_t)hV * dS * dS * 4);
+        } else {
+            L.wq = W(T("attn_q.weight"), (size_t)chQkv * rbQ8e);
+            L.wk = W(T("attn_k.weight"), (size_t)hKV * dh * rbQ8e);
+            L.wv = W(T("attn_v.weight"), (size_t)hKV * dh * rbQ8e);
+            L.qn = W(T("attn_q_norm.weight"), dh * 4);
+            L.kn = W(T("attn_k_norm.weight"), dh * 4);
+            L.wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
+            L.kc = W(nullptr, (size_t)hKV * tmax * dh * 4);
+            L.vc = W(nullptr, (size_t)hKV * tmax * dh * 4);
+        }
+        L.mgi = W(moe.gi, (size_t)moe.nExp * nEmbd * 4);
+        L.mgis = W(moe.gis, nEmbd * 4);
+        L.mge = W(moe.ge, (size_t)moe.nExp * moe.nFf * moe.rbGE);
+        L.mue = W(moe.ue, (size_t)moe.nExp * moe.nFf * moe.rbGE);
+        L.mde = W(moe.de, (size_t)moe.nExp * moe.nEmbd * moe.rbDE);
+        L.mgs = W(moe.gs, (size_t)moe.nFf * moe.rbGS);
+        L.mus = W(moe.us, (size_t)moe.nFf * moe.rbGS);
+        L.mds = W(moe.ds, (size_t)moe.nEmbd * moe.rbDS);
+        if (il % 8 == 7) printf("  loaded %u/40 layers (%zu MB resident)\n", il + 1, umaMB);
+    }
+    printf("model resident: ~%zu MB\n", umaMB);
+
+    struct { uint32_t n; float e; } pcRms{nEmbd, eps};
+    struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
+        pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
+    struct { uint32_t n, h; } pcAb{nEmbd, hV};
+    struct { uint32_t ch; } pcConv{chQkv};
+    struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
+    struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
+    struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
+    struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; }
+        pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase};
+    const uint32_t amWgs = (vocab + 4095) / 4096;
+    struct { uint32_t n, span; } pcAm{vocab, 4096};
+    struct { uint32_t m, pos; } pcAm2{amWgs, 0};
+    struct { uint32_t kdim, idx, perReq; } pcEmb{nEmbd, 0, 0};
+    const uint32_t thrN = nsg * 32;
+
+    auto dsp = [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
+                   std::initializer_list<id<MTLBuffer>> bufs,
+                   const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr) {
+        [enc setComputePipelineState:pso];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:pc length:pcSize atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+    };
+    auto bar = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    };
+
+    auto recordToken = [&](id<MTLComputeCommandEncoder> enc, uint32_t pos, bool withHead) {
+        pcFa.pos = pos;
+        dsp(enc, pRms, {bXin, layers[0].aNorm, bXn}, &pcRms, 8, 1, 256);
+        bar(enc);
+        for (uint32_t il = 0; il < nLayer; il++) {
+            Layer& L = layers[il];
+            if (L.rec) {
+                dsp(enc, pGemvA, {L.qkvW, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+                dsp(enc, pGemvA, {L.zW, bXn, bMid}, &pcZ, 8, dIn / 4, 256);
+                dsp(enc, pAb, {bXn, L.alW, L.beW, L.dt, L.av, bGb}, &pcAb, 8,
+                    (2 * hV + nsg - 1) / nsg, thrN);
+                bar(enc);
+                dsp(enc, pConv, {L.convSt, bBig, L.ker, bConvOut}, &pcConv, 4,
+                    (chQkv + 255) / 256, 256);
+                bar(enc);
+                dsp(enc, pStep, {bConvOut, bGb, L.S, bO}, &pcStep, 16, hV, 128);
+                bar(enc);
+                dsp(enc, pGate, {bO, L.sn, bMid, bAtt}, &pcGate, 12, (hV + nsg - 1) / nsg, thrN);
+                bar(enc);
+                dsp(enc, pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+            } else {
+                dsp(enc, pGemvA, {L.wq, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+                dsp(enc, pGemvA, {L.wk, bXn, bKin}, &pcKV, 8, hKV * dh / 4, 256);
+                dsp(enc, pGemvA, {L.wv, bXn, bVin}, &pcKV, 8, hKV * dh / 4, 256);
+                bar(enc);
+                dsp(enc, pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.kc, L.vc, bRope},
+                    &pcFa, 32, hQ + 2 * hKV, 256);
+                bar(enc);
+                dsp(enc, pAttn, {bMid, L.kc, L.vc, bBig, bAtt}, &pcFa, 32, hQ, 256);
+                bar(enc);
+                dsp(enc, pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+            }
+            bar(enc);
+            dsp(enc, pAddN, {bXin, bAttnOut, L.pn, bY, bXn2}, &pcRms, 8, 1, 256);
+            bar(enc);
+            dsp(enc, pMoeL, {L.mgi, L.mgis, bXn2, bML}, &pcv, 16, (257 + nsg - 1) / nsg, thrN);
+            bar(enc);
+            dsp(enc, pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
+            bar(enc);
+            dsp(enc, pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bXn2, bMSel, bMH}, &pcv, 16,
+                (9 * 512 + nsg - 1) / nsg, thrN);
+            bar(enc);
+            dsp(enc, L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bMH, bMSel, bMY}, &pcv, 16,
+                (nEmbd + nsg - 1) / nsg, thrN);
+            bar(enc);
+            // layer tail: residual sum + NEXT layer's norm (output_norm at the end)
+            id<MTLBuffer> nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
+            dsp(enc, pAddN, {bY, bMY, nextNorm, bXin, bXn}, &pcRms, 8, 1, 256);
+            bar(enc);
+        }
+        if (withHead) {
+            // bXn holds output_norm(x) from the last layer tail
+            dsp(enc, pHead, {bHeadW, bXn, bLogits}, &pcHead, 8, (vocab + 3) / 4, 64);
+        }
+    };
+
+    const uint32_t nPrompt = (uint32_t)promptIds.size();
+
+    // ---- prefill: one command buffer ----
+    auto t0 = std::chrono::steady_clock::now();
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc =
+            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        for (uint32_t pos = 0; pos < nPrompt; pos++) {
+            pcEmb.idx = pos;
+            dsp(enc, pEmb, {bEmbdW, bPids, bXin}, &pcEmb, 12, 1, 256);
+            bar(enc);
+            recordToken(enc, pos, pos + 1 == nPrompt);
+            bar(enc);
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double prefillMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // ---- greedy decode: one command buffer, GPU-resident sampling ----
+    double gpuS = 0;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc =
+            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        for (uint32_t i = 0; i < nGen; i++) {
+            uint32_t pos = nPrompt + i;
+            pcAm2.pos = i;
+            dsp(enc, pAm1, {bLogits, bAV, bAI}, &pcAm, 8, amWgs, 256);
+            bar(enc);
+            dsp(enc, pAm2, {bAV, bAI, bTok, bRb}, &pcAm2, 8, 1, 256);
+            bar(enc);
+            pcEmb.idx = 0;
+            dsp(enc, pEmb, {bEmbdW, bTok, bXin}, &pcEmb, 12, 1, 256);
+            bar(enc);
+            recordToken(enc, pos, true);
+            bar(enc);
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        gpuS = cb.GPUEndTime - cb.GPUStartTime;
+    }
+    auto t2 = std::chrono::steady_clock::now();
+    double decodeMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+
+    const uint32_t* rb = (const uint32_t*)bRb.contents;
+    printf("GEN:");
+    for (uint32_t i = 0; i < nGen; i++) printf(" %u", rb[i]);
+    printf("\n");
+    printf("prefill: %u tokens in %.1f ms (%.1f tok/s serial)\n",
+           nPrompt, prefillMs, nPrompt * 1000.0 / prefillMs);
+    printf("decode:  %u tokens in %.1f ms wall / %.1f ms gpu -> %.2f ms/tok, %.1f tok/s\n",
+           nGen, decodeMs, gpuS * 1e3, gpuS * 1e3 / nGen, nGen / gpuS);
+    return true;
+}
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -1602,6 +1911,12 @@ int main(int argc, char** argv) {
             ok = caseBlock(c, argU(2, 0), argU(3, 3), argU(4, 200));
         } else if (mode == "ablock") {
             ok = caseABlock(c, argU(2, 3), argU(3, 3), argU(4, 200));
+        } else if (mode == "token") {
+            if (argc < 4) {
+                fprintf(stderr, "usage: qk token <ids-file> <nGen> [tmax]\n");
+                return 1;
+            }
+            ok = caseToken(c, argv[2], argU(3, 12), argU(4, 128));
         } else {
             fprintf(stderr, "mode '%s' not ported to Metal yet "
                             "(M2: q8_0/q6_k/iq4_xs/iq3_xxs; M3: moe/block/ablock; "
