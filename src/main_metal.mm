@@ -34,6 +34,7 @@
 
 #include "gguf.h"
 #include "quants.h"
+#include "../include/qk.h"
 
 static const char* kDefaultGguf =
     "models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf";  // set QK_GGUF; this is a last resort
@@ -1837,6 +1838,729 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     return true;
 }
 
+
+// ===================== qk.h C ABI: persistent per-slot engine =====================
+// Metal implementation of the server-oriented engine: N slots each hold their
+// own sequence; one encoded step (grid z = slot) advances all of them, with
+// per-slot positions from a slotPos buffer (fa_*_srv kernels). Uses the fused
+// Metal kernel set (dn_step megakernel, moe_logits_addn, merged MoE), which is
+// token-parity-validated against llama.cpp. On UMA, prefix-cache snapshots,
+// state resets and carry seeding are plain memcpy/memset — no staging.
+
+struct qk_engine {
+    MtlCtx c{};
+    Gguf g;
+    uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
+    bool shareFork = false;
+    uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
+    static constexpr uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
+    static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64, nLayer = 40;
+    float eps = 1e-6f;
+    uint32_t nsg = 4;
+
+    id<MTLComputePipelineState> pGemvA, pGemvO, pAb, pStep, pPrep, pAttn, pMoeS,
+        pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pAm1, pAm2, pEmb,
+        pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
+
+    struct Layer {
+        bool rec = false, downQ6 = false;
+        id<MTLBuffer> aNorm, pn;
+        id<MTLBuffer> qkvW, zW, alW, beW, dt, av, ker, sn, outW;   // rec
+        id<MTLBuffer> wq, wk, wv, qn, kn, wo;                       // attn
+        id<MTLBuffer> mgi, mgis, mge, mue, mde, mgs, mus, mds;      // moe
+        id<MTLBuffer> st1, st2;      // per-slot state: rec=(conv,S) attn=(kc,vc)
+        size_t ps1 = 0, ps2 = 0;     // per-slot byte stride
+    };
+    std::vector<Layer> layers;
+
+    id<MTLBuffer> bXin, bXn, bBig, bMid, bKin, bVin, bGb, bAtt, bAttnOut, bY, bXn2,
+        bML, bMH, bMSel, bMY, bONorm, bHeadW, bLogits, bEmbdW, bRope, bAV, bAI,
+        bTok, bRbScratch, bSlotIn, bSlotPos;
+
+    uint32_t maxB = 0;
+    id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
+        bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry;
+
+    struct Slot {
+        bool active = false;
+        std::vector<uint32_t> prompt;
+        std::vector<uint32_t> genTokens;
+        uint32_t cursor = 0, pos = 0, gen = 0, maxGen = 0, last = 0;
+    };
+    std::vector<Slot> slots;
+
+    struct CacheEntry {
+        std::vector<uint32_t> tokens;
+        std::vector<uint8_t> snap;   // host copy of all st1/st2 stripes (UMA memcpy)
+        uint64_t lru = 0;
+        bool valid = false;
+    };
+    std::vector<CacheEntry> pcache;
+    std::vector<size_t> snapOff1, snapOff2;
+    size_t snapSize = 0;
+    uint64_t lruClock = 0;
+
+    bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
+    int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
+    void prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
+                          std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0);
+    uint32_t serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
+                                 std::vector<float>& logits);
+    void resetSlot(uint32_t slot);
+    void snapshotSlot(uint32_t slot);
+    int matchPrefix(const uint32_t* prompt, uint32_t n);
+    void restoreInto(uint32_t slot, int cacheIdx);
+    void copyStripes(uint32_t slot, uint8_t* snap, bool save);
+    void encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim);
+};
+
+void qk_engine::resetSlot(uint32_t slot) {
+    for (auto& L : layers) {   // GPU is idle at every call site (engine is synchronous)
+        memset((uint8_t*)L.st1.contents + (size_t)slot * L.ps1, 0, L.ps1);
+        memset((uint8_t*)L.st2.contents + (size_t)slot * L.ps2, 0, L.ps2);
+    }
+}
+
+void qk_engine::copyStripes(uint32_t slot, uint8_t* snap, bool save) {
+    for (uint32_t il = 0; il < nLayer; il++) {
+        Layer& L = layers[il];
+        uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)slot * L.ps1;
+        uint8_t* s2 = (uint8_t*)L.st2.contents + (size_t)slot * L.ps2;
+        if (save) {
+            memcpy(snap + snapOff1[il], s1, L.ps1);
+            memcpy(snap + snapOff2[il], s2, L.ps2);
+        } else {
+            memcpy(s1, snap + snapOff1[il], L.ps1);
+            memcpy(s2, snap + snapOff2[il], L.ps2);
+        }
+    }
+}
+
+void qk_engine::snapshotSlot(uint32_t slot) {
+    if (pcache.empty()) return;
+    Slot& sl = slots[slot];
+    size_t fedGen = sl.pos > sl.prompt.size() ? sl.pos - sl.prompt.size() : 0;
+    if (fedGen > sl.genTokens.size()) fedGen = sl.genTokens.size();
+    if (sl.pos < 8 || sl.pos > nCtx) return;
+    int idx = 0;
+    for (uint32_t i = 0; i < pcache.size(); i++) {
+        if (!pcache[i].valid) { idx = (int)i; break; }
+        if (pcache[i].lru < pcache[idx].lru) idx = (int)i;
+    }
+    CacheEntry& e = pcache[idx];
+    size_t pp = std::min((size_t)sl.pos, sl.prompt.size());
+    e.tokens.assign(sl.prompt.begin(), sl.prompt.begin() + pp);
+    e.tokens.insert(e.tokens.end(), sl.genTokens.begin(), sl.genTokens.begin() + fedGen);
+    e.lru = ++lruClock;
+    e.valid = true;
+    copyStripes(slot, e.snap.data(), /*save=*/true);
+}
+
+int qk_engine::matchPrefix(const uint32_t* prompt, uint32_t n) {
+    int best = -1;
+    uint32_t bestLen = 8;
+    for (uint32_t i = 0; i < pcache.size(); i++) {
+        if (!pcache[i].valid) continue;
+        const auto& tk = pcache[i].tokens;
+        uint32_t L = (uint32_t)tk.size();
+        if (L >= n || L <= bestLen) continue;
+        bool ok = true;
+        for (uint32_t j = 0; j < L; j++)
+            if (tk[j] != prompt[j]) { ok = false; break; }
+        if (ok) { best = (int)i; bestLen = L; }
+    }
+    return best;
+}
+
+void qk_engine::restoreInto(uint32_t slot, int cacheIdx) {
+    pcache[cacheIdx].lru = ++lruClock;
+    copyStripes(slot, pcache[cacheIdx].snap.data(), /*save=*/false);
+}
+
+bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t errLen) {
+    auto fail = [&](const char* m) { if (err && errLen) snprintf(err, errLen, "%s", m); return false; };
+    nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
+    shareFork = getenv("QK_FORK") != nullptr;
+    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 32768 || chunkN < 1 || chunkN > 32)
+        return fail("qk_open: bad config");
+    initMtl(c, "libqk");
+    if (!g.open(path)) return fail("qk_open: cannot open GGUF");
+    const GgufTensor* tEmbd = g.find("token_embd.weight");
+    const GgufTensor* tONorm = g.find("output_norm.weight");
+    const GgufTensor* tHead = g.find("output.weight");
+    if (!tEmbd || !tONorm || !tHead || tEmbd->type != GGML_Q6_K || tHead->type != GGML_Q6_K)
+        return fail("qk_open: missing/unexpected embd/head tensors");
+    vocab = (uint32_t)tHead->ne[1];
+    const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
+    const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);
+    const uint32_t nB = nSlots, tmax = nCtx;
+    nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
+
+    pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
+    pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
+    pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
+    pStep  = getPipe(c, "dn_step", "dn_step", 0);
+    pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", 0);
+    pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", 0);
+    pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
+    pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
+    pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    pMoeD4 = getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
+    pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
+    pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
+    pHead  = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
+    pAm1   = getPipe(c, "argmax", "argmax1", 0);
+    pAm2   = getPipe(c, "argmax", "argmax2", 0);
+    pEmb   = getPipe(c, "embed_q6k", "embed_q6k", 0);
+    pPrepB = getPipe(c, "fa_batch", "fa_prep_batch", 0);
+    pAttnB = getPipe(c, "fa_batch", "fa_attn_batch", 0);
+    pAbB   = getPipe(c, "dn_batch", "dn_ab_batch", nsg);
+    pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
+    pStepB = getPipe(c, "dn_batch", "dn_step_batch", 0);
+    pGateB = getPipe(c, "dn_batch", "dn_gate_batch", nsg);
+    pGemmB = getPipe(c, "gemm_q8_0", "gemm_q8_0", 0);
+    static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 float4s");
+
+    bXin = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    bXn = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    bBig = createBuf(c, (size_t)nB * chQkv * 4, nullptr, true);
+    bMid = createBuf(c, (size_t)nB * dIn * 4, nullptr, true);
+    bKin = createBuf(c, (size_t)nB * hKV * dh * 4, nullptr, true);
+    bVin = createBuf(c, (size_t)nB * hKV * dh * 4, nullptr, true);
+    bGb = createBuf(c, (size_t)nB * 2 * hV * 4, nullptr, true);
+    bAtt = createBuf(c, (size_t)nB * dIn * 4, nullptr, true);
+    bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    bY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    bML = createBuf(c, (size_t)nB * 257 * 4, nullptr, true);
+    bMH = createBuf(c, (size_t)nB * 9 * 512 * 4, nullptr, true);
+    bMSel = createBuf(c, (size_t)nB * 128, nullptr, true);
+    bMY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    bONorm = createBuf(c, nEmbd * 4, tONorm->data, true);
+    bHeadW = createBuf(c, (size_t)vocab * rbE, tHead->data, true);
+    bLogits = createBuf(c, (size_t)nB * vocab * 4, nullptr, true);
+    bEmbdW = createBuf(c, (size_t)vocab * rbE, tEmbd->data, true);
+    bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
+    bAV = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
+    bAI = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
+    bTok = createBuf(c, (size_t)nB * 4, nullptr, true);
+    bRbScratch = createBuf(c, 64, nullptr, true);
+    bSlotIn = createBuf(c, (size_t)nB * 4, nullptr, true);
+    bSlotPos = createBuf(c, (size_t)nB * 4, nullptr, true);
+    memset(bSlotIn.contents, 0, (size_t)nB * 4);
+    memset(bSlotPos.contents, 0, (size_t)nB * 4);
+    {
+        const uint32_t half = nRot / 2;
+        float* rope = (float*)bRope.contents;
+        for (uint32_t p = 0; p < tmax; p++)
+            for (uint32_t j = 0; j < half; j++) {
+                float th = (float)p * std::pow(kFreqBase, -2.f * (float)j / (float)nRot);
+                rope[2 * ((size_t)p * half + j)] = std::cos(th);
+                rope[2 * ((size_t)p * half + j) + 1] = std::sin(th);
+            }
+    }
+
+    uint32_t cap = 128;
+    if (const char* v = getenv("QK_MAXB")) {
+        long x = atol(v);
+        if (x >= 16 && x <= 1024) cap = (uint32_t)x;
+    }
+    maxB = cap;
+    bbXin = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
+    bbXn = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
+    bbBig = createBuf(c, (size_t)cap * chQkv * 4, nullptr, true);
+    bbMid = createBuf(c, (size_t)cap * dIn * 4, nullptr, true);
+    bbKin = createBuf(c, (size_t)cap * hKV * dh * 4, nullptr, true);
+    bbVin = createBuf(c, (size_t)cap * hKV * dh * 4, nullptr, true);
+    bbGb = createBuf(c, (size_t)cap * 2 * hV * 4, nullptr, true);
+    bbConvOut = createBuf(c, (size_t)cap * chQkv * 4, nullptr, true);
+    bbO = createBuf(c, (size_t)cap * dIn * 4, nullptr, true);
+    bbAtt = createBuf(c, (size_t)cap * dIn * 4, nullptr, true);
+    bbAttnOut = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
+    bbY = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
+    bbXn2 = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
+    bbML = createBuf(c, (size_t)cap * 257 * 4, nullptr, true);
+    bbMH = createBuf(c, (size_t)cap * 9 * 512 * 4, nullptr, true);
+    bbMSel = createBuf(c, (size_t)cap * 128, nullptr, true);
+    bbMY = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
+    bbLogits = createBuf(c, (size_t)cap * vocab * 4, nullptr, true);
+    bbIds = createBuf(c, (size_t)cap * 4, nullptr, true);
+    bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, nullptr, true);
+    memset(bbCarry.contents, 0, (size_t)nLayer * chQkv * 3 * 4);
+
+    layers.resize(nLayer);
+    char nb[128];
+    for (uint32_t il = 0; il < nLayer; il++) {
+        Layer& L = layers[il];
+        auto T = [&](const char* suffix) -> const GgufTensor* {
+            snprintf(nb, sizeof nb, "blk.%u.%s", il, suffix); return g.find(nb);
+        };
+        auto W = [&](const GgufTensor* t, size_t n) -> id<MTLBuffer> {
+            return createBuf(c, n, t ? (const void*)t->data : nullptr, true);
+        };
+        MoeT moe;
+        if (!loadMoeT(g, il, moe)) return fail("qk_open: MoE tensors missing");
+        L.downQ6 = moe.downQ6;
+        L.rec = T("ssm_a") != nullptr;
+        L.aNorm = W(T("attn_norm.weight"), nEmbd * 4);
+        L.pn = W(T("post_attention_norm.weight"), nEmbd * 4);
+        if (L.rec) {
+            L.qkvW = W(T("attn_qkv.weight"), (size_t)chQkv * rbQ8e);
+            L.zW = W(T("attn_gate.weight"), (size_t)dIn * rbQ8e);
+            L.alW = W(T("ssm_alpha.weight"), (size_t)hV * nEmbd * 4);
+            L.beW = W(T("ssm_beta.weight"), (size_t)hV * nEmbd * 4);
+            L.dt = W(T("ssm_dt.bias"), hV * 4);
+            L.av = W(T("ssm_a"), hV * 4);
+            L.ker = W(T("ssm_conv1d.weight") ? T("ssm_conv1d.weight") : T("ssm_conv1d"),
+                      (size_t)chQkv * 4 * 4);
+            L.sn = W(T("ssm_norm.weight"), dS * 4);
+            L.outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
+            L.ps1 = (size_t)chQkv * 3 * 4;
+            L.ps2 = (size_t)hV * dS * dS * 4;
+        } else {
+            L.wq = W(T("attn_q.weight"), (size_t)chQkv * rbQ8e);
+            L.wk = W(T("attn_k.weight"), (size_t)hKV * dh * rbQ8e);
+            L.wv = W(T("attn_v.weight"), (size_t)hKV * dh * rbQ8e);
+            L.qn = W(T("attn_q_norm.weight"), dh * 4);
+            L.kn = W(T("attn_k_norm.weight"), dh * 4);
+            L.wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
+            L.ps1 = (size_t)hKV * tmax * dh * 4;
+            L.ps2 = (size_t)hKV * tmax * dh * 4;
+        }
+        L.st1 = createBuf(c, (size_t)nB * L.ps1, nullptr, true);
+        L.st2 = createBuf(c, (size_t)nB * L.ps2, nullptr, true);
+        memset(L.st1.contents, 0, (size_t)nB * L.ps1);
+        memset(L.st2.contents, 0, (size_t)nB * L.ps2);
+        L.mgi = W(moe.gi, (size_t)moe.nExp * nEmbd * 4);
+        L.mgis = W(moe.gis, nEmbd * 4);
+        L.mge = W(moe.ge, (size_t)moe.nExp * moe.nFf * moe.rbGE);
+        L.mue = W(moe.ue, (size_t)moe.nExp * moe.nFf * moe.rbGE);
+        L.mde = W(moe.de, (size_t)moe.nExp * moe.nEmbd * moe.rbDE);
+        L.mgs = W(moe.gs, (size_t)moe.nFf * moe.rbGS);
+        L.mus = W(moe.us, (size_t)moe.nFf * moe.rbGS);
+        L.mds = W(moe.ds, (size_t)moe.nEmbd * moe.rbDS);
+    }
+
+    snapOff1.resize(nLayer);
+    snapOff2.resize(nLayer);
+    size_t off = 0;
+    for (uint32_t il = 0; il < nLayer; il++) {
+        snapOff1[il] = off; off += layers[il].ps1;
+        snapOff2[il] = off; off += layers[il].ps2;
+    }
+    snapSize = off;
+    uint32_t PCACHE_N = 3;
+    if (const char* pcn = getenv("QK_PCACHE")) {
+        long v = strtol(pcn, nullptr, 10);
+        if (v >= 1 && v <= 256) PCACHE_N = (uint32_t)v;
+    }
+    pcache.resize(PCACHE_N);
+    for (auto& e : pcache) e.snap.resize(snapSize);
+
+    slots.resize(nSlots);
+    return true;
+}
+
+// Encode one serial decode/prefill step for slots [0, zdim): embed(+L0 norm)
+// -> 40 layers (srv attention) -> head -> argmax into bTok.
+void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
+    auto dsp = [&](id<MTLComputePipelineState> pso,
+                   std::initializer_list<id<MTLBuffer>> bufs,
+                   const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr) {
+        [enc setComputePipelineState:pso];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:pc length:pcSize atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, zdim)
+            threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+    };
+    auto bar = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    const uint32_t thrN = nsg * 32;
+
+    struct { uint32_t n; float e; } pcRms{nEmbd, eps};
+    struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
+        pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
+    struct { uint32_t n, h; } pcAb{nEmbd, hV};
+    struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
+    struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
+    struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, 512, 256, 8, eps};
+    struct { uint32_t pos, tmax, dh_, nRot_, hQ_, hKV_; float e, fb; }
+        pcFa{0, nCtx, dh, nRot, hQ, hKV, eps, kFreqBase};
+    const uint32_t amWgs = (vocab + 4095) / 4096;
+    struct { uint32_t n, span; } pcAm{vocab, 4096};
+    struct { uint32_t m, pos; } pcAm2{amWgs, 0};
+    struct { uint32_t k, idx, pr; float e; } pcE{nEmbd, 0, 1, eps};
+
+    dsp(pEmb, {bEmbdW, bSlotIn, bXin, layers[0].aNorm, bXn}, &pcE, 16, 1, 256);
+    bar();
+    for (uint32_t il = 0; il < nLayer; il++) {
+        Layer& L = layers[il];
+        if (L.rec) {
+            dsp(pGemvA, {L.qkvW, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+            dsp(pGemvA, {L.zW, bXn, bMid}, &pcZ, 8, dIn / 4, 256);
+            dsp(pAb, {bXn, L.alW, L.beW, L.dt, L.av, bGb}, &pcAb, 8,
+                (2 * hV + nsg - 1) / nsg, thrN);
+            bar();
+            dsp(pStep, {bBig, L.st1, L.ker, bGb, L.st2, bMid, L.sn, bAtt},
+                &pcStep, 16, hV, dS);
+            bar();
+            dsp(pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+        } else {
+            dsp(pGemvA, {L.wq, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+            dsp(pGemvA, {L.wk, bXn, bKin}, &pcKV, 8, hKV * dh / 4, 256);
+            dsp(pGemvA, {L.wv, bXn, bVin}, &pcKV, 8, hKV * dh / 4, 256);
+            bar();
+            dsp(pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.st1, L.st2, bRope, bSlotPos},
+                &pcFa, 32, hQ + 2 * hKV, 256);
+            bar();
+            dsp(pAttn, {bMid, L.st1, L.st2, bBig, bAtt, bSlotPos}, &pcFa, 32, hQ, 256);
+            bar();
+            dsp(pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+        }
+        bar();
+        dsp(pMoeLA, {L.mgi, L.mgis, bXin, bAttnOut, L.pn, bML, bY, bXn2}, &pcv5, 20,
+            (257 + nsg - 1) / nsg, thrN);
+        bar();
+        dsp(pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
+        bar();
+        dsp(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bXn2, bMSel, bMH}, &pcv, 16,
+            (9 * 512 + nsg - 1) / nsg, thrN);
+        bar();
+        dsp(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bMH, bMSel, bMY}, &pcv, 16,
+            (nEmbd + nsg - 1) / nsg, thrN);
+        bar();
+        id<MTLBuffer> nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
+        dsp(pAddN, {bY, bMY, nextNorm, bXin, bXn}, &pcRms, 8, 1, 256);
+        bar();
+    }
+    dsp(pHead, {bHeadW, bXn, bLogits}, &pcHead, 8, (vocab + 3) / 4, 64);
+    bar();
+    dsp(pAm1, {bLogits, bAV, bAI}, &pcAm, 8, amWgs, 256);
+    bar();
+    dsp(pAm2, {bAV, bAI, bTok, bRbScratch}, &pcAm2, 8, 1, 256);
+}
+
+int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
+    for (uint32_t s = 0; s < nSlots; s++) outCnt[s] = 0;
+    *outFin = 0;
+    int activeAtEntry = 0;
+    for (uint32_t s = 0; s < nSlots; s++) if (slots[s].active) activeAtEntry++;
+    if (!activeAtEntry) return 0;
+
+    uint32_t* slotIn = (uint32_t*)bSlotIn.contents;
+    uint32_t* slotPos = (uint32_t*)bSlotPos.contents;
+    const uint32_t* tok = (const uint32_t*)bTok.contents;
+
+    for (uint32_t step = 0; step < chunkN; step++) {
+        int nAct = 0;
+        uint32_t maxZ = 0;
+        for (uint32_t s = 0; s < nSlots; s++) {
+            Slot& sl = slots[s];
+            if (!sl.active) { slotIn[s] = 0; slotPos[s] = 0; continue; }
+            nAct++; maxZ = s + 1;
+            if (sl.cursor < sl.prompt.size()) {
+                slotIn[s] = sl.prompt[sl.cursor];
+                slotPos[s] = sl.cursor;
+            } else {
+                slotIn[s] = sl.last;
+                slotPos[s] = sl.pos;
+            }
+        }
+        if (!nAct) break;
+
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc =
+                [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            encodeStep(enc, maxZ);
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+
+        for (uint32_t s = 0; s < nSlots; s++) {
+            Slot& sl = slots[s];
+            if (!sl.active) continue;
+            uint32_t sampled = tok[s];
+            bool prefilling = sl.cursor < sl.prompt.size();
+            if (prefilling && sl.cursor + 1 < sl.prompt.size()) {
+                sl.cursor++;
+                continue;
+            }
+            if (prefilling) { sl.cursor = (uint32_t)sl.prompt.size(); sl.pos = (uint32_t)sl.prompt.size(); }
+            if (sampled == eosTok) {
+                if (!prefilling) sl.pos++;
+                snapshotSlot(s);
+                sl.active = false; *outFin |= 1u << s;
+                continue;
+            }
+            outTok[s * chunkN + outCnt[s]++] = sampled;
+            sl.genTokens.push_back(sampled);
+            sl.last = sampled;
+            sl.gen++;
+            if (!prefilling) sl.pos++;
+            if (sl.pos >= nCtx || sl.gen >= sl.maxGen) {
+                snapshotSlot(s);
+                sl.active = false; *outFin |= 1u << s;
+            }
+        }
+    }
+    return activeAtEntry;
+}
+
+void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
+                                 std::vector<float>& logits, bool wantLogits, uint32_t base) {
+    if (!toks || n < 1 || n > maxB || slot >= nSlots || (size_t)base + n > nCtx) {
+        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u\n", n, slot, base);
+        exit(1);
+    }
+    memcpy(bbIds.contents, toks, (size_t)n * 4);
+    if (wantLogits) logits.resize(vocab);
+    if (base == 0) resetSlot(slot);
+    // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
+    for (uint32_t il = 0; il < nLayer; il++) {
+        if (!layers[il].rec) continue;
+        uint8_t* dst = (uint8_t*)bbCarry.contents + (size_t)il * chQkv * 3 * 4;
+        if (base == 0) memset(dst, 0, (size_t)chQkv * 3 * 4);
+        else memcpy(dst, (uint8_t*)layers[il].st1.contents + (size_t)slot * layers[il].ps1,
+                    (size_t)chQkv * 3 * 4);
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc =
+            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        auto dspz = [&](id<MTLComputePipelineState> pso,
+                        std::initializer_list<id<MTLBuffer>> bufs,
+                        std::initializer_list<size_t> offs,
+                        const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr, uint32_t z) {
+            [enc setComputePipelineState:pso];
+            uint32_t i = 0;
+            auto ob = offs.begin();
+            for (id<MTLBuffer> b : bufs) {
+                size_t o = ob != offs.end() ? *ob++ : 0;
+                [enc setBuffer:b offset:o atIndex:i++];
+            }
+            [enc setBytes:pc length:pcSize atIndex:i];
+            [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, z)
+                threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+        };
+        auto bar = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+        const uint32_t thrN = nsg * 32;
+
+        struct { uint32_t n; float e; } pcRms{nEmbd, eps};
+        struct { uint32_t m, k; } pcP;
+        struct { uint32_t n, hv, Tn; } pcAbB{nEmbd, hV, n};
+        struct { uint32_t channels, dState, qkCh; float e; uint32_t Tn; }
+            pcConvB{chQkv, dS, 2 * hK * dS, eps, n};
+        struct { uint32_t dState, hK_, hV_, Tn; } pcStepB{dS, hK, hV, n};
+        struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
+        struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
+        struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, 512, 256, 8, eps};
+        struct { uint32_t tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t base_, Tn, qbase; }
+            pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, base, n, 0};
+        struct { uint32_t k, idx, pr; float e; } pcE{nEmbd, 0, 1, eps};
+        struct { uint32_t M, K, N; } pcG;
+
+        // projection: tiled GEMM for n>=48 (weight reads amortized), else z=n GEMV
+        auto proj = [&](id<MTLBuffer> W, id<MTLBuffer> X, id<MTLBuffer> Y,
+                        uint32_t M, uint32_t K, bool isOut) {
+            if (n >= 48) {
+                pcG = {M, K, n};
+                dspz(pGemmB, {W, X, Y}, {}, &pcG, 12, (M + 127) / 128, 256, (n + 63) / 64);
+            } else {
+                pcP = {M, K};
+                dspz(isOut ? pGemvO : pGemvA, {W, X, Y}, {}, &pcP, 8,
+                     isOut ? (M + 1) / 2 : (M + 3) / 4, 256, n);
+            }
+        };
+
+        dspz(pEmb, {bEmbdW, bbIds, bbXin, layers[0].aNorm, bbXn}, {}, &pcE, 16, 1, 256, n);
+        bar();
+        for (uint32_t il = 0; il < nLayer; il++) {
+            Layer& L = layers[il];
+            size_t so1 = (size_t)slot * L.ps1, so2 = (size_t)slot * L.ps2;
+            if (L.rec) {
+                proj(L.qkvW, bbXn, bbBig, chQkv, nEmbd, false);
+                proj(L.zW, bbXn, bbMid, dIn, nEmbd, false);
+                dspz(pAbB, {bbXn, L.alW, L.beW, L.dt, L.av, bbGb}, {}, &pcAbB, 12,
+                     (2 * hV + nsg - 1) / nsg, thrN, n);
+                bar();
+                dspz(pConvB, {bbCarry, bbBig, L.ker, bbConvOut, L.st1},
+                     {(size_t)il * chQkv * 3 * 4, 0, 0, 0, so1},
+                     &pcConvB, 20, chQkv / dS, dS, n);
+                bar();
+                dspz(pStepB, {bbConvOut, bbGb, bbO, L.st2}, {0, 0, 0, so2},
+                     &pcStepB, 16, hV, dS, 1);
+                bar();
+                dspz(pGateB, {bbO, L.sn, bbMid, bbAtt}, {}, &pcGateB, 16,
+                     (hV + nsg - 1) / nsg, thrN, n);
+                bar();
+                proj(L.outW, bbAtt, bbAttnOut, nEmbd, dIn, true);
+            } else {
+                proj(L.wq, bbXn, bbBig, chQkv, nEmbd, false);
+                proj(L.wk, bbXn, bbKin, hKV * dh, nEmbd, false);
+                proj(L.wv, bbXn, bbVin, hKV * dh, nEmbd, false);
+                bar();
+                dspz(pPrepB, {bbBig, bbKin, bbVin, L.qn, L.kn, bbMid, L.st1, L.st2, bRope},
+                     {0, 0, 0, 0, 0, 0, so1, so2, 0}, &pcFaB, 40, hQ + 2 * hKV, 256, n);
+                bar();
+                dspz(pAttnB, {bbMid, L.st1, L.st2, bbBig, bbAtt},
+                     {0, so1, so2, 0, 0}, &pcFaB, 40, hQ, 256, n);
+                bar();
+                proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true);
+            }
+            bar();
+            dspz(pMoeLA, {L.mgi, L.mgis, bbXin, bbAttnOut, L.pn, bbML, bbY, bbXn2}, {},
+                 &pcv5, 20, (257 + nsg - 1) / nsg, thrN, n);
+            bar();
+            dspz(pMoeS, {bbML, bbMSel}, {}, &pcv, 16, 1, 32, n);
+            bar();
+            dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, {}, &pcv, 16,
+                 (9 * 512 + nsg - 1) / nsg, thrN, n);
+            bar();
+            dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY}, {},
+                 &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
+            bar();
+            id<MTLBuffer> nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
+            dspz(pAddN, {bbY, bbMY, nextNorm, bbXin, bbXn}, {}, &pcRms, 8, 1, 256, n);
+            bar();
+        }
+        if (wantLogits) {
+            struct { uint32_t m, k; } pcHead{vocab, nEmbd};
+            dspz(pHead, {bHeadW, bbXn, bbLogits}, {}, &pcHead, 8, (vocab + 3) / 4, 64, n);
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    if (wantLogits)
+        memcpy(logits.data(), (uint8_t*)bbLogits.contents + (size_t)(n - 1) * vocab * 4,
+               (size_t)vocab * 4);
+}
+
+uint32_t qk_engine::serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
+                                        std::vector<float>& logits) {
+    logits.resize(vocab);
+    for (uint32_t s = 0; s < slot; s++) {
+        if (slots[s].active) {
+            fprintf(stderr, "serialPrefillLogits(slot=%u): lower slot %u is active; refusing\n",
+                    slot, s);
+            std::fill(logits.begin(), logits.end(), 0.0f);
+            return 0;
+        }
+    }
+    resetSlot(slot);
+    uint32_t* slotIn = (uint32_t*)bSlotIn.contents;
+    uint32_t* slotPos = (uint32_t*)bSlotPos.contents;
+    for (uint32_t s = 0; s < nSlots; s++) { slotIn[s] = 0; slotPos[s] = 0; }
+    for (uint32_t i = 0; i < n; i++) {
+        slotIn[slot] = toks[i];
+        slotPos[slot] = i;
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc =
+                [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            encodeStep(enc, slot + 1);
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
+    memcpy(logits.data(), (uint8_t*)bLogits.contents + (size_t)slot * vocab * 4,
+           (size_t)vocab * 4);
+    uint32_t best = 0;
+    for (uint32_t i = 1; i < vocab; i++) if (logits[i] > logits[best]) best = i;
+    slots[slot].active = false;
+    return best;
+}
+
+extern "C" {
+
+__attribute__((visibility("default")))
+qk_engine* qk_open(const char* gguf_path, const qk_config* cfg, char* err, size_t err_len) {
+    if (!gguf_path || !cfg) { if (err && err_len) snprintf(err, err_len, "qk_open: null arg"); return nullptr; }
+    qk_engine* e = new (std::nothrow) qk_engine();
+    if (!e) { if (err && err_len) snprintf(err, err_len, "qk_open: oom"); return nullptr; }
+    if (!e->open(gguf_path, *cfg, err, err_len)) { delete e; return nullptr; }
+    return e;
+}
+
+__attribute__((visibility("default"))) void qk_close(qk_engine* e) { delete e; }
+__attribute__((visibility("default"))) uint32_t qk_n_vocab(const qk_engine* e) { return e->vocab; }
+__attribute__((visibility("default"))) uint32_t qk_n_ctx(const qk_engine* e) { return e->nCtx; }
+__attribute__((visibility("default"))) uint32_t qk_n_slots(const qk_engine* e) { return e->nSlots; }
+__attribute__((visibility("default"))) uint32_t qk_chunk(const qk_engine* e) { return e->chunkN; }
+__attribute__((visibility("default"))) uint32_t qk_eos_token(const qk_engine* e) { return e->eosTok; }
+__attribute__((visibility("default"))) uint32_t qk_bos_token(const qk_engine* e) { return e->bosTok; }
+
+__attribute__((visibility("default")))
+int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt,
+                  uint32_t max_gen, uint32_t snap_prefix) {
+    if (!e || slot >= e->nSlots) return -1;
+    if (e->slots[slot].active) return -2;
+    if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
+    for (uint32_t i = 0; i < n_prompt; i++) if (prompt[i] >= e->vocab) return -4;
+    qk_engine::Slot& s = e->slots[slot];
+    int cidx = e->matchPrefix(prompt, n_prompt);
+    uint32_t start;
+    if (cidx >= 0) {
+        e->restoreInto(slot, cidx);
+        start = (uint32_t)e->pcache[cidx].tokens.size();
+    } else {
+        e->resetSlot(slot);
+        start = 0;
+    }
+    uint32_t target = n_prompt >= 1 ? n_prompt - 1 : 0;
+    uint32_t done = start;
+    auto batch_to = [&](uint32_t limit) {
+        while (limit > done && limit - done >= 16) {
+            uint32_t chunk = std::min(e->maxB, limit - done);
+            std::vector<float> unused;
+            e->prefillBatchLast(prompt + done, chunk, slot, unused, /*wantLogits=*/false, /*base=*/done);
+            done += chunk;
+        }
+    };
+    uint32_t snapAt = (snap_prefix > start && snap_prefix < target) ? snap_prefix : 0;
+    uint32_t snapPos = 0;
+    if (!getenv("QK_NO_BATCH")) {
+        if (snapAt) {
+            batch_to(snapAt);
+            if (e->shareFork && done > start) {
+                s.pos = done; s.prompt.assign(prompt, prompt + n_prompt);
+                e->snapshotSlot(slot);
+                snapPos = done;
+            }
+        }
+        batch_to(target);
+    }
+    if (getenv("QK_PCACHE_LOG")) {
+        fprintf(stderr, "[pcache] slot=%u prompt=%u reuse=%u prefill=%u hit=%d snap=%u\n",
+                slot, n_prompt, start, done - start, cidx >= 0 ? 1 : 0, snapPos);
+        fflush(stderr);
+    }
+    s.cursor = done; s.pos = done;
+    s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
+    s.genTokens.clear();
+    s.gen = 0; s.maxGen = max_gen; s.last = 0;
+    if (e->shareFork && snapPos == 0 && done > start) e->snapshotSlot(slot);
+    return 0;
+}
+
+__attribute__((visibility("default")))
+void qk_slot_cancel(qk_engine* e, uint32_t slot) {
+    if (e && slot < e->nSlots) { e->slots[slot].active = false; e->slots[slot].prompt.clear(); }
+}
+
+__attribute__((visibility("default")))
+int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint32_t* out_finished) {
+    if (!e || !out_tokens || !out_counts || !out_finished) return -1;
+    return e->stepChunk(out_tokens, out_counts, out_finished);
+}
+
+}  // extern "C"
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -1848,6 +2572,7 @@ static void listTensors(const std::string& filter) {
     }
 }
 
+#ifndef QK_LIBRARY
 int main(int argc, char** argv) {
     @autoreleasepool {
         std::string mode = argc > 1 ? argv[1] : "suite";
@@ -1855,6 +2580,304 @@ int main(int argc, char** argv) {
         if (mode == "list") {
             listTensors(argc > 2 ? argv[2] : "");
             return 0;
+        }
+
+
+        if (mode == "serve-test2") {
+            if (argc < 5) {
+                fprintf(stderr, "usage: qk serve-test2 <ids1> <ids2> <nGen> [tmax] [delay]\n");
+                return 1;
+            }
+            auto readIds = [](const char* path, std::vector<uint32_t>& out) {
+                FILE* f = fopen(path, "r");
+                if (!f) { perror(path); return false; }
+                int v;
+                while (fscanf(f, "%d%*[, \n]", &v) == 1) out.push_back((uint32_t)v);
+                fclose(f);
+                return true;
+            };
+            std::vector<uint32_t> p1, p2;
+            if (!readIds(argv[2], p1) || !readIds(argv[3], p2)) return 1;
+            uint32_t nGen = (uint32_t)atoi(argv[4]);
+            uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 4096;
+            uint32_t delay = argc > 6 ? (uint32_t)atoi(argv[6]) : 0;
+            qk_config cfg{2, tmax, 8};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            uint32_t ch = qk_chunk(e);
+            std::vector<uint32_t> outTok((size_t)2 * ch), outCnt(2);
+            std::vector<std::vector<uint32_t>> gen(2);
+            uint32_t finMask = 0;
+            auto t0 = std::chrono::steady_clock::now();
+            fprintf(stderr, "[t2] slot_start 0 (%zu toks)\n", p1.size());
+            if (qk_slot_start(e, 0, p1.data(), (uint32_t)p1.size(), nGen, 0)) { fprintf(stderr, "start0 failed\n"); return 1; }
+            uint32_t steps = 0;
+            bool started2 = false;
+            while (true) {
+                if (!started2 && steps >= delay) {
+                    fprintf(stderr, "[t2] slot_start 1 (%zu toks) at step %u\n", p2.size(), steps);
+                    if (qk_slot_start(e, 1, p2.data(), (uint32_t)p2.size(), nGen, 0)) { fprintf(stderr, "start1 failed\n"); return 1; }
+                    started2 = true;
+                }
+                int active = qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask);
+                if (active < 0) { fprintf(stderr, "step error\n"); return 1; }
+                if (active == 0 && started2) break;
+                steps++;
+                for (uint32_t sl = 0; sl < 2; sl++)
+                    for (uint32_t i = 0; i < outCnt[sl]; i++) gen[sl].push_back(outTok[sl * ch + i]);
+                if (steps % 64 == 0)
+                    fprintf(stderr, "[t2] step %u gen0=%zu gen1=%zu\n", steps, gen[0].size(), gen[1].size());
+            }
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            printf("serve-test2: OK gen0=%zu gen1=%zu tokens in %.1f ms (%u steps)\n",
+                   gen[0].size(), gen[1].size(), ms, steps);
+            printf("GEN0:"); for (uint32_t t : gen[0]) printf(" %u", t); printf("\n");
+            printf("GEN1:"); for (uint32_t t : gen[1]) printf(" %u", t); printf("\n");
+            qk_close(e);
+            return 0;
+        }
+
+        if (mode == "serve-test") {
+            if (argc < 4) {
+                fprintf(stderr, "usage: qk serve-test <ids-file> <nGen> [nSlots] [tmax]\n");
+                return 1;
+            }
+            std::vector<uint32_t> prompt;
+            {
+                FILE* f = fopen(argv[2], "r");
+                if (!f) { perror(argv[2]); return 1; }
+                int v;
+                while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+                fclose(f);
+            }
+            uint32_t nGen = (uint32_t)atoi(argv[3]);
+            uint32_t nSlots = argc > 4 ? (uint32_t)atoi(argv[4]) : 1;
+            uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 128;
+            qk_config cfg{nSlots, tmax, 8};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            uint32_t ch = qk_chunk(e);
+            std::vector<std::vector<uint32_t>> gen(nSlots);
+            std::vector<uint32_t> outTok((size_t)nSlots * ch), outCnt(nSlots);
+            uint32_t finMask = 0;
+            auto t0 = std::chrono::steady_clock::now();
+            for (uint32_t sl = 0; sl < nSlots; sl++)
+                qk_slot_start(e, sl, prompt.data(), (uint32_t)prompt.size(), nGen, 0);
+            while (qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask) > 0)
+                for (uint32_t sl = 0; sl < nSlots; sl++)
+                    for (uint32_t i = 0; i < outCnt[sl]; i++) gen[sl].push_back(outTok[sl * ch + i]);
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            bool allEq = true;
+            for (uint32_t sl = 1; sl < nSlots; sl++) if (gen[sl] != gen[0]) allEq = false;
+            printf("serve-test: %u slots x prompt %zu -> %zu tokens each in %.1f ms (%.1f tok/s agg)\n",
+                   nSlots, prompt.size(), gen[0].size(), ms,
+                   (double)(gen[0].size() * nSlots) * 1000.0 / ms);
+            if (nSlots > 1) printf("all slots identical: %s\n", allEq ? "YES" : "NO");
+            printf("GEN:");
+            for (uint32_t t : gen[0]) printf(" %u", t);
+            printf("\n");
+            qk_close(e);
+            return 0;
+        }
+
+        if (mode == "cachetest") {
+            if (argc < 4) { fprintf(stderr, "usage: qk cachetest <ids-file> <nGen> [tmax]\n"); return 1; }
+            std::vector<uint32_t> prompt;
+            {
+                FILE* f = fopen(argv[2], "r");
+                if (!f) { perror(argv[2]); return 1; }
+                int v;
+                while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+                fclose(f);
+            }
+            uint32_t nGen = (uint32_t)atoi(argv[3]);
+            uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 4096;
+            auto run = [&](qk_engine* e, const std::vector<uint32_t>& ids, uint32_t gN, double& ms) {
+                std::vector<uint32_t> out;
+                qk_slot_start(e, 0, ids.data(), (uint32_t)ids.size(), gN, 0);
+                uint32_t ch = qk_chunk(e);
+                std::vector<uint32_t> ot((size_t)ch), oc(1);
+                uint32_t fin = 0;
+                auto t0 = std::chrono::steady_clock::now();
+                while (qk_step_chunk(e, ot.data(), oc.data(), &fin) > 0)
+                    for (uint32_t i = 0; i < oc[0]; i++) out.push_back(ot[i]);
+                ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                return out;
+            };
+            char err[256] = {0};
+            qk_config cfg{1, tmax, 8};
+            qk_engine* eA = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!eA) { fprintf(stderr, "open: %s\n", err); return 1; }
+            double t1;
+            auto R = run(eA, prompt, nGen, t1);
+            std::vector<uint32_t> p2 = prompt;
+            p2.insert(p2.end(), R.begin(), R.end());
+            p2.insert(p2.end(), prompt.begin(), prompt.end());
+            double tw;
+            auto warm = run(eA, p2, nGen, tw);
+            qk_close(eA);
+            qk_engine* eB = qk_open(ggufPath(), &cfg, err, sizeof err);
+            double tc;
+            auto cold = run(eB, p2, nGen, tc);
+            qk_close(eB);
+            printf("cachetest: turn-2 prompt %zu tokens, gen %u\n", p2.size(), nGen);
+            printf("  cold (full prefill) %.1f ms  |  warm (cached prefix) %.1f ms  |  %.2fx faster\n",
+                   tc, tw, tw > 0 ? tc / tw : 0.0);
+            bool eq = warm == cold;
+            printf("  warm output identical to cold: %s\n", eq ? "YES" : "NO");
+            if (!eq) {
+                size_t d = 0;
+                while (d < warm.size() && d < cold.size() && warm[d] == cold[d]) d++;
+                printf("  first divergence at token %zu\n", d);
+            }
+            return 0;
+        }
+
+        if (mode == "prefillcmp") {
+            uint32_t N = argc > 2 ? (uint32_t)atoi(argv[2]) : 32;
+            uint32_t ctx = argc > 3 ? (uint32_t)atoi(argv[3]) : 2048;
+            if (N < 1 || N > 1024 || N + 1 > ctx) {
+                fprintf(stderr, "usage: qk prefillcmp [N<=maxB] [ctx]  (requires N+1 <= ctx)\n");
+                return 1;
+            }
+            qk_config cfg{2, ctx, 8};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+
+            uint32_t cap = std::min<uint32_t>(e->maxB, ctx - 1);
+            std::vector<uint32_t> sizes;
+            for (uint32_t sz : {1u, 2u, 8u, 15u, 16u, 17u, 32u, 48u, 64u, 96u, 127u, 128u, 192u, 256u})
+                if (sz <= cap) sizes.push_back(sz);
+            if (N <= cap && std::find(sizes.begin(), sizes.end(), N) == sizes.end()) sizes.push_back(N);
+            std::vector<uint32_t> seeds{1234u, 42u, 2026u};
+
+            uint32_t nCase = 0, nPass = 0;
+            double worstRel = 0;
+            printf("prefillcmp sweep: sizes x seeds, ctx=%u  (tokS=serial argmax, tokB=batched argmax)\n", ctx);
+            for (uint32_t sz : sizes) {
+                for (uint32_t seed : seeds) {
+                    std::mt19937 rng(seed);
+                    std::vector<uint32_t> toks(sz);
+                    for (uint32_t i = 0; i < sz; i++) toks[i] = rng() % (e->vocab - 16) + 4;
+
+                    std::vector<float> logitsS, logitsB;
+                    uint32_t tokS = e->serialPrefillLogits(toks.data(), sz, 1, logitsS);
+                    e->prefillBatchLast(toks.data(), sz, 0, logitsB);
+                    uint32_t tokB = (uint32_t)(std::max_element(logitsB.begin(), logitsB.end()) - logitsB.begin());
+
+                    double maxAbs = 0, refMax = 1e-9;
+                    for (uint32_t i = 0; i < e->vocab; i++) {
+                        maxAbs = std::max(maxAbs, (double)std::fabs(logitsB[i] - logitsS[i]));
+                        refMax = std::max(refMax, (double)std::fabs(logitsS[i]));
+                    }
+                    double rel = maxAbs / refMax;
+                    worstRel = std::max(worstRel, rel);
+                    bool ok = (tokS == tokB);
+                    nCase++; if (ok) nPass++;
+                    printf("  N=%-4u seed=%-5u tokS=%-7u tokB=%-7u %s  max|dlogit|=%.4g rel=%.2g\n",
+                           sz, seed, tokS, tokB, ok ? "MATCH" : "**MISMATCH**", maxAbs, rel);
+                }
+            }
+            bool allOk = (nPass == nCase);
+            printf("\nprefillcmp: %u/%u argmax matches, worst rel logit diff %.2g -> %s\n",
+                   nPass, nCase, worstRel, allOk ? "PREFILL TOKEN-EXACT" : "PREFILL DIVERGENCE");
+            qk_close(e);
+            return allOk ? 0 : 1;
+        }
+
+        if (mode == "prefillbench") {
+            uint32_t ctx = argc > 2 ? (uint32_t)atoi(argv[2]) : 2048;
+            qk_config cfg{2, ctx, 8};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            uint32_t cap = std::min<uint32_t>(e->maxB, ctx - 1);
+            std::vector<float> lS, lB;
+            printf("prefillbench: serial (N per-token forwards) vs batched (1 forward), ctx=%u\n", ctx);
+            printf("  %-6s %10s %10s %8s %10s\n", "N", "serial_ms", "batch_ms", "speedup", "tok/s_bat");
+            for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u, 192u, 256u}) {
+                if (N > cap) continue;
+                std::mt19937 rng(1234);
+                std::vector<uint32_t> toks(N);
+                for (uint32_t i = 0; i < N; i++) toks[i] = rng() % (e->vocab - 16) + 4;
+                e->prefillBatchLast(toks.data(), N, 0, lB);   // warm
+                e->serialPrefillLogits(toks.data(), N, 1, lS);
+                auto t0 = std::chrono::steady_clock::now();
+                e->serialPrefillLogits(toks.data(), N, 1, lS);
+                auto t1 = std::chrono::steady_clock::now();
+                e->prefillBatchLast(toks.data(), N, 0, lB);
+                auto t2 = std::chrono::steady_clock::now();
+                double sMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                double bMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+                printf("  %-6u %10.2f %10.2f %7.2fx %10.0f\n", N, sMs, bMs, sMs / bMs, N / (bMs / 1000.0));
+            }
+            qk_close(e);
+            return 0;
+        }
+
+        if (mode == "prefilldecode") {
+            uint32_t N = argc > 2 ? (uint32_t)atoi(argv[2]) : 32;
+            uint32_t M = argc > 3 ? (uint32_t)atoi(argv[3]) : 24;
+            uint32_t ctx = argc > 4 ? (uint32_t)atoi(argv[4]) : 2048;
+            if (N < 1 || N > 1024 || N + M > ctx) { fprintf(stderr, "usage: qk prefilldecode [N<=maxB] [M] [ctx]\n"); return 1; }
+            qk_config cfg{2, ctx, 8};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            if (N > e->maxB) { fprintf(stderr, "N=%u > maxB=%u (raise QK_MAXB)\n", N, e->maxB); return 1; }
+            uint32_t ch = qk_chunk(e);
+            uint32_t nSl = qk_n_slots(e);
+            std::vector<uint32_t> outTok((size_t)nSl * ch), outCnt(nSl);
+            uint32_t fin = 0;
+
+            bool allOk = true;
+            for (uint32_t seed : {1234u, 7u, 99u}) {
+                std::mt19937 rng(seed);
+                std::vector<uint32_t> toks(N);
+                for (uint32_t i = 0; i < N; i++) toks[i] = rng() % (e->vocab - 16) + 4;
+
+                std::vector<uint32_t> refSeq;
+                qk_slot_start(e, 1, toks.data(), N, M, 0);
+                while (e->stepChunk(outTok.data(), outCnt.data(), &fin) > 0)
+                    for (uint32_t i = 0; i < outCnt[1]; i++) refSeq.push_back(outTok[(size_t)1 * ch + i]);
+
+                std::vector<float> lB;
+                e->prefillBatchLast(toks.data(), N, 0, lB);
+                uint32_t tok0 = (uint32_t)(std::max_element(lB.begin(), lB.end()) - lB.begin());
+                std::vector<uint32_t> batSeq;
+                qk_engine::Slot& s0 = e->slots[0];
+                s0.prompt.assign(toks.begin(), toks.end());
+                if (tok0 != e->eosTok) {
+                    batSeq.push_back(tok0);
+                    s0.genTokens.assign(1, tok0);
+                    s0.cursor = N; s0.pos = N; s0.gen = 1; s0.maxGen = M; s0.last = tok0; s0.active = true;
+                    while (e->stepChunk(outTok.data(), outCnt.data(), &fin) > 0)
+                        for (uint32_t i = 0; i < outCnt[0]; i++) batSeq.push_back(outTok[(size_t)0 * ch + i]);
+                } else {
+                    s0.active = false;
+                }
+
+                size_t cmp = std::min(refSeq.size(), batSeq.size());
+                size_t match = 0;
+                while (match < cmp && refSeq[match] == batSeq[match]) match++;
+                bool ok = (refSeq.size() == batSeq.size()) && (match == refSeq.size());
+                allOk &= ok;
+                printf("  seed=%-5u N=%u M=%u serial=%zu tok, batched=%zu tok, matched %zu -> %s\n",
+                       seed, N, M, refSeq.size(), batSeq.size(), match, ok ? "OK" : "**DIVERGE**");
+                if (!ok) {
+                    printf("    serial :"); for (uint32_t t : refSeq) printf(" %u", t); printf("\n");
+                    printf("    batched:"); for (uint32_t t : batSeq) printf(" %u", t); printf("\n");
+                }
+            }
+            printf("prefilldecode: %s\n", allOk ? "HANDOFF EXACT (batched prefill -> serial decode == all-serial)"
+                                                : "HANDOFF DIVERGENCE");
+            qk_close(e);
+            return allOk ? 0 : 1;
         }
 
         MtlCtx c;
@@ -1909,3 +2932,4 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 }
+#endif  // QK_LIBRARY
