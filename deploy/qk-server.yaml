@@ -7,6 +7,13 @@ metadata:
     app: qk-server
 spec:
   replicas: 0   # starts idle; only one of {gemma-server, qk-server} may hold the GPU at a time
+  # Recreate, NOT RollingUpdate: two overlapping pods cannot both fit the
+  # ~17.6 GB model in 20 GB VRAM. Under overlap the new pod's weights silently
+  # fall back to GTT (host RAM over PCIe) — the server comes up healthy at
+  # ~9 tok/s (symptom: card0 vram ~3 GB, gtt ~27 GB). Recreate kills the old
+  # pod first so the load always lands in VRAM.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: qk-server
@@ -40,6 +47,10 @@ spec:
         - "8"
         env:
         - name: QK_FORK           # same-prompt requests share one prefill (fork mode)
+          value: "1"
+        - name: QK_SPEC           # prompt-lookup speculative decoding (exact-output;
+          value: "1"              # ~1.5x on echo-heavy turns, neutral otherwise)
+        - name: QK_SPEC_LOG       # one [spec] stats line per request that speculated
           value: "1"
         # Batched prefill flushes its command buffer every QK_SUBMIT_LAYERS layers
         # (engine default 8) so no single vkQueueSubmit can outlive amdgpu's ~10 s

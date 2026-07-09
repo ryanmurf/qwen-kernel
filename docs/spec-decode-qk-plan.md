@@ -1,5 +1,16 @@
 # Speculative decoding in the qk engine — design + implementation plan
 
+> **STATUS 2026-07-09: P0–P3 shipped** (`qk verify` / `qk speccmp` harnesses,
+> `QK_SPEC` in the deployment). Measured: oracle full-accept 2.1–2.6× (K=8–64,
+> token-exact at every position); rollback token-exact under forced partial
+> accepts incl. 127 consecutive rejections; echo-heavy generation 1.48×
+> end-to-end at avg accept 7.48/8; non-echo workloads untriggered (+1% noise);
+> 75 s verify soak peaked 99 °C junction. One design change vs. the plan below:
+> scratch persistence needed **no shader flag** — slot state is bound by
+> descriptor offset, so verify mode is copy-live→scratch + rebind
+> (`copyDnStripes`/`verifyRound` in `src/main.cpp`). v1 speculates only when a
+> single slot is active; multi-slot fairness awaits production `[spec]` data.
+
 Task #5 deliverable. Companion to [speculative-decoding.md](speculative-decoding.md), which
 assessed spec decode for the *llama.cpp* serving path (2026-04). Since then the rig moved to the
 from-scratch qk engine (`src/main.cpp` + `server/`), which changes the calculus in two ways:

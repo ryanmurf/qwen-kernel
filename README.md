@@ -104,6 +104,8 @@ Env knobs:
 | `QK_GGUF`, `QK_DEVICE`, `QK_SHADER_DIR` | model path, Vulkan device index, SPIR-V dir |
 | | (`QK_GGUF`/`--model` also accept the first shard of an llama.cpp-style split model, `…-00001-of-NNNNN.gguf`) |
 | `QK_FORK=1` | prefix cache: same-prefix requests restore instead of re-prefilling |
+| `QK_SPEC=1` | prompt-lookup speculative decoding (exact output; ~1.5× on echo-heavy generation) |
+| `QK_SPEC_K`, `QK_SPEC_L`, `QK_SPEC_LOG=1` | verify width (8), trigger n-gram length (6), per-request `[spec]` stats |
 | `QK_PCACHE`, `QK_PCACHE_LOG=1` | prefix-cache LRU depth (default 3), per-request stats |
 | `QK_NO_BATCH=1` | force serial prefill (correctness reference) |
 | `QK_MAXB` | batch-prefill chunk width (default 128; buffers scale with it) |
