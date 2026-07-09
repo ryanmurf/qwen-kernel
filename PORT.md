@@ -384,3 +384,50 @@ is the step-change lever once serving works.
   against 546 are therefore conservative lower bounds.
 - DeltaNet state bytes assume f32 state resident on GPU, read+write per
   token per linear layer; conv-state traffic (~0.1 MB/layer) ignored.
+
+## Execution plan — beat llama.cpp Metal on EVERY axis (2026-07-09)
+
+Scorecard today (this box, this GGUF) and the plan to flip every ✗:
+
+| axis | llama.cpp | qk | plan |
+|---|---|---|---|
+| decode 1-stream | 84.2 tok/s | **120.5 ✓** (parity ✓) | stretch to 150 (C3) |
+| prefill batched | 1452 tok/s | ✗ serial ~110 | B1 ≥4× serial, B2 GEMM ≥1452 |
+| serving/multi-slot | llama-server | ✗ none yet | A1-A5 (M5) |
+| agg. throughput | --parallel N | ✗ | B3 z-axis slots ≥ llama.cpp |
+| load time / RSS | mmap no-copy | ✗ 15 GB copy | C1 no-copy MTLBuffer + offsets |
+| long ctx | 256k | ✗ tmax 128, fa cap 1024 | C2 srv attention kernels, f16 KV, ctx 16k |
+| quality | reference | ✓ token-exact | keep: parity gate on every change |
+
+**Phase A — serving foundation (M5):**
+A1 port batch/srv kernels: gemm_q8_0, fa_prep/attn_batch, fa_prep/attn_srv,
+   dn_*_batch, moe_down_q8b, add_rms3 (batched-prefill + multi-slot chains).
+A2 qk.h C ABI engine in main_metal.mm; build libqk.dylib (APPLE branch).
+A3 harnesses green: prefillcmp, prefillbench, prefilldecode, serve-test,
+   serve-test2, cachetest — all token-exact.
+A4 prefix cache snapshot/restore = plain UMA memcpys.
+A5 Rust server dlopens libqk.dylib; /v1/messages up; claude CLI round trip.
+
+**Phase B — prefill/throughput supremacy:**
+B1 batched prefill ≥4× own serial (DoD bar) via chunked GEMM chain.
+B2 profile → simdgroup_matrix GEMM for q8/iq3/iq4 to ≥1452 tok/s pp512
+   (llama.cpp ≈ 31% of f16 peak here; beatable with fused-MoE GEMM).
+B3 multi-slot aggregate decode > llama.cpp --parallel at 2/4/8/16 slots.
+
+**Phase C — polish past llama.cpp:**
+C1 no-copy weights: ONE MTLBuffer over the whole GGUF mmap
+   (newBufferWithBytesNoCopy needs page alignment — the mmap base is;
+   per-tensor via setBuffer:offset:, GGUF aligns tensors to 32 B ✓)
+   → load ≈ llama.cpp, peak RSS −15 GB.
+C2 long context: fa srv kernels (chunked softmax past the 1024 cap),
+   f16 KV cache (llama.cpp default — keeps comparisons apples-to-apples),
+   ctx 16384 serving config like the RDNA3 deploy.
+C3 decode 150 stretch: post-barrier bandwidth-ramp microbench, nr0
+   row-pairing on in-block q8 GEMVs, then spec-decode per
+   docs/spec-decode-qk-plan.md as the step change.
+C4 final scorecard in README + PORT.md: decode, prefill, aggregate, TTFT,
+   load, RSS, CLI-path E2E — every row green vs llama.cpp Metal.
+
+Rules of engagement (unchanged): every kernel lands with CPU-reference
+validation; every phase ends with the token-parity gate ×3 prompts; every
+result (positive or negative) recorded here; commit per green step.
