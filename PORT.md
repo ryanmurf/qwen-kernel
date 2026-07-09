@@ -372,6 +372,44 @@ microbench — if real, fewer/fatter stages is the endgame; (d) f16
 h/activations; (e) speculative decoding (docs/spec-decode-qk-plan.md)
 is the step-change lever once serving works.
 
+## M5 — serving on Metal: engine, harnesses, server, CLI round trip (2026-07-09)
+
+**The full serving stack runs on this laptop.** `libqk.dylib` (same TU as
+the CLI, `QK_LIBRARY`), the unmodified-in-spirit Rust server (one 12-line
+compatibility patch: Claude Code ≥2.2 sends in-messages `system` turns),
+and the qk.h engine implemented on Metal with the fused kernel set.
+
+Gates, all green on first full runs:
+
+| gate | result |
+|---|---|
+| serve-test 1 slot | TOKEN-EXACT vs llama.cpp greedy reference |
+| prefillcmp (14 sizes × 3 seeds) | 36/36 argmax MATCH, worst rel 1.3e-6 |
+| prefilldecode ×3 seeds | HANDOFF EXACT |
+| serve-test 4 slots | all slots identical YES, 104.8 tok/s aggregate |
+| serve-test2 staggered | OK |
+| cachetest | warm ≡ cold YES |
+| /v1/messages | "The capital of France is Paris." |
+| Claude CLI tool round trip | **num_turns=2, is_error=false** at ctx 32768 |
+
+The CLI round trip is the real-world stress test: Claude Code's 2026
+system prompt is **29.8k tokens**. Turn 1 cold-prefills 29,809 tokens;
+turn 2 hits the prefix cache with `reuse=29809 prefill=44` — the
+cross-turn O(delta) design carried over from RDNA3 intact, as plain UMA
+memcpys (snapshots are host vectors now; no staging buffers, no Vulkan
+copy machinery).
+
+Metal-specific engine notes: no pre-recorded command buffers exist on
+Metal, so the serial step is encoded per token (~0.4 ms host) with grid
+z = highest-active-slot; per-slot state stripes bind via setBuffer:offset;
+gemm_q8_0 restructured to BK=32 (Apple's 32 KB threadgroup ceiling vs
+RDNA3's 64 KB LDS); srv attention uses online softmax — context is bounded
+by KV memory, not threadgroup arrays (32k validated).
+
+Prefill today: 214–241 tok/s batched = 2.5–2.9× serial (Vulkan reached
+4.2×; llama.cpp Metal does 1452). Phase B owns this: the scalar f32 GEMM
+and the z-per-token MoE are the gaps.
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);

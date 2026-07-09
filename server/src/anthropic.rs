@@ -274,6 +274,13 @@ fn render_prompt(req: &MessagesReq) -> Result<String> {
                 out.push_str(&render_assistant_content(&message.content)?);
                 out.push_str("<|im_end|>\n");
             }
+            // Claude Code >= 2.2 sends system reminders as in-messages system
+            // turns (older CLIs only used the top-level `system` field).
+            "system" => {
+                out.push_str("<|im_start|>system\n");
+                out.push_str(&render_user_content(&message.content)?);
+                out.push_str("<|im_end|>\n");
+            }
             role => {
                 return Err(ServerError::bad_request(format!(
                     "unsupported message role: {role}"
