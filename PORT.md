@@ -410,6 +410,28 @@ Prefill today: 214–241 tok/s batched = 2.5–2.9× serial (Vulkan reached
 4.2×; llama.cpp Metal does 1452). Phase B owns this: the scalar f32 GEMM
 and the z-per-token MoE are the gaps.
 
+## Phase B (in progress) — prefill: 2.9× serial, GEMM variants benched (2026-07-09)
+
+`caseBGemm` ports the GEMM validation harness. Measured (M=8192, K=2048):
+
+| variant | N=128 | N=512 | correctness |
+|---|---|---|---|
+| scalar f32, BK=32 (shipping) | 1.92 TFLOPS | 2.34 TFLOPS | PASS 4.5e-4 |
+| simdgroup_float8x8, BK=32 | 1.03 TFLOPS | 1.39 TFLOPS | PASS 2e-3 — **slower**: f32 MMA ≈ scalar on Apple + fragment-store tail |
+| simdgroup_half8x8, BK=64 | — | — | **FAIL 0.9 rel — bug** (structural, not f16 rounding; bisect vs the passing f32 twin next: BK=64 two-block staging is the delta) |
+
+Engine ships the exact scalar kernel (QK_GEMM=sg|h opt-in). prefillbench:
+219–247 tok/s at chunks 64–256 = 2.6–2.9× serial. B1's ≥4× and B2's 1452
+need: fixed f16 fragments (llama.cpp precedent — our greedy parity already
+holds against THEIR f16 prefill, and prefillcmp/prefilldecode/CLI gates
+decide acceptance), then expert-grouped MoE GEMM (today each token re-reads
+its own experts: 128×10.9 MB/layer with only ~14% SLC dedup).
+
+Budget at N=128 (530 ms/chunk): projections ≈180 ms (scalar GEMM), MoE
+≈180 ms (ungrouped expert reads), dn_step_batch ≈60–120 ms (32 tgs,
+serial over Tn — low occupancy by design, state in registers), attention +
+small ops ≈50 ms.
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);

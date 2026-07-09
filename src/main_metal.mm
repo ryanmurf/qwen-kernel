@@ -2561,6 +2561,91 @@ int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint
 
 }  // extern "C"
 
+
+// Batched-prefill GEMM validation: Y[N,M] = X[N,K]·W[M,K]^T vs CPU reference.
+static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t iters) {
+    printf("\n== bgemm  Y[%u,%u] = X[%u,%u] . W(q8)[%u,%u]^T ==\n", N, M, N, K, M, K);
+    if (K % 32) { fprintf(stderr, "K must be a multiple of 32\n"); return false; }
+    size_t nb = (size_t)M * K / 32;
+    std::vector<block_q8_0> blocks(nb);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        b.d = qk_f32_to_f16(0.005f + 0.02f * (rng() & 0xFFFF) / 65536.0f);
+        for (auto& q : b.qs) q = (int8_t)((int)(rng() % 255) - 127);
+    }
+    std::vector<float> X((size_t)N * K);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : X) v = nd(rng);
+
+    std::vector<float> yref((size_t)N * M), tmp(K);
+    for (uint32_t m = 0; m < M; m++) {
+        dequant_row_q8_0(&blocks[(size_t)m * (K / 32)], tmp.data(), K);
+        for (uint32_t n = 0; n < N; n++) {
+            double a = 0;
+            for (uint32_t k = 0; k < K; k++) a += (double)tmp[k] * X[(size_t)n * K + k];
+            yref[(size_t)n * M + m] = (float)a;
+        }
+    }
+
+    const char* gv = getenv("QK_GEMM");
+    const char* fn = "gemm_q8_0";
+    if (gv && !strcmp(gv, "sg")) fn = "gemm_q8_0_sg";
+    if (gv && !strcmp(gv, "h")) fn = "gemm_q8_0_h";
+    bool scalar = !strcmp(fn, "gemm_q8_0");
+    id<MTLComputePipelineState> pso = getPipe(c, "gemm_q8_0", fn, 0);
+    printf("variant: %s\n", fn);
+    id<MTLBuffer> bW = createBuf(c, nb * sizeof(block_q8_0), blocks.data());
+    id<MTLBuffer> bX = createBuf(c, X.size() * 4, X.data());
+    id<MTLBuffer> bY = createBuf(c, yref.size() * 4);
+    struct { uint32_t M, K, N; } pc{M, K, N};
+    auto enc1 = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:bY offset:0 atIndex:2];
+        [enc setBytes:&pc length:12 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((M + 127) / 128, 1, (N + 63) / 64)
+            threadsPerThreadgroup:MTLSizeMake(scalar ? 256 : 128, 1, 1)];
+    };
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        enc1(enc);
+        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    }
+    const float* yg = (const float*)bY.contents;
+    double rms = 0;
+    for (size_t i = 0; i < yref.size(); i++) rms += (double)yref[i] * yref[i];
+    rms = std::sqrt(rms / yref.size());
+    double denomFloor = std::max(1e-3, 1e-3 * rms);
+    double maxRel = 0; uint32_t bad = 0;
+    for (size_t i = 0; i < yref.size(); i++) {
+        double rel = std::fabs((double)yg[i] - yref[i]) / std::max(denomFloor, (double)std::fabs(yref[i]));
+        maxRel = std::max(maxRel, rel);
+        if (rel > 1e-2 && bad++ < 4) printf("  y[%zu]: gpu=%g ref=%g\n", i, yg[i], yref[i]);
+    }
+    bool pass = bad == 0;
+    printf("correctness: max_rel_err = %.3g  ->  %s\n", maxRel, pass ? "PASS" : "FAIL");
+    if (pass && iters) {
+        auto run = [&]() -> double {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                for (uint32_t i = 0; i < iters; i++) enc1(enc);
+                [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                return (cb.GPUEndTime - cb.GPUStartTime) * 1e9 / iters;
+            }
+        };
+        run();
+        double ns = run();
+        double flops = 2.0 * M * K * N;
+        double wBytes = (double)nb * 34;
+        printf("gpu: %8.1f µs/iter | %7.1f GFLOP/s | W %6.1f GB/s-equiv\n",
+               ns / 1e3, flops / ns, wBytes / ns);
+    }
+    return pass;
+}
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -2917,6 +3002,8 @@ int main(int argc, char** argv) {
             ok = caseBlock(c, argU(2, 0), argU(3, 3), argU(4, 200));
         } else if (mode == "ablock") {
             ok = caseABlock(c, argU(2, 3), argU(3, 3), argU(4, 200));
+        } else if (mode == "bgemm") {
+            ok = caseBGemm(c, argU(2, 8192), argU(3, 2048), argU(4, 128), argU(5, 50));
         } else if (mode == "token") {
             if (argc < 4) {
                 fprintf(stderr, "usage: qk token <ids-file> <nGen> [tmax]\n");
