@@ -62,6 +62,14 @@ tokenizer reproduces llama.cpp byte-for-byte.
   token) and the DeltaNet recurrence collapsed into one workgroup-per-head
   dispatch. Auto-selected; `QK_NO_BATCH=1` forces the serial reference path.
   Chunk width saturates at 128 (measured; 256 is token-exact but +1%).
+- **Pipeline split (`QK_LAYERS=a:b`)** — an engine instance can own just
+  transformer layers `[a,b)`: the first stage also owns the embedding, the
+  last owns final-norm + head + argmax, and the ~8 KB/token residual row
+  crosses stage boundaries through the `qk_stage_run` ABI (in-process or
+  TCP — `qk pipe` / `qk pipe-worker`). Greedy output is token-exact vs the
+  unsplit engine at every tested boundary; two stages of a 20-layer half
+  hold ~8.5 GB each vs ~15.4 GB whole. Foundation for serving models larger
+  than one GPU (e.g. tron + midnight once the Metal port lands).
 - **`deploy/`** — k8s deployment sharing one GPU with a llama.cpp fallback
   backend (`switch.sh qk|gemma`), image build script, and an
   orphaned-GPU-process reaper. See `deploy/README.md`.
@@ -94,6 +102,8 @@ qk token <ids> <n> [tmax] [batch]   # end-to-end greedy generation
 qk warm <ids> <n>        # prefix-cache TTFT demo        qk serve-test <ids> <n> [slots]
 qk prefillcmp|prefillbench|prefilldecode   # batched-prefill exactness / timing / handoff
 qk verify <ids> <n> [K,..]   # spec-decode verify rounds (oracle draft): exactness + c(K)
+qk pipe <ids> <n> [split] [tmax] [host:port]   # pipeline-split parity/timing (2 stages)
+qk pipe-worker <port> [a:b] [tmax]             # serve one stage over TCP
 qk list [filter]         # tensors in the GGUF
 ```
 
@@ -104,6 +114,7 @@ Env knobs:
 | `QK_GGUF`, `QK_DEVICE`, `QK_SHADER_DIR` | model path, Vulkan device index, SPIR-V dir |
 | | (`QK_GGUF`/`--model` also accept the first shard of an llama.cpp-style split model, `…-00001-of-NNNNN.gguf`) |
 | `QK_FORK=1` | prefix cache: same-prefix requests restore instead of re-prefilling |
+| `QK_LAYERS=a:b` | pipeline split: this engine owns layers `[a,b)` only, driven via `qk_stage_run` |
 | `QK_SPEC=1` | prompt-lookup speculative decoding (exact output; ~1.5× on echo-heavy generation) |
 | `QK_SPEC_K`, `QK_SPEC_L`, `QK_SPEC_LOG=1` | verify width (8), trigger n-gram length (6), per-request `[spec]` stats |
 | `QK_PCACHE`, `QK_PCACHE_LOG=1` | prefix-cache LRU depth (default 3), per-request stats |

@@ -68,6 +68,38 @@ void qk_slot_cancel(qk_engine *e, uint32_t slot);
 int qk_step_chunk(qk_engine *e, uint32_t *out_tokens, uint32_t *out_counts,
                   uint32_t *out_finished);
 
+/* ---- Pipeline split (QK_LAYERS=a:b) ----------------------------------------
+ * With QK_LAYERS=a:b in the environment, qk_open loads ONLY transformer layers
+ * [a,b): the first stage (a==0) additionally owns the token embedding; the
+ * last stage (b==n_layer) owns the final norm + lm head + argmax. Weights,
+ * KV cache and recurrent state outside the range are never allocated, so N
+ * stages on N devices together hold one model.
+ *
+ * A split engine is driven ONLY through qk_stage_run below — qk_slot_start /
+ * qk_step_chunk return an error on it. The caller (one driver per sequence)
+ * carries the ~8 KB/token hidden row between stages. An unsplit engine also
+ * accepts qk_stage_run (toks in, ids out), which is the same forward pass. */
+
+uint32_t qk_layer_first(const qk_engine *e); /* a (0 when unsplit)          */
+uint32_t qk_layer_end(const qk_engine *e);   /* b (n_layer when unsplit)    */
+uint32_t qk_n_layer(const qk_engine *e);     /* total model layers          */
+uint32_t qk_n_embd(const qk_engine *e);      /* hidden row width (floats)   */
+
+/* Run n positions [base, base+n) of `slot` through this stage's layers,
+ * chunking internally. base==0 resets the slot's state first (fresh sequence);
+ * base>0 continues it (caller guarantees positions [0,base) were already run).
+ *
+ * First stage:     toks      = n token ids            (hidden_in must be NULL)
+ * Later stages:    hidden_in = n * n_embd floats from the previous stage
+ * Non-last stage:  hidden_out = n * n_embd floats out (ids_out ignored)
+ * Last stage:      ids_out    = n u32 out — ids_out[i] is the greedy argmax
+ *                  AFTER position base+i, so ids_out[n-1] is the next token.
+ *
+ * Returns 0 on success, negative on bad args. Blocks the engine thread. */
+int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
+                 const float *hidden_in, uint32_t n, uint32_t base,
+                 float *hidden_out, uint32_t *ids_out);
+
 #ifdef __cplusplus
 }
 #endif
