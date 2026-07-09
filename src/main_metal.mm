@@ -169,10 +169,15 @@ static id<MTLBuffer> createBuf(MtlCtx& c, size_t size, const void* init = nullpt
 
 // ---------- generic GEMV run: upload, verify, benchmark ----------
 
+// fixedNr0 != 0: llama.cpp-style kernel owning its work shape — NSG
+// simdgroups per threadgroup (function constant 0, QK_TPR overrides for
+// sweeps), fixedNr0 consecutive rows per simdgroup. tgMemBytes: threadgroup
+// memory for staged tables (index 0).
 static bool runGemv(MtlCtx& c, const char* kernelName, const void* wBytes,
                     size_t wSize, const std::vector<float>& x, uint32_t M,
                     uint32_t K, const std::vector<float>& yref, uint32_t iters,
-                    uint32_t unitsPerRow, double tol = 1e-2) {
+                    uint32_t unitsPerRow, double tol = 1e-2,
+                    uint32_t fixedNr0 = 0, uint32_t tgMemBytes = 0) {
     size_t sizeX = (size_t)K * 4, sizeY = (size_t)M * 4;
 
     // threads-per-row function constant: shrink for skinny rows so a
@@ -189,7 +194,16 @@ static bool runGemv(MtlCtx& c, const char* kernelName, const void* wBytes,
         uint32_t v = (uint32_t)atoi(e);
         if (v >= 4 && v <= 256 && (v & (v - 1)) == 0) tpr = v;
     }
-    uint32_t rowsPerWg = 256 / tpr;
+    uint32_t nsg = 2;  // simdgroups per tg for fixed-shape kernels (llama.cpp ships 2)
+    if (fixedNr0) {
+        if (const char* e = getenv("QK_TPR")) {
+            uint32_t v = (uint32_t)atoi(e);
+            if (v >= 1 && v <= 8) nsg = v;
+        }
+        tpr = nsg;  // function-constant slot carries NSG for these kernels
+    }
+    uint32_t rowsPerWg = fixedNr0 ? nsg * fixedNr0 : 256 / tpr;
+    uint32_t tgThreads = fixedNr0 ? nsg * 32 : 256;
 
     id<MTLBuffer> bW = createBuf(c, wSize, wBytes);
     id<MTLBuffer> bX = createBuf(c, sizeX, x.data());
@@ -206,8 +220,9 @@ static bool runGemv(MtlCtx& c, const char* kernelName, const void* wBytes,
         [enc setBuffer:bX offset:0 atIndex:1];
         [enc setBuffer:bY offset:0 atIndex:2];
         [enc setBytes:&pc length:8 atIndex:3];
+        if (tgMemBytes) [enc setThreadgroupMemoryLength:tgMemBytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(tgThreads, 1, 1)];
     };
 
     // correctness pass
@@ -261,8 +276,11 @@ static bool runGemv(MtlCtx& c, const char* kernelName, const void* wBytes,
         double ns = runBench();
         double bytes = (double)wSize + sizeX + sizeY;
         double flops = 2.0 * M * K;
-        printf("gpu: %8.1f µs/iter | %7.1f GB/s | %8.1f GFLOP/s | %.1f MiB/iter (UMA, tpr %u)\n",
-               ns / 1e3, bytes / ns, flops / ns, bytes / (1 << 20), tpr);
+        char geo[32];
+        if (fixedNr0) snprintf(geo, sizeof geo, "nsg %u x %u rows", nsg, fixedNr0);
+        else          snprintf(geo, sizeof geo, "tpr %u", tpr);
+        printf("gpu: %8.1f µs/iter | %7.1f GB/s | %8.1f GFLOP/s | %.1f MiB/iter (UMA, %s)\n",
+               ns / 1e3, bytes / ns, flops / ns, bytes / (1 << 20), geo);
     }
     return pass;
 }
@@ -354,7 +372,7 @@ static bool caseQ6K(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
         yref[m] = (float)acc;
     }
     return runGemv(c, "gemv_q6_k", blocks.data(), nb * sizeof(block_q6_K),
-                   x, M, K, yref, iters, K / 16);
+                   x, M, K, yref, iters, K / 16, 1e-2, 2, 0);
 }
 
 static bool caseIQ4XS(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
@@ -383,7 +401,7 @@ static bool caseIQ4XS(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
         yref[m] = (float)acc;
     }
     return runGemv(c, "gemv_iq4_xs", blocks.data(), nb * sizeof(block_iq4_xs),
-                   x, M, K, yref, iters, K / 32);
+                   x, M, K, yref, iters, K / 32, 1e-2, 2, 128);
 }
 
 static bool caseIQ3XXS(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
@@ -410,7 +428,7 @@ static bool caseIQ3XXS(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
         yref[m] = (float)acc;
     }
     return runGemv(c, "gemv_iq3_xxs", blocks.data(), nb * sizeof(block_iq3_xxs),
-                   x, M, K, yref, iters, K / 32);
+                   x, M, K, yref, iters, K / 32, 1e-2, 4, 1152);
 }
 
 // ---------- real weights from the GGUF ----------
@@ -464,18 +482,19 @@ static bool caseGguf(MtlCtx& c, const std::string& tensorName, uint32_t iters) {
     }
 
     const char* kern = nullptr;
-    uint32_t units = K;
+    uint32_t units = K, fixedNr0v = 0, tgMem = 0;
     switch (t->type) {
         case GGML_Q8_0:    kern = "gemv_q8_0";    units = K / 32; break;
-        case GGML_Q6_K:    kern = "gemv_q6_k";    units = K / 16; break;
-        case GGML_IQ4_XS:  kern = "gemv_iq4_xs";  units = K / 32; break;
-        case GGML_IQ3_XXS: kern = "gemv_iq3_xxs"; units = K / 32; break;
+        case GGML_Q6_K:    kern = "gemv_q6_k";    units = K / 16; fixedNr0v = 2; break;
+        case GGML_IQ4_XS:  kern = "gemv_iq4_xs";  units = K / 32; fixedNr0v = 2; tgMem = 128; break;
+        case GGML_IQ3_XXS: kern = "gemv_iq3_xxs"; units = K / 32; fixedNr0v = 4; tgMem = 1152; break;
         case GGML_F16:     kern = "gemv_f16";     units = K / 8;  break;
         default:
             fprintf(stderr, "no Metal kernel for %s\n", ggmlTypeName(t->type));
             return false;
     }
-    return runGemv(c, kern, t->data, (size_t)M * rowBytes, x, M, K, yref, iters, units);
+    return runGemv(c, kern, t->data, (size_t)M * rowBytes, x, M, K, yref, iters,
+                   units, 1e-2, fixedNr0v, tgMem);
 }
 
 static void listTensors(const std::string& filter) {
