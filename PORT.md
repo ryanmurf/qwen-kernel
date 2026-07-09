@@ -329,6 +329,47 @@ out 16 µs per deltanet block — nr0-pair rework like M2b's q6_k could
 reclaim ~15-20%); the ~40 µs/block fixed overhead (single-tg latency
 kernels + launches); iq3 gateup ALU.
 
+## M6a — fusion experiments: what moved, what didn't (2026-07-09)
+
+Three structural fusions attempted after M4, each validated (block/ablock
+PASS, token parity re-verified 100/100 ×3 prompts after every change):
+
+1. **dn_step v3** — conv+silu (idempotent state shift), q/k L2 norm, delta
+   rule, and the gated output norm in ONE dispatch (was four). The shared
+   q/k channels of a k-head are convolved redundantly by the hV/hK
+   v-head threadgroups; the state shift writes identical values (benign
+   race). Block: 178.4 → 172.8 µs. KEPT.
+2. **Inline expert re-selection** (moe_pick_all per consumer simdgroup, no
+   select stage): correct but **39% SLOWER** (MoE 64 → 89 µs) — the
+   +30-register footprint (v[8]+ids[8]+ws[8]) collapses occupancy on the
+   DRAM-bound expert kernels and latency hiding dies. REVERTED; the
+   dedicated 1-simdgroup select stage stays. Lesson: on Apple, a fat
+   memory-bound kernel buys nothing from absorbing scalar work that
+   needs registers.
+3. **moe_logits_addn** (residual add + post_attention_norm folded into the
+   router-logits dispatch; every simd recomputes the scalar RMS from
+   SLC-hot vectors — register-light, unlike #2) and **embed_q6k + layer-0
+   rms fusion**: correct, ~neutral on time (−1 stage/layer and −1/token
+   but block time flat within noise). KEPT (fewer stages = simpler M5
+   chunk encoding), but the honest reading:
+
+**Stage-count reduction has hit diminishing returns.** Removing ~200
+stages per token (5/layer) moved end-to-end <2%. The block runs at an
+effective ~350 GB/s against 60.3 MB/layer while the same kernels do
+500-522 standalone — the gap is INSIDE the bandwidth-bound stages:
+per-stage DRAM ramp from idle after each barrier, and the delta-state
+access pattern (each thread walks a private 512 B row; line utilization
+recovers only across 8-iteration windows). Decode: 118.6–119.8 tok/s
+(vs 119.7–122.1 pre-fusion — flat), parity intact.
+
+M6 leads, updated by evidence: (a) transpose the delta state to [i][j]
+so lanes coalesce per i-step — est. up to ~0.5 ms/token if state R/W is
+really running at half bandwidth (verify with a stage-isolated timer
+first); (b) nr0 row-pairing for the in-block q8_0 GEMV shapes; (c) probe
+the post-barrier bandwidth ramp with a two-dispatch microbench —
+if real, fewer/fatter stages (whole-layer megakernels using the
+threadgroup-serialized pattern) is the endgame; (d) f16 h/activations.
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);

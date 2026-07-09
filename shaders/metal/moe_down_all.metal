@@ -2,8 +2,7 @@
 using namespace metal;
 
 // Weighted down-projection, routed AND shared experts in ONE dispatch with
-// a single write to y (replaces the down_iq4 -> barrier -> down_q8
-// read-modify-write pair):
+// a single write to y (replaces down -> barrier -> shared-down):
 //   y[o] = sum_s w[s]*(dE[ids[s]][o] · h_s)  +  wShared*(dS[o] · h_shared)
 // One SIMDGROUP per output o; lane task ids cover the routed sub-blocks
 // first, then the shared-expert q8 blocks. Two entry points share the file:

@@ -952,14 +952,13 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);   // K = n_embd
     id<MTLComputePipelineState> pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
-    id<MTLComputePipelineState> pConv  = getPipe(c, "dn_conv", "dn_conv", 0);
     id<MTLComputePipelineState> pStep  = getPipe(c, "dn_step", "dn_step", 0);
-    id<MTLComputePipelineState> pGate  = getPipe(c, "dn_gate", "dn_gate", nsg);
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);  // K = d_inner
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
     id<MTLComputePipelineState> pMoeL  = getPipe(c, "moe_logits", "moe_logits", nsg);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
+    id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
     id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pMoeDn = moe.downQ6
         ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
@@ -1012,11 +1011,10 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcOut{nEmbd, dIn};
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
-    struct { uint32_t ch; } pcConv{chQkv};
     struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
-    struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
     struct { uint32_t n; } pcAdd{nEmbd};
     struct { uint32_t a, b, cc, d; } pcv{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed};
+    struct { uint32_t a, b, cc, d; float e; } pcv5{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed, eps};
 
     auto dsp = [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
                    std::initializer_list<id<MTLBuffer>> bufs,
@@ -1040,17 +1038,12 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
         dsp(enc, pGemvA, {bZW, bXn, bZ}, &pcZ, 8, dIn / 4, 256);
         dsp(enc, pAb, {bXn, bAlW, bBeW, bDt, bAv, bGb}, &pcAb, 8, (2 * hV + nsg - 1) / nsg, thrN);
         bar(enc);
-        dsp(enc, pConv, {bConvSt, bQkv, bKer, bConvOut}, &pcConv, 4, (chQkv + 255) / 256, 256);
-        bar(enc);
-        dsp(enc, pStep, {bConvOut, bGb, bS, bO}, &pcStep, 16, hV, 128);
-        bar(enc);
-        dsp(enc, pGate, {bO, bSN, bZ, bAtt}, &pcGate, 12, (hV + nsg - 1) / nsg, thrN);
+        dsp(enc, pStep, {bQkv, bConvSt, bKer, bGb, bS, bZ, bSN, bAtt}, &pcStep, 16, hV, dS);
         bar(enc);
         dsp(enc, pGemvO, {bOutW, bAtt, bAttnOut}, &pcOut, 8, nEmbd / 2, 256);
         bar(enc);
-        dsp(enc, pAddN, {bXin, bAttnOut, bPN, bY, bXn2}, &pcRms, 8, 1, 256);
-        bar(enc);
-        dsp(enc, pMoeL, {bMGI, bMGIS, bXn2, bML}, &pcv, 16, (moe.nExp + 1 + nsg - 1) / nsg, thrN);
+        dsp(enc, pMoeLA, {bMGI, bMGIS, bXin, bAttnOut, bPN, bML, bY, bXn2}, &pcv5, 20,
+            (moe.nExp + 1 + nsg - 1) / nsg, thrN);
         bar(enc);
         dsp(enc, pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
         bar(enc);
@@ -1237,7 +1230,7 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
         };
         runBench();
         double ns = runBench();
-        printf("gpu: %8.1f µs/block | 14 dispatches, 1 submit\n", ns / 1e3);
+        printf("gpu: %8.1f µs/block | 11 dispatches, 1 submit\n", ns / 1e3);
         printf("     30 deltanet blocks -> %.2f ms/token\n", ns * 30 / 1e6);
     }
     return pass;
@@ -1299,8 +1292,8 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
-    id<MTLComputePipelineState> pMoeL  = getPipe(c, "moe_logits", "moe_logits", nsg);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
+    id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
     id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pMoeDn = moe.downQ6
         ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
@@ -1360,6 +1353,7 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
         pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase};
     struct { uint32_t n; } pcAdd{nEmbd};
     struct { uint32_t a, b, cc, d; } pcv{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed};
+    struct { uint32_t a, b, cc, d; float e; } pcv5{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed, eps};
 
     auto dsp = [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
                    std::initializer_list<id<MTLBuffer>> bufs,
@@ -1391,9 +1385,8 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
         bar(enc);
         dsp(enc, pGemvO, {bWo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
         bar(enc);
-        dsp(enc, pAddN, {bXin, bAttnOut, bPN, bY, bXn2}, &pcRms, 8, 1, 256);
-        bar(enc);
-        dsp(enc, pMoeL, {bMGI, bMGIS, bXn2, bML}, &pcv, 16, (moe.nExp + 1 + nsg - 1) / nsg, thrN);
+        dsp(enc, pMoeLA, {bMGI, bMGIS, bXin, bAttnOut, bPN, bML, bY, bXn2}, &pcv5, 20,
+            (moe.nExp + 1 + nsg - 1) / nsg, thrN);
         bar(enc);
         dsp(enc, pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
         bar(enc);
@@ -1540,7 +1533,7 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
         };
         runBench();
         double ns = runBench();
-        printf("gpu: %8.1f µs/block (pos=%u) | 13 dispatches, 1 submit\n", ns / 1e3, nTok - 1);
+        printf("gpu: %8.1f µs/block (pos=%u) | 12 dispatches, 1 submit\n", ns / 1e3, nTok - 1);
     }
     return pass;
 }
@@ -1587,15 +1580,13 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
     id<MTLComputePipelineState> pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
-    id<MTLComputePipelineState> pConv  = getPipe(c, "dn_conv", "dn_conv", 0);
     id<MTLComputePipelineState> pStep  = getPipe(c, "dn_step", "dn_step", 0);
-    id<MTLComputePipelineState> pGate  = getPipe(c, "dn_gate", "dn_gate", nsg);
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", 0);
     id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", 0);
-    id<MTLComputePipelineState> pMoeL  = getPipe(c, "moe_logits", "moe_logits", nsg);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
+    id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
     id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pMoeD4 = getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
     id<MTLComputePipelineState> pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
@@ -1712,16 +1703,15 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
         pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
-    struct { uint32_t ch; } pcConv{chQkv};
     struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
-    struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
+    struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, 512, 256, 8, eps};
     struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; }
         pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase};
     const uint32_t amWgs = (vocab + 4095) / 4096;
     struct { uint32_t n, span; } pcAm{vocab, 4096};
     struct { uint32_t m, pos; } pcAm2{amWgs, 0};
-    struct { uint32_t kdim, idx, perReq; } pcEmb{nEmbd, 0, 0};
+    struct { uint32_t kdim, idx, perReq; float e; } pcEmb{nEmbd, 0, 0, eps};
     const uint32_t thrN = nsg * 32;
 
     auto dsp = [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
@@ -1739,9 +1729,7 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     };
 
     auto recordToken = [&](id<MTLComputeCommandEncoder> enc, uint32_t pos, bool withHead) {
-        pcFa.pos = pos;
-        dsp(enc, pRms, {bXin, layers[0].aNorm, bXn}, &pcRms, 8, 1, 256);
-        bar(enc);
+        pcFa.pos = pos;   // embed_q6k already produced bXin AND bXn (layer-0 norm)
         for (uint32_t il = 0; il < nLayer; il++) {
             Layer& L = layers[il];
             if (L.rec) {
@@ -1750,12 +1738,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
                 dsp(enc, pAb, {bXn, L.alW, L.beW, L.dt, L.av, bGb}, &pcAb, 8,
                     (2 * hV + nsg - 1) / nsg, thrN);
                 bar(enc);
-                dsp(enc, pConv, {L.convSt, bBig, L.ker, bConvOut}, &pcConv, 4,
-                    (chQkv + 255) / 256, 256);
-                bar(enc);
-                dsp(enc, pStep, {bConvOut, bGb, L.S, bO}, &pcStep, 16, hV, 128);
-                bar(enc);
-                dsp(enc, pGate, {bO, L.sn, bMid, bAtt}, &pcGate, 12, (hV + nsg - 1) / nsg, thrN);
+                dsp(enc, pStep, {bBig, L.convSt, L.ker, bGb, L.S, bMid, L.sn, bAtt},
+                    &pcStep, 16, hV, dS);
                 bar(enc);
                 dsp(enc, pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
             } else {
@@ -1771,9 +1755,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
                 dsp(enc, pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
             }
             bar(enc);
-            dsp(enc, pAddN, {bXin, bAttnOut, L.pn, bY, bXn2}, &pcRms, 8, 1, 256);
-            bar(enc);
-            dsp(enc, pMoeL, {L.mgi, L.mgis, bXn2, bML}, &pcv, 16, (257 + nsg - 1) / nsg, thrN);
+            dsp(enc, pMoeLA, {L.mgi, L.mgis, bXin, bAttnOut, L.pn, bML, bY, bXn2}, &pcv5, 20,
+                (257 + nsg - 1) / nsg, thrN);
             bar(enc);
             dsp(enc, pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
             bar(enc);
@@ -1804,7 +1787,7 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
             [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         for (uint32_t pos = 0; pos < nPrompt; pos++) {
             pcEmb.idx = pos;
-            dsp(enc, pEmb, {bEmbdW, bPids, bXin}, &pcEmb, 12, 1, 256);
+            dsp(enc, pEmb, {bEmbdW, bPids, bXin, layers[0].aNorm, bXn}, &pcEmb, 16, 1, 256);
             bar(enc);
             recordToken(enc, pos, pos + 1 == nPrompt);
             bar(enc);
@@ -1830,7 +1813,7 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
             dsp(enc, pAm2, {bAV, bAI, bTok, bRb}, &pcAm2, 8, 1, 256);
             bar(enc);
             pcEmb.idx = 0;
-            dsp(enc, pEmb, {bEmbdW, bTok, bXin}, &pcEmb, 12, 1, 256);
+            dsp(enc, pEmb, {bEmbdW, bTok, bXin, layers[0].aNorm, bXn}, &pcEmb, 16, 1, 256);
             bar(enc);
             recordToken(enc, pos, true);
             bar(enc);
