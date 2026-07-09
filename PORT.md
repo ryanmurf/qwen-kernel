@@ -294,6 +294,41 @@ Structural findings that drove the design (measured by
 Kernel inventory after M3: 19 MSL kernels; every decode-path operation of
 the hybrid architecture now has a validated Metal implementation.
 
+## M4 — end-to-end greedy decode: token-exact parity at 1.43× (2026-07-09)
+
+**`qk token` runs the full model — and beats llama.cpp Metal with exact
+correctness.**
+
+- **Parity: greedy output is token-for-token identical to llama.cpp Metal**
+  (same build, same GGUF, same input ids, temperature 0) on 3 prompts ×
+  100 tokens — 100/100 each. References via `llama-server /completion`
+  with `"temperature":0` (NOTE: do NOT pass `"samplers":[]` — that removes
+  the temperature stage and silently makes the reference non-greedy; an
+  hour went there).
+- **Decode: 8.26–8.36 ms/token = 119.7–122.1 tok/s**, thermally flat over
+  repeated runs. llama.cpp Metal tg128 on this box: 84.2 tok/s →
+  **1.43×** (DoD ≥1.3× met; stretch 150 = M6 target).
+- Prefill in this harness is serial per-token (~9 ms/token after warmup;
+  first command buffer pays ~1.6 s of first-touch page-in for the 15 GB
+  resident set). Batched prefill is M5 (`prefillbench` on RDNA3 got 4.2×
+  serial).
+
+Structure: the whole generation is TWO command buffers (one prefill, one
+decode). GPU-resident sampling: head GEMV (q6_k, nsg=2) → two-pass argmax
+(ties to lower index, matching llama.cpp greedy) → winner recorded to a
+history buffer and fed straight into `embed_q6k` for the next position —
+the host reads ids only after the last token. Layer chaining uses
+`add_rmsnorm` as the layer tail (residual sum + NEXT layer's attn_norm;
+output_norm after layer 39), so a layer is 13 (attn) / 14 (deltanet)
+dispatches. ~15.0 GB resident (UMA, untracked shared buffers).
+
+Per-token budget at 8.3 ms: 30 deltanet blocks ≈ 5.3 ms + 10 attn blocks
+≈ 1.7 ms + head+argmax+embed ≈ 1.0 ms + inter-block glue ≈ 0.3. M6 levers,
+in expected-value order: q8_0 GEMV shapes dominate the blocks (qkv 30 µs +
+out 16 µs per deltanet block — nr0-pair rework like M2b's q6_k could
+reclaim ~15-20%); the ~40 µs/block fixed overhead (single-tg latency
+kernels + launches); iq3 gateup ALU.
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);
