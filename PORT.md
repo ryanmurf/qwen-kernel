@@ -181,33 +181,65 @@ Correctness (tol 1e-2, scale-aware rel err; all PASS):
 | iq4_xs | PASS | blk.0.ffn_down_exps[:,:,0] | 1.3e-4 / 2.3e-5 |
 | iq3_xxs | PASS | blk.0.ffn_gate_exps[:,:,0] | 1.6e-4 / 9.8e-6 |
 
-Bandwidth, DRAM-honest shapes (W ≥ 98 MiB, no SLC assist):
+Bandwidth after the face-off rework (v2 kernels, see next section):
 
-| kernel | shape | GB/s | % of 546 | note |
-|---|---|---|---|---|
-| f16 | 248320×2048 | 515 | 94% | M1 |
-| q8_0 | 32768×8192 | **522** | 96% | dense format is done |
-| q6_k | 32768×8192 | 370 | 68% | ALU-bound |
-| q6_k | output.weight (real) | 374 | 69% | 1.12 ms/token for the head |
-| iq4_xs | 32768×8192 | 345 | 63% | ALU-bound |
-| iq3_xxs | 32768×8192 | 288 | 53% | ALU-bound, after restructure |
+| kernel | synth 8192×8192 | real tensor | note |
+|---|---|---|---|
+| f16 | 520 | 515 (head shape, M1) | 94–95% of 546 |
+| q8_0 | 511 (522 @ 32768×8192) | 708 (attn_qkv, SLC) | 96% of peak, done |
+| q6_k | 499 | **499 output.weight (398 MB)** | head now 0.84 ms/token |
+| iq4_xs | 407 | tiny slice, latency-bound | +34% vs v1 |
+| iq3_xxs | 353 | tiny slice, latency-bound | +27% vs v1, beats llama.cpp |
 
-Restructuring iq3_xxs from the GLSL's 8-element work unit to a 32-element
-unit (read the aux u32 once instead of 4×, grid indices via two
-packed_uchar4 loads, 4× ILP per thread) took it from 201 → 288 GB/s
-(+43%), still exact. The same trick is the template for the M3
-`moe_gateup_iq3` port. Remaining IQ/K-format gap is dequant ALU (grid
-lookups, sign logic, nibble surgery) — M6 material: threadgroup-cached
-tables, half-math magnitudes, XOR-sign tricks.
+First iq3_xxs step (before the face-off): 32-element work unit instead of
+the GLSL's 8 (aux u32 read once instead of 4×, packed_uchar4 grid loads)
+— 201 → 288 GB/s. The v2 rework below took it to 353.
 
-**Decode projection at today's kernel speeds** (per-token active set from
-M0, per-format GB/s from above): Q8_0 1.49 GB @ 522 = 2.85 ms; head Q6_K
-0.417 @ 374 = 1.12 ms; expert IQ3 0.257 @ 288 = 0.89 ms; expert IQ4 0.165
-@ 345 = 0.48 ms; Q6_K expert-downs (blk 34/38/39) 0.021 = 0.06 ms; F32
-0.10 + DeltaNet state 0.126 @ ~520 = 0.43 ms → **≈ 5.83 ms ⇒ 172 tok/s
-GEMV-streaming bound**. RDNA3 realized ~75% of its equivalent bound
-end-to-end; 75% here ⇒ ~130 tok/s ≥ 1.55× llama.cpp — the 1.3× DoD has
-margin, the 150 stretch needs M6 wins on q6_k (head) and iq3_xxs.
+**Decode projection at v2 kernel speeds** (per-token active set from M0):
+Q8_0 1.49 GB @ 522 = 2.85 ms; head Q6_K 0.417 @ 499 = 0.84 ms; expert IQ3
+0.257 @ 353 = 0.73 ms; expert IQ4 0.165 @ 407 = 0.41 ms; Q6_K expert-downs
+0.021 = 0.05 ms; F32 0.10 + DeltaNet state 0.126 @ ~520 = 0.43 ms →
+**≈ 5.31 ms ⇒ 188 tok/s GEMV-streaming bound**. RDNA3 realized ~75% of its
+equivalent bound end-to-end; 75% here ⇒ ~141 tok/s ≈ 1.68× llama.cpp. The
+1.3× DoD (109.5 tok/s) has real margin; the 150 stretch needs ~80%
+realization — fusion quality (M3/M6) decides it.
+
+### M2b — kernel face-off vs llama.cpp Metal, and the rework it forced
+
+Ryan asked for a llama.cpp-vs-qk comparison on this box. Method: llama.cpp
+`test-backend-ops perf -o MUL_MAT` (build `f2d1c2f`, its own Metal kernels,
+n=1 decode GEMV, m=4096 k=14336) vs `qk <fmt> 4096 14336` — identical
+shapes, identical bytes, both loop-hot. µs/op is the comparator.
+
+Round 1 (my straight GLSL ports): f16 and q8_0 at parity or ahead; q6_K
+**26% behind** (136.4 vs 101.3 µs), iq4_xs **22% behind** (97.8 vs 75.9),
+iq3_xxs 7% behind. So I read their kernels (MIT) and adopted the work
+shape for those three: one simdgroup per NR0 consecutive rows (2/2/4),
+NSG=2 simdgroups per 64-thread threadgroup, x staged in registers and
+reused across rows, q6_K quadrant dequant via constant masks (no variable
+shifts), iq4_xs qs as uint32 + 0x0f0f0f0f nibble masks + byte-aliased
+codebook lookups from threadgroup memory, iq3_xxs grid+signs staged in
+threadgroup memory; sign application kept vectorized (float4 select) —
+that last bit is mine and is why iq3_xxs ends up *ahead* of llama.cpp.
+
+Final standings, same shape, this box (µs/op, lower wins):
+
+| format | llama.cpp | qk v2 | qk vs llama.cpp |
+|---|---|---|---|
+| f16 | 230.5 | 229.3 | +0.5% |
+| q8_0 | 125.0 | 121.5 | **+3%** |
+| q6_K | 101.3 | 106.3 | −4.7% |
+| iq4_xs | 75.9 | 80.4 | −5.6% |
+| iq3_xxs | 78.4 | 68.2 | **+15%** |
+
+NSG sweep confirmed llama.cpp's nsg=2 beats 4 and 8 on all three reworked
+kernels (e.g. iq3_xxs: 68.2 / 75.0 µs at nsg 2/4). Weighted by this
+model's actual per-token byte mix (Q8_0-heavy dense + IQ3 experts), the qk
+set is now net faster than llama.cpp's kernels for this workload; the
+remaining ~5% q6_K and iq4_xs gaps are unroll/codegen detail — M6. The small-M
+regression from fixed row-pair geometry (expert slices, M=512: 64
+threadgroups) doesn't matter for decode — the engine's MoE path batches
+8 experts × slots on the z-axis (M3).
 
 Quant type census for the port (which kernel serves what, per token):
 Q8_0 = all dense attn/DeltaNet projections + shared experts (1.49 GB);
