@@ -1,11 +1,11 @@
 // qk — Qwen kernel harness, Metal host (Apple Silicon port of main.cpp).
-// M1: fp16 GEMV. Same CLI, same CPU-reference validation methodology, same
-// output format as the Vulkan harness; kernels arrive milestone by milestone
-// (M2: quant GEMVs, M3: fused blocks, M4: token loop, M5: qk.h engine).
+// M1: fp16 GEMV. M2: quantized GEMV (Q8_0, Q6_K, IQ4_XS, IQ3_XXS) on raw
+// ggml blocks, validated against CPU dequant reference and real tensors
+// from the GGUF. (M3: fused blocks, M4: token loop, M5: qk.h engine.)
 //
 // Usage:
-//   qk                        synthetic suite (kernels ported so far)
-//   qk f16 [M] [K] [iters]
+//   qk                        synthetic suite: f16, q8_0, q6_k, iq4_xs, iq3_xxs
+//   qk f16|q8_0|q6_k|iq4_xs|iq3_xxs [M] [K] [iters]
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
 //   qk list [filter]          list tensors in the GGUF
 //
@@ -96,6 +96,18 @@ static std::string loadMetalSource(const char* argv0, const char* name) {
         exit(1);
     }
     fclose(f);
+
+    // resolve #include "file" against the shader search path (mirrors the
+    // GLSL flow where glslc handles iq_tables.glsl; <...> includes are MSL
+    // stdlib and stay for the runtime compiler)
+    size_t pos = 0;
+    while ((pos = src.find("#include \"", pos)) != std::string::npos) {
+        size_t q1 = pos + 10, q2 = src.find('"', q1);
+        if (q2 == std::string::npos) break;
+        std::string inc = src.substr(q1, q2 - q1);
+        src = src.substr(0, pos) + loadMetalSource(argv0, inc.c_str()) +
+              src.substr(q2 + 1);
+    }
     return src;
 }
 
@@ -289,6 +301,118 @@ static bool caseF16(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
     return runGemv(c, "gemv_f16", Wh.data(), Wh.size() * 2, x, M, K, yref, iters, K / 8);
 }
 
+static bool caseQ80(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
+    printf("\n== q8_0 GEMV  M=%u K=%u (W %.1f MiB) ==\n", M, K,
+           (double)M * K / 32 * 34 / (1 << 20));
+    if (K % 32) {
+        fprintf(stderr, "K must be a multiple of 32\n");
+        return false;
+    }
+    size_t nb = (size_t)M * K / 32;
+    std::vector<block_q8_0> blocks(nb);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        b.d = qk_f32_to_f16(0.005f + 0.02f * (rng() & 0xFFFF) / 65536.0f);
+        for (auto& q : b.qs) q = (int8_t)((int)(rng() % 255) - 127);
+    }
+    auto x = randomX(K);
+
+    std::vector<float> yref(M), tmp(K);
+    for (uint32_t m = 0; m < M; m++) {
+        dequant_row_q8_0(&blocks[(size_t)m * (K / 32)], tmp.data(), K);
+        double acc = 0;
+        for (uint32_t k = 0; k < K; k++) acc += (double)tmp[k] * x[k];
+        yref[m] = (float)acc;
+    }
+    return runGemv(c, "gemv_q8_0", blocks.data(), nb * sizeof(block_q8_0),
+                   x, M, K, yref, iters, K / 32);
+}
+
+static bool caseQ6K(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
+    printf("\n== q6_k GEMV  M=%u K=%u (W %.1f MiB) ==\n", M, K,
+           (double)M * K / 256 * 210 / (1 << 20));
+    if (K % 256) {
+        fprintf(stderr, "K must be a multiple of 256\n");
+        return false;
+    }
+    size_t nb = (size_t)M * K / 256;
+    std::vector<block_q6_K> blocks(nb);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        for (auto& v : b.ql) v = (uint8_t)rng();
+        for (auto& v : b.qh) v = (uint8_t)rng();
+        for (auto& v : b.scales) v = (int8_t)((int)(rng() % 255) - 127);
+        b.d = qk_f32_to_f16(0.0002f + 0.0008f * (rng() & 0xFFFF) / 65536.0f);
+    }
+    auto x = randomX(K);
+
+    std::vector<float> yref(M), tmp(K);
+    for (uint32_t m = 0; m < M; m++) {
+        dequant_row_q6_K(&blocks[(size_t)m * (K / 256)], tmp.data(), K);
+        double acc = 0;
+        for (uint32_t k = 0; k < K; k++) acc += (double)tmp[k] * x[k];
+        yref[m] = (float)acc;
+    }
+    return runGemv(c, "gemv_q6_k", blocks.data(), nb * sizeof(block_q6_K),
+                   x, M, K, yref, iters, K / 16);
+}
+
+static bool caseIQ4XS(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
+    printf("\n== iq4_xs GEMV  M=%u K=%u (W %.1f MiB) ==\n", M, K,
+           (double)M * K / 256 * 136 / (1 << 20));
+    if (K % 256) {
+        fprintf(stderr, "K must be a multiple of 256\n");
+        return false;
+    }
+    size_t nb = (size_t)M * K / 256;
+    std::vector<block_iq4_xs> blocks(nb);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        b.d = qk_f32_to_f16(0.002f + 0.004f * (rng() & 0xFFFF) / 65536.0f);
+        b.scales_h = (uint16_t)rng();
+        for (auto& v : b.scales_l) v = (uint8_t)rng();
+        for (auto& v : b.qs) v = (uint8_t)rng();
+    }
+    auto x = randomX(K);
+
+    std::vector<float> yref(M), tmp(K);
+    for (uint32_t m = 0; m < M; m++) {
+        dequant_row_iq4_xs(&blocks[(size_t)m * (K / 256)], tmp.data(), K);
+        double acc = 0;
+        for (uint32_t k = 0; k < K; k++) acc += (double)tmp[k] * x[k];
+        yref[m] = (float)acc;
+    }
+    return runGemv(c, "gemv_iq4_xs", blocks.data(), nb * sizeof(block_iq4_xs),
+                   x, M, K, yref, iters, K / 32);
+}
+
+static bool caseIQ3XXS(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
+    printf("\n== iq3_xxs GEMV  M=%u K=%u (W %.1f MiB) ==\n", M, K,
+           (double)M * K / 256 * 98 / (1 << 20));
+    if (K % 256) {
+        fprintf(stderr, "K must be a multiple of 256\n");
+        return false;
+    }
+    size_t nb = (size_t)M * K / 256;
+    std::vector<block_iq3_xxs> blocks(nb);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        b.d = qk_f32_to_f16(0.002f + 0.004f * (rng() & 0xFFFF) / 65536.0f);
+        for (auto& v : b.qs) v = (uint8_t)rng();
+    }
+    auto x = randomX(K);
+
+    std::vector<float> yref(M), tmp(K);
+    for (uint32_t m = 0; m < M; m++) {
+        dequant_row_iq3_xxs(&blocks[(size_t)m * (K / 256)], tmp.data(), K);
+        double acc = 0;
+        for (uint32_t k = 0; k < K; k++) acc += (double)tmp[k] * x[k];
+        yref[m] = (float)acc;
+    }
+    return runGemv(c, "gemv_iq3_xxs", blocks.data(), nb * sizeof(block_iq3_xxs),
+                   x, M, K, yref, iters, K / 32);
+}
+
 // ---------- real weights from the GGUF ----------
 
 static const char* ggufPath() {
@@ -342,9 +466,13 @@ static bool caseGguf(MtlCtx& c, const std::string& tensorName, uint32_t iters) {
     const char* kern = nullptr;
     uint32_t units = K;
     switch (t->type) {
-        case GGML_F16: kern = "gemv_f16"; units = K / 8; break;
+        case GGML_Q8_0:    kern = "gemv_q8_0";    units = K / 32; break;
+        case GGML_Q6_K:    kern = "gemv_q6_k";    units = K / 16; break;
+        case GGML_IQ4_XS:  kern = "gemv_iq4_xs";  units = K / 32; break;
+        case GGML_IQ3_XXS: kern = "gemv_iq3_xxs"; units = K / 32; break;
+        case GGML_F16:     kern = "gemv_f16";     units = K / 8;  break;
         default:
-            fprintf(stderr, "no Metal kernel for %s yet (M2)\n", ggmlTypeName(t->type));
+            fprintf(stderr, "no Metal kernel for %s\n", ggmlTypeName(t->type));
             return false;
     }
     return runGemv(c, kern, t->data, (size_t)M * rowBytes, x, M, K, yref, iters, units);
@@ -380,9 +508,21 @@ int main(int argc, char** argv) {
         bool ok = true;
         if (mode == "suite") {
             ok &= caseF16(c, 8192, 8192, 200);
-            printf("\n(Metal port M1: f16 only; q8_0/q6_k/iq4_xs/iq3_xxs land in M2)\n");
+            ok &= caseQ80(c, 8192, 8192, 200);
+            ok &= caseQ6K(c, 8192, 8192, 200);
+            ok &= caseIQ4XS(c, 8192, 8192, 200);
+            ok &= caseIQ3XXS(c, 8192, 8192, 200);
+            printf("\nreal-weight mode: qk gguf <tensor>   (see: qk list blk.0)\n");
         } else if (mode == "f16") {
             ok = caseF16(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+        } else if (mode == "q8_0") {
+            ok = caseQ80(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+        } else if (mode == "q6_k") {
+            ok = caseQ6K(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+        } else if (mode == "iq4_xs") {
+            ok = caseIQ4XS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+        } else if (mode == "iq3_xxs") {
+            ok = caseIQ3XXS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
         } else if (mode == "gguf") {
             if (argc < 3) {
                 fprintf(stderr, "usage: qk gguf <tensor> [iters]\n");

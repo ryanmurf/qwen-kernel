@@ -156,6 +156,66 @@ stored `gh` token is invalid (`gh auth status`: "token in default is
 invalid"; re-auth is interactive). Commits are local until Ryan runs
 `gh auth login -h github.com`. Retrying at each milestone.
 
+## M2 — quant GEMVs: q8_0, q6_k, iq4_xs, iq3_xxs (2026-07-08)
+
+**Delivered:** all four quant GEMV kernels ported to MSL, PASS against the
+CPU dequant references on synthetic random blocks AND on real tensors
+mmap'd from the GGUF. `qk suite` runs the full five-kernel matrix; `qk gguf
+<tensor>` works for every weight type in this model.
+
+Kernels are hand-written MSL from the GLSL (not SPIRV-Cross): same block
+structs (static_asserted to ggml sizes), same work decomposition, subgroup
+ops → simd ops. `gemv_q8_0`/`gemv_q6_k` keep the grid-z query batching the
+engine uses for multi-slot decode. `#include "iq_tables.metal"` is resolved
+by a tiny include inliner in `loadMetalSource` (runtime MSL has no include
+paths). One MSL gotcha vs GLSL: thread-position attributes must be all
+scalar or all vector — mixing `uint tid` with `uint3 tgpig` is a compile
+error.
+
+Correctness (tol 1e-2, scale-aware rel err; all PASS):
+
+| kernel | synthetic 8192×8192 | real tensor | max_rel_err (synth / real) |
+|---|---|---|---|
+| q8_0 | PASS | blk.0.attn_qkv 2048→8192 (17 MB) | 1.9e-4 / 1.5e-4 |
+| q6_k | PASS | output.weight 2048→248320 (398 MB) | 6.0e-5 / 2.0e-4 |
+| iq4_xs | PASS | blk.0.ffn_down_exps[:,:,0] | 1.3e-4 / 2.3e-5 |
+| iq3_xxs | PASS | blk.0.ffn_gate_exps[:,:,0] | 1.6e-4 / 9.8e-6 |
+
+Bandwidth, DRAM-honest shapes (W ≥ 98 MiB, no SLC assist):
+
+| kernel | shape | GB/s | % of 546 | note |
+|---|---|---|---|---|
+| f16 | 248320×2048 | 515 | 94% | M1 |
+| q8_0 | 32768×8192 | **522** | 96% | dense format is done |
+| q6_k | 32768×8192 | 370 | 68% | ALU-bound |
+| q6_k | output.weight (real) | 374 | 69% | 1.12 ms/token for the head |
+| iq4_xs | 32768×8192 | 345 | 63% | ALU-bound |
+| iq3_xxs | 32768×8192 | 288 | 53% | ALU-bound, after restructure |
+
+Restructuring iq3_xxs from the GLSL's 8-element work unit to a 32-element
+unit (read the aux u32 once instead of 4×, grid indices via two
+packed_uchar4 loads, 4× ILP per thread) took it from 201 → 288 GB/s
+(+43%), still exact. The same trick is the template for the M3
+`moe_gateup_iq3` port. Remaining IQ/K-format gap is dequant ALU (grid
+lookups, sign logic, nibble surgery) — M6 material: threadgroup-cached
+tables, half-math magnitudes, XOR-sign tricks.
+
+**Decode projection at today's kernel speeds** (per-token active set from
+M0, per-format GB/s from above): Q8_0 1.49 GB @ 522 = 2.85 ms; head Q6_K
+0.417 @ 374 = 1.12 ms; expert IQ3 0.257 @ 288 = 0.89 ms; expert IQ4 0.165
+@ 345 = 0.48 ms; Q6_K expert-downs (blk 34/38/39) 0.021 = 0.06 ms; F32
+0.10 + DeltaNet state 0.126 @ ~520 = 0.43 ms → **≈ 5.83 ms ⇒ 172 tok/s
+GEMV-streaming bound**. RDNA3 realized ~75% of its equivalent bound
+end-to-end; 75% here ⇒ ~130 tok/s ≥ 1.55× llama.cpp — the 1.3× DoD has
+margin, the 150 stretch needs M6 wins on q6_k (head) and iq3_xxs.
+
+Quant type census for the port (which kernel serves what, per token):
+Q8_0 = all dense attn/DeltaNet projections + shared experts (1.49 GB);
+Q6_K = output head + token_embd (row lookup) + ffn_down_exps in blk
+34/38/39 only (unsloth dynamic bump); IQ3_XXS = all routed gate/up experts
+(80 tensors, 8.2 GB stored); IQ4_XS = routed down experts in the other 37
+layers. F32 = norms, routers, ssm small tensors.
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);
