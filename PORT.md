@@ -362,13 +362,15 @@ access pattern (each thread walks a private 512 B row; line utilization
 recovers only across 8-iteration windows). Decode: 118.6–119.8 tok/s
 (vs 119.7–122.1 pre-fusion — flat), parity intact.
 
-M6 leads, updated by evidence: (a) transpose the delta state to [i][j]
-so lanes coalesce per i-step — est. up to ~0.5 ms/token if state R/W is
-really running at half bandwidth (verify with a stage-isolated timer
-first); (b) nr0 row-pairing for the in-block q8_0 GEMV shapes; (c) probe
-the post-barrier bandwidth ramp with a two-dispatch microbench —
-if real, fewer/fatter stages (whole-layer megakernels using the
-threadgroup-serialized pattern) is the endgame; (d) f16 h/activations.
+M6 leads, updated by evidence: (a) ~~delta-state transpose~~ TESTED —
+[i][j] scalar layout is 16% WORSE (203 vs 175 µs/block): 4× instruction
+count and dependent scalar chains beat the coalescing win; the float4
+row layout already recovers line utilization over its 8-iteration
+windows. Reverted. (b) nr0 row-pairing for the in-block q8_0 GEMV
+shapes; (c) probe the post-barrier bandwidth ramp with a two-dispatch
+microbench — if real, fewer/fatter stages is the endgame; (d) f16
+h/activations; (e) speculative decoding (docs/spec-decode-qk-plan.md)
+is the step-change lever once serving works.
 
 ### Method notes (M0)
 
