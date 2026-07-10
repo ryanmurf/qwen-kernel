@@ -2080,8 +2080,9 @@ struct qk_engine {
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
-    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4;
-    id<MTLBuffer> bbStart, bbATok, bbASlot;
+    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4,
+        pMoeDG4, pMoeDG6, pMoeDR;
+    id<MTLBuffer> bbStart, bbATok, bbASlot, bbMDy;
     // Grouped (decode-once) MoE gate+up for prefill chunks. Variants:
     // 1 = v1 read-once (SLOWER — kept as bit-exact control); 2 = v2 f32
     // narrow; 3 = v3 f16 64x32 (llama mul_mm_id class — fastest, opt-in);
@@ -2271,6 +2272,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeGuG2 = getPipe(c, "moe_grouped", "moe_gu_grouped2", 0);
     pMoeGuG3 = getPipe(c, "moe_grouped", "moe_gu_grouped3", 0);
     pMoeGuG4 = getPipe(c, "moe_grouped", "moe_gu_grouped4", 0);
+    pMoeDG4  = getPipe(c, "moe_down_grouped", "moe_down_grouped_iq4", 0);
+    pMoeDG6  = getPipe(c, "moe_down_grouped", "moe_down_grouped_q6k", 0);
+    pMoeDR   = getPipe(c, "moe_down_grouped", "moe_down_reduce", 0);
     if (const char* mg = getenv("QK_MOE_GROUPED")) { moeGrouped = atoi(mg); moeGroupN = 0; }
     if (const char* mn = getenv("QK_MOE_GROUP_N")) moeGroupN = (uint32_t)atoi(mn);
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 float4s");
@@ -2356,6 +2360,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbStart = createBuf(c, 258 * 4, nullptr, true);
     bbATok = createBuf(c, (size_t)cap * 9 * 4, nullptr, true);
     bbASlot = createBuf(c, (size_t)cap * 9 * 4, nullptr, true);
+    bbMDy = createBuf(c, (size_t)cap * 9 * nEmbd * 4, nullptr, true);
     bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, nullptr, true);
     memset(bbCarry.contents, 0, (size_t)nLayer * chQkv * 3 * 4);
 
@@ -2722,13 +2727,19 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     dspz(pMoeGuG, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
                                    bbASlot, bbMH}, &pcv, 16, (257 * 512 + nsg - 1) / nsg,
                          thrN, 1);
+                bar();
+                dspz(L.downQ6 ? pMoeDG6 : pMoeDG4,
+                     {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
+                     &pcv, 16, 257 * (nEmbd / 32), 128, 1);
+                bar();
+                dspz(pMoeDR, {bbMDy, bbMSel, bbMY}, &pcv, 16, (nEmbd + 255) / 256, 256, n);
             } else {
                 dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
                      (9 * 512 + nsg - 1) / nsg, thrN, n);
+                bar();
+                dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY},
+                     &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
             }
-            bar();
-            dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY},
-                 &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
             bar();
             }
             WB nextNorm = il + 1 < lEnd ? layers[il + 1].aNorm : bONorm;

@@ -527,14 +527,48 @@ serial control, lap-thermal so ratios are the hard data:**
 | v4 default | 1567–1726 | **5.68–5.69×** | 297–327 |
 | v3 record | 1438–1661 | **6.20–6.51×** | 309–356 |
 
-pp512 standing: **~310–356 tok/s vs llama.cpp 1452 — gap 4.1×** (was
-6.3× at the start of the round). Next fat, in order: grouped DOWN
-projection (still ungrouped; ~40% of remaining MoE decode), attention at
-512 (fa_attn_batch is O(N²) — N=512 batch runs at 4.4 ms/tok vs 2.8 at
-N=128, so something quadratic-ish is growing), then dn/select/logits
-small ops. Contamination note: one bench triple was invalidated by a
-leftover llama-server holding 17 GB (kill %1 in a fresh shell is a
-no-op — check `ps`, not job tables); numbers above are from clean runs.
+pp512 standing after gate+up only: ~310–356 tok/s vs llama.cpp 1452.
+Contamination note: one bench triple was invalidated by a leftover
+llama-server holding 17 GB (kill %1 in a fresh shell is a no-op — check
+`ps`, not job tables); numbers above are from clean runs.
+
+### Phase B round 3 — grouped DOWN projection (2026-07-09)
+
+Same decode-once structure for the down mats (`moe_down_grouped.metal`):
+one threadgroup per (expert, 32-row tile of n_embd), K = n_ff = 512,
+f32 staging + f32 MMA, both routed formats (IQ4_XS ×37 layers, Q6_K
+×34/38/39) plus the shared Q8_0 expert. Down accumulates ACROSS experts
+per token, so grouped threadgroups write unweighted per-slot results to
+a dY[tok][slot][2048] scratch (bbMDy) and `moe_down_reduce` folds the 9
+slots with the routing weights — two extra dispatches + one barrier per
+layer, noise. Engages together with grouped gate+up (same n ≥ 192
+default threshold; QK_MOE_GROUPED forces).
+
+Gates, all green in one pass:
+- serve-test ids1/2/3 forced-v4: TOKEN-EXACT; prefilldecode HANDOFF EXACT.
+- scalar-proj + fully-grouped prefillcmp: **36/36 @ 1.4e-6** (tighter
+  than gu-only — order noise, coin-toss direction).
+- default h-GEMM + forced-v4: **36/36 @ 0.075** — the N=48 near-tie that
+  flipped in round 2 landed back on the matching side; those cells are
+  dice at the noise floor, and the full config currently rolls 36/36.
+- Long prompt (1040 tok, two 512 grouped chunks): TOKEN-EXACT vs
+  llama.cpp for default-v4 AND v3-f16.
+
+N=512 interleaved (serial control wobbled ±18% — lap thermals; ratios
+are the hard data):
+
+| config | batch ms | speedup vs own serial | tok/s |
+|---|---|---|---|
+| ungrouped | 2050 | 4.28× | 250 |
+| v4 + grouped down (DEFAULT) | 1015–1424 | **6.57–6.74×** | 359–504 |
+| v3 + grouped down (record) | 1198 | **7.51×** | 427 |
+
+pp512 standing: **~427 tok/s conservative (v3), 504 best-observed (v4,
+coolest run) vs llama.cpp 1452 — gap ~2.9–3.4×**, from 6.3× at the
+start of Phase B round 2. Next: stage isolation at N=512 to re-rank the
+remaining fat (attention O(N²), dn chain, select/logits, projections),
+retune QK_MOE_GROUP_N now that down is grouped too, f16 down variant
+for the v3 record config, and the record run on a hard surface.
 
 ## C1 — no-copy weights: 15.5 GB RSS → 318 MB (2026-07-09)
 
