@@ -3784,11 +3784,14 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     // n*(base+n); at a long base a single full-chunk attention dispatch exceeds
     // amdgpu's ~10 s gfx-ring timeout -> VK_ERROR_DEVICE_LOST. Tile the (fully
     // independent) query axis so each attention dispatch stays under this budget.
-    // 128k leaves margin for a contended/thermally-clamped GPU (empirically ~256k
-    // is the single-slot hard limit). Tunable via env.
+    // The budget is a WALL-TIME proxy: the query-blocked kernel does ~16x more
+    // q*k per second than its naive predecessor (whose measured limits set the
+    // old 128k default), so the default scales by the same factor — 2M keeps
+    // the original safety margin, and measured 10k-prefill is flat from 2M up.
+    // Tunable via env.
     static const uint64_t attnBudget = [] {
         const char* v = getenv("QK_ATTN_BUDGET");
-        long x = v ? atol(v) : 131072;
+        long x = v ? atol(v) : 2097152;
         return (uint64_t)(x < 4096 ? 4096 : x);
     }();
     auto flushCB = [&]() {
@@ -3901,14 +3904,18 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             // Attention over the full [0, base+n) key range, but tiled along the
             // independent query axis so no single dispatch exceeds attnBudget.
             // Each tile flushes (submit + waitIdle) to bound its ring occupancy;
-            // queries carry no cross-tile state so this is exact.
+            // queries carry no cross-tile state so this is exact. The kernel is
+            // query-BLOCKED (QB queries per workgroup share each K/V read), so
+            // tile offsets stay QB-aligned and z counts blocks, not queries.
             {
+                constexpr uint32_t kQB = 16;  // must match QB in fa_attn_batch.comp
                 uint32_t qt = (uint32_t)std::max<uint64_t>(1, attnBudget / (uint64_t)(base + n));
                 qt = std::min(qt, n);
+                qt = std::max(kQB, qt - qt % kQB);
                 for (uint32_t qo = 0; qo < n; qo += qt) {
                     uint32_t tile = std::min(qt, n - qo);
                     pcFaB.qbase = qo;
-                    zdim = tile;
+                    zdim = (tile + kQB - 1) / kQB;
                     disp(pAttnB, BL.sAttn, hQ, &pcFaB, 40);
                     if (qo + tile < n) { barrier(); flushCB(); }
                 }
