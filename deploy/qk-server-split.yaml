@@ -1,0 +1,91 @@
+# qk-server in SPLIT mode: tron runs the HEAD stage (layers [0,22) + the whole
+# serving brain) and forwards hidden rows to midnight's Metal pipe-worker
+# (layers [22,40)). Same switch.sh contract as the other backends: replicas
+# starts at 0, the gemma-server Service selects `gpu-llm: server`, and only
+# ONE backend may be scaled up at a time (`./switch.sh split`).
+#
+# Worker prerequisite: `qk pipe-worker 18100 22:40 32768 2` running on
+# midnight (see the launchd template + runbook in docs/split-serving.md).
+# The worker's slots/ctx must cover the head's; the qkp2 hello enforces it
+# loudly at connect. Startup ORDER does not matter — the head connects
+# lazily and a request against a down worker fails 5xx without killing the
+# server.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qk-server-split
+  namespace: gemma
+  labels:
+    app: qk-server-split
+spec:
+  replicas: 0   # idle by default; ./switch.sh split scales it up
+  strategy:
+    type: Recreate   # same single-GPU overlap hazard as qk-server.yaml
+  selector:
+    matchLabels:
+      app: qk-server-split
+  template:
+    metadata:
+      labels:
+        app: qk-server-split
+        gpu-llm: server   # the gemma-server Service routes here when scaled up
+    spec:
+      containers:
+      - name: qk-server-split
+        image: localhost:32000/qk-server:vulkan
+        imagePullPolicy: Always
+        args:
+        - --model
+        - /models/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf
+        - --engine-lib
+        - /app/libqk.so
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+        # Head owns layers [0,22) (~9 GB + KV) — balance point vs midnight's
+        # M4 Max measured near 22; retune per docs/split-serving.md when
+        # either engine's speed changes.
+        - --slots
+        - "2"
+        - --ctx
+        - "32768"
+        - --chunk
+        - "8"
+        - --split-next
+        - REDACTED-LAN-IP:18100
+        env:
+        - name: QK_LAYERS
+          value: "0:22"
+        # Snapshot ENTRY COUNT for split cross-turn reuse (qk_state_n) — each
+        # entry is a host snapshot of this stage's state (~0.8 GiB at ctx
+        # 32768 for 5 attn layers + DN share). The worker allocates its own
+        # QK_PCACHE entries; keep the counts equal on both sides.
+        - name: QK_PCACHE
+          value: "6"
+        # NB: QK_FORK / QK_SPEC are unsupported in split mode v1 (the server
+        # warns and they never engage) — deliberately unset here.
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: 12Gi
+          limits:
+            memory: 24Gi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /models
+          name: models
+          readOnly: true
+        - mountPath: /dev/dri
+          name: dri
+      volumes:
+      - hostPath:
+          path: /home/ryan/intellij/ggerganov/llama.cpp
+          type: Directory
+        name: models
+      - hostPath:
+          path: /dev/dri
+          type: Directory
+        name: dri

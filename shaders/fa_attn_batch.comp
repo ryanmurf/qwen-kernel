@@ -1,7 +1,16 @@
 #version 450
 
-// Batched prefill variant of fa_attn_srv: each z workgroup is a token offset
-// within one prompt chunk for a single slot, attending causally through pos.
+// Batched-prefill attention, query-blocked ("flash") edition. Each workgroup
+// is (head, block of QB=16 chunk queries) and scans the K/V cache ONCE for
+// the whole block: K tiles staged through LDS, V rows read coalesced from
+// global, per-query online softmax. The naive predecessor gave every query
+// its own workgroup, so a 128-query chunk re-read the entire K/V 128 times
+// per head (~33 GB/s effective at 10k base); this reads it once per block —
+// a 16x traffic cut, and 8 q-heads still share each kv head above that.
+//
+// Host contract: gl_WorkGroupID.z indexes query BLOCKS (zdim =
+// ceil(tile/QB)), query-tile offsets (pc.qbase) are QB-aligned, and pc.Tn
+// bounds the chunk — overhanging queries in the last block are masked here.
 
 layout(local_size_x = 256) in;
 
@@ -18,82 +27,113 @@ layout(push_constant) uniform PC {
     uint Tn; uint qbase;
 } pc;
 
-shared float q[256];
-shared float sc[256];
-shared float red[256];
-shared float m;
-shared float l;
+const uint QB = 16u;  // queries per block  (matches kQB in the host dispatch)
+const uint TK = 16u;  // keys per LDS tile
+
+// +1 padding column: row stride 256 hits the same LDS bank for every row.
+shared float qs[QB][257];
+shared float ks[TK][257];
+shared float sc[QB][TK];   // per-tile scores, then exp'd probabilities
+shared float mi[QB];       // running max
+shared float li[QB];       // running denominator
+shared float corr[QB];     // exp(old_m - new_m) for this tile
 
 void main() {
-    uint h  = gl_WorkGroupID.x;
-    uint t  = gl_LocalInvocationID.x;
-    uint dh = pc.dh;
-    // qbase lets the host tile the attention over query sub-ranges (each a
-    // separate, ring-timeout-bounded dispatch) without any cross-query state.
-    uint n  = pc.qbase + gl_WorkGroupID.z;
-    uint pos = pc.base + n;
-    uint nk = pos + 1u;
-    uint kv = h / (pc.hQ / pc.hKV);
-    uint qfo = n * pc.hQ * 2u * dh;
-    uint qho = n * pc.hQ * dh;
+    uint h   = gl_WorkGroupID.x;
+    uint t   = gl_LocalInvocationID.x;
+    uint dh  = pc.dh;
+    uint blk = pc.qbase + gl_WorkGroupID.z * QB;  // first chunk-query of the block
+    uint kv  = h / (pc.hQ / pc.hKV);
 
-    if (t < dh) q[t] = qhat[qho + h * dh + t];
-    if (t == 0u) {
-        m = -3.4e38;
-        l = 0.0;
+    // Cooperative Q-block load: thread t moves qhat[(blk+i)*hQ*dh + h*dh + d]
+    // for its strip of (i, d). Rows past Tn stay unread garbage — every use
+    // below is per-query and their outputs are never written.
+    for (uint x = t; x < QB * dh; x += 256u) {
+        uint i = x / dh, d = x % dh;
+        if (blk + i < pc.Tn) qs[i][d] = qhat[(blk + i) * pc.hQ * dh + h * dh + d];
     }
+    if (t < QB) {
+        mi[t] = -3.4e38;
+        li[t] = 0.0;
+    }
+    float acc[QB];
+    for (uint i = 0u; i < QB; ++i) acc[i] = 0.0;
     barrier();
 
-    float qs = inversesqrt(float(dh));
-    float acc = 0.0;
-    for (uint p0 = 0u; p0 < nk; p0 += 256u) {
-        uint ts = min(256u, nk - p0);
+    uint nq = min(QB, pc.Tn - min(blk, pc.Tn));          // live queries in block
+    if (nq == 0u) return;                                 // whole block past Tn
+    uint nkMax = pc.base + blk + nq;                      // keys for the LAST query
+    float scale = inversesqrt(float(dh));
 
-        if (t < ts) {
-            float score = 0.0;
-            uint base = (kv * pc.tmax + (p0 + t)) * dh;
-            for (uint j = 0u; j < dh; ++j) score += q[j] * kc[base + j];
-            sc[t] = score * qs;
+    for (uint p0 = 0u; p0 < nkMax; p0 += TK) {
+        uint ts = min(TK, nkMax - p0);
+
+        // Stage the K tile (coalesced: consecutive threads, consecutive floats).
+        for (uint x = t; x < ts * dh; x += 256u) {
+            uint j = x / dh, d = x % dh;
+            ks[j][d] = kc[(kv * pc.tmax + (p0 + j)) * dh + d];
         }
         barrier();
 
-        red[t] = (t < ts) ? sc[t] : -3.4e38;
-        barrier();
-        for (uint s = 128u; s > 0u; s >>= 1u) {
-            if (t < s) red[t] = max(red[t], red[t + s]);
-            barrier();
+        // Scores: one thread per (query i, key j) pair; d-order matches the
+        // old kernel's dot. Causal mask: key p0+j is visible to query i iff
+        // p0+j <= base+blk+i.
+        {
+            uint i = t / TK, j = t % TK;
+            if (i < QB) {
+                float s = -3.4e38;
+                if (j < ts && i < nq && p0 + j <= pc.base + blk + i) {
+                    s = 0.0;
+                    for (uint d = 0u; d < dh; ++d) s += qs[i][d] * ks[j][d];
+                    s *= scale;
+                }
+                sc[i][j] = s;
+            }
         }
-
-        float oldm = m;
-        float newm = max(oldm, red[0]);
-        float corr = exp(oldm - newm);
-
-        acc *= corr;
-        if (t < ts) sc[t] = exp(sc[t] - newm);
-        if (t == 0u) l *= corr;
         barrier();
 
-        red[t] = (t < ts) ? sc[t] : 0.0;
-        barrier();
-        for (uint s = 128u; s > 0u; s >>= 1u) {
-            if (t < s) red[t] += red[t + s];
-            barrier();
+        // Per-query online-softmax bookkeeping (serial over TK — deterministic).
+        if (t < QB) {
+            uint i = t;
+            float rowmax = -3.4e38;
+            for (uint j = 0u; j < ts; ++j) rowmax = max(rowmax, sc[i][j]);
+            float newm = max(mi[i], rowmax);
+            corr[i] = exp(mi[i] - newm);
+            mi[i] = newm;
         }
+        barrier();
+        {
+            uint i = t / TK, j = t % TK;
+            if (i < QB && j < ts)
+                sc[i][j] = sc[i][j] <= -3.0e38 ? 0.0 : exp(sc[i][j] - mi[i]);
+        }
+        barrier();
+        if (t < QB) {
+            uint i = t;
+            float sum = 0.0;
+            for (uint j = 0u; j < ts; ++j) sum += sc[i][j];
+            li[i] = li[i] * corr[i] + sum;
+        }
+        barrier();
 
+        // V accumulation: thread t owns dim t; V rows read once per block,
+        // coalesced across lanes, shared by all queries.
         if (t < dh) {
-            for (uint j = 0u; j < ts; ++j)
-                acc += sc[j] * vc[(kv * pc.tmax + (p0 + j)) * dh + t];
+            for (uint i = 0u; i < nq; ++i) acc[i] *= corr[i];
+            for (uint j = 0u; j < ts; ++j) {
+                float v = vc[(kv * pc.tmax + (p0 + j)) * dh + t];
+                for (uint i = 0u; i < nq; ++i) acc[i] += sc[i][j] * v;
+            }
         }
-        if (t == 0u) {
-            l += red[0];
-            m = newm;
-        }
-        barrier();
+        barrier();  // sc/ks reused next tile
     }
 
     if (t < dh) {
-        float o = acc / l;
-        float g = qfull[qfo + h * 2u * dh + dh + t];
-        att[qho + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+        for (uint i = 0u; i < nq; ++i) {
+            uint n = blk + i;
+            float o = acc[i] / li[i];
+            float g = qfull[n * pc.hQ * 2u * dh + h * 2u * dh + dh + t];
+            att[n * pc.hQ * dh + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+        }
     }
 }

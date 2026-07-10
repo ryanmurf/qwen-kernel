@@ -18,9 +18,25 @@
 > Decode 17.2 ms/tok engine-level (s1 5.1 + s2+net 12.1; worker compute
 > ~5 ms, WiFi RTT ~4.3 ms avg is the tax — wire the Mac for ~0.3 ms), 50
 > tok/s streamed end-to-end at 200 tokens. Two GPU vendors, two APIs, two
-> engines — one bit-exact model. Follow-ons: wired link, S balance sweep
-> (22 was near-even), worker slots=4 for a head slots sweep, async driver
-> to overlap the stages.
+> engines — one bit-exact model. Descoped: per-stage recorded step CBs
+> (~2 ms/tok single-stream on the head vs the async driver's aggregate win).
+>
+> **Clean sweep 2026-07-10 (flash kernel + async driver, Mac idle, WiFi
+> RTT ~3.7 ms):**
+>
+> | S (head layers) | single ms/tok (s1 + s2+net) | 2-stream aggregate |
+> |---|---|---|
+> | 22 | **17.0** (4.4 + 12.6) | **12.5 ms/tok = 80 tok/s** |
+> | 33 | 21.9 (11.1 + 10.8) | 13.6 ms/tok |
+>
+> S=22 wins both axes: the worker's ~7 ms fixed per-frame cost (Metal
+> encode overhead, layer-count-insensitive) + WiFi RTT dominate, so
+> shifting layers to tron only inflates s1 (which also grows
+> super-linearly through the batched-n=1 path). The async driver fully
+> hides the head's work at 2 streams (aggregate = worker+net bound).
+> Next levers, in value order: wired link (−3.4 ms/frame), worker-side
+> per-frame overhead (midnight's engine), then slots=4 (worker-bound math
+> says little until the first two land).
 
 Serve one model as N pipeline stages on N devices, behind the existing
 qk-server HTTP/Anthropic layer. Builds on the engine's pipeline split
@@ -172,3 +188,31 @@ everything above (admission, slots, trimming, SSE) is untouched.
 | P1 | `--split-next` + split driver in engine.rs, worker = `qk pipe-worker` | localhost 2-stage: parity gates 1–3 |
 | P2 | slots=2 interleave + failure drills + timing table in this doc | gate 4, numbers recorded |
 | P3 | deploy manifest for the 2-stage-on-one-box shape (bigger ctx/slots experiment) | slots/ctx sweep vs unsplit baseline |
+
+## Two-node deployment (runbook)
+
+Pieces (all in `deploy/`): `qk-server-split.yaml` (the tron head,
+`QK_LAYERS=0:22` + `--split-next midnight:18100`, replicas 0 by default),
+`midnight-qk-worker.plist` (launchd template for the Metal worker —
+KeepAlive, caffeinate, args `port layers ctx slots`), and `switch.sh split`
+to flip client traffic (scales the other backends to 0 first; the
+`gemma-server` Service keeps routing by the shared `gpu-llm: server` label).
+
+- **Startup order does not matter.** The head connects lazily; a request
+  against a down worker returns a clean 5xx and the head stays up.
+- **Worker restart** (crash, launchd relaunch): in-flight requests fail 5xx,
+  the head voids its snapshot registry (a restarted worker lost its half),
+  reconnects on the next request, and new sequences start at base 0 —
+  no head bounce needed.
+- **Sizing contract**: worker `slots`/`ctx` must cover the head's, and the
+  layer ranges must be contiguous to layer 40 — the qkp2 hello rejects any
+  mismatch at connect with a specific error. Keep `QK_PCACHE` equal on both
+  sides (it is the snapshot entry count for split cross-turn reuse).
+- **Applying the yaml resets replicas to 0** (deliberate, switch.sh owns
+  scaling) — always `./switch.sh split` (or `kubectl scale ... --replicas=1`)
+  after `kubectl apply`.
+- **Probe**: the hello doubles as a health check —
+  `python3 -c "import socket,struct; s=socket.create_connection((HOST,18100),5); s.sendall(struct.pack('<I',0x716b7032)); print(struct.unpack('<7I', s.recv(28)))"`
+- Split mode v1 serves without `QK_FORK`/`QK_SPEC` (the server warns if
+  set); cross-turn reuse comes from the split driver's own boundary
+  snapshots (`[split-cache]` log lines).

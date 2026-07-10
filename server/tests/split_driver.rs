@@ -16,7 +16,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 const CFG: QkConfig = QkConfig {
     n_slots: 2,
-    n_ctx: 64,
+    n_ctx: 2048, // > CHUNK so multi-chunk prefill pipelining gets exercised
     chunk: 4,
 };
 const N_EMBD: usize = 4; // stub's hidden row width
@@ -265,6 +265,59 @@ fn split_driver_serves_the_serial_stream() {
         // …and the delta starts at the boundary, not at 0.
         let first_run = turn2.iter().find(|f| f.0 == 1).expect("a run frame");
         assert_eq!(first_run.3, boundary);
+    }
+
+    // Pipelined multi-chunk prefill: 300 tokens = frames of 128+128+44,
+    // stream still exact. (Tokens offset by 500 so this prompt does NOT
+    // share a prefix with the reuse scenario's snapshot above — which the
+    // driver would otherwise correctly restore, changing the chunking.)
+    let mut big: Vec<u32> = (0..299u32).map(|i| (i % 200) + 500).collect();
+    big.push(11);
+    let mark = frames.lock().unwrap().len();
+    let (t, _) = run_job(&engine, &sem, big.clone(), 2);
+    assert_eq!(t, vec![lcg(11), lcg(lcg(11))]);
+    {
+        let f = frames.lock().unwrap();
+        let sizes: Vec<u32> = f[mark..]
+            .iter()
+            .filter(|fr| fr.0 == 1 && fr.3 < big.len() as u32)
+            .map(|fr| fr.2)
+            .collect();
+        assert_eq!(sizes, vec![128, 128, 44], "prefill chunking: {sizes:?}");
+    }
+
+    // Two slots decoding concurrently (phase-1 sends interleave; replies
+    // collected in order): both streams must be exact.
+    let (tx_a, mut rx_a) = mpsc::channel(64);
+    let (tx_b, mut rx_b) = mpsc::channel(64);
+    for (prompt, tx) in [(vec![3u32, 9, 11], tx_a), (vec![5u32, 8, 42], tx_b)] {
+        engine
+            .handle()
+            .submit(Job {
+                prompt_ids: prompt,
+                max_gen: 5,
+                snap_prefix: 0,
+                events: tx,
+                permit: sem.clone().try_acquire_owned().expect("permit"),
+            })
+            .expect("submit");
+    }
+    for (rx, seed) in [(&mut rx_a, 11u32), (&mut rx_b, 42u32)] {
+        let mut tokens = Vec::new();
+        loop {
+            match rx.blocking_recv().expect("events") {
+                SlotEvent::Tokens(t) => tokens.extend(t),
+                SlotEvent::Done { .. } => break,
+                SlotEvent::Error(e) => panic!("slot errored: {e}"),
+            }
+        }
+        let mut expect = Vec::new();
+        let mut prev = seed;
+        for _ in 0..5 {
+            prev = lcg(prev);
+            expect.push(prev);
+        }
+        assert_eq!(tokens, expect, "seed {seed}");
     }
 
     engine.shutdown();
