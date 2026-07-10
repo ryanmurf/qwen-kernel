@@ -292,7 +292,7 @@ kernel void moe_gu_grouped2(device const block_iq3_xxs* gwE   [[buffer(0)]],
 constant uint G3M = 64u;   // weight rows per tile (per matrix)
 constant uint G3N = 32u;   // token columns per pass
 constant uint G3K = 64u;   // K elems staged per chunk
-constant uint G3S = 66u;   // padded half stride
+constant uint G3S = 68u;   // padded half stride (8B-aligned rows for half4 stores)
 
 // v4 (decode-once, wide, f32, QK_MOE_GROUPED=4): v3's 32-token-column shape
 // with v2's f32 exactness — 32x32 tile in 25 KB. Captures most of the
@@ -302,7 +302,7 @@ constant uint G3S = 66u;   // padded half stride
 constant uint G4M = 32u;
 constant uint G4N = 32u;
 constant uint G4K = 64u;
-constant uint G4S = 65u;
+constant uint G4S = 68u;
 
 kernel void moe_gu_grouped4(device const block_iq3_xxs* gwE   [[buffer(0)]],
                             device const block_iq3_xxs* uwE   [[buffer(1)]],
@@ -359,35 +359,35 @@ kernel void moe_gu_grouped4(device const block_iq3_xxs* gwE   [[buffer(0)]],
                 const uint aux = uint(blk.qs[ao]) | (uint(blk.qs[ao + 1u]) << 8u) |
                                  (uint(blk.qs[ao + 2u]) << 16u) | (uint(blk.qs[ao + 3u]) << 24u);
                 const float db = float(blk.d) * (0.5f + float(aux >> 28u)) * 0.5f;
+                threadgroup float4* dst4 = (threadgroup float4*)dst;
                 for (uint l = 0u; l < 4u; ++l) {
                     const uint signs = iq_signbyte((aux >> (7u * l)) & 127u);
                     const uint g1 = iq3xxs_grid[blk.qs[ib32 * 8u + 2u * l]];
                     const uint g2 = iq3xxs_grid[blk.qs[ib32 * 8u + 2u * l + 1u]];
-                    for (uint j = 0u; j < 4u; ++j) {
-                        dst[l * 8u + j] = db * float((g1 >> (8u * j)) & 255u) *
-                                          (((signs >> j) & 1u) ? -1.0f : 1.0f);
-                        dst[l * 8u + 4u + j] = db * float((g2 >> (8u * j)) & 255u) *
-                                               (((signs >> (4u + j)) & 1u) ? -1.0f : 1.0f);
-                    }
+                    const float4 m1 = float4(uint4(g1, g1 >> 8u, g1 >> 16u, g1 >> 24u) & 255u);
+                    const float4 m2 = float4(uint4(g2, g2 >> 8u, g2 >> 16u, g2 >> 24u) & 255u);
+                    const float4 s1 = select(float4(1.0f), float4(-1.0f),
+                                             bool4(signs & 1u, signs & 2u, signs & 4u, signs & 8u));
+                    const float4 s2 = select(float4(1.0f), float4(-1.0f),
+                                             bool4(signs & 16u, signs & 32u, signs & 64u, signs & 128u));
+                    dst4[2u * l]      = db * m1 * s1;
+                    dst4[2u * l + 1u] = db * m2 * s2;
                 }
             } else {                                     // shared: Q8_0
                 device const block_q8_0* mat = smat ? uwS : gwS;
                 device const block_q8_0& blk = mat[(ulong)row * (K >> 5) + g32];
                 const float d = float(blk.d);
                 device const packed_char4* qp = (device const packed_char4*)blk.qs;
-                for (uint i = 0u; i < 8u; ++i) {
-                    const char4 q = char4(qp[i]);
-                    dst[4u * i + 0u] = d * float(q.x);
-                    dst[4u * i + 1u] = d * float(q.y);
-                    dst[4u * i + 2u] = d * float(q.z);
-                    dst[4u * i + 3u] = d * float(q.w);
-                }
+                threadgroup float4* dst4 = (threadgroup float4*)dst;
+                for (uint i = 0u; i < 8u; ++i)
+                    dst4[i] = d * float4(char4(qp[i]));
             }
-            for (uint idx = tid; idx < G4N * G4K; idx += 128u) {
+            for (uint idx = tid * 4u; idx < G4N * G4K; idx += 128u * 4u) {
                 const uint tt = idx >> 6, kk = idx & 63u;
                 const uint ti = t0 + tt;
-                Xsh[tt * G4S + kk] = ti < c
-                    ? x[(ulong)aTok[s0 + ti] * K + k0 + kk] : 0.0f;
+                ((threadgroup float4*)&Xsh[tt * G4S + kk])[0] = ti < c
+                    ? *(device const packed_float4*)(x + (ulong)aTok[s0 + ti] * K + k0 + kk)
+                    : float4(0.0f);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -483,35 +483,35 @@ kernel void moe_gu_grouped3(device const block_iq3_xxs* gwE   [[buffer(0)]],
                 const uint aux = uint(blk.qs[ao]) | (uint(blk.qs[ao + 1u]) << 8u) |
                                  (uint(blk.qs[ao + 2u]) << 16u) | (uint(blk.qs[ao + 3u]) << 24u);
                 const float db = float(blk.d) * (0.5f + float(aux >> 28u)) * 0.5f;
+                threadgroup half4* dst4 = (threadgroup half4*)dst;
                 for (uint l = 0u; l < 4u; ++l) {
                     const uint signs = iq_signbyte((aux >> (7u * l)) & 127u);
                     const uint g1 = iq3xxs_grid[blk.qs[ib32 * 8u + 2u * l]];
                     const uint g2 = iq3xxs_grid[blk.qs[ib32 * 8u + 2u * l + 1u]];
-                    for (uint j = 0u; j < 4u; ++j) {
-                        dst[l * 8u + j] = half(db * float((g1 >> (8u * j)) & 255u) *
-                                               (((signs >> j) & 1u) ? -1.0f : 1.0f));
-                        dst[l * 8u + 4u + j] = half(db * float((g2 >> (8u * j)) & 255u) *
-                                                    (((signs >> (4u + j)) & 1u) ? -1.0f : 1.0f));
-                    }
+                    const float4 m1 = float4(uint4(g1, g1 >> 8u, g1 >> 16u, g1 >> 24u) & 255u);
+                    const float4 m2 = float4(uint4(g2, g2 >> 8u, g2 >> 16u, g2 >> 24u) & 255u);
+                    const float4 s1 = select(float4(1.0f), float4(-1.0f),
+                                             bool4(signs & 1u, signs & 2u, signs & 4u, signs & 8u));
+                    const float4 s2 = select(float4(1.0f), float4(-1.0f),
+                                             bool4(signs & 16u, signs & 32u, signs & 64u, signs & 128u));
+                    dst4[2u * l]      = half4(db * m1 * s1);
+                    dst4[2u * l + 1u] = half4(db * m2 * s2);
                 }
             } else {                                     // shared: Q8_0
                 device const block_q8_0* mat = smat ? uwS : gwS;
                 device const block_q8_0& blk = mat[(ulong)row * (K >> 5) + g32];
                 const half d = blk.d;
                 device const packed_char4* qp = (device const packed_char4*)blk.qs;
-                for (uint i = 0u; i < 8u; ++i) {
-                    const char4 q = char4(qp[i]);
-                    dst[4u * i + 0u] = d * half(q.x);
-                    dst[4u * i + 1u] = d * half(q.y);
-                    dst[4u * i + 2u] = d * half(q.z);
-                    dst[4u * i + 3u] = d * half(q.w);
-                }
+                threadgroup half4* dst4 = (threadgroup half4*)dst;
+                for (uint i = 0u; i < 8u; ++i)
+                    dst4[i] = d * half4(char4(qp[i]));
             }
-            for (uint idx = tid; idx < G3N * G3K; idx += 256u) {
+            for (uint idx = tid * 4u; idx < G3N * G3K; idx += 256u * 4u) {
                 const uint tt = idx >> 6, kk = idx & 63u;
                 const uint ti = t0 + tt;
-                Xsh[tt * G3S + kk] = ti < c
-                    ? half(x[(ulong)aTok[s0 + ti] * K + k0 + kk]) : 0.0h;
+                ((threadgroup half4*)&Xsh[tt * G3S + kk])[0] = ti < c
+                    ? half4(*(device const packed_float4*)(x + (ulong)aTok[s0 + ti] * K + k0 + kk))
+                    : half4(0.0h);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 

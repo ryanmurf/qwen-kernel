@@ -570,6 +570,40 @@ remaining fat (attention O(N²), dn chain, select/logits, projections),
 retune QK_MOE_GROUP_N now that down is grouped too, f16 down variant
 for the v3 record config, and the record run on a hard surface.
 
+### Phase B round 3.5 — f16 down + vectorized staging (2026-07-09)
+
+- **f16 grouped down** (`moe_down_grouped_h_*`, 64×32 tiles, 16 elems
+  per staging thread — IQ4_XS nibble planes and Q6_K 16-elem scale
+  groups split naturally). QK_MOE_GROUPED=3 is now f16 end-to-end in
+  the MoE.
+- **Stage isolation at N=512** (v4 config, 1003 ms chunk): gu 406 ms,
+  down+reduce 196, projections 176, dn 104, **attention 16 (the O(N²)
+  worry was wrong)**, head/logits/norms ~105. MoE was still 60% — hence
+  the two moves above.
+- **Vectorized threadgroup staging**: the dequant stages wrote 32 scalar
+  tg stores per thread per chunk; half4/float4 stores (row strides
+  66/65 → 68 for alignment) are bit-identical (moegcmp max_rel
+  unchanged to the digit) and large: v3 gu 6.06 → **4.79 ms/layer**
+  (−21%), v4 gu 9.57 → **7.21** (−25%).
+- moegcmp per-layer at n=512 uniform (worst case): ungrouped 13.9 | v4
+  7.21 (f32-exact) | v3 4.79 (f16).
+- Crossovers with down grouped (interleaved, stable controls): v4 still
+  ties at N=128 / loses at 96 → threshold 192 stands. **v3 wins already
+  at N=96** (214 vs 251 ms) and by 21% at 128 — its crossover is below
+  the default serving chunk, relevant if the record config ever becomes
+  default.
+- Gates re-run over the vectorized kernels: forced-v4 serve-test
+  TOKEN-EXACT, prefilldecode HANDOFF EXACT, long-prompt (2×512 grouped
+  chunks) TOKEN-EXACT for default AND v3.
+- N=512 cool-state: **v3 775.7 ms → 660 tok/s pp512**. Same-sequence
+  later runs decay to 1230 ms purely thermally (lap). llama.cpp 1452:
+  **gap now ~2.2× cool**.
+
+Cross-box note: wire bumped to qkp2 mid-round (tron) — pipe harness
+re-mirrored from main, qk_state_n/save/load implemented over the pcache
+snap buffers, gates (a)/(b) token-exact incl. reconnect, live worker on
+:18100 relaunched on the new build.
+
 ## C1 — no-copy weights: 15.5 GB RSS → 318 MB (2026-07-09)
 
 The engine now wraps the entire GGUF mmap in ONE
