@@ -1,0 +1,105 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Routed experts, gate+up in one pass: for slot s (0..n_used-1) and FFN row r,
+// h[s*n_ff + r] = silu(gate_exps[ids[s]][r]·x) * (up_exps[ids[s]][r]·x).
+// Both weight tensors are IQ4_XS (136 B per 256-elem super-block, 8 sub-blocks
+// of 32 with 6-bit scales and the shared iq4nl codebook). One workgroup per
+// (slot, row); threads stride over 32-element sub-blocks.
+
+layout(local_size_x = 256) in;
+
+#include "iq_tables.glsl"
+
+struct block_iq4_xs {
+    float16_t d;
+    uint16_t  scales_h;
+    uint8_t   scales_l[4];
+    uint8_t   qs[128];
+};
+
+layout(std430, binding = 0) readonly buffer BufG { block_iq4_xs gw[]; };
+layout(std430, binding = 1) readonly buffer BufU { block_iq4_xs uw[]; };
+layout(std430, binding = 2) readonly buffer BufX { float x[]; };
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
+layout(std430, binding = 3) readonly buffer Sel { SelT sel[]; };
+layout(std430, binding = 4) writeonly buffer BufH { float h[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float pg[256];
+shared float pu[256];
+
+void main() {
+    uint wg  = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint s   = wg / pc.n_ff;
+    uint r   = wg % pc.n_ff;
+    uint tid = gl_LocalInvocationID.x;
+    uint rq  = gl_WorkGroupID.z;
+    uint xo2 = rq * pc.n_embd;
+    uint ho  = rq * (pc.n_used + 1u) * pc.n_ff;
+
+    float accG = 0.0, accU = 0.0;
+    if (s < pc.n_used) {
+        uint kb   = pc.n_embd / 256u;  // super-blocks per row
+        uint nu   = kb * 8u;           // 32-element sub-blocks per row
+        uint eid  = min(sel[rq].ids[s], pc.n_expert - 1u);  // guard vs OOB weight read
+        uint base = (eid * pc.n_ff + r) * kb;
+
+        for (uint u = tid; u < nu; u += 256u) {
+            uint b    = u >> 3u;
+            uint ib   = u & 7u;
+            uint bi   = base + b;
+            uint qoff = ib * 16u;
+            uint xoff = xo2 + b * 256u + ib * 32u;
+
+            // gate
+            {
+                float d  = float(gw[bi].d);
+                uint  slb = uint(gw[bi].scales_l[ib >> 1u]);
+                uint  sh  = uint(gw[bi].scales_h);
+                int   ls  = int(((slb >> (4u * (ib & 1u))) & 0xFu) |
+                                (((sh >> (2u * ib)) & 3u) << 4u)) - 32;
+                float dl = d * float(ls);
+                float s1 = 0.0, s2 = 0.0;
+                for (uint j = 0u; j < 16u; ++j) {
+                    uint q = uint(gw[bi].qs[qoff + j]);
+                    s1 += float(kvalues_iq4nl[q & 0xFu]) * x[xoff + j];
+                    s2 += float(kvalues_iq4nl[q >> 4u]) * x[xoff + 16u + j];
+                }
+                accG += dl * (s1 + s2);
+            }
+            // up
+            {
+                float d  = float(uw[bi].d);
+                uint  slb = uint(uw[bi].scales_l[ib >> 1u]);
+                uint  sh  = uint(uw[bi].scales_h);
+                int   ls  = int(((slb >> (4u * (ib & 1u))) & 0xFu) |
+                                (((sh >> (2u * ib)) & 3u) << 4u)) - 32;
+                float dl = d * float(ls);
+                float s1 = 0.0, s2 = 0.0;
+                for (uint j = 0u; j < 16u; ++j) {
+                    uint q = uint(uw[bi].qs[qoff + j]);
+                    s1 += float(kvalues_iq4nl[q & 0xFu]) * x[xoff + j];
+                    s2 += float(kvalues_iq4nl[q >> 4u]) * x[xoff + 16u + j];
+                }
+                accU += dl * (s1 + s2);
+            }
+        }
+    }
+
+    float gS = subgroupAdd(accG);
+    float uS = subgroupAdd(accU);
+    if (gl_SubgroupInvocationID == 0u) { pg[gl_SubgroupID] = gS; pu[gl_SubgroupID] = uS; }
+    barrier();
+    if (tid == 0u && s < pc.n_used) {
+        float g = 0.0, u = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) { g += pg[i]; u += pu[i]; }
+        h[ho + s * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;   // silu(g) * u
+    }
+}

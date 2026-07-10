@@ -5,20 +5,21 @@
 // the selected logits only — the full-softmax denominator cancels under
 // llama.cpp's norm_w renormalization. Also computes the shared-expert
 // sigmoid gate: wShared = sigmoid(gate_inp_shexp · x).
+// Sized for n_expert <= 512 (Qwen3-Next-80B) and n_used <= 16.
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 512) in;
 
 layout(std430, binding = 0) readonly buffer BufL   { float logits[]; };
 layout(std430, binding = 1) readonly buffer BufGIS { float gis[]; };
 layout(std430, binding = 2) readonly buffer BufX   { float x[]; };
-struct SelT { uint ids[8]; float w[8]; float wShared; float pad[15]; };
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
 layout(std430, binding = 3) buffer Sel { SelT sel[]; };
 
 layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
 
-shared float sl[256];
-shared float red[256];
-shared uint  redi[256];
+shared float sl[512];
+shared float red[512];
+shared uint  redi[512];
 
 void main() {
     uint t = gl_LocalInvocationID.x;
@@ -34,10 +35,10 @@ void main() {
 
     // shared-expert gate dot
     float sacc = 0.0;
-    for (uint k = t; k < pc.n_embd; k += 256u) sacc += gis[k] * x[rq * pc.n_embd + k];
+    for (uint k = t; k < pc.n_embd; k += 512u) sacc += gis[k] * x[rq * pc.n_embd + k];
     red[t] = sacc;
     barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
+    for (uint s = 256u; s > 0u; s >>= 1u) {
         if (t < s) red[t] += red[t + s];
         barrier();
     }
@@ -49,7 +50,7 @@ void main() {
         red[t] = sl[t];
         redi[t] = t;
         barrier();
-        for (uint s = 128u; s > 0u; s >>= 1u) {
+        for (uint s = 256u; s > 0u; s >>= 1u) {
             if (t < s && red[t + s] > red[t]) {
                 red[t] = red[t + s];
                 redi[t] = redi[t + s];
