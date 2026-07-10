@@ -36,6 +36,8 @@ type QkStageRun = unsafe extern "C" fn(
     *mut u32,   // ids_out (last stage) or NULL
 ) -> c_int;
 
+type QkStateOp = unsafe extern "C" fn(*mut QkEngineOpaque, u32, u32) -> c_int;
+
 /// Pipeline-split ABI (engine ≥ 240c63e). Resolved as a group; `None` on
 /// older engine libraries, which still serve unsplit.
 struct StageSymbols {
@@ -44,6 +46,14 @@ struct StageSymbols {
     layer_end: QkGetter,
     n_layer: QkGetter,
     n_embd: QkGetter,
+}
+
+/// Snapshot ABI (engine ≥ #30): driver-managed state save/load for split
+/// cross-turn reuse. Separate group — a stage-capable lib may predate it.
+struct StateSymbols {
+    n: QkGetter,
+    save: QkStateOp,
+    load: QkStateOp,
 }
 
 struct Symbols {
@@ -58,6 +68,7 @@ struct Symbols {
     slot_cancel: QkSlotCancel,
     step_chunk: QkStepChunk,
     stage: Option<StageSymbols>,
+    state: Option<StateSymbols>,
 }
 
 pub struct Engine {
@@ -125,6 +136,20 @@ impl Engine {
                         layer_end: *end,
                         n_layer: *layers,
                         n_embd: *embd,
+                    }),
+                    _ => None,
+                }
+            },
+            state: unsafe {
+                match (
+                    lib.get(b"qk_state_n\0"),
+                    lib.get(b"qk_state_save\0"),
+                    lib.get(b"qk_state_load\0"),
+                ) {
+                    (Ok(n), Ok(save), Ok(load)) => Some(StateSymbols {
+                        n: *n,
+                        save: *save,
+                        load: *load,
                     }),
                     _ => None,
                 }
@@ -292,6 +317,31 @@ impl Engine {
         };
         if rc < 0 {
             bail!("qk_stage_run failed with code {rc}");
+        }
+        Ok(())
+    }
+
+    /// Number of driver-managed state snapshot entries (0 when the engine
+    /// library predates the snapshot ABI).
+    pub fn state_n(&self) -> u32 {
+        self.syms
+            .state
+            .as_ref()
+            .map_or(0, |s| unsafe { (s.n)(self.raw) })
+    }
+
+    pub fn state_save(&mut self, slot: u32, idx: u32) -> Result<()> {
+        let s = self.syms.state.as_ref().context("no snapshot ABI")?;
+        if unsafe { (s.save)(self.raw, slot, idx) } < 0 {
+            bail!("qk_state_save({slot}, {idx}) failed");
+        }
+        Ok(())
+    }
+
+    pub fn state_load(&mut self, slot: u32, idx: u32) -> Result<()> {
+        let s = self.syms.state.as_ref().context("no snapshot ABI")?;
+        if unsafe { (s.load)(self.raw, slot, idx) } < 0 {
+            bail!("qk_state_load({slot}, {idx}) failed");
         }
         Ok(())
     }

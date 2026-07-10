@@ -4085,6 +4085,23 @@ int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float*
 }
 
 __attribute__((visibility("default")))
+uint32_t qk_state_n(const qk_engine* e) { return (uint32_t)e->pcache.size(); }
+
+__attribute__((visibility("default")))
+int qk_state_save(qk_engine* e, uint32_t slot, uint32_t idx) {
+    if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
+    e->copyStripes(slot, e->pcache[idx].snap.buf, /*save=*/true);
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int qk_state_load(qk_engine* e, uint32_t slot, uint32_t idx) {
+    if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
+    e->copyStripes(slot, e->pcache[idx].snap.buf, /*save=*/false);
+    return 0;
+}
+
+__attribute__((visibility("default")))
 int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt,
                   uint32_t max_gen, uint32_t snap_prefix) {
     if (!e || slot >= e->nSlots) return -1;
@@ -4649,8 +4666,9 @@ int main(int argc, char** argv) {
         // Connection hello: client sends the magic; worker replies
         // {magic, lFirst, lEnd, nLayer, nEmbd, nSlots, nCtx} so mismatched
         // builds/splits fail loudly instead of streaming garbage. Bump the
-        // magic ("qkp2"...) on any wire change.
-        const uint32_t kPipeMagic = 0x716b7031;  // "qkp1"
+        // magic on any wire change. qkp2 = qkp1 + state ops (op3 save /
+        // op4 load, idx in the n field, 4-byte status reply).
+        const uint32_t kPipeMagic = 0x716b7032;  // "qkp2"
         char err[256] = {0};
 
         if (mode == "pipe-worker") {
@@ -4692,8 +4710,17 @@ int main(int argc, char** argv) {
                 if (!writeAll(fd, hello, sizeof hello)) { close(fd); continue; }
                 fprintf(stderr, "[pipe-worker] client connected\n");
                 PipeHdr h;
-                while (readAll(fd, &h, sizeof h) && h.op == 1) {
-                    if (h.n < 1 || h.slot >= e->nSlots || (size_t)h.base + h.n > e->nCtx) break;
+                while (readAll(fd, &h, sizeof h) && h.op != 2) {
+                    if (h.op == 3 || h.op == 4) {
+                        // state save/load: idx rides in the n field; 4-byte status reply
+                        uint32_t rc = (uint32_t)(h.op == 3 ? qk_state_save(e, h.slot, h.n)
+                                                           : qk_state_load(e, h.slot, h.n));
+                        if (!writeAll(fd, &rc, 4)) break;
+                        continue;
+                    }
+                    if (h.op != 1 || h.n < 1 || h.slot >= e->nSlots ||
+                        (size_t)h.base + h.n > e->nCtx)
+                        break;
                     int rc;
                     if (e->firstStage()) {
                         toks.resize(h.n);
