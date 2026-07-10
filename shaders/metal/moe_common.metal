@@ -2,11 +2,11 @@
 // shaders/moe_*.comp). Pulled in via the loadMetalSource include inliner.
 // Requires iq_tables.metal to be included first where IQ formats are used.
 
-struct SelT {
-    uint  ids[8];
-    float w[8];
+struct SelT {          // 160 B; must match host SelH and every consumer
+    uint  ids[16];      // top-k expert ids (k = n_used <= 16)
+    float w[16];
     float wShared;
-    float pad[15];
+    float pad[7];
 };
 
 struct MoePC {
@@ -69,9 +69,9 @@ static inline void moe_pick_all(device const float* logits, uint nExp,
                                 thread uint* ids, thread float* ws,
                                 thread float& wShared) {
     wShared = 1.0f / (1.0f + exp(-logits[nExp]));
-    const uint perLane = (nExp + 31u) / 32u;  // 8 for 256 experts
-    float v[8];
-    for (uint i = 0u; i < perLane && i < 8u; ++i) {
+    const uint perLane = (nExp + 31u) / 32u;  // 16 for 512 experts
+    float v[16];
+    for (uint i = 0u; i < perLane && i < 16u; ++i) {
         const uint g = i * 32u + slid;
         float lv = g < nExp ? logits[g] : -3.4e38f;
         v[i] = (isnan(lv) || isinf(lv)) ? -3.4e38f : lv;
@@ -80,7 +80,7 @@ static inline void moe_pick_all(device const float* logits, uint nExp,
     for (uint round = 0u; round < nUsed; ++round) {
         float lm = -3.4e38f;
         uint  li = 0u;
-        for (uint i = 0u; i < perLane && i < 8u; ++i)
+        for (uint i = 0u; i < perLane && i < 16u; ++i)
             if (v[i] > lm) { lm = v[i]; li = i; }
         const float gm = simd_max(lm);
         const uint  g  = li * 32u + slid;

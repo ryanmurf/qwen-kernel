@@ -28,20 +28,20 @@ kernel void moe_select(device const float* logits [[buffer(0)]],
     }
 
     // lane-resident logits, sanitized
-    const uint perLane = (pc.n_expert + 31u) / 32u;  // 8 for 256 experts
-    float v[8];
-    for (uint i = 0u; i < perLane && i < 8u; ++i) {
+    const uint perLane = (pc.n_expert + 31u) / 32u;  // 16 for 512 experts
+    float v[16];
+    for (uint i = 0u; i < perLane && i < 16u; ++i) {
         const uint g = i * 32u + slid;
         float lv = g < pc.n_expert ? logits[rq * stride + g] : -3.4e38f;
         v[i] = (isnan(lv) || isinf(lv)) ? -3.4e38f : lv;
     }
 
-    float wsel[8];
-    uint  idsel[8];
+    float wsel[16];
+    uint  idsel[16];
     for (uint round = 0u; round < pc.n_used; ++round) {
         float lm = -3.4e38f;
         uint  li = 0u;
-        for (uint i = 0u; i < perLane && i < 8u; ++i)
+        for (uint i = 0u; i < perLane && i < 16u; ++i)
             if (v[i] > lm) { lm = v[i]; li = i; }          // first hit = lowest index
         const float gm = simd_max(lm);
         const uint  g  = li * 32u + slid;                   // global expert index
