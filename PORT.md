@@ -458,6 +458,41 @@ EXACT and prefillcmp 36/36 re-verified after the binding surgery. This is
 now BETTER than llama.cpp's mmap path (which still faults the whole model
 into its own dirty pages for GPU residency on load).
 
+## D — cross-box pipeline split on Metal (tron brief, 2026-07-10)
+
+Merged origin/main 0c508e2 (clean; the in-messages system-turn patch had
+converged with upstream d39168a). Metal engine implements the frozen ABI:
+`QK_LAYERS=a:b` partial load (layer states only in range; logits/argmax
+buffers only on the last stage; weights are free either way — no-copy),
+`qk_stage_run` chunked over maxB with hidden-in → first-layer rms entry
+and hidden-out = raw residual rows via UMA memcpy; the boundary layer
+binds a zeroed dummy next-norm (dead xn), exactly the Vulkan trick.
+`qk pipe`/`qk pipe-worker` compiled from main.cpp verbatim.
+
+Gates (brief §4), all token-exact vs the unsplit engine AND the llama.cpp
+greedy references:
+
+| gate | result |
+|---|---|
+| a. in-process split 20 (deltanet boundary) | GEN exact |
+| a. in-process split 24 (attention-layer boundary) | GEN exact |
+| b. TCP worker localhost, split 20 | GEN exact |
+| b. reconnect, second prompt | GEN exact |
+
+Timing (localhost, warm): 9.55 ms/tok split vs 8.3 unsplit → split
+overhead ≈ 1.2 ms/tok including loopback TCP of the 8 KB hidden row.
+In-process two-engine mode is slower (52–76 ms/tok — two Metal contexts
+contending in one process); use the worker for real numbers. For tron
+(gate c): launch the worker here with slots/ctx covering the head, e.g.
+`QK_LAYERS=22:40 QK_GGUF=... build/qk pipe-worker <port> 22:40 2 32768`
+— s2 on midnight measured ~5.3 ms/tok at split 20 with 4k ctx; balance S
+per the brief using tron's ~5.8 ms/tok full-model decode.
+
+One false alarm worth recording: an apparent engine-vs-reference
+divergence on prompt 3 was a stale memory of the PRE-fix (accidentally
+sampled) reference — the regenerated greedy ref matches the engine
+exactly. Trust files, not recollection.
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);

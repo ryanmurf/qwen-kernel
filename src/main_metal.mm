@@ -20,6 +20,13 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1865,6 +1872,11 @@ struct qk_engine {
     uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
     bool shareFork = false;
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
+    // Pipeline split (QK_LAYERS=a:b): this engine owns layers [lFirst, lEnd).
+    uint32_t lFirst = 0, lEnd = 40;
+    bool firstStage() const { return lFirst == 0; }
+    bool lastStage() const { return lEnd == nLayer; }
+    bool splitStage() const { return lFirst != 0 || lEnd != nLayer; }
     static constexpr uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
     static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64, nLayer = 40;
     float eps = 1e-6f;
@@ -1895,7 +1907,9 @@ struct qk_engine {
 
     uint32_t maxB = 0;
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
-        bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry;
+        bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
+        bbAV, bbAI, bbTok;
+    id<MTLComputePipelineState> pRms;
 
     struct Slot {
         bool active = false;
@@ -1919,7 +1933,11 @@ struct qk_engine {
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
     void prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
-                          std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0);
+                          std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0,
+                          uint32_t* argmaxOut = nullptr, const float* hiddenIn = nullptr,
+                          float* hiddenOut = nullptr);
+    int stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
+                 uint32_t base, float* hiddenOut, uint32_t* idsOut);
     uint32_t serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
                                  std::vector<float>& logits);
     void resetSlot(uint32_t slot);
@@ -1932,6 +1950,7 @@ struct qk_engine {
 
 void qk_engine::resetSlot(uint32_t slot) {
     for (auto& L : layers) {   // GPU is idle at every call site (engine is synchronous)
+        if (!L.st1) continue;  // layer outside this stage's [lFirst, lEnd)
         memset((uint8_t*)L.st1.contents + (size_t)slot * L.ps1, 0, L.ps1);
         memset((uint8_t*)L.st2.contents + (size_t)slot * L.ps2, 0, L.ps2);
     }
@@ -1940,6 +1959,7 @@ void qk_engine::resetSlot(uint32_t slot) {
 void qk_engine::copyStripes(uint32_t slot, uint8_t* snap, bool save) {
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
+        if (!L.st1) continue;
         uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)slot * L.ps1;
         uint8_t* s2 = (uint8_t*)L.st2.contents + (size_t)slot * L.ps2;
         if (save) {
@@ -1999,6 +2019,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     shareFork = getenv("QK_FORK") != nullptr;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 32768 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
+    if (const char* v = getenv("QK_LAYERS")) {   // pipeline-split stage [a,b)
+        uint32_t a = 0, b = 0;
+        if (sscanf(v, "%u:%u", &a, &b) == 2 && a < b && b <= nLayer) { lFirst = a; lEnd = b; }
+        else return fail("qk_open: bad QK_LAYERS (want a:b with 0 <= a < b <= 40)");
+    }
     initMtl(c, "libqk");
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     {   // ONE no-copy buffer over the mmap: zero weight copies at open.
@@ -2026,6 +2051,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     const uint32_t nB = nSlots, tmax = nCtx;
     nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
 
+    pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
     pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
@@ -2076,9 +2102,18 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bMH = createBuf(c, (size_t)nB * 9 * 512 * 4, nullptr, true);
     bMSel = createBuf(c, (size_t)nB * 128, nullptr, true);
     bMY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
-    bONorm = WOFF(tONorm);
+    if (lastStage()) {
+        bONorm = WOFF(tONorm);
+    } else {
+        // dummy boundary norm: the stage's last add_rmsnorm tail still writes
+        // an xn, but it is dead — the next stage re-norms with its own layer's
+        // attn_norm. Zeroed weights keep the dead lane finite.
+        id<MTLBuffer> z = createBuf(c, nEmbd * 4, nullptr, true);
+        memset(z.contents, 0, nEmbd * 4);
+        bONorm = WB{z, 0};
+    }
     bHeadW = WOFF(tHead);
-    bLogits = createBuf(c, (size_t)nB * vocab * 4, nullptr, true);
+    bLogits = splitStage() ? nil : createBuf(c, (size_t)nB * vocab * 4, nullptr, true);
     bEmbdW = WOFF(tEmbd);
     bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
     bAV = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
@@ -2123,14 +2158,19 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMH = createBuf(c, (size_t)cap * 9 * 512 * 4, nullptr, true);
     bbMSel = createBuf(c, (size_t)cap * 128, nullptr, true);
     bbMY = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
-    bbLogits = createBuf(c, (size_t)cap * vocab * 4, nullptr, true);
+    bbLogits = lastStage() ? createBuf(c, (size_t)cap * vocab * 4, nullptr, true) : nil;
+    if (lastStage()) {
+        bbAV = createBuf(c, (size_t)cap * 64 * 4, nullptr, true);
+        bbAI = createBuf(c, (size_t)cap * 64 * 4, nullptr, true);
+        bbTok = createBuf(c, (size_t)cap * 4, nullptr, true);
+    }
     bbIds = createBuf(c, (size_t)cap * 4, nullptr, true);
     bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, nullptr, true);
     memset(bbCarry.contents, 0, (size_t)nLayer * chQkv * 3 * 4);
 
     layers.resize(nLayer);
     char nb[128];
-    for (uint32_t il = 0; il < nLayer; il++) {
+    for (uint32_t il = lFirst; il < lEnd; il++) {
         Layer& L = layers[il];
         auto T = [&](const char* suffix) -> const GgufTensor* {
             snprintf(nb, sizeof nb, "blk.%u.%s", il, suffix); return g.find(nb);
@@ -2347,16 +2387,22 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 }
 
 void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
-                                 std::vector<float>& logits, bool wantLogits, uint32_t base) {
-    if (!toks || n < 1 || n > maxB || slot >= nSlots || (size_t)base + n > nCtx) {
-        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u\n", n, slot, base);
+                                 std::vector<float>& logits, bool wantLogits, uint32_t base,
+                                 uint32_t* argmaxOut, const float* hiddenIn, float* hiddenOut) {
+    if ((!toks && !hiddenIn) || n < 1 || n > maxB || slot >= nSlots ||
+        (size_t)base + n > nCtx ||
+        (hiddenIn && firstStage()) || (!hiddenIn && !firstStage()) ||
+        ((wantLogits || argmaxOut) && !lastStage())) {
+        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u stage=[%u,%u)\n",
+                n, slot, base, lFirst, lEnd);
         exit(1);
     }
-    memcpy(bbIds.contents, toks, (size_t)n * 4);
+    if (hiddenIn) memcpy(bbXin.contents, hiddenIn, (size_t)n * nEmbd * 4);   // UMA
+    else memcpy(bbIds.contents, toks, (size_t)n * 4);
     if (wantLogits) logits.resize(vocab);
     if (base == 0) resetSlot(slot);
     // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
-    for (uint32_t il = 0; il < nLayer; il++) {
+    for (uint32_t il = lFirst; il < lEnd; il++) {
         if (!layers[il].rec) continue;
         uint8_t* dst = (uint8_t*)bbCarry.contents + (size_t)il * chQkv * 3 * 4;
         if (base == 0) memset(dst, 0, (size_t)chQkv * 3 * 4);
@@ -2408,9 +2454,15 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             }
         };
 
-        dspz(pEmb, {bEmbdW, bbIds, bbXin, layers[0].aNorm, bbXn}, &pcE, 16, 1, 256, n);
+        if (hiddenIn) {
+            // later stage: the previous stage's residual rows are already in
+            // bbXin; apply this stage's first-layer norm to produce bbXn
+            dspz(pRms, {bbXin, layers[lFirst].aNorm, bbXn}, &pcRms, 8, 1, 256, n);
+        } else {
+            dspz(pEmb, {bEmbdW, bbIds, bbXin, layers[lFirst].aNorm, bbXn}, &pcE, 16, 1, 256, n);
+        }
         bar();
-        for (uint32_t il = 0; il < nLayer; il++) {
+        for (uint32_t il = lFirst; il < lEnd; il++) {
             Layer& L = layers[il];
             size_t so1 = (size_t)slot * L.ps1, so2 = (size_t)slot * L.ps2;
             if (L.rec) {
@@ -2455,13 +2507,22 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY},
                  &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
             bar();
-            WB nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
+            WB nextNorm = il + 1 < lEnd ? layers[il + 1].aNorm : bONorm;
             dspz(pAddN, {bbY, bbMY, nextNorm, bbXin, bbXn}, &pcRms, 8, 1, 256, n);
             bar();
         }
-        if (wantLogits) {
+        if (wantLogits || argmaxOut) {
             struct { uint32_t m, k; } pcHead{vocab, nEmbd};
             dspz(pHead, {bHeadW, bbXn, bbLogits}, &pcHead, 8, (vocab + 3) / 4, 64, n);
+            if (argmaxOut) {
+                bar();
+                const uint32_t amWgs = (vocab + 4095) / 4096;
+                struct { uint32_t nn, span; } pcAm{vocab, 4096};
+                struct { uint32_t m, pos; } pcAm2{amWgs, 0};
+                dspz(pAm1, {bbLogits, bbAV, bbAI}, &pcAm, 8, amWgs, 256, n);
+                bar();
+                dspz(pAm2, {bbAV, bbAI, bbTok, bRbScratch}, &pcAm2, 8, 1, 256, n);
+            }
         }
         [enc endEncoding];
         [cb commit];
@@ -2470,6 +2531,24 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     if (wantLogits)
         memcpy(logits.data(), (uint8_t*)bbLogits.contents + (size_t)(n - 1) * vocab * 4,
                (size_t)vocab * 4);
+    if (argmaxOut) memcpy(argmaxOut, bbTok.contents, (size_t)n * 4);
+    if (hiddenOut) memcpy(hiddenOut, bbXin.contents, (size_t)n * nEmbd * 4);   // UMA
+}
+
+int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
+                        uint32_t base, float* hiddenOut, uint32_t* idsOut) {
+    if (slot >= nSlots || n < 1 || (size_t)base + n > nCtx) return -1;
+    if (firstStage() ? (!toks || hiddenIn != nullptr) : !hiddenIn) return -2;
+    if (lastStage() ? !idsOut : !hiddenOut) return -3;
+    std::vector<float> dummy;
+    for (uint32_t off = 0; off < n; off += maxB) {
+        uint32_t cn = std::min(maxB, n - off);
+        prefillBatchLast(toks ? toks + off : nullptr, cn, slot, dummy, /*wantLogits=*/false,
+                         base + off, lastStage() ? idsOut + off : nullptr,
+                         hiddenIn ? hiddenIn + (size_t)off * nEmbd : nullptr,
+                         hiddenOut ? hiddenOut + (size_t)off * nEmbd : nullptr);
+    }
+    return 0;
 }
 
 uint32_t qk_engine::serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
@@ -2526,11 +2605,23 @@ __attribute__((visibility("default"))) uint32_t qk_n_slots(const qk_engine* e) {
 __attribute__((visibility("default"))) uint32_t qk_chunk(const qk_engine* e) { return e->chunkN; }
 __attribute__((visibility("default"))) uint32_t qk_eos_token(const qk_engine* e) { return e->eosTok; }
 __attribute__((visibility("default"))) uint32_t qk_bos_token(const qk_engine* e) { return e->bosTok; }
+__attribute__((visibility("default"))) uint32_t qk_layer_first(const qk_engine* e) { return e->lFirst; }
+__attribute__((visibility("default"))) uint32_t qk_layer_end(const qk_engine* e) { return e->lEnd; }
+__attribute__((visibility("default"))) uint32_t qk_n_layer(const qk_engine* e) { return qk_engine::nLayer; }
+__attribute__((visibility("default"))) uint32_t qk_n_embd(const qk_engine* e) { return qk_engine::nEmbd; }
+
+__attribute__((visibility("default")))
+int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float* hidden_in,
+                 uint32_t n, uint32_t base, float* hidden_out, uint32_t* ids_out) {
+    if (!e) return -1;
+    return e->stageRun(slot, toks, hidden_in, n, base, hidden_out, ids_out);
+}
 
 __attribute__((visibility("default")))
 int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt,
                   uint32_t max_gen, uint32_t snap_prefix) {
     if (!e || slot >= e->nSlots) return -1;
+    if (e->splitStage()) return -5;  // split stages are driven via qk_stage_run
     if (e->slots[slot].active) return -2;
     if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
     for (uint32_t i = 0; i < n_prompt; i++) if (prompt[i] >= e->vocab) return -4;
@@ -2588,6 +2679,7 @@ void qk_slot_cancel(qk_engine* e, uint32_t slot) {
 __attribute__((visibility("default")))
 int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint32_t* out_finished) {
     if (!e || !out_tokens || !out_counts || !out_finished) return -1;
+    if (e->splitStage()) return -5;  // split stages are driven via qk_stage_run
     return e->stepChunk(out_tokens, out_counts, out_finished);
 }
 
@@ -2700,6 +2792,230 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+
+        if (mode == "pipe" || mode == "pipe-worker") {
+            // Pipeline-split (QK_LAYERS) harness — task: run the model as N stages
+            // that each own a layer range, handing the ~8 KB/token residual row
+            // across the boundary. Greedy output must be token-exact vs the
+            // unsplit engine (`qk serve-test <ids> <nGen> 1 <tmax>`).
+            //
+            //   qk pipe <ids-file> <nGen> [split=20] [tmax=4096] [host:port]
+            //     Stage 1 = layers [0,split) in-process. Stage 2 = layers
+            //     [split,40): in-process too (default), or a remote
+            //     `qk pipe-worker` when host:port is given.
+            //   qk pipe-worker <port> [a:b=20:40] [tmax=4096]
+            //     Serve a stage over TCP. Frame: {op,slot,n,base} u32 header;
+            //     op1 payload = n ids (first stage) or n*2048 f32 rows; reply =
+            //     n ids (last stage) or n*2048 f32 rows. op2 ends the connection.
+            signal(SIGPIPE, SIG_IGN);
+            auto readAll = [](int fd, void* p, size_t n) -> bool {
+                uint8_t* b = (uint8_t*)p;
+                while (n) { ssize_t r = read(fd, b, n); if (r <= 0) return false; b += r; n -= (size_t)r; }
+                return true;
+            };
+            auto writeAll = [](int fd, const void* p, size_t n) -> bool {
+                const uint8_t* b = (const uint8_t*)p;
+                while (n) { ssize_t r = write(fd, b, n); if (r <= 0) return false; b += r; n -= (size_t)r; }
+                return true;
+            };
+            struct PipeHdr { uint32_t op, slot, n, base; };
+            const uint32_t nEmbd = qk_engine::nEmbd, nLay = qk_engine::nLayer;
+            // Connection hello: client sends the magic; worker replies
+            // {magic, lFirst, lEnd, nLayer, nEmbd, nSlots, nCtx} so mismatched
+            // builds/splits fail loudly instead of streaming garbage. Bump the
+            // magic ("qkp2"...) on any wire change.
+            const uint32_t kPipeMagic = 0x716b7031;  // "qkp1"
+            char err[256] = {0};
+
+            if (mode == "pipe-worker") {
+                if (argc < 3) {
+                    fprintf(stderr,
+                            "usage: qk pipe-worker <port> [a:b=20:40] [tmax=4096] [slots=1]\n"
+                            "       (slots/tmax must cover the head server's --slots/--ctx)\n");
+                    return 1;
+                }
+                uint16_t port = (uint16_t)atoi(argv[2]);
+                setenv("QK_LAYERS", argc > 3 ? argv[3] : "20:40", 1);
+                uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 4096;
+                uint32_t wslots = argc > 5 ? (uint32_t)atoi(argv[5]) : 1;
+                qk_config cfg{wslots, tmax, 8};
+                qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+                if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+                int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+                setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+                sockaddr_in sa{};
+                sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(port);
+                if (bind(ls, (sockaddr*)&sa, sizeof sa) || listen(ls, 1)) { perror("bind/listen"); return 1; }
+                fprintf(stderr, "[pipe-worker] layers [%u,%u) nCtx %u listening on :%u\n",
+                        e->lFirst, e->lEnd, tmax, port);
+                std::vector<uint32_t> toks, ids;
+                std::vector<float> hin, hout;
+                while (true) {
+                    int fd = accept(ls, nullptr, nullptr);
+                    if (fd < 0) continue;
+                    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                    uint32_t cmagic = 0;
+                    if (!readAll(fd, &cmagic, 4) || cmagic != kPipeMagic) {
+                        fprintf(stderr, "[pipe-worker] bad hello magic %08x — old/foreign client?\n",
+                                cmagic);
+                        close(fd);
+                        continue;
+                    }
+                    uint32_t hello[7] = {kPipeMagic, e->lFirst, e->lEnd, nLay, nEmbd,
+                                         e->nSlots,  e->nCtx};
+                    if (!writeAll(fd, hello, sizeof hello)) { close(fd); continue; }
+                    fprintf(stderr, "[pipe-worker] client connected\n");
+                    PipeHdr h;
+                    while (readAll(fd, &h, sizeof h) && h.op == 1) {
+                        if (h.n < 1 || h.slot >= e->nSlots || (size_t)h.base + h.n > e->nCtx) break;
+                        int rc;
+                        if (e->firstStage()) {
+                            toks.resize(h.n);
+                            if (!readAll(fd, toks.data(), (size_t)h.n * 4)) break;
+                        } else {
+                            hin.resize((size_t)h.n * nEmbd);
+                            if (!readAll(fd, hin.data(), hin.size() * 4)) break;
+                        }
+                        if (e->lastStage()) ids.resize(h.n);
+                        else hout.resize((size_t)h.n * nEmbd);
+                        rc = e->stageRun(h.slot, e->firstStage() ? toks.data() : nullptr,
+                                         e->firstStage() ? nullptr : hin.data(), h.n, h.base,
+                                         e->lastStage() ? nullptr : hout.data(),
+                                         e->lastStage() ? ids.data() : nullptr);
+                        if (rc) { fprintf(stderr, "[pipe-worker] stage_run rc=%d\n", rc); break; }
+                        bool ok2 = e->lastStage() ? writeAll(fd, ids.data(), (size_t)h.n * 4)
+                                                  : writeAll(fd, hout.data(), hout.size() * 4);
+                        if (!ok2) break;
+                    }
+                    close(fd);
+                    fprintf(stderr, "[pipe-worker] client gone\n");
+                }
+            }
+
+            // driver: qk pipe <ids> <nGen> [split] [tmax] [host:port]
+            if (argc < 4) {
+                fprintf(stderr, "usage: qk pipe <ids-file> <nGen> [split=20] [tmax=4096] [host:port]\n");
+                return 1;
+            }
+            std::vector<uint32_t> prompt;
+            {
+                FILE* f = fopen(argv[2], "r");
+                if (!f) { perror(argv[2]); return 1; }
+                int v;
+                while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+                fclose(f);
+            }
+            uint32_t nGen = (uint32_t)atoi(argv[3]);
+            uint32_t split = argc > 4 ? (uint32_t)atoi(argv[4]) : 20;
+            uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 4096;
+            const char* net = argc > 6 ? argv[6] : nullptr;
+            uint32_t np = (uint32_t)prompt.size();
+            if (split < 1 || split >= nLay || np < 1 || np + nGen > tmax) {
+                fprintf(stderr, "pipe: bad args (split 1..%u, prompt+nGen <= tmax)\n", nLay - 1);
+                return 1;
+            }
+            char lay[24];
+            snprintf(lay, sizeof lay, "0:%u", split);
+            setenv("QK_LAYERS", lay, 1);
+            qk_config cfg{1, tmax, 8};
+            qk_engine* e1 = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e1) { fprintf(stderr, "qk_open stage1 failed: %s\n", err); return 1; }
+            qk_engine* e2 = nullptr;
+            int fd = -1;
+            if (net) {
+                std::string hp = net;
+                size_t colon = hp.rfind(':');
+                if (colon == std::string::npos) { fprintf(stderr, "pipe: bad host:port\n"); return 1; }
+                std::string host = hp.substr(0, colon), port = hp.substr(colon + 1);
+                addrinfo hints{}, *res = nullptr;
+                hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+                if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) || !res) {
+                    fprintf(stderr, "pipe: cannot resolve %s\n", net); return 1;
+                }
+                fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+                if (fd < 0 || connect(fd, res->ai_addr, res->ai_addrlen)) { perror("connect"); return 1; }
+                freeaddrinfo(res);
+                int one = 1;
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                uint32_t magic = kPipeMagic, hello[7];
+                if (!writeAll(fd, &magic, 4) || !readAll(fd, hello, sizeof hello) ||
+                    hello[0] != kPipeMagic) {
+                    fprintf(stderr, "pipe: worker hello failed (old/foreign build?)\n");
+                    return 1;
+                }
+                if (hello[1] != split || hello[2] != nLay || hello[3] != nLay || hello[4] != nEmbd ||
+                    hello[5] < 1 || hello[6] < tmax) {
+                    fprintf(stderr,
+                            "pipe: worker mismatch: layers [%u,%u) of %u, n_embd %u, slots %u, ctx %u "
+                            "(need [%u,%u) of %u, n_embd %u, ctx >= %u)\n",
+                            hello[1], hello[2], hello[3], hello[4], hello[5], hello[6], split, nLay,
+                            nLay, nEmbd, tmax);
+                    return 1;
+                }
+            } else {
+                snprintf(lay, sizeof lay, "%u:%u", split, nLay);
+                setenv("QK_LAYERS", lay, 1);
+                e2 = qk_open(ggufPath(), &cfg, err, sizeof err);
+                if (!e2) { fprintf(stderr, "qk_open stage2 failed: %s\n", err); return 1; }
+            }
+            unsetenv("QK_LAYERS");
+            // stage 2 = local engine or remote worker (assumed to reach layer nLay:
+            // it replies per-position greedy ids)
+            auto stage2 = [&](uint32_t n, uint32_t base, const float* h, uint32_t* out) -> bool {
+                if (e2) return e2->stageRun(0, nullptr, h, n, base, nullptr, out) == 0;
+                PipeHdr hd{1, 0, n, base};
+                return writeAll(fd, &hd, sizeof hd) && writeAll(fd, h, (size_t)n * nEmbd * 4) &&
+                       readAll(fd, out, (size_t)n * 4);
+            };
+            std::vector<float> hid((size_t)np * nEmbd);
+            std::vector<uint32_t> ids(np);
+            auto t0 = std::chrono::steady_clock::now();
+            if (e1->stageRun(0, prompt.data(), nullptr, np, 0, hid.data(), nullptr)) {
+                fprintf(stderr, "pipe: stage1 prefill failed\n"); return 1;
+            }
+            if (!stage2(np, 0, hid.data(), ids.data())) {
+                fprintf(stderr, "pipe: stage2 prefill failed\n"); return 1;
+            }
+            double prefillMs = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0).count();
+            uint32_t next = ids[np - 1], pos = np;
+            std::vector<uint32_t> gen;
+            double s1Ms = 0, s2Ms = 0;
+            while (next != e1->eosTok && (uint32_t)gen.size() < nGen) {
+                gen.push_back(next);
+                if ((uint32_t)gen.size() == nGen) break;
+                auto ta = std::chrono::steady_clock::now();
+                if (e1->stageRun(0, &next, nullptr, 1, pos, hid.data(), nullptr)) {
+                    fprintf(stderr, "pipe: stage1 step failed\n"); return 1;
+                }
+                auto tb = std::chrono::steady_clock::now();
+                uint32_t am;
+                if (!stage2(1, pos, hid.data(), &am)) {
+                    fprintf(stderr, "pipe: stage2 step failed\n"); return 1;
+                }
+                auto tc = std::chrono::steady_clock::now();
+                s1Ms += std::chrono::duration<double, std::milli>(tb - ta).count();
+                s2Ms += std::chrono::duration<double, std::milli>(tc - tb).count();
+                next = am;
+                pos++;
+            }
+            uint32_t steps = pos - np;
+            printf("pipe: layers [0,%u)+[%u,%u)%s | prompt %u prefill %.1f ms | %zu tokens, %.2f ms/tok (s1 %.2f, s2%s %.2f)\n",
+                   split, split, nLay, net ? " over TCP" : " in-process", np, prefillMs, gen.size(),
+                   steps ? (s1Ms + s2Ms) / steps : 0.0, steps ? s1Ms / steps : 0.0,
+                   net ? "+net" : "", steps ? s2Ms / steps : 0.0);
+            printf("GEN:");
+            for (uint32_t t : gen) printf(" %u", t);
+            printf("\n");
+            if (fd >= 0) {
+                PipeHdr bye{2, 0, 0, 0};
+                writeAll(fd, &bye, sizeof bye);
+                close(fd);
+            }
+            qk_close(e1);
+            if (e2) qk_close(e2);
+            return 0;
+        }
 
         if (mode == "serve-test2") {
             if (argc < 5) {
