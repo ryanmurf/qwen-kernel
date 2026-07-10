@@ -33,7 +33,10 @@ pub async fn spawn_server(model: &Path, queue: usize, slots: u32) -> anyhow::Res
         model,
         QkConfig {
             n_slots: slots,
-            n_ctx: 64,
+            // Roomy enough that fit_to_context's generation reserve (n_ctx/8)
+            // never rejects the short fixture prompts; tests that need a tight
+            // window should spawn their own config.
+            n_ctx: 256,
             chunk: 4,
         },
         None,

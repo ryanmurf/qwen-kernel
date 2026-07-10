@@ -349,7 +349,11 @@ fn fit_to_context(state: &AppState, req: &mut MessagesReq) -> Result<String> {
     const KEEP_RECENT: usize = 6;
     const CTX_RESERVE: u32 = 512; // room for at least a short generation
     let n_ctx = state.engine.n_ctx;
-    let hard = n_ctx.saturating_sub(CTX_RESERVE); // the server would reject beyond this
+    // Purely a quality heuristic — prepare_generation clamps max_gen to the
+    // real capacity — so scale it down on small-ctx servers (tests,
+    // experiments) instead of reserving the whole window away.
+    let reserve = CTX_RESERVE.min(n_ctx / 8);
+    let hard = n_ctx.saturating_sub(reserve); // the server would reject beyond this
     // When we MUST trim, cut down to a lower target so the session has headroom to
     // grow a few more turns with its prefix cache intact — instead of pinning at
     // the ceiling and cold-prefilling ~n_ctx tokens EVERY turn (each trim that
