@@ -67,6 +67,8 @@ spec:
           value: "1"
         - name: QK_MAX_TOOL_CHARS # cap a single tool_result before context-fit trimming
           value: "4000"
+        - name: QK_STATS_FILE     # [spec]/[pcache] lines append here and survive pod
+          value: "/stats/qk-stats.log"  # restarts (kubectl logs reset on every bounce)
         # Batched prefill flushes its command buffer every QK_SUBMIT_LAYERS layers
         # (engine default 8) so no single vkQueueSubmit can outlive amdgpu's ~10 s
         # gfx-ring timeout (the 2026-07-06 VK_ERROR_DEVICE_LOST crash loop). Set
@@ -86,6 +88,8 @@ spec:
           readOnly: true
         - mountPath: /dev/dri
           name: dri
+        - mountPath: /stats
+          name: stats
       volumes:
       - hostPath:
           path: /home/ryan/intellij/ggerganov/llama.cpp
@@ -95,3 +99,7 @@ spec:
           path: /dev/dri
           type: Directory
         name: dri
+      - hostPath:
+          path: /var/lib/qk-stats
+          type: DirectoryOrCreate
+        name: stats
