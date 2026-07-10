@@ -91,3 +91,79 @@ kernel void moe_logits_addn(device const float* gi      [[buffer(0)]],
     const float lg = simd_sum(acc) * scale;
     if (slid == 0u) logits[rq * (pc.n_expert + 1u) + e] = lg;
 }
+
+// Batched router logits for grouped-prefill chunks: one f32 GEMM over the
+// 257 router rows (gis = virtual row 256) instead of a GEMV per token.
+// Same 32x32 f32-fragment skeleton as moe_gu_grouped4 minus the dequant;
+// order-only noise class. Residual+norm run separately via add_rmsnorm
+// (identical outputs to moe_logits_addn's y/xn2). GemmPC: M=257, K, N=n;
+// logits stride = M.
+struct LgPC { uint M; uint K; uint N; };
+constant uint LGS = 68u;
+
+kernel void moe_logits_gemm(device const float* gi     [[buffer(0)]],
+                            device const float* gis    [[buffer(1)]],
+                            device const float* x      [[buffer(2)]],
+                            device float*       logits [[buffer(3)]],
+                            constant LgPC&      pc     [[buffer(4)]],
+                            uint3 tid3  [[thread_position_in_threadgroup]],
+                            uint3 tgpig [[threadgroup_position_in_grid]],
+                            uint  sgid  [[simdgroup_index_in_threadgroup]],
+                            uint  slid  [[thread_index_in_simdgroup]])
+{
+    const uint tid = tid3.x;                 // 0..127, 4 simdgroups
+    const uint row0 = tgpig.x * 32u;
+    const uint tok0 = tgpig.z * 32u;
+
+    threadgroup float Wsh[32u * LGS];
+    threadgroup float Xsh[32u * LGS];
+    threadgroup float outb[4u * 72u];
+
+    simdgroup_float8x8 acc[4];
+    for (uint i = 0u; i < 4u; ++i) acc[i] = simdgroup_float8x8(0.0f);
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += 64u) {
+        for (uint idx = tid * 4u; idx < 32u * 64u; idx += 128u * 4u) {
+            const uint rr = idx >> 6, kk = idx & 63u;
+            const uint r = row0 + rr;
+            float4 v = float4(0.0f);
+            if (r + 1u < pc.M)
+                v = *(device const packed_float4*)(gi + (ulong)r * pc.K + k0 + kk);
+            else if (r + 1u == pc.M)
+                v = *(device const packed_float4*)(gis + k0 + kk);
+            ((threadgroup float4*)&Wsh[rr * LGS + kk])[0] = v;
+        }
+        for (uint idx = tid * 4u; idx < 32u * 64u; idx += 128u * 4u) {
+            const uint tt = idx >> 6, kk = idx & 63u;
+            ((threadgroup float4*)&Xsh[tt * LGS + kk])[0] = (tok0 + tt < pc.N)
+                ? *(device const packed_float4*)(x + (ulong)(tok0 + tt) * pc.K + k0 + kk)
+                : float4(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kf = 0u; kf < 8u; ++kf) {
+            simdgroup_float8x8 a;
+            simdgroup_load(a, &Wsh[(sgid * 8u) * LGS + kf * 8u], LGS);
+            for (uint nc = 0u; nc < 4u; ++nc) {
+                simdgroup_float8x8 bfr;
+                simdgroup_load(bfr, &Xsh[(nc * 8u) * LGS + kf * 8u], LGS, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc[nc], a, bfr, acc[nc]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* buf = &outb[sgid * 72u];
+    const uint fi = slid >> 2, fj0 = (slid & 3u) * 2u;
+    for (uint nc = 0u; nc < 4u; ++nc) {
+        simdgroup_store(acc[nc], buf, 9u);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const uint row = row0 + sgid * 8u + fi;
+        for (uint jj = 0u; jj < 2u; ++jj) {
+            const uint tok = tok0 + nc * 8u + fj0 + jj;
+            if (row < pc.M && tok < pc.N)
+                logits[(ulong)tok * pc.M + row] = buf[fi * 9u + fj0 + jj];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
