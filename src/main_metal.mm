@@ -2867,6 +2867,20 @@ __attribute__((visibility("default"))) uint32_t qk_n_layer(const qk_engine* e) {
 __attribute__((visibility("default"))) uint32_t qk_n_embd(const qk_engine* e) { return qk_engine::nEmbd; }
 
 __attribute__((visibility("default")))
+uint32_t qk_state_n(const qk_engine* e) { return (uint32_t)e->pcache.size(); }
+
+int qk_state_save(qk_engine* e, uint32_t slot, uint32_t idx) {
+    if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
+    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/true);
+    return 0;
+}
+
+int qk_state_load(qk_engine* e, uint32_t slot, uint32_t idx) {
+    if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
+    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/false);
+    return 0;
+}
+
 int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float* hidden_in,
                  uint32_t n, uint32_t base, float* hidden_out, uint32_t* ids_out) {
     if (!e) return -1;
@@ -3079,8 +3093,9 @@ int main(int argc, char** argv) {
             // Connection hello: client sends the magic; worker replies
             // {magic, lFirst, lEnd, nLayer, nEmbd, nSlots, nCtx} so mismatched
             // builds/splits fail loudly instead of streaming garbage. Bump the
-            // magic ("qkp2"...) on any wire change.
-            const uint32_t kPipeMagic = 0x716b7031;  // "qkp1"
+            // magic on any wire change. qkp2 = qkp1 + state ops (op3 save /
+            // op4 load, idx in the n field, 4-byte status reply).
+            const uint32_t kPipeMagic = 0x716b7032;  // "qkp2"
             char err[256] = {0};
 
             if (mode == "pipe-worker") {
@@ -3122,8 +3137,17 @@ int main(int argc, char** argv) {
                     if (!writeAll(fd, hello, sizeof hello)) { close(fd); continue; }
                     fprintf(stderr, "[pipe-worker] client connected\n");
                     PipeHdr h;
-                    while (readAll(fd, &h, sizeof h) && h.op == 1) {
-                        if (h.n < 1 || h.slot >= e->nSlots || (size_t)h.base + h.n > e->nCtx) break;
+                    while (readAll(fd, &h, sizeof h) && h.op != 2) {
+                        if (h.op == 3 || h.op == 4) {
+                            // state save/load: idx rides in the n field; 4-byte status reply
+                            uint32_t rc = (uint32_t)(h.op == 3 ? qk_state_save(e, h.slot, h.n)
+                                                               : qk_state_load(e, h.slot, h.n));
+                            if (!writeAll(fd, &rc, 4)) break;
+                            continue;
+                        }
+                        if (h.op != 1 || h.n < 1 || h.slot >= e->nSlots ||
+                            (size_t)h.base + h.n > e->nCtx)
+                            break;
                         int rc;
                         if (e->firstStage()) {
                             toks.resize(h.n);
@@ -3149,8 +3173,13 @@ int main(int argc, char** argv) {
             }
 
             // driver: qk pipe <ids> <nGen> [split] [tmax] [host:port]
+            // `split` is one boundary ("20") or a comma list ("13,27" -> THREE
+            // in-process stages) — the multi-boundary form exercises middle
+            // stages (hidden in AND hidden out). Remote mode needs exactly one
+            // boundary (the worker is the tail).
             if (argc < 4) {
-                fprintf(stderr, "usage: qk pipe <ids-file> <nGen> [split=20] [tmax=4096] [host:port]\n");
+                fprintf(stderr,
+                        "usage: qk pipe <ids-file> <nGen> [split=20|a,b,..] [tmax=4096] [host:port]\n");
                 return 1;
             }
             std::vector<uint32_t> prompt;
@@ -3162,21 +3191,36 @@ int main(int argc, char** argv) {
                 fclose(f);
             }
             uint32_t nGen = (uint32_t)atoi(argv[3]);
-            uint32_t split = argc > 4 ? (uint32_t)atoi(argv[4]) : 20;
+            std::vector<uint32_t> bounds;
+            for (const char* p = argc > 4 ? argv[4] : "20"; *p;) {
+                bounds.push_back((uint32_t)strtoul(p, (char**)&p, 10));
+                if (*p == ',') p++;
+            }
             uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 4096;
             const char* net = argc > 6 ? argv[6] : nullptr;
             uint32_t np = (uint32_t)prompt.size();
-            if (split < 1 || split >= nLay || np < 1 || np + nGen > tmax) {
-                fprintf(stderr, "pipe: bad args (split 1..%u, prompt+nGen <= tmax)\n", nLay - 1);
+            bool boundsOk = !bounds.empty();
+            for (size_t i = 0; i < bounds.size(); i++)
+                boundsOk &= bounds[i] >= 1 && bounds[i] < nLay && (i == 0 || bounds[i] > bounds[i - 1]);
+            if (!boundsOk || np < 1 || np + nGen > tmax || (net && bounds.size() != 1)) {
+                fprintf(stderr, "pipe: bad args (boundaries ascending in 1..%u, one boundary with "
+                                "host:port, prompt+nGen <= tmax)\n", nLay - 1);
                 return 1;
             }
+            uint32_t split = bounds[0];
             char lay[24];
-            snprintf(lay, sizeof lay, "0:%u", split);
-            setenv("QK_LAYERS", lay, 1);
             qk_config cfg{1, tmax, 8};
-            qk_engine* e1 = qk_open(ggufPath(), &cfg, err, sizeof err);
-            if (!e1) { fprintf(stderr, "qk_open stage1 failed: %s\n", err); return 1; }
-            qk_engine* e2 = nullptr;
+            // In-process stages: [0,b0), [b0,b1), ..., and — unless remote — [bLast,40).
+            std::vector<qk_engine*> eng;
+            uint32_t lo = 0;
+            for (size_t s = 0; s < bounds.size() + (net ? 0 : 1); s++) {
+                uint32_t hi = s < bounds.size() ? bounds[s] : nLay;
+                snprintf(lay, sizeof lay, "%u:%u", lo, hi);
+                setenv("QK_LAYERS", lay, 1);
+                eng.push_back(qk_open(ggufPath(), &cfg, err, sizeof err));
+                if (!eng.back()) { fprintf(stderr, "qk_open stage [%s] failed: %s\n", lay, err); return 1; }
+                lo = hi;
+            }
             int fd = -1;
             if (net) {
                 std::string hp = net;
@@ -3208,58 +3252,78 @@ int main(int argc, char** argv) {
                             nLay, nEmbd, tmax);
                     return 1;
                 }
-            } else {
-                snprintf(lay, sizeof lay, "%u:%u", split, nLay);
-                setenv("QK_LAYERS", lay, 1);
-                e2 = qk_open(ggufPath(), &cfg, err, sizeof err);
-                if (!e2) { fprintf(stderr, "qk_open stage2 failed: %s\n", err); return 1; }
             }
             unsetenv("QK_LAYERS");
-            // stage 2 = local engine or remote worker (assumed to reach layer nLay:
-            // it replies per-position greedy ids)
-            auto stage2 = [&](uint32_t n, uint32_t base, const float* h, uint32_t* out) -> bool {
-                if (e2) return e2->stageRun(0, nullptr, h, n, base, nullptr, out) == 0;
-                PipeHdr hd{1, 0, n, base};
-                return writeAll(fd, &hd, sizeof hd) && writeAll(fd, h, (size_t)n * nEmbd * 4) &&
-                       readAll(fd, out, (size_t)n * 4);
+            // Run n positions from `base` through the whole chain; the final stage
+            // (in-process last engine, or the remote worker) yields per-position ids.
+            // Per-stage wall time accumulates into stMs.
+            size_t nStages = eng.size() + (net ? 1 : 0);
+            std::vector<double> stMs(nStages, 0.0);
+            std::vector<float> hidA, hidB;
+            auto runChain = [&](const uint32_t* toks, uint32_t n, uint32_t base,
+                                uint32_t* ids) -> bool {
+                hidA.resize((size_t)n * nEmbd);
+                hidB.resize((size_t)n * nEmbd);
+                const float* hin = nullptr;
+                for (size_t s = 0; s < eng.size(); s++) {
+                    bool last = !net && s + 1 == eng.size();
+                    float* hout = last ? nullptr : (s % 2 ? hidB.data() : hidA.data());
+                    auto ta = std::chrono::steady_clock::now();
+                    if (eng[s]->stageRun(0, s == 0 ? toks : nullptr, hin, n, base, hout,
+                                         last ? ids : nullptr)) {
+                        fprintf(stderr, "pipe: stage %zu failed\n", s);
+                        return false;
+                    }
+                    stMs[s] += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - ta).count();
+                    hin = hout;
+                }
+                if (net) {
+                    auto ta = std::chrono::steady_clock::now();
+                    PipeHdr hd{1, 0, n, base};
+                    if (!(writeAll(fd, &hd, sizeof hd) && writeAll(fd, hin, (size_t)n * nEmbd * 4) &&
+                          readAll(fd, ids, (size_t)n * 4))) {
+                        fprintf(stderr, "pipe: remote stage failed\n");
+                        return false;
+                    }
+                    stMs.back() += std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - ta).count();
+                }
+                return true;
             };
-            std::vector<float> hid((size_t)np * nEmbd);
             std::vector<uint32_t> ids(np);
             auto t0 = std::chrono::steady_clock::now();
-            if (e1->stageRun(0, prompt.data(), nullptr, np, 0, hid.data(), nullptr)) {
-                fprintf(stderr, "pipe: stage1 prefill failed\n"); return 1;
-            }
-            if (!stage2(np, 0, hid.data(), ids.data())) {
-                fprintf(stderr, "pipe: stage2 prefill failed\n"); return 1;
-            }
+            if (!runChain(prompt.data(), np, 0, ids.data())) return 1;
             double prefillMs = std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - t0).count();
+            std::fill(stMs.begin(), stMs.end(), 0.0);  // report decode-only per-stage times
             uint32_t next = ids[np - 1], pos = np;
             std::vector<uint32_t> gen;
-            double s1Ms = 0, s2Ms = 0;
-            while (next != e1->eosTok && (uint32_t)gen.size() < nGen) {
+            while (next != eng[0]->eosTok && (uint32_t)gen.size() < nGen) {
                 gen.push_back(next);
                 if ((uint32_t)gen.size() == nGen) break;
-                auto ta = std::chrono::steady_clock::now();
-                if (e1->stageRun(0, &next, nullptr, 1, pos, hid.data(), nullptr)) {
-                    fprintf(stderr, "pipe: stage1 step failed\n"); return 1;
-                }
-                auto tb = std::chrono::steady_clock::now();
                 uint32_t am;
-                if (!stage2(1, pos, hid.data(), &am)) {
-                    fprintf(stderr, "pipe: stage2 step failed\n"); return 1;
-                }
-                auto tc = std::chrono::steady_clock::now();
-                s1Ms += std::chrono::duration<double, std::milli>(tb - ta).count();
-                s2Ms += std::chrono::duration<double, std::milli>(tc - tb).count();
+                if (!runChain(&next, 1, pos, &am)) return 1;
                 next = am;
                 pos++;
             }
             uint32_t steps = pos - np;
-            printf("pipe: layers [0,%u)+[%u,%u)%s | prompt %u prefill %.1f ms | %zu tokens, %.2f ms/tok (s1 %.2f, s2%s %.2f)\n",
-                   split, split, nLay, net ? " over TCP" : " in-process", np, prefillMs, gen.size(),
-                   steps ? (s1Ms + s2Ms) / steps : 0.0, steps ? s1Ms / steps : 0.0,
-                   net ? "+net" : "", steps ? s2Ms / steps : 0.0);
+            double totMs = 0;
+            for (double m : stMs) totMs += m;
+            printf("pipe: layers");
+            lo = 0;
+            for (size_t s = 0; s < nStages; s++) {
+                uint32_t hi = s < bounds.size() ? bounds[s] : nLay;
+                printf("%s[%u,%u)", s ? "+" : " ", lo, hi);
+                lo = hi;
+            }
+            printf("%s | prompt %u prefill %.1f ms | %zu tokens, %.2f ms/tok (",
+                   net ? " over TCP" : " in-process", np, prefillMs, gen.size(),
+                   steps ? totMs / steps : 0.0);
+            for (size_t s = 0; s < nStages; s++)
+                printf("%ss%zu%s %.2f", s ? ", " : "", s + 1,
+                       net && s + 1 == nStages ? "+net" : "", steps ? stMs[s] / steps : 0.0);
+            printf(")\n");
             printf("GEN:");
             for (uint32_t t : gen) printf(" %u", t);
             printf("\n");
@@ -3268,8 +3332,7 @@ int main(int argc, char** argv) {
                 writeAll(fd, &bye, sizeof bye);
                 close(fd);
             }
-            qk_close(e1);
-            if (e2) qk_close(e2);
+            for (qk_engine* e : eng) qk_close(e);
             return 0;
         }
 

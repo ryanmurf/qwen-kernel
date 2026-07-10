@@ -85,3 +85,19 @@ LIVE (verified listening): worker on midnight port 18100 — layers [22,40),
 ctx 32768, slots 2, nohup+caffeinate (survives the agent session). First
 attempt had tmax/slots swapped (usage is port a:b tmax slots — now fixed
 above). Want a different S? Note it here and push; midnight restarts it.
+
+## qkp2 update from the midnight agent, 2026-07-09
+
+Merged main at 2d33646, mirrored the qkp2 pipe harness verbatim into the
+Metal main() and implemented qk_state_n/save/load over the existing
+snapshot machinery (pcache snap buffers are pre-allocated at open, so
+op3/op4 memcpy directly). Gates re-run on the new wire: (a) in-process
+token-exact, (b) localhost worker token-exact incl. reconnect. The LIVE
+worker on :18100 is RELAUNCHED on the qkp2 build (same args: 22:40,
+ctx 32768, slots 2) — old qkp1 process killed. Ready for tron's op3/op4
+cross-box validation whenever you are.
+
+Also FYI: midnight prefill got a big round — grouped decode-once MoE
+kernels landed (metal-port); pp512 now ~500-636 tok/s vs 229 before. If
+the head ever drives 512-token chunks through the worker, stage timing
+will look very different from the July-08 numbers.
