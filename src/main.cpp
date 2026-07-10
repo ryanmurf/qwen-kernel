@@ -12,6 +12,15 @@
 
 #include <vulkan/vulkan.h>
 
+// pipeline-split harness (qk pipe / pipe-worker): plain TCP between stages
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <csignal>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -22,6 +31,7 @@
 #include <new>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gguf.h"
@@ -2666,6 +2676,14 @@ struct qk_engine {
     static constexpr uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
     static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64, nLayer = 40;
     float eps = 1e-6f;
+    // Pipeline split (QK_LAYERS=a:b): this engine owns layers [lFirst, lEnd).
+    // First stage also owns the embedding; last stage owns norm+head+argmax.
+    // layers/blayers stay nLayer long (global indexing); unowned entries hold
+    // no buffers and null descriptor sets — every walk skips them.
+    uint32_t lFirst = 0, lEnd = nLayer;
+    bool firstStage() const { return lFirst == 0; }
+    bool lastStage() const { return lEnd == nLayer; }
+    bool splitStage() const { return lFirst != 0 || lEnd != nLayer; }
 
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pGate, pGemvO, pAddN, pPrep, pAttn, pMoeL,
@@ -2703,6 +2721,13 @@ struct qk_engine {
     VkDescriptorSet sbEmb, sbHead;
     uint32_t* bbIdsMap = nullptr;
 
+    // Spec-decode verify (P0): per-position greedy argmax over bbLogits rows.
+    // argmax1/argmax2 already z-batch (row rq at offset rq*vocab), so verify just
+    // needs maxB-deep candidate buffers and a host-visible id readback.
+    Buf bvAV, bvAI, bvTok, bvSamp;
+    VkDescriptorSet svAm1, svAm2;
+    uint32_t* bvSampMap = nullptr;
+
     // One pre-recorded step CB per dispatch depth: stepCBs[z-1] dispatches z
     // slots. Submitting the one matching the highest active slot avoids paying
     // the (bandwidth-bound) weight re-reads for idle slots on light load.
@@ -2715,8 +2740,33 @@ struct qk_engine {
         std::vector<uint32_t> prompt;      // full prompt of the current request
         std::vector<uint32_t> genTokens;   // tokens generated so far (for the cache key)
         uint32_t cursor = 0, pos = 0, gen = 0, maxGen = 0, last = 0;
+        // Speculative decoding (QK_SPEC). A verify round can commit up to K
+        // tokens at once; the ABI emits <= chunk per call, so the overflow waits
+        // in outQ (a queue-draining call does no GPU work). finPending: the GPU
+        // side finished (EOS / max_gen, state snapshotted) but queued tokens are
+        // still being emitted; the slot frees when the queue drains.
+        std::vector<uint32_t> outQ;
+        size_t outQHead = 0;
+        bool finPending = false;
+        // prompt-lookup draft: hash of every specL-gram in (prompt ++ genTokens)
+        // -> END index (exclusive) of its latest occurrence; built lazily
+        std::unordered_map<uint64_t, uint32_t> ngram;
+        uint32_t ngramBuilt = 0;
+        uint32_t specRounds = 0, specFed = 0, specEmitted = 0, serialSteps = 0;
+        void resetSpec() {
+            outQ.clear(); outQHead = 0; finPending = false;
+            ngram.clear(); ngramBuilt = 0;
+            specRounds = specFed = specEmitted = serialSteps = 0;
+        }
     };
     std::vector<Slot> slots;
+    bool specOn = false;          // QK_SPEC=1: speculative decoding (single-active-slot v1)
+    uint32_t specL = 6, specK = 8;  // QK_SPEC_L trigger n-gram length, QK_SPEC_K verify width
+    std::vector<uint32_t> specToks, specAm;  // verify batch + per-position argmax scratch
+    // Prompt-lookup draft for slot s: if the specL-gram suffix of its history
+    // recurs earlier, fill specToks with [pending token, drafted continuation..]
+    // and return the batch length n >= 2; 0 = no trigger (stay serial).
+    uint32_t specDraft(uint32_t s);
 
     // Prefix cache: after a request finishes, its recurrent state (delta-rule S +
     // conv + K/V for positions [0,pos)) is snapshotted to a host-resident buffer
@@ -2740,8 +2790,39 @@ struct qk_engine {
     // slot at position `base` — keeps the restored state, seeds each layer's conv carry
     // from the slot's conv window, and writes K/V at pos=base+n. Enables cache-hit suffix
     // batching and >maxB multi-chunk prefill.
+    // argmaxOut (optional): also run the z-batched argmax over ALL n logit rows and
+    // write the n greedy ids (the prediction FOLLOWING toks[i]) — the spec-decode
+    // verify primitive. Costs one head pass over n rows + two small reductions.
+    // scratchState: run the gated-DeltaNet layers against the SCRATCH stripe
+    // (index nSlots) instead of the slot's live stripe, leaving the live recurrent
+    // state untouched at `base` — the spec-decode verify mode. The caller seeds
+    // scratch (copyDnStripes) first; K/V writes still go to the live cache, which
+    // is safe under rejection (causal reads never pass the committed position).
+    // hiddenIn (split stages after the first): n*nEmbd residual rows from the
+    // previous stage, injected in place of the embedding (toks may be null).
+    // hiddenOut (split stages before the last): the residual rows after this
+    // stage's final layer are read back for the next stage.
     void prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
-                          std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0);
+                          std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0,
+                          uint32_t* argmaxOut = nullptr, bool scratchState = false,
+                          const float* hiddenIn = nullptr, float* hiddenOut = nullptr);
+    // Pipeline stage driver (see qk_stage_run in qk.h): n positions from `base`,
+    // chunked at maxB; ids in / hidden out on the first stage, hidden in / ids
+    // out on the last. base==0 resets the slot.
+    int stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
+                 uint32_t base, float* hiddenOut, uint32_t* idsOut);
+    // Copy the 30 gated-DeltaNet layers' (conv window, delta-rule S) stripes
+    // between stripe indices (a slot, or the scratch stripe = nSlots). ~63 MB,
+    // one submit.
+    void copyDnStripes(uint32_t fromStripe, uint32_t toStripe);
+    // One spec-decode verify round: batched forward of n draft tokens from `base`
+    // on the scratch stripe + per-position greedy ids into outIds. Live state
+    // stays at `base`; K/V beyond the eventually-accepted prefix is garbage that
+    // is never read. Caller then either promotes (full accept) or re-runs the
+    // accepted prefix in live mode (commit pass).
+    void verifyRound(const uint32_t* toks, uint32_t n, uint32_t slot, uint32_t base,
+                     uint32_t* outIds);
+    void promoteScratch(uint32_t slot) { copyDnStripes(nSlots, slot); }
     // Serial reference: drive the recorded per-token step CB over n prompt tokens on
     // `slot`, then read back that slot's raw logit row (the prediction after the last
     // prompt token). Returns the greedy argmax (robust to EOS, unlike the slot API).
@@ -2766,7 +2847,7 @@ qk_engine::~qk_engine() {
         destroyBuf(c, *b);
     for (Buf* b : {&bbXin, &bbXn, &bbBig, &bbMid, &bbKin, &bbVin, &bbGb, &bbConvOut, &bbO,
                    &bbAtt, &bbAttnOut, &bbY, &bbXn2, &bbML, &bbMH, &bbMSel, &bbMY, &bbMY2,
-                   &bbLogits, &bbIds, &bbCarry})
+                   &bbLogits, &bbIds, &bbCarry, &bvAV, &bvAI, &bvTok, &bvSamp})
         destroyBuf(c, *b);
     if (dpool) vkDestroyDescriptorPool(c.dev, dpool, nullptr);
     for (Pipe* pp : {&pRms, &pGemvA, &pAb, &pConvN, &pStep, &pGate, &pGemvO, &pAddN, &pPrep,
@@ -2789,6 +2870,7 @@ void qk_engine::resetSlot(uint32_t slot) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
     for (auto& L : layers) {
+        if (!L.st1) continue;  // layer not owned by this pipeline stage
         vkCmdFillBuffer(c.cb, L.st1, (VkDeviceSize)slot * L.ps1, L.ps1, 0u);
         vkCmdFillBuffer(c.cb, L.st2, (VkDeviceSize)slot * L.ps2, L.ps2, 0u);
     }
@@ -2808,6 +2890,7 @@ void qk_engine::copyStripes(uint32_t slot, VkBuffer snapBuf, bool save) {
     VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
+        if (!L.st1) continue;  // layer not owned by this pipeline stage
         VkBufferCopy a, b;
         if (save) {
             a = {(VkDeviceSize)slot * L.ps1, snapOff1[il], L.ps1};
@@ -2827,6 +2910,33 @@ void qk_engine::copyStripes(uint32_t slot, VkBuffer snapBuf, bool save) {
     si.pCommandBuffers = &c.cb;
     VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
     VK_CHECK(vkQueueWaitIdle(c.queue));
+}
+
+void qk_engine::copyDnStripes(uint32_t fromStripe, uint32_t toStripe) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+    for (auto& L : layers) {
+        if (!L.rec || !L.st1) continue;
+        VkBufferCopy a{(VkDeviceSize)fromStripe * L.ps1, (VkDeviceSize)toStripe * L.ps1, L.ps1};
+        VkBufferCopy b{(VkDeviceSize)fromStripe * L.ps2, (VkDeviceSize)toStripe * L.ps2, L.ps2};
+        vkCmdCopyBuffer(c.cb, L.st1, L.st1, 1, &a);
+        vkCmdCopyBuffer(c.cb, L.st2, L.st2, 1, &b);
+    }
+    VK_CHECK(vkEndCommandBuffer(c.cb));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &c.cb;
+    VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(c.queue));
+}
+
+void qk_engine::verifyRound(const uint32_t* toks, uint32_t n, uint32_t slot, uint32_t base,
+                            uint32_t* outIds) {
+    copyDnStripes(slot, nSlots);  // seed scratch = live state at `base`
+    std::vector<float> dummy;
+    prefillBatchLast(toks, n, slot, dummy, /*wantLogits=*/false, base, outIds,
+                     /*scratchState=*/true);
 }
 
 // Snapshot a finished slot's state into an LRU cache entry, keyed by its full
@@ -2888,6 +2998,13 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     // VRAM (~32K at 4 slots on a 20 GB card), not shared memory.
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 32768 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
+    // QK_LAYERS=a:b — pipeline-split stage owning layers [a,b). Driven via
+    // qk_stage_run only (slot_start/step_chunk are disabled on a split engine).
+    if (const char* v = getenv("QK_LAYERS")) {
+        unsigned a = 0, b = 0;
+        if (sscanf(v, "%u:%u", &a, &b) == 2 && a < b && b <= nLayer) { lFirst = a; lEnd = b; }
+        else return fail("qk_open: bad QK_LAYERS (want a:b with 0 <= a < b <= 40)");
+    }
     initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     const GgufTensor* tEmbd = g.find("token_embd.weight");
@@ -2952,22 +3069,28 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bMSel = createBuf(c, (size_t)nB * 128, stor, true);
     bMY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     bMY2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
+    // bONorm always exists (a non-last stage binds it as the throwaway next-norm
+    // of its final add_rms3); the real weight is only uploaded on the last stage.
+    // Embed/head weights and the logits/argmax buffers are stage-gated — each is
+    // O(vocab) (~400 MB weights, ~1 MB/row logits), the split's whole point.
     bONorm = createBuf(c, nEmbd * 4, stor, true);
-    bHeadW = createBuf(c, (size_t)vocab * rbE, stor, true);
-    bLogits = createBuf(c, (size_t)nB * vocab * 4, storSrc, true);
-    bEmbdW = createBuf(c, (size_t)vocab * rbE, stor, true);
+    if (lastStage()) {
+        bHeadW = createBuf(c, (size_t)vocab * rbE, stor, true);
+        bLogits = createBuf(c, (size_t)nB * vocab * 4, storSrc, true);
+        bAV = createBuf(c, (size_t)nB * 64 * 4, stor, true);
+        bAI = createBuf(c, (size_t)nB * 64 * 4, stor, true);
+        bTok = createBuf(c, (size_t)nB * 4, storSrc, true);
+        bSamp = createBuf(c, (size_t)nB * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);  // readback
+    }
+    if (firstStage()) bEmbdW = createBuf(c, (size_t)vocab * rbE, stor, true);
     bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, stor, true);
-    bAV = createBuf(c, (size_t)nB * 64 * 4, stor, true);
-    bAI = createBuf(c, (size_t)nB * 64 * 4, stor, true);
-    bTok = createBuf(c, (size_t)nB * 4, storSrc, true);
     bSlotIn = createBuf(c, (size_t)nB * 4, stor, false);   // host-visible, host-written each step
     bSlotPos = createBuf(c, (size_t)nB * 4, stor, false);
-    bSamp = createBuf(c, (size_t)nB * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);  // readback
     stage = createBuf(c, 160u << 20,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
     VK_CHECK(vkMapMemory(c.dev, bSlotIn.mem, 0, VK_WHOLE_SIZE, 0, (void**)&slotInMap));
     VK_CHECK(vkMapMemory(c.dev, bSlotPos.mem, 0, VK_WHOLE_SIZE, 0, (void**)&slotPosMap));
-    VK_CHECK(vkMapMemory(c.dev, bSamp.mem, 0, VK_WHOLE_SIZE, 0, (void**)&sampMap));
+    if (lastStage()) VK_CHECK(vkMapMemory(c.dev, bSamp.mem, 0, VK_WHOLE_SIZE, 0, (void**)&sampMap));
     for (uint32_t s = 0; s < nB; s++) { slotInMap[s] = 0; slotPosMap[s] = 0; }
 
     VK_CHECK(vkMapMemory(c.dev, stage.mem, 0, VK_WHOLE_SIZE, 0, &stageMap));
@@ -2993,7 +3116,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             submitWait();
         }
     };
-    upload(bONorm, tONorm->data, nEmbd * 4);
+    upload(bONorm, lastStage() ? tONorm->data : nullptr, nEmbd * 4);
     {
         const uint32_t half = nRot / 2;
         std::vector<float> rope((size_t)tmax * half * 2);
@@ -3005,8 +3128,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             }
         upload(bRope, rope.data(), rope.size() * 4);
     }
-    upload(bHeadW, tHead->data, (size_t)vocab * rbE);
-    upload(bEmbdW, tEmbd->data, (size_t)vocab * rbE);
+    if (lastStage()) upload(bHeadW, tHead->data, (size_t)vocab * rbE);
+    if (firstStage()) upload(bEmbdW, tEmbd->data, (size_t)vocab * rbE);
 
     VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -3040,7 +3163,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         else fprintf(stderr, "QK_MAXB=%s out of range [16,1024]; using %u\n", v, cap);
     }
     maxB = cap;
-    bbXin = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
+    // storSrc: a non-last pipeline stage copies its final residual rows out of
+    // bbXin for the next stage (prefillBatchLast hiddenOut).
+    bbXin = createBuf(c, (size_t)cap * nEmbd * 4, storSrc, true);
     bbXn = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbBig = createBuf(c, (size_t)cap * chQkv * 4, stor, true);
     bbMid = createBuf(c, (size_t)cap * dIn * 4, stor, true);
@@ -3058,7 +3183,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMSel = createBuf(c, (size_t)cap * 128, stor, true);
     bbMY = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbMY2 = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
-    bbLogits = createBuf(c, (size_t)cap * vocab * 4, storSrc, true);
+    if (lastStage()) bbLogits = createBuf(c, (size_t)cap * vocab * 4, storSrc, true);
     bbIds = createBuf(c, (size_t)cap * 4, stor, false);
     // Per-layer conv carry (the 3 tokens before a chunk): one [chQkv*3] slice per layer,
     // so a seeded (base>0) chunk can seed each deltanet layer's carry from its own conv
@@ -3066,11 +3191,18 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, storSrc, true);
     upload(bbCarry, nullptr, (size_t)nLayer * chQkv * 3 * 4);
     VK_CHECK(vkMapMemory(c.dev, bbIds.mem, 0, VK_WHOLE_SIZE, 0, (void**)&bbIdsMap));
+    if (lastStage()) {
+        bvAV = createBuf(c, (size_t)cap * 64 * 4, stor, true);
+        bvAI = createBuf(c, (size_t)cap * 64 * 4, stor, true);
+        bvTok = createBuf(c, (size_t)cap * 4, storSrc, true);
+        bvSamp = createBuf(c, (size_t)cap * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+        VK_CHECK(vkMapMemory(c.dev, bvSamp.mem, 0, VK_WHOLE_SIZE, 0, (void**)&bvSampMap));
+    }
 
     layers.resize(nLayer);
     blayers.resize(nLayer);
     char nb[128];
-    for (uint32_t il = 0; il < nLayer; il++) {
+    for (uint32_t il = lFirst; il < lEnd; il++) {
         Layer& L = layers[il];
         BLayer& BL = blayers[il];
         auto T = [&](const char* suffix) -> const GgufTensor* {
@@ -3099,8 +3231,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                              (size_t)chQkv * 4 * 4);
             VkBuffer sn = W(T("ssm_norm.weight"), dS * 4);
             VkBuffer outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
-            VkBuffer convSt = W(nullptr, (size_t)nB * chQkv * 3 * 4);
-            VkBuffer S = W(nullptr, (size_t)nB * hV * dS * dS * 4);
+            // +1 stripe: the spec-decode verify scratch (stripe index nSlots).
+            // Verify rounds are engine-thread-serial, so one shared scratch
+            // stripe serves every slot (~63 MB total across the 30 rec layers).
+            VkBuffer convSt = W(nullptr, (size_t)(nB + 1) * chQkv * 3 * 4);
+            VkBuffer S = W(nullptr, (size_t)(nB + 1) * hV * dS * dS * 4);
             L.st1 = convSt; L.ps1 = (size_t)chQkv * 3 * 4;
             L.st2 = S;      L.ps2 = (size_t)hV * dS * dS * 4;
             L.sRms = mkSet(pRms, {bXin.buf, aNorm, bXn.buf});
@@ -3178,20 +3313,31 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         BL.sMoeDn = mkSet(L.downQ6 ? pMoeDn6 : pMoeDn4, {mde, bbMH.buf, bbMSel.buf, bbMY.buf});
         BL.sMoeDns = mkSet(pMoeDnsB, {mds, bbMH.buf, bbMSel.buf, bbMY2.buf});
     }
-    for (uint32_t il = 0; il < nLayer; il++)
+    // A stage's LAST layer pre-norms with the next stage's first attn_norm in the
+    // full model; here it binds bONorm instead — real weight on the last stage
+    // (the final-norm handoff, unchanged), zeros elsewhere. That xn output is
+    // dead on a non-last stage: the residual (bXin) crosses the stage boundary
+    // and the next stage re-norms it with its own first layer's sRms.
+    for (uint32_t il = lFirst; il < lEnd; il++)
         layers[il].sAdd3 = mkSet(pAdd3, {bY.buf, bMY.buf, bMY2.buf,
-                                         il + 1 < nLayer ? layers[il + 1].aNormBuf : bONorm.buf,
+                                         il + 1 < lEnd ? layers[il + 1].aNormBuf : bONorm.buf,
                                          bXin.buf, bXn.buf});
-    for (uint32_t il = 0; il < nLayer; il++)
+    for (uint32_t il = lFirst; il < lEnd; il++)
         blayers[il].sAdd3 = mkSet(pAdd3, {bbY.buf, bbMY.buf, bbMY2.buf,
-                                          il + 1 < nLayer ? layers[il + 1].aNormBuf : bONorm.buf,
+                                          il + 1 < lEnd ? layers[il + 1].aNormBuf : bONorm.buf,
                                           bbXin.buf, bbXn.buf});
-    sHead = mkSet(pHead, {bHeadW.buf, bXn.buf, bLogits.buf});
-    sAm1 = mkSet(pAm1, {bLogits.buf, bAV.buf, bAI.buf});
-    sAm2 = mkSet(pAm2, {bAV.buf, bAI.buf, bTok.buf});
-    sEmb = mkSet(pEmb, {bEmbdW.buf, bSlotIn.buf, bXin.buf});
-    sbHead = mkSet(pHead, {bHeadW.buf, bbXn.buf, bbLogits.buf});
-    sbEmb = mkSet(pEmb, {bEmbdW.buf, bbIds.buf, bbXin.buf});
+    if (lastStage()) {
+        sHead = mkSet(pHead, {bHeadW.buf, bXn.buf, bLogits.buf});
+        sAm1 = mkSet(pAm1, {bLogits.buf, bAV.buf, bAI.buf});
+        sAm2 = mkSet(pAm2, {bAV.buf, bAI.buf, bTok.buf});
+        sbHead = mkSet(pHead, {bHeadW.buf, bbXn.buf, bbLogits.buf});
+        svAm1 = mkSet(pAm1, {bbLogits.buf, bvAV.buf, bvAI.buf});
+        svAm2 = mkSet(pAm2, {bvAV.buf, bvAI.buf, bvTok.buf});
+    }
+    if (firstStage()) {
+        sEmb = mkSet(pEmb, {bEmbdW.buf, bSlotIn.buf, bXin.buf});
+        sbEmb = mkSet(pEmb, {bEmbdW.buf, bbIds.buf, bbXin.buf});
+    }
 
     // ---- prefix cache: host-resident snapshots of the per-slot state stripes ----
     {
@@ -3225,6 +3371,18 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
 
     // ---- record one re-submittable step CB per dispatch depth (z = 1..nSlots) ----
+    specOn = getenv("QK_SPEC") != nullptr;
+    if (const char* v = getenv("QK_SPEC_L")) {
+        long x = atol(v);
+        if (x >= 2 && x <= 64) specL = (uint32_t)x;
+    }
+    if (const char* v = getenv("QK_SPEC_K")) {
+        long x = atol(v);
+        if (x >= 2 && (uint32_t)x <= maxB) specK = (uint32_t)x;
+    }
+    specToks.resize(maxB);
+    specAm.resize(maxB);
+
     stepCBs.resize(nSlots);
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -3263,7 +3421,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     struct { uint32_t m; } pcAm2{amWgs};
     struct { uint32_t k, idx, pr; } pcE{nEmbd, 0, 1};  // idx0 + perReq1 -> ids[rq] = slotInput[rq]
 
-    for (uint32_t z = 1; z <= nSlots; z++) {
+    // A split stage lacks embed/head, so the fused per-token step CBs cannot be
+    // recorded; every forward goes through prefillBatchLast via stageRun instead
+    // (the slot_start/step_chunk API is rejected on split engines).
+    for (uint32_t z = 1; z <= (splitStage() ? 0 : nSlots); z++) {
     zdim = z;
     rcb = stepCBs[z - 1];
     VK_CHECK(vkBeginCommandBuffer(rcb, &cbbi));
@@ -3332,7 +3493,40 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     return true;
 }
 
+uint32_t qk_engine::specDraft(uint32_t s) {
+    Slot& sl = slots[s];
+    const uint32_t L = specL;
+    size_t H = sl.prompt.size() + sl.genTokens.size();
+    if (H < (size_t)L + 1) return 0;
+    auto tok = [&](size_t i) {
+        return i < sl.prompt.size() ? sl.prompt[i] : sl.genTokens[i - sl.prompt.size()];
+    };
+    auto gramHash = [&](size_t end) {  // FNV-1a over hist[end-L, end)
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = end - L; i < end; i++) { h ^= tok(i); h *= 1099511628211ull; }
+        return h;
+    };
+    // Index grams ending strictly before H, so the query (the gram ending AT H)
+    // never matches itself; it becomes indexable once the history grows past it.
+    if (sl.ngramBuilt < L) sl.ngramBuilt = L;
+    for (size_t end = sl.ngramBuilt; end < H; end++) sl.ngram[gramHash(end)] = (uint32_t)end;
+    sl.ngramBuilt = (uint32_t)H;
+    auto it = sl.ngram.find(gramHash(H));
+    if (it == sl.ngram.end()) return 0;  // no trigger: stay serial (zero GPU cost)
+    uint32_t e = it->second;             // suffix also ends at e; continuation = hist[e..]
+    uint32_t maxN = std::min(std::min(specK, nCtx - sl.pos), sl.maxGen - sl.gen);
+    if (maxN < 2) return 0;
+    uint32_t nDraft = std::min<uint32_t>(maxN - 1, (uint32_t)(H - e));
+    specToks[0] = tok(H - 1);            // == sl.last: sampled but not yet fed
+    for (uint32_t j = 0; j < nDraft; j++) specToks[1 + j] = tok(e + j);
+    return 1 + nDraft;
+    // A hash collision only fakes a trigger; acceptance still compares real
+    // argmaxes, so output stays exact — the round is just wasted work.
+}
+
 // Advance every active slot by up to chunkN steps. Returns active-at-entry.
+// With QK_SPEC: drain queued spec tokens first (no GPU), then run gated verify
+// rounds (single active slot), then serial steps for any remaining budget.
 int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     for (uint32_t s = 0; s < nSlots; s++) outCnt[s] = 0;
     *outFin = 0;
@@ -3340,22 +3534,107 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     for (uint32_t s = 0; s < nSlots; s++) if (slots[s].active) activeAtEntry++;
     if (!activeAtEntry) return 0;
 
+    auto finish = [&](uint32_t s) {  // GPU-side finished; free once the queue drains
+        Slot& sl = slots[s];
+        if (sl.finPending && sl.outQHead >= sl.outQ.size()) {
+            if (specOn && sl.specRounds && getenv("QK_SPEC_LOG")) {
+                fprintf(stderr, "[spec] slot=%u rounds=%u fed=%u emitted=%u serial=%u avg_accept=%.2f\n",
+                        s, sl.specRounds, sl.specFed, sl.specEmitted, sl.serialSteps,
+                        (double)sl.specFed / sl.specRounds);
+                fflush(stderr);
+            }
+            sl.resetSpec();
+            sl.active = false;
+            *outFin |= 1u << s;
+        }
+    };
+    auto emitTok = [&](uint32_t s, uint32_t t) {  // ABI cap: overflow waits in outQ
+        if (outCnt[s] < chunkN) outTok[s * chunkN + outCnt[s]++] = t;
+        else slots[s].outQ.push_back(t);
+    };
+
+    // ---- phase 1: drain queued spec tokens (no GPU work) ----
+    for (uint32_t s = 0; s < nSlots; s++) {
+        Slot& sl = slots[s];
+        if (!sl.active) continue;
+        while (sl.outQHead < sl.outQ.size() && outCnt[s] < chunkN)
+            outTok[s * chunkN + outCnt[s]++] = sl.outQ[sl.outQHead++];
+        if (sl.outQHead >= sl.outQ.size()) { sl.outQ.clear(); sl.outQHead = 0; }
+        finish(s);
+    }
+
+    // ---- phase 2: speculative verify rounds ----
+    // v1 fires only with a single active slot: a round blocks the engine thread
+    // for c(K) ~ one serial chunk, but advances just one slot — fine alone, a
+    // fairness question with concurrent slots (revisit with P3 replay numbers).
+    if (specOn) {
+        int only = -1, nAct = 0;
+        for (uint32_t s = 0; s < nSlots; s++)
+            if (slots[s].active && !slots[s].finPending) { nAct++; only = (int)s; }
+        if (nAct == 1) {
+            Slot& sl = slots[only];
+            while (sl.active && !sl.finPending && sl.cursor >= sl.prompt.size() &&
+                   outCnt[only] < chunkN) {
+                uint32_t n = specDraft((uint32_t)only);
+                if (n < 2) break;
+                verifyRound(specToks.data(), n, (uint32_t)only, sl.pos, specAm.data());
+                uint32_t k = 1;
+                while (k < n && specToks[k] == specAm[k - 1]) k++;
+                // an accepted greedy EOS ends the request: commit the tokens FED
+                // up to it (its K/V is written, like a serial decode-step EOS) but
+                // emit only the tokens before it
+                uint32_t emitN = k;
+                bool eosHit = false;
+                for (uint32_t i = 0; i < k; i++)
+                    if (specAm[i] == eosTok) { eosHit = true; emitN = i; k = i + 1; break; }
+                if (k == n) promoteScratch((uint32_t)only);  // scratch state IS post-k
+                else {
+                    // rollback: live state is still at pos; commit the k accepted
+                    // tokens by re-running them in live mode (exact — same input,
+                    // same state as the verify round computed)
+                    std::vector<float> dummy;
+                    prefillBatchLast(specToks.data(), k, (uint32_t)only, dummy, false, sl.pos);
+                }
+                sl.pos += k;
+                for (uint32_t i = 0; i < emitN; i++) {
+                    sl.genTokens.push_back(specAm[i]);
+                    sl.last = specAm[i];
+                    sl.gen++;
+                    emitTok((uint32_t)only, specAm[i]);
+                }
+                sl.specRounds++;
+                sl.specFed += k;
+                sl.specEmitted += emitN;
+                if (eosHit || sl.gen >= sl.maxGen || sl.pos >= nCtx) {
+                    snapshotSlot((uint32_t)only);
+                    sl.finPending = true;
+                    finish((uint32_t)only);  // may free the slot (and reset finPending)
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- phase 3: serial steps for whatever emission budget remains ----
     for (uint32_t step = 0; step < chunkN; step++) {
         int nAct = 0;
         uint32_t maxZ = 0;  // highest active slot index + 1 = needed dispatch depth
+        bool need = false;  // someone still owes prefill progress or emitted tokens
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
-            if (!sl.active) { slotInMap[s] = 0; slotPosMap[s] = 0; continue; }
+            if (!sl.active || sl.finPending) { slotInMap[s] = 0; slotPosMap[s] = 0; continue; }
             nAct++; maxZ = s + 1;
             if (sl.cursor < sl.prompt.size()) {         // prefill: feed prompt[cursor] at position cursor
                 slotInMap[s] = sl.prompt[sl.cursor];
                 slotPosMap[s] = sl.cursor;
+                need = true;
             } else {                                    // decode: feed last sampled at pos
                 slotInMap[s] = sl.last;
                 slotPosMap[s] = sl.pos;
+                if (outCnt[s] < chunkN) need = true;
             }
         }
-        if (!nAct) break;
+        if (!nAct || !need) break;
 
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1; si.pCommandBuffers = &stepCBs[maxZ - 1];  // dispatch only up to the top active slot
@@ -3364,7 +3643,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
-            if (!sl.active) continue;
+            if (!sl.active || sl.finPending) continue;
             uint32_t sampled = sampMap[s];
             bool prefilling = sl.cursor < sl.prompt.size();
             if (prefilling && sl.cursor + 1 < sl.prompt.size()) {
@@ -3373,20 +3652,23 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
             }
             // this step produced a real generated token (last prompt token, or a decode step)
             if (prefilling) { sl.cursor = (uint32_t)sl.prompt.size(); sl.pos = (uint32_t)sl.prompt.size(); }
+            sl.serialSteps++;
             if (sampled == eosTok) {
                 if (!prefilling) sl.pos++;  // a decode-step EOS still fed a token (its K/V is written)
                 snapshotSlot(s);            // cache before the next step overwrites this slot
-                sl.active = false; *outFin |= 1u << s;
+                sl.finPending = true;
+                finish(s);                  // queue empty -> frees now (pre-spec behavior)
                 continue;
             }
-            outTok[s * chunkN + outCnt[s]++] = sampled;
+            emitTok(s, sampled);
             sl.genTokens.push_back(sampled);
             sl.last = sampled;
             sl.gen++;
             if (!prefilling) sl.pos++;
             if (sl.pos >= nCtx || sl.gen >= sl.maxGen) {
                 snapshotSlot(s);
-                sl.active = false; *outFin |= 1u << s;
+                sl.finPending = true;
+                finish(s);
             }
         }
     }
@@ -3402,13 +3684,23 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 // tiled GEMM for n>=48 (accumulation order differs from serial GEMV by ~1e-7, argmax-
 // stable; review R1).
 void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
-                                 std::vector<float>& logits, bool wantLogits, uint32_t base) {
-    if (!toks || n < 1 || n > maxB || slot >= nSlots || (size_t)base + n > nCtx) {
-        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u\n", n, slot, base);
+                                 std::vector<float>& logits, bool wantLogits, uint32_t base,
+                                 uint32_t* argmaxOut, bool scratchState,
+                                 const float* hiddenIn, float* hiddenOut) {
+    if ((!toks && !hiddenIn) || n < 1 || n > maxB || slot >= nSlots || (size_t)base + n > nCtx ||
+        (hiddenIn && firstStage()) || (!hiddenIn && !firstStage()) ||
+        ((wantLogits || argmaxOut) && !lastStage())) {
+        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u stage=[%u,%u)\n",
+                n, slot, base, lFirst, lEnd);
         exit(1);
     }
-    memcpy(bbIdsMap, toks, (size_t)n * 4);
+    if (!hiddenIn) memcpy(bbIdsMap, toks, (size_t)n * 4);
     if (wantLogits) logits.resize(vocab);
+    // Hidden-row I/O rides the host-visible staging buffer at fixed offsets:
+    // [0, vocab*4) stays the wantLogits readback; hidden-in and hidden-out get
+    // disjoint maxB-row regions above it (no transfer/transfer hazard).
+    const size_t hidInOff = 1u << 20, hidOutOff = (1u << 20) + (size_t)maxB * nEmbd * 4;
+    if (hiddenIn) memcpy((uint8_t*)stageMap + hidInOff, hiddenIn, (size_t)n * nEmbd * 4);
     // base=0: zero the slot's recurrent state so dn_step's seed reads 0 and the conv
     // window starts clean (idempotent). base>0: keep the existing state to continue from.
     if (base == 0) resetSlot(slot);
@@ -3418,21 +3710,25 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     {
         VkDescriptorBufferInfo dbi; VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr.descriptorCount = 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr.pBufferInfo = &dbi;
-        auto rebind = [&](VkDescriptorSet ds, uint32_t binding, VkBuffer buf, size_t ps) {
-            dbi = {buf, (VkDeviceSize)slot * ps, (VkDeviceSize)ps};
+        auto rebind = [&](VkDescriptorSet ds, uint32_t binding, VkBuffer buf, size_t ps, uint32_t stripe) {
+            dbi = {buf, (VkDeviceSize)stripe * ps, (VkDeviceSize)ps};
             wr.dstSet = ds; wr.dstBinding = binding;
             vkUpdateDescriptorSets(c.dev, 1, &wr, 0, nullptr);
         };
-        for (uint32_t il = 0; il < nLayer; il++) {
+        // Verify mode: the DeltaNet scan seeds from and persists to the scratch
+        // stripe (pre-seeded by the caller); the live stripe keeps the state at
+        // `base`. K/V stays on the live slot — rejected positions are never read.
+        uint32_t dnStripe = scratchState ? nSlots : slot;
+        for (uint32_t il = lFirst; il < lEnd; il++) {
             Layer& L = layers[il]; BLayer& BL = blayers[il];
             if (L.rec) {                                   // st1=convSt, st2=S
-                rebind(BL.sConv, 4, L.st1, L.ps1);
-                rebind(BL.sStep, 3, L.st2, L.ps2);
+                rebind(BL.sConv, 4, L.st1, L.ps1, dnStripe);
+                rebind(BL.sStep, 3, L.st2, L.ps2, dnStripe);
             } else {                                       // st1=kc, st2=vc
-                rebind(BL.sPrep, 6, L.st1, L.ps1);
-                rebind(BL.sPrep, 7, L.st2, L.ps2);
-                rebind(BL.sAttn, 1, L.st1, L.ps1);
-                rebind(BL.sAttn, 2, L.st2, L.ps2);
+                rebind(BL.sPrep, 6, L.st1, L.ps1, slot);
+                rebind(BL.sPrep, 7, L.st2, L.ps2, slot);
+                rebind(BL.sAttn, 1, L.st1, L.ps1, slot);
+                rebind(BL.sAttn, 2, L.st2, L.ps2, slot);
             }
         }
     }
@@ -3534,19 +3830,27 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     if (base == 0) {
         vkCmdFillBuffer(c.cb, bbCarry.buf, 0, (VkDeviceSize)nLayer * chQkv * 3 * 4, 0u);
     } else {
-        for (uint32_t il = 0; il < nLayer; il++) {
+        for (uint32_t il = lFirst; il < lEnd; il++) {
             if (!layers[il].rec) continue;
             VkBufferCopy cc{(VkDeviceSize)slot * layers[il].ps1, (VkDeviceSize)il * chQkv * 3 * 4,
                             (VkDeviceSize)chQkv * 3 * 4};
             vkCmdCopyBuffer(c.cb, layers[il].st1, bbCarry.buf, 1, &cc);
         }
     }
+    if (hiddenIn) {
+        // Later pipeline stage: the previous stage's residual rows replace the
+        // embedding as this stage's bbXin input.
+        VkBufferCopy ch{hidInOff, 0, (VkDeviceSize)n * nEmbd * 4};
+        vkCmdCopyBuffer(c.cb, stage.buf, bbXin.buf, 1, &ch);
+        barrier();
+    } else {
+        barrier();
+        disp(pEmb, sbEmb, 1, &pcE, 12);
+        barrier();
+    }
+    disp(pRms, blayers[lFirst].sRms, 1, &pcRms, 8);
     barrier();
-    disp(pEmb, sbEmb, 1, &pcE, 12);
-    barrier();
-    disp(pRms, blayers[0].sRms, 1, &pcRms, 8);
-    barrier();
-    for (uint32_t il = 0; il < nLayer; il++) {
+    for (uint32_t il = lFirst; il < lEnd; il++) {
         Layer& L = layers[il];
         BLayer& BL = blayers[il];
         zdim = n;
@@ -3606,21 +3910,47 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         barrier();
         disp(pAdd3, BL.sAdd3, 1, &pcRms, 8);
         barrier();
-        if ((il + 1) % flushEvery == 0 && il + 1 < nLayer) flushCB();
+        if ((il + 1 - lFirst) % flushEvery == 0 && il + 1 < lEnd) flushCB();
+    }
+    if (hiddenOut) {
+        // Non-last pipeline stage: export the residual rows after this stage's
+        // final layer (what the full model would feed the next layer's norm).
+        VkMemoryBarrier mh{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mh.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mh.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mh, 0, nullptr, 0, nullptr);
+        VkBufferCopy ch{0, hidOutOff, (VkDeviceSize)n * nEmbd * 4};
+        vkCmdCopyBuffer(c.cb, bbXin.buf, stage.buf, 1, &ch);
     }
     // The head (last-token logits) is only needed by validation callers; when the
     // slot is being prefilled for decode, the serial step over the final prompt token
     // produces the first generated token, so skip the head entirely (a large save).
-    if (wantLogits) {
+    if (wantLogits || argmaxOut) {
         zdim = n;
         disp(pHead, sbHead, (vocab + 1) / 2, &pcHead, 8);
+        if (argmaxOut) {
+            barrier();
+            const uint32_t amWgs = (vocab + 4095) / 4096;
+            struct { uint32_t n, span; } pcAm{vocab, 4096};
+            struct { uint32_t m; } pcAm2{amWgs};
+            disp(pAm1, svAm1, amWgs, &pcAm, 8);
+            barrier();
+            disp(pAm2, svAm2, 1, &pcAm2, 4);
+        }
         VkMemoryBarrier m2{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         m2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         m2.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &m2, 0, nullptr, 0, nullptr);
-        VkBufferCopy cp{(VkDeviceSize)(n - 1) * vocab * 4, 0, (VkDeviceSize)vocab * 4};
-        vkCmdCopyBuffer(c.cb, bbLogits.buf, stage.buf, 1, &cp);
+        if (wantLogits) {
+            VkBufferCopy cp{(VkDeviceSize)(n - 1) * vocab * 4, 0, (VkDeviceSize)vocab * 4};
+            vkCmdCopyBuffer(c.cb, bbLogits.buf, stage.buf, 1, &cp);
+        }
+        if (argmaxOut) {
+            VkBufferCopy cv{0, 0, (VkDeviceSize)n * 4};
+            vkCmdCopyBuffer(c.cb, bvTok.buf, bvSamp.buf, 1, &cv);
+        }
     }
 
     VK_CHECK(vkEndCommandBuffer(c.cb));
@@ -3630,6 +3960,25 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
     VK_CHECK(vkQueueWaitIdle(c.queue));
     if (wantLogits) memcpy(logits.data(), stageMap, (size_t)vocab * 4);
+    if (argmaxOut) memcpy(argmaxOut, bvSampMap, (size_t)n * 4);
+    if (hiddenOut) memcpy(hiddenOut, (uint8_t*)stageMap + hidOutOff, (size_t)n * nEmbd * 4);
+}
+
+int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
+                        uint32_t base, float* hiddenOut, uint32_t* idsOut) {
+    if (slot >= nSlots || n < 1 || (size_t)base + n > nCtx) return -1;
+    if (firstStage() ? (!toks || hiddenIn != nullptr) : !hiddenIn) return -2;
+    if (lastStage() ? !idsOut : !hiddenOut) return -3;
+    std::vector<float> dummy;
+    for (uint32_t off = 0; off < n; off += maxB) {
+        uint32_t cn = std::min(maxB, n - off);
+        prefillBatchLast(toks ? toks + off : nullptr, cn, slot, dummy, /*wantLogits=*/false,
+                         base + off, lastStage() ? idsOut + off : nullptr,
+                         /*scratchState=*/false,
+                         hiddenIn ? hiddenIn + (size_t)off * nEmbd : nullptr,
+                         hiddenOut ? hiddenOut + (size_t)off * nEmbd : nullptr);
+    }
+    return 0;
 }
 
 uint32_t qk_engine::serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
@@ -3700,11 +4049,23 @@ __attribute__((visibility("default"))) uint32_t qk_n_slots(const qk_engine* e) {
 __attribute__((visibility("default"))) uint32_t qk_chunk(const qk_engine* e) { return e->chunkN; }
 __attribute__((visibility("default"))) uint32_t qk_eos_token(const qk_engine* e) { return e->eosTok; }
 __attribute__((visibility("default"))) uint32_t qk_bos_token(const qk_engine* e) { return e->bosTok; }
+__attribute__((visibility("default"))) uint32_t qk_layer_first(const qk_engine* e) { return e->lFirst; }
+__attribute__((visibility("default"))) uint32_t qk_layer_end(const qk_engine* e) { return e->lEnd; }
+__attribute__((visibility("default"))) uint32_t qk_n_layer(const qk_engine* e) { return qk_engine::nLayer; }
+__attribute__((visibility("default"))) uint32_t qk_n_embd(const qk_engine* e) { return qk_engine::nEmbd; }
+
+__attribute__((visibility("default")))
+int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float* hidden_in,
+                 uint32_t n, uint32_t base, float* hidden_out, uint32_t* ids_out) {
+    if (!e) return -1;
+    return e->stageRun(slot, toks, hidden_in, n, base, hidden_out, ids_out);
+}
 
 __attribute__((visibility("default")))
 int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt,
                   uint32_t max_gen, uint32_t snap_prefix) {
     if (!e || slot >= e->nSlots) return -1;
+    if (e->splitStage()) return -5;  // split stages are driven via qk_stage_run
     if (e->slots[slot].active) return -2;
     if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
     for (uint32_t i = 0; i < n_prompt; i++) if (prompt[i] >= e->vocab) return -4;
@@ -3765,6 +4126,7 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
     s.genTokens.clear();
     s.gen = 0; s.maxGen = max_gen; s.last = 0;
+    s.resetSpec();  // fresh queue + n-gram index (history changed; rebuilt lazily)
     // If we did not take a history snapshot (snap_prefix disabled / prompt too
     // short), fall back to caching the full prefill so identical-prompt requests
     // still fork off it.
@@ -3774,12 +4136,17 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
 
 __attribute__((visibility("default")))
 void qk_slot_cancel(qk_engine* e, uint32_t slot) {
-    if (e && slot < e->nSlots) { e->slots[slot].active = false; e->slots[slot].prompt.clear(); }
+    if (e && slot < e->nSlots) {
+        e->slots[slot].active = false;
+        e->slots[slot].prompt.clear();
+        e->slots[slot].resetSpec();
+    }
 }
 
 __attribute__((visibility("default")))
 int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint32_t* out_finished) {
     if (!e || !out_tokens || !out_counts || !out_finished) return -1;
+    if (e->splitStage()) return -5;  // split stages are driven via qk_stage_run
     return e->stepChunk(out_tokens, out_counts, out_finished);
 }
 
@@ -4086,6 +4453,477 @@ int main(int argc, char** argv) {
             printf("  first divergence at token %zu\n", d);
         }
         return 0;
+    }
+
+    if (mode == "speccmp") {
+        // Spec-decode P1 harness: the full accept / reject / rollback state
+        // machine vs the serial stream. Drafts are taken from the serial
+        // reference (oracle) with every C-th drafted position corrupted, forcing
+        // partial accepts at controlled spots: C=0 pure oracle (always full
+        // accept + promote), C=1 every draft wrong (worst case: k=1 rounds, a
+        // commit pass each round). The reconstructed output must be
+        // token-identical to serial in EVERY mode — that is the rollback proof.
+        if (argc < 4) {
+            fprintf(stderr, "usage: qk speccmp <ids-file> <nGen> [K] [C,C,...]\n");
+            return 1;
+        }
+        std::vector<uint32_t> prompt;
+        {
+            FILE* f = fopen(argv[2], "r");
+            if (!f) { perror(argv[2]); return 1; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+            fclose(f);
+        }
+        uint32_t nGen = (uint32_t)atoi(argv[3]);
+        uint32_t K = argc > 4 ? (uint32_t)atoi(argv[4]) : 8;
+        std::vector<uint32_t> Cs{0, 4, 2, 1};
+        if (argc > 5) {
+            Cs.clear();
+            for (const char* p = argv[5]; *p;) {
+                Cs.push_back((uint32_t)strtoul(p, (char**)&p, 10));
+                if (*p == ',') p++;
+            }
+        }
+        qk_config cfg{1, 4096, 8};
+        char err[256] = {0};
+        qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+        if (K < 2 || K > e->maxB) { fprintf(stderr, "K must be in [2, maxB]\n"); return 1; }
+
+        // serial reference
+        std::vector<uint32_t> S = prompt;
+        double serialMsTok = 0;
+        {
+            qk_slot_start(e, 0, prompt.data(), (uint32_t)prompt.size(), nGen, 0);
+            uint32_t ch = qk_chunk(e), fin = 0;
+            std::vector<uint32_t> ot(ch), oc(1);
+            double decodeMs = 0;
+            uint32_t decodeTok = 0;
+            bool prefilled = false;
+            while (true) {
+                auto t0 = std::chrono::steady_clock::now();
+                int act = qk_step_chunk(e, ot.data(), oc.data(), &fin);
+                double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+                if (act <= 0) break;
+                for (uint32_t i = 0; i < oc[0]; i++) S.push_back(ot[i]);
+                if (prefilled) { decodeMs += ms; decodeTok += oc[0]; }
+                if (oc[0] > 0) prefilled = true;
+                if (fin & 1u) break;
+            }
+            serialMsTok = decodeTok ? decodeMs / decodeTok : 0;
+        }
+        uint32_t np = (uint32_t)prompt.size();
+        uint32_t sGen = (uint32_t)S.size() - np;
+        if (sGen < 4) { fprintf(stderr, "stream too short (early EOS?)\n"); return 1; }
+        printf("speccmp: prompt %u, serial %u gen tokens at %.2f ms/tok, K=%u\n",
+               np, sGen, serialMsTok, K);
+        printf("  %-8s %7s %7s %7s %9s %8s %10s   %s\n",
+               "corrupt", "rounds", "avg_k", "full%", "commits", "ms/tok", "vs_serial", "exact");
+
+        bool allOk = true;
+        std::vector<float> dummy;
+        std::vector<uint32_t> am(e->maxB), toks(e->maxB);
+        for (uint32_t C : Cs) {
+            // fresh live state: batch-prefill the prompt from empty; final chunk's
+            // argmax gives the first generated token
+            uint32_t next = 0;
+            for (uint32_t off = 0; off < np;) {
+                uint32_t n = std::min(e->maxB, np - off);
+                bool last = off + n >= np;
+                e->prefillBatchLast(prompt.data() + off, n, 0, dummy, false, off,
+                                    last ? am.data() : nullptr);
+                if (last) next = am[n - 1];
+                off += n;
+            }
+            std::vector<uint32_t> out{next};
+            uint32_t pos = np, rounds = 0, fullAcc = 0, commits = 0;
+            uint64_t sumK = 0;
+            double specMs = 0;
+            bool hitEos = false;
+            while (out.size() < sGen && !hitEos) {
+                uint32_t Kr = std::min(K, (uint32_t)S.size() - pos);
+                if (Kr < 1) break;
+                toks[0] = next;
+                for (uint32_t i = 1; i < Kr; i++) {
+                    toks[i] = S[pos + i];
+                    if (C > 0 && i % C == 0) toks[i] = toks[i] == 5 ? 6 : 5;  // guaranteed wrong
+                }
+                auto t0 = std::chrono::steady_clock::now();
+                e->verifyRound(toks.data(), Kr, 0, pos, am.data());
+                uint32_t k = 1;
+                while (k < Kr && toks[k] == am[k - 1]) k++;
+                if (k == Kr) {
+                    e->promoteScratch(0);
+                    fullAcc++;
+                } else {
+                    // rollback: live state is still at `pos`; re-run the k accepted
+                    // tokens in live mode to commit recurrent state + K/V
+                    e->prefillBatchLast(toks.data(), k, 0, dummy, false, pos);
+                    commits++;
+                }
+                specMs += std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0).count();
+                rounds++;
+                sumK += k;
+                // emit: the accepted drafts (toks[1..k) == am[0..k-1)) plus the
+                // round's new token am[k-1]. Only am[k-1] can be EOS (accepted
+                // drafts come from S, which contains none).
+                for (uint32_t i = 1; i < k; i++) out.push_back(toks[i]);
+                if (am[k - 1] == qk_eos_token(e)) hitEos = true;
+                else out.push_back(am[k - 1]);
+                next = am[k - 1];
+                pos += k;
+            }
+            if (out.size() > sGen) out.resize(sGen);
+            bool ok = out.size() == sGen && std::equal(out.begin(), out.end(), S.begin() + np);
+            allOk = allOk && ok;
+            printf("  C=%-6u %7u %7.2f %6.0f%% %9u %8.2f %9.2fx   %s\n",
+                   C, rounds, rounds ? (double)sumK / rounds : 0,
+                   rounds ? 100.0 * fullAcc / rounds : 0, commits,
+                   out.empty() ? 0 : specMs / out.size(),
+                   specMs > 0 ? serialMsTok * out.size() / specMs : 0,
+                   ok ? "EXACT" : "**MISMATCH**");
+            if (!ok) {
+                size_t d = 0;
+                while (d < out.size() && d < sGen && out[d] == S[np + d]) d++;
+                printf("      first divergence at gen token %zu/%u\n", d, sGen);
+            }
+        }
+        printf("speccmp: %s\n", allOk ? "ROLLBACK TOKEN-EXACT (all corruption modes)"
+                                      : "DIVERGENCE (see above)");
+        qk_close(e);
+        return allOk ? 0 : 1;
+    }
+
+    if (mode == "pipe" || mode == "pipe-worker") {
+        // Pipeline-split (QK_LAYERS) harness — task: run the model as N stages
+        // that each own a layer range, handing the ~8 KB/token residual row
+        // across the boundary. Greedy output must be token-exact vs the
+        // unsplit engine (`qk serve-test <ids> <nGen> 1 <tmax>`).
+        //
+        //   qk pipe <ids-file> <nGen> [split=20] [tmax=4096] [host:port]
+        //     Stage 1 = layers [0,split) in-process. Stage 2 = layers
+        //     [split,40): in-process too (default), or a remote
+        //     `qk pipe-worker` when host:port is given.
+        //   qk pipe-worker <port> [a:b=20:40] [tmax=4096]
+        //     Serve a stage over TCP. Frame: {op,slot,n,base} u32 header;
+        //     op1 payload = n ids (first stage) or n*2048 f32 rows; reply =
+        //     n ids (last stage) or n*2048 f32 rows. op2 ends the connection.
+        signal(SIGPIPE, SIG_IGN);
+        auto readAll = [](int fd, void* p, size_t n) -> bool {
+            uint8_t* b = (uint8_t*)p;
+            while (n) { ssize_t r = read(fd, b, n); if (r <= 0) return false; b += r; n -= (size_t)r; }
+            return true;
+        };
+        auto writeAll = [](int fd, const void* p, size_t n) -> bool {
+            const uint8_t* b = (const uint8_t*)p;
+            while (n) { ssize_t r = write(fd, b, n); if (r <= 0) return false; b += r; n -= (size_t)r; }
+            return true;
+        };
+        struct PipeHdr { uint32_t op, slot, n, base; };
+        const uint32_t nEmbd = qk_engine::nEmbd, nLay = qk_engine::nLayer;
+        // Connection hello: client sends the magic; worker replies
+        // {magic, lFirst, lEnd, nLayer, nEmbd, nSlots, nCtx} so mismatched
+        // builds/splits fail loudly instead of streaming garbage. Bump the
+        // magic ("qkp2"...) on any wire change.
+        const uint32_t kPipeMagic = 0x716b7031;  // "qkp1"
+        char err[256] = {0};
+
+        if (mode == "pipe-worker") {
+            if (argc < 3) {
+                fprintf(stderr,
+                        "usage: qk pipe-worker <port> [a:b=20:40] [tmax=4096] [slots=1]\n"
+                        "       (slots/tmax must cover the head server's --slots/--ctx)\n");
+                return 1;
+            }
+            uint16_t port = (uint16_t)atoi(argv[2]);
+            setenv("QK_LAYERS", argc > 3 ? argv[3] : "20:40", 1);
+            uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 4096;
+            uint32_t wslots = argc > 5 ? (uint32_t)atoi(argv[5]) : 1;
+            qk_config cfg{wslots, tmax, 8};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+            setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+            sockaddr_in sa{};
+            sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(port);
+            if (bind(ls, (sockaddr*)&sa, sizeof sa) || listen(ls, 1)) { perror("bind/listen"); return 1; }
+            fprintf(stderr, "[pipe-worker] layers [%u,%u) nCtx %u listening on :%u\n",
+                    e->lFirst, e->lEnd, tmax, port);
+            std::vector<uint32_t> toks, ids;
+            std::vector<float> hin, hout;
+            while (true) {
+                int fd = accept(ls, nullptr, nullptr);
+                if (fd < 0) continue;
+                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                uint32_t cmagic = 0;
+                if (!readAll(fd, &cmagic, 4) || cmagic != kPipeMagic) {
+                    fprintf(stderr, "[pipe-worker] bad hello magic %08x — old/foreign client?\n",
+                            cmagic);
+                    close(fd);
+                    continue;
+                }
+                uint32_t hello[7] = {kPipeMagic, e->lFirst, e->lEnd, nLay, nEmbd,
+                                     e->nSlots,  e->nCtx};
+                if (!writeAll(fd, hello, sizeof hello)) { close(fd); continue; }
+                fprintf(stderr, "[pipe-worker] client connected\n");
+                PipeHdr h;
+                while (readAll(fd, &h, sizeof h) && h.op == 1) {
+                    if (h.n < 1 || h.slot >= e->nSlots || (size_t)h.base + h.n > e->nCtx) break;
+                    int rc;
+                    if (e->firstStage()) {
+                        toks.resize(h.n);
+                        if (!readAll(fd, toks.data(), (size_t)h.n * 4)) break;
+                    } else {
+                        hin.resize((size_t)h.n * nEmbd);
+                        if (!readAll(fd, hin.data(), hin.size() * 4)) break;
+                    }
+                    if (e->lastStage()) ids.resize(h.n);
+                    else hout.resize((size_t)h.n * nEmbd);
+                    rc = e->stageRun(h.slot, e->firstStage() ? toks.data() : nullptr,
+                                     e->firstStage() ? nullptr : hin.data(), h.n, h.base,
+                                     e->lastStage() ? nullptr : hout.data(),
+                                     e->lastStage() ? ids.data() : nullptr);
+                    if (rc) { fprintf(stderr, "[pipe-worker] stage_run rc=%d\n", rc); break; }
+                    bool ok2 = e->lastStage() ? writeAll(fd, ids.data(), (size_t)h.n * 4)
+                                              : writeAll(fd, hout.data(), hout.size() * 4);
+                    if (!ok2) break;
+                }
+                close(fd);
+                fprintf(stderr, "[pipe-worker] client gone\n");
+            }
+        }
+
+        // driver: qk pipe <ids> <nGen> [split] [tmax] [host:port]
+        if (argc < 4) {
+            fprintf(stderr, "usage: qk pipe <ids-file> <nGen> [split=20] [tmax=4096] [host:port]\n");
+            return 1;
+        }
+        std::vector<uint32_t> prompt;
+        {
+            FILE* f = fopen(argv[2], "r");
+            if (!f) { perror(argv[2]); return 1; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+            fclose(f);
+        }
+        uint32_t nGen = (uint32_t)atoi(argv[3]);
+        uint32_t split = argc > 4 ? (uint32_t)atoi(argv[4]) : 20;
+        uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 4096;
+        const char* net = argc > 6 ? argv[6] : nullptr;
+        uint32_t np = (uint32_t)prompt.size();
+        if (split < 1 || split >= nLay || np < 1 || np + nGen > tmax) {
+            fprintf(stderr, "pipe: bad args (split 1..%u, prompt+nGen <= tmax)\n", nLay - 1);
+            return 1;
+        }
+        char lay[24];
+        snprintf(lay, sizeof lay, "0:%u", split);
+        setenv("QK_LAYERS", lay, 1);
+        qk_config cfg{1, tmax, 8};
+        qk_engine* e1 = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e1) { fprintf(stderr, "qk_open stage1 failed: %s\n", err); return 1; }
+        qk_engine* e2 = nullptr;
+        int fd = -1;
+        if (net) {
+            std::string hp = net;
+            size_t colon = hp.rfind(':');
+            if (colon == std::string::npos) { fprintf(stderr, "pipe: bad host:port\n"); return 1; }
+            std::string host = hp.substr(0, colon), port = hp.substr(colon + 1);
+            addrinfo hints{}, *res = nullptr;
+            hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) || !res) {
+                fprintf(stderr, "pipe: cannot resolve %s\n", net); return 1;
+            }
+            fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            if (fd < 0 || connect(fd, res->ai_addr, res->ai_addrlen)) { perror("connect"); return 1; }
+            freeaddrinfo(res);
+            int one = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            uint32_t magic = kPipeMagic, hello[7];
+            if (!writeAll(fd, &magic, 4) || !readAll(fd, hello, sizeof hello) ||
+                hello[0] != kPipeMagic) {
+                fprintf(stderr, "pipe: worker hello failed (old/foreign build?)\n");
+                return 1;
+            }
+            if (hello[1] != split || hello[2] != nLay || hello[3] != nLay || hello[4] != nEmbd ||
+                hello[5] < 1 || hello[6] < tmax) {
+                fprintf(stderr,
+                        "pipe: worker mismatch: layers [%u,%u) of %u, n_embd %u, slots %u, ctx %u "
+                        "(need [%u,%u) of %u, n_embd %u, ctx >= %u)\n",
+                        hello[1], hello[2], hello[3], hello[4], hello[5], hello[6], split, nLay,
+                        nLay, nEmbd, tmax);
+                return 1;
+            }
+        } else {
+            snprintf(lay, sizeof lay, "%u:%u", split, nLay);
+            setenv("QK_LAYERS", lay, 1);
+            e2 = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e2) { fprintf(stderr, "qk_open stage2 failed: %s\n", err); return 1; }
+        }
+        unsetenv("QK_LAYERS");
+        // stage 2 = local engine or remote worker (assumed to reach layer nLay:
+        // it replies per-position greedy ids)
+        auto stage2 = [&](uint32_t n, uint32_t base, const float* h, uint32_t* out) -> bool {
+            if (e2) return e2->stageRun(0, nullptr, h, n, base, nullptr, out) == 0;
+            PipeHdr hd{1, 0, n, base};
+            return writeAll(fd, &hd, sizeof hd) && writeAll(fd, h, (size_t)n * nEmbd * 4) &&
+                   readAll(fd, out, (size_t)n * 4);
+        };
+        std::vector<float> hid((size_t)np * nEmbd);
+        std::vector<uint32_t> ids(np);
+        auto t0 = std::chrono::steady_clock::now();
+        if (e1->stageRun(0, prompt.data(), nullptr, np, 0, hid.data(), nullptr)) {
+            fprintf(stderr, "pipe: stage1 prefill failed\n"); return 1;
+        }
+        if (!stage2(np, 0, hid.data(), ids.data())) {
+            fprintf(stderr, "pipe: stage2 prefill failed\n"); return 1;
+        }
+        double prefillMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t0).count();
+        uint32_t next = ids[np - 1], pos = np;
+        std::vector<uint32_t> gen;
+        double s1Ms = 0, s2Ms = 0;
+        while (next != e1->eosTok && (uint32_t)gen.size() < nGen) {
+            gen.push_back(next);
+            if ((uint32_t)gen.size() == nGen) break;
+            auto ta = std::chrono::steady_clock::now();
+            if (e1->stageRun(0, &next, nullptr, 1, pos, hid.data(), nullptr)) {
+                fprintf(stderr, "pipe: stage1 step failed\n"); return 1;
+            }
+            auto tb = std::chrono::steady_clock::now();
+            uint32_t am;
+            if (!stage2(1, pos, hid.data(), &am)) {
+                fprintf(stderr, "pipe: stage2 step failed\n"); return 1;
+            }
+            auto tc = std::chrono::steady_clock::now();
+            s1Ms += std::chrono::duration<double, std::milli>(tb - ta).count();
+            s2Ms += std::chrono::duration<double, std::milli>(tc - tb).count();
+            next = am;
+            pos++;
+        }
+        uint32_t steps = pos - np;
+        printf("pipe: layers [0,%u)+[%u,%u)%s | prompt %u prefill %.1f ms | %zu tokens, %.2f ms/tok (s1 %.2f, s2%s %.2f)\n",
+               split, split, nLay, net ? " over TCP" : " in-process", np, prefillMs, gen.size(),
+               steps ? (s1Ms + s2Ms) / steps : 0.0, steps ? s1Ms / steps : 0.0,
+               net ? "+net" : "", steps ? s2Ms / steps : 0.0);
+        printf("GEN:");
+        for (uint32_t t : gen) printf(" %u", t);
+        printf("\n");
+        if (fd >= 0) {
+            PipeHdr bye{2, 0, 0, 0};
+            writeAll(fd, &bye, sizeof bye);
+            close(fd);
+        }
+        qk_close(e1);
+        if (e2) qk_close(e2);
+        return 0;
+    }
+
+    if (mode == "verify") {
+        // Spec-decode P0 harness: oracle-draft verify rounds vs the serial stream.
+        // 1) Generate nGen tokens serially -> reference stream S (and decode ms/tok).
+        // 2) Re-run from empty: batch-prefill the prompt, then advance in verify
+        //    rounds that feed K tokens straight from S (an oracle draft = 100%
+        //    acceptance). Every per-position argmax must reproduce S exactly —
+        //    this is the full-accept spec-decode path end to end, and it measures
+        //    the true c(K) verify-round cost incl. argmax + readback.
+        if (argc < 4) {
+            fprintf(stderr, "usage: qk verify <ids-file> <nGen> [K,K,...] [tmax]\n");
+            return 1;
+        }
+        std::vector<uint32_t> prompt;
+        {
+            FILE* f = fopen(argv[2], "r");
+            if (!f) { perror(argv[2]); return 1; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+            fclose(f);
+        }
+        uint32_t nGen = (uint32_t)atoi(argv[3]);
+        std::vector<uint32_t> Ks;
+        if (argc > 4) {
+            for (const char* p = argv[4]; *p;) {
+                Ks.push_back((uint32_t)strtoul(p, (char**)&p, 10));
+                if (*p == ',') p++;
+            }
+        } else {
+            Ks = {8, 16, 32};
+        }
+        uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 4096;
+        qk_config cfg{1, tmax, 8};
+        char err[256] = {0};
+        qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+        if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+
+        // serial reference stream + decode-only ms/token (chunks after prefill ends)
+        std::vector<uint32_t> S = prompt;
+        double serialMsTok = 0;
+        {
+            qk_slot_start(e, 0, prompt.data(), (uint32_t)prompt.size(), nGen, 0);
+            uint32_t ch = qk_chunk(e), fin = 0;
+            std::vector<uint32_t> ot(ch), oc(1);
+            double decodeMs = 0;
+            uint32_t decodeTok = 0;
+            bool prefilled = false;
+            while (true) {
+                auto t0 = std::chrono::steady_clock::now();
+                int act = qk_step_chunk(e, ot.data(), oc.data(), &fin);
+                double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+                if (act <= 0) break;
+                for (uint32_t i = 0; i < oc[0]; i++) S.push_back(ot[i]);
+                if (prefilled) { decodeMs += ms; decodeTok += oc[0]; }
+                if (oc[0] > 0) prefilled = true;
+                if (fin & 1u) break;
+            }
+            serialMsTok = decodeTok ? decodeMs / decodeTok : 0;
+            printf("verify: prompt %zu, serial stream %zu gen tokens, serial decode %.2f ms/tok\n",
+                   prompt.size(), S.size() - prompt.size(), serialMsTok);
+        }
+        uint32_t np = (uint32_t)prompt.size();
+        if (S.size() < (size_t)np + 4) { fprintf(stderr, "stream too short (early EOS?)\n"); return 1; }
+
+        bool allOk = true;
+        printf("  %-4s %8s %10s %8s %10s   %s\n", "K", "rounds", "round_ms", "ms/tok", "vs_serial", "exact");
+        for (uint32_t K : Ks) {
+            if (K < 1 || K > e->maxB) { printf("  K=%u skipped (maxB=%u)\n", K, e->maxB); continue; }
+            // fresh state: batch-prefill the prompt from empty in <=maxB chunks
+            std::vector<float> dummy;
+            for (uint32_t off = 0; off < np;) {
+                uint32_t n = std::min(e->maxB, np - off);
+                e->prefillBatchLast(prompt.data() + off, n, 0, dummy, false, off);
+                off += n;
+            }
+            // oracle rounds: feed S[pos..pos+k) (entry 0 = last committed token);
+            // argmax i must equal S[pos+i+1]
+            uint32_t pos = np, mism = 0, rounds = 0, committed = 0;
+            double roundMs = 0;
+            std::vector<uint32_t> am(e->maxB);
+            while (pos + 1 < (uint32_t)S.size()) {
+                uint32_t k = std::min(K, (uint32_t)S.size() - pos - 1);
+                auto t0 = std::chrono::steady_clock::now();
+                e->prefillBatchLast(&S[pos], k, 0, dummy, false, pos, am.data());
+                roundMs += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t0).count();
+                rounds++;
+                for (uint32_t i = 0; i < k; i++)
+                    if (am[i] != S[pos + i + 1]) mism++;
+                committed += k;
+                pos += k;
+            }
+            double msTok = committed ? roundMs / committed : 0;
+            bool ok = mism == 0;
+            allOk = allOk && ok;
+            printf("  %-4u %8u %10.1f %8.2f %9.2fx   %s\n",
+                   K, rounds, rounds ? roundMs / rounds : 0, msTok,
+                   msTok > 0 ? serialMsTok / msTok : 0, ok ? "EXACT" : "**MISMATCH**");
+            if (!ok) printf("      %u/%u positions diverged\n", mism, committed);
+        }
+        printf("verify: %s\n", allOk ? "ORACLE SPEC ROUNDS TOKEN-EXACT" : "DIVERGENCE (see above)");
+        qk_close(e);
+        return allOk ? 0 : 1;
     }
 
     if (mode == "prefillcmp") {

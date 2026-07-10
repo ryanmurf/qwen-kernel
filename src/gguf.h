@@ -53,15 +53,37 @@ struct GgufTensor {
 
 class Gguf {
   public:
+    // Accepts a single-file GGUF or the FIRST shard of an llama.cpp-style split
+    // model ("<prefix>-00001-of-000NN.gguf", written by llama-gguf-split). For a
+    // split model the shard count comes from the split.count KV; sibling shards
+    // are derived from the filename and merged into one tensor directory. All
+    // non-split KV metadata (arch, tokenizer, ...) lives in shard 1, so callers
+    // that parse KVs from the given path keep working unchanged.
     bool open(const std::string& path) {
-        fd_ = ::open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) { perror(path.c_str()); return false; }
-        struct stat st;
-        fstat(fd_, &st);
-        size_ = (size_t)st.st_size;
-        base_ = (const uint8_t*)mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (base_ == MAP_FAILED) { perror("mmap"); return false; }
-        return parse();
+        uint16_t splitCount = 0;
+        if (!openOne(path, &splitCount)) return false;
+        if (splitCount > 1) {
+            const char* marker = "-00001-of-";
+            size_t tp = path.rfind(marker);
+            bool okName = tp != std::string::npos &&
+                          path.size() == tp + 10 + 5 + 5 &&  // marker + "NNNNN" + ".gguf"
+                          path.compare(path.size() - 5, 5, ".gguf") == 0;
+            if (!okName) {
+                fprintf(stderr, "gguf: split.count=%u but path is not a -00001-of-NNNNN.gguf first shard: %s\n",
+                        splitCount, path.c_str());
+                return false;
+            }
+            std::string prefix = path.substr(0, tp);
+            for (uint16_t i = 2; i <= splitCount; i++) {
+                char name[64];
+                snprintf(name, sizeof name, "-%05u-of-%05u.gguf", i, splitCount);
+                if (!openOne(prefix + name, nullptr)) return false;
+            }
+            if (splitTensorsTotal_ && tensors_.size() != (size_t)splitTensorsTotal_)
+                fprintf(stderr, "gguf: split.tensors.count=%llu but merged %zu tensors\n",
+                        (unsigned long long)splitTensorsTotal_, tensors_.size());
+        }
+        return true;
     }
 
     const GgufTensor* find(const std::string& name) const {
@@ -76,9 +98,23 @@ class Gguf {
   private:
     const uint8_t* base_ = nullptr;
     size_t size_ = 0, pos_ = 0;
-    int fd_ = -1;
     uint64_t alignment_ = 32;
+    uint64_t splitTensorsTotal_ = 0;
     std::map<std::string, GgufTensor> tensors_;
+    std::vector<std::pair<const uint8_t*, size_t>> maps_;  // keeps every shard mapped
+
+    bool openOne(const std::string& path, uint16_t* splitCountOut) {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) { perror(path.c_str()); return false; }
+        struct stat st;
+        fstat(fd, &st);
+        size_ = (size_t)st.st_size;
+        base_ = (const uint8_t*)mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);  // the mapping holds its own reference
+        if (base_ == MAP_FAILED) { perror("mmap"); return false; }
+        maps_.emplace_back(base_, size_);
+        return parse(splitCountOut);
+    }
 
     template <typename T> T rd() {
         T v;
@@ -110,12 +146,13 @@ class Gguf {
         }
     }
 
-    bool parse() {
+    bool parse(uint16_t* splitCountOut) {
         if (size_ < 24 || memcmp(base_, "GGUF", 4) != 0) {
             fprintf(stderr, "not a GGUF file\n");
             return false;
         }
         pos_ = 4;
+        alignment_ = 32;  // per-shard default; each shard may set its own
         uint32_t ver = rd<uint32_t>();
         if (ver < 2) { fprintf(stderr, "gguf v%u unsupported\n", ver); return false; }
         uint64_t nTensors = rd<uint64_t>();
@@ -125,6 +162,8 @@ class Gguf {
             uint32_t t = rd<uint32_t>();
             uint64_t v = skipValue(t);
             if (key == "general.alignment" && v) alignment_ = v;
+            if (key == "split.count" && splitCountOut) *splitCountOut = (uint16_t)v;
+            if (key == "split.tensors.count") splitTensorsTotal_ = v;
         }
         struct Info { std::string name; GgufTensor t; uint64_t off; };
         std::vector<Info> infos(nTensors);

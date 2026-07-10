@@ -7,6 +7,13 @@ metadata:
     app: qk-server
 spec:
   replicas: 0   # starts idle; only one of {gemma-server, qk-server} may hold the GPU at a time
+  # Recreate, NOT RollingUpdate: two overlapping pods cannot both fit the
+  # ~17.6 GB model in 20 GB VRAM. Under overlap the new pod's weights silently
+  # fall back to GTT (host RAM over PCIe) — the server comes up healthy at
+  # ~9 tok/s (symptom: card0 vram ~3 GB, gtt ~27 GB). Recreate kills the old
+  # pod first so the load always lands in VRAM.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: qk-server
@@ -29,17 +36,25 @@ spec:
         - 0.0.0.0
         - --port
         - "8080"
-        # slots*ctx KV must fit VRAM beside the ~15.5 GB model: at slots=4/ctx=16384
-        # the 20 GB card overcommits and spills to GTT (PCIe) -> ~30x slowdown once
-        # long agentic sessions fill their contexts. slots=2 fits with headroom.
+        # slots*ctx KV must fit VRAM beside the ~15.5 GB model (KV is allocated
+        # upfront at open, so the open footprint is the whole story). Measured
+        # clean-open at slots=2 (2026-07-10): ctx 16384 -> 17.65 GB, 24576 ->
+        # 18.28 GB, 32768 -> 18.92 GB, all stable under full-depth touch (29.5k-
+        # token prompt, zero GTT creep). 32768 ships: Claude Code >= 2.2's system
+        # prompt alone is ~29.8k tokens. slots=4/ctx=16384 (~18.1 GB + spikes)
+        # spilled historically; keep slots=2.
         - --slots
         - "2"
         - --ctx
-        - "16384"
+        - "32768"
         - --chunk
         - "8"
         env:
         - name: QK_FORK           # same-prompt requests share one prefill (fork mode)
+          value: "1"
+        - name: QK_SPEC           # prompt-lookup speculative decoding (exact-output;
+          value: "1"              # ~1.5x on echo-heavy turns, neutral otherwise)
+        - name: QK_SPEC_LOG       # one [spec] stats line per request that speculated
           value: "1"
         # Batched prefill flushes its command buffer every QK_SUBMIT_LAYERS layers
         # (engine default 8) so no single vkQueueSubmit can outlive amdgpu's ~10 s

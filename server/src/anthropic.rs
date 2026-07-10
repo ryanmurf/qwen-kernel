@@ -356,7 +356,11 @@ fn fit_to_context(state: &AppState, req: &mut MessagesReq) -> Result<String> {
     const KEEP_RECENT: usize = 6;
     const CTX_RESERVE: u32 = 512; // room for at least a short generation
     let n_ctx = state.engine.n_ctx;
-    let hard = n_ctx.saturating_sub(CTX_RESERVE); // the server would reject beyond this
+    // Purely a quality heuristic — prepare_generation clamps max_gen to the
+    // real capacity — so scale it down on small-ctx servers (tests,
+    // experiments) instead of reserving the whole window away.
+    let reserve = CTX_RESERVE.min(n_ctx / 8);
+    let hard = n_ctx.saturating_sub(reserve); // the server would reject beyond this
     // When we MUST trim, cut down to a lower target so the session has headroom to
     // grow a few more turns with its prefix cache intact — instead of pinning at
     // the ceiling and cold-prefilling ~n_ctx tokens EVERY turn (each trim that
@@ -1217,6 +1221,28 @@ mod tests {
         let prompt = render_prompt(&req).expect("renders");
         assert!(prompt.starts_with("<|im_start|>system\nYou are terse.<|im_end|>\n"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n{\"color\":"));
+    }
+
+    #[test]
+    fn renders_in_messages_system_turns() {
+        // Claude Code >= 2.2 injects system reminders as system-role entries
+        // inside `messages`, alongside the top-level `system` field.
+        let req = req_from_json(json!({
+            "max_tokens": 16,
+            "system": "You are terse.",
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": [
+                    { "type": "text", "text": "<system-reminder>stay on task</system-reminder>" }
+                ]},
+                { "role": "user", "content": "continue" }
+            ]
+        }));
+        let prompt = render_prompt(&req).expect("renders");
+        assert!(prompt.contains(
+            "<|im_start|>system\n<system-reminder>stay on task</system-reminder><|im_end|>\n\
+             <|im_start|>user\ncontinue<|im_end|>\n"
+        ));
     }
 
     #[test]

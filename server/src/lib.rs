@@ -3,6 +3,7 @@ pub mod engine;
 pub mod ffi;
 pub mod gguf;
 pub mod http;
+pub mod split;
 pub mod template;
 pub mod tokenizer;
 

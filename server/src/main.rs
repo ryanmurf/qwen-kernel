@@ -30,6 +30,11 @@ struct Cli {
     chunk: u32,
     #[arg(long, env = "QK_ENGINE_LIB", default_value = "../build/libqk.so")]
     engine_lib: PathBuf,
+    /// Split serving (docs/split-serving.md): host:port of the worker stage
+    /// (`qk pipe-worker`) holding the remaining layers. Requires this process
+    /// to load the head stage (QK_LAYERS=0:S in the environment).
+    #[arg(long)]
+    split_next: Option<String>,
     #[arg(long, default_value_t = 64)]
     queue: usize,
     #[arg(long, value_enum, default_value_t = CliTemplateMode::Auto)]
@@ -69,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
             n_ctx: cli.ctx,
             chunk: cli.chunk,
         },
+        cli.split_next.clone(),
     )?;
     let state = AppState {
         tokenizer,
