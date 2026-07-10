@@ -31,6 +31,12 @@ QK_COPY_WEIGHTS — no-copy weights degrade 2–6× after memory-pressure
 events and don't self-heal); bisect infra (tests/ parity fixtures +
 scripts/bisect_gate.sh, ~6 s/step).
 
+**pp512 update, same day:** GEMM'd router logits in the grouped regime
+(moe_logits_gemm + add_rmsnorm rebind; gates green, semantics proven at
+scalar 36/36 @ 9.7e-5) → **v3 620/614 ms = 825/834 tok/s, gap 1.74×**;
+v4 exact-config 740 ms = 692 tok/s (probe 545 GB/s, coolest state yet —
+scorecard table above predates this).
+
 **pp512 gap = 1.95× and fully budgeted** (N=512 chunk, ms): grouped
 gate+up 230, projections 139 (GEMM-saturated at 10.4 TFLOPs), misc/logits
 113, grouped down 87, DeltaNet chain 76, attention 32. Named levers:
