@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for the midnight (macOS) pipeline-split worker: the Metal
+  qk engine serving layers [22,40) over TCP for tron's split head.
+
+  Install (on midnight; adjust the two ABSOLUTE PATHS for the real repo):
+    cp midnight-qk-worker.plist ~/Library/LaunchAgents/com.qk.pipe-worker.plist
+    launchctl load ~/Library/LaunchAgents/com.qk.pipe-worker.plist
+  Stop / remove:
+    launchctl unload ~/Library/LaunchAgents/com.qk.pipe-worker.plist
+
+  KeepAlive relaunches it on crash; a relaunched worker has EMPTY state and
+  snapshots — the head handles this (fails in-flight requests, reconnects
+  lazily, voids its snapshot registry, next sequences start at base 0).
+  ProcessType Interactive + the caffeinate wrapper keep the GPU clocks and
+  the machine awake while serving. Args: port layers ctx slots — slots/ctx
+  must cover the head's (qk-server-split.yaml runs slots=2, ctx=32768).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.qk.pipe-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>/Users/ryan/IdeaProjects/nes-experimental/qk-metal/qwen-kernel/build/qk</string>
+    <string>pipe-worker</string>
+    <string>18100</string>
+    <string>22:40</string>
+    <string>32768</string>
+    <string>2</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>QK_GGUF</key>
+    <string>/Users/ryan/IdeaProjects/nes-experimental/qk-metal/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf</string>
+    <key>QK_PCACHE</key>
+    <string>6</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/qk-pipe-worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/qk-pipe-worker.log</string>
+</dict>
+</plist>
