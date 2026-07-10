@@ -432,9 +432,17 @@ class), prefilldecode HANDOFF EXACT, prefillbench **285–318 tok/s =
 3.6–3.85× serial** cold, ~3.0–3.5× thermally soaked. QK_GEMM=scalar forces
 the bit-exact f32 path (247 tok/s).
 
-Remaining to B1's 4× and B2's 1452: expert-grouped MoE GEMM (each token
-still re-reads its own experts: 128×10.9 MB/layer, ~14% SLC dedup) and
-dn_step_batch occupancy; then head-to-head pp512.
+Remaining to B1's 4× and B2's 1452, updated by measurement
+(QK_PREFILL_SKIP stage isolation at N=128, chunk 408 ms): **MoE = 218 ms
+(53%)**, projections ≈ 48 ms (f16 GEMM did its job), DeltaNet batch ≈ 0,
+attention ≈ noise. A read-once grouped gu (token→expert counting sort +
+one simdgroup per (expert,row) looping its tokens; bit-identical results,
+36/36) measured SLOWER (522 vs 408 ms) — decisive evidence the MoE stage
+is **ALU-bound on iq3 decode (~152 GB/s effective), not DRAM-bound**. The
+real lever is decode-ONCE: dequantize each expert row to threadgroup
+half-precision and multiply all its tokens GEMM-style (the gemm_q8_0_h
+structure with an assignment gather). Kernels + QK_MOE_GROUPED env kept
+for that next round.
 
 Budget at N=128 (530 ms/chunk): projections ≈180 ms (scalar GEMM), MoE
 ≈180 ms (ungrouped expert reads), dn_step_batch ≈60–120 ms (32 tgs,
