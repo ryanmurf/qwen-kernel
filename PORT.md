@@ -699,6 +699,24 @@ vendors — RDNA3 head, Apple Metal worker — one bit-exact model.**
 Follow-ons (wired link, S sweep, slots=4 worker) tracked on the tron
 side; the midnight worker stays up on :18100.
 
+**Arc complete (tron final, 2026-07-09): clean-sweep S sweep with this
+box idle — S=22 optimal; single-stream 17.0 ms/tok, two-stream
+aggregate 12.5 ms/tok (80 tok/s), token-exact throughout.** The wire
+moved to qkp2 (op3/op4 state ops) mid-arc and this side re-gated on it
+same-day. tron's sweep attributes ~7 ms of layer-insensitive per-frame
+cost to this worker; local repro of the S=33 shape (raw pipe client,
+ctx 32768) finds NO fixed cost at steady state — gpu 2.3 ms + 0.15 ms
+submit, s2+net 2.61 ms/tok — but a first-~32-frames warmup regime
+(9.4 ms wall vs 3.1 gpu: lazy GPU page-table mappings on the mmap
+weights; mlock wires CPU pages only) and an op3-per-frame candidate
+(~134 MB KV stripes per attn layer at 32k ctx ≈ 9 ms) that would both
+read as a fixed tax. Probes for tron's side are in CROSSBOX-BRIEF.md;
+QK_STAGE_STATS=1 on the worker prints the gpu/wall split directly.
+Deploy templates (qk-server-split.yaml, midnight-qk-worker.plist)
+adopted into the tree from main; the worker keeps nohup+caffeinate for
+now. Remaining cross-box items are external: wired ethernet, and the
+per-frame question above.
+
 One false alarm worth recording: an apparent engine-vs-reference
 divergence on prompt 3 was a stale memory of the PRE-fix (accidentally
 sampled) reference — the regenerated greedy ref matches the engine
