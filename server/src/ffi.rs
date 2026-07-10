@@ -25,6 +25,26 @@ type QkSlotStart =
     unsafe extern "C" fn(*mut QkEngineOpaque, u32, *const u32, u32, u32, u32) -> c_int;
 type QkSlotCancel = unsafe extern "C" fn(*mut QkEngineOpaque, u32);
 type QkStepChunk = unsafe extern "C" fn(*mut QkEngineOpaque, *mut u32, *mut u32, *mut u32) -> c_int;
+type QkStageRun = unsafe extern "C" fn(
+    *mut QkEngineOpaque,
+    u32,        // slot
+    *const u32, // toks (first stage) or NULL
+    *const f32, // hidden_in (later stages) or NULL
+    u32,        // n
+    u32,        // base
+    *mut f32,   // hidden_out (non-last stage) or NULL
+    *mut u32,   // ids_out (last stage) or NULL
+) -> c_int;
+
+/// Pipeline-split ABI (engine ≥ 240c63e). Resolved as a group; `None` on
+/// older engine libraries, which still serve unsplit.
+struct StageSymbols {
+    stage_run: QkStageRun,
+    layer_first: QkGetter,
+    layer_end: QkGetter,
+    n_layer: QkGetter,
+    n_embd: QkGetter,
+}
 
 struct Symbols {
     close: QkClose,
@@ -37,6 +57,7 @@ struct Symbols {
     slot_start: QkSlotStart,
     slot_cancel: QkSlotCancel,
     step_chunk: QkStepChunk,
+    stage: Option<StageSymbols>,
 }
 
 pub struct Engine {
@@ -90,6 +111,24 @@ impl Engine {
             slot_start: unsafe { *lib.get(b"qk_slot_start\0")? },
             slot_cancel: unsafe { *lib.get(b"qk_slot_cancel\0")? },
             step_chunk: unsafe { *lib.get(b"qk_step_chunk\0")? },
+            stage: unsafe {
+                match (
+                    lib.get(b"qk_stage_run\0"),
+                    lib.get(b"qk_layer_first\0"),
+                    lib.get(b"qk_layer_end\0"),
+                    lib.get(b"qk_n_layer\0"),
+                    lib.get(b"qk_n_embd\0"),
+                ) {
+                    (Ok(run), Ok(first), Ok(end), Ok(layers), Ok(embd)) => Some(StageSymbols {
+                        stage_run: *run,
+                        layer_first: *first,
+                        layer_end: *end,
+                        n_layer: *layers,
+                        n_embd: *embd,
+                    }),
+                    _ => None,
+                }
+            },
         };
         let model = CString::new(model.as_os_str().to_string_lossy().as_bytes())
             .context("model path contains interior NUL")?;
@@ -192,6 +231,92 @@ impl Engine {
 
     pub fn bos_token(&self) -> u32 {
         unsafe { (self.syms.bos_token)(self.raw) }
+    }
+
+    /// Pipeline-split topology, or `None` when the engine library predates
+    /// the stage ABI (such a library still serves unsplit requests).
+    pub fn stage_info(&self) -> Option<StageInfo> {
+        let s = self.syms.stage.as_ref()?;
+        Some(StageInfo {
+            first: unsafe { (s.layer_first)(self.raw) },
+            end: unsafe { (s.layer_end)(self.raw) },
+            n_layer: unsafe { (s.n_layer)(self.raw) },
+            n_embd: unsafe { (s.n_embd)(self.raw) },
+        })
+    }
+
+    /// Run n positions [base, base+n) of `slot` through this engine's stage
+    /// (see qk_stage_run in qk.h). Exactly one of `toks`/`hidden_in` feeds it
+    /// (ids on the first stage, hidden rows otherwise) and exactly one of
+    /// `hidden_out`/`ids_out` receives it (ids on the last stage). base == 0
+    /// resets the slot. Buffer lengths are validated against n and n_embd.
+    pub fn stage_run(
+        &mut self,
+        slot: u32,
+        toks: Option<&[u32]>,
+        hidden_in: Option<&[f32]>,
+        base: u32,
+        hidden_out: Option<&mut [f32]>,
+        ids_out: Option<&mut [u32]>,
+    ) -> Result<()> {
+        let info = self
+            .stage_info()
+            .context("engine library has no pipeline-split ABI (qk_stage_run)")?;
+        let row = info.n_embd as usize;
+        let n = match (toks, hidden_in) {
+            (Some(t), None) => t.len(),
+            (None, Some(h)) if row > 0 && h.len() % row == 0 => h.len() / row,
+            _ => bail!("stage_run: need exactly one of toks / whole hidden_in rows"),
+        };
+        let n = u32::try_from(n).context("stage_run: batch too long")?;
+        if n == 0 {
+            bail!("stage_run: empty batch");
+        }
+        match (&hidden_out, &ids_out) {
+            (Some(h), None) if h.len() == n as usize * row => {}
+            (None, Some(i)) if i.len() == n as usize => {}
+            _ => bail!("stage_run: need exactly one of hidden_out / ids_out, sized to n"),
+        }
+        let stage = self.syms.stage.as_ref().expect("checked above");
+        let rc = unsafe {
+            (stage.stage_run)(
+                self.raw,
+                slot,
+                toks.map_or(std::ptr::null(), <[u32]>::as_ptr),
+                hidden_in.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                n,
+                base,
+                hidden_out.map_or(std::ptr::null_mut(), <[f32]>::as_mut_ptr),
+                ids_out.map_or(std::ptr::null_mut(), <[u32]>::as_mut_ptr),
+            )
+        };
+        if rc < 0 {
+            bail!("qk_stage_run failed with code {rc}");
+        }
+        Ok(())
+    }
+}
+
+/// Which layer range this engine instance owns (QK_LAYERS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageInfo {
+    pub first: u32,
+    pub end: u32,
+    pub n_layer: u32,
+    pub n_embd: u32,
+}
+
+impl StageInfo {
+    pub fn is_first(&self) -> bool {
+        self.first == 0
+    }
+
+    pub fn is_last(&self) -> bool {
+        self.end == self.n_layer
+    }
+
+    pub fn is_split(&self) -> bool {
+        !(self.is_first() && self.is_last())
     }
 }
 
