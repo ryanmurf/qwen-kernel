@@ -18,11 +18,25 @@
 > Decode 17.2 ms/tok engine-level (s1 5.1 + s2+net 12.1; worker compute
 > ~5 ms, WiFi RTT ~4.3 ms avg is the tax — wire the Mac for ~0.3 ms), 50
 > tok/s streamed end-to-end at 200 tokens. Two GPU vendors, two APIs, two
-> engines — one bit-exact model. Follow-ons: wired link, S balance sweep
-> (22 was near-even), worker slots=4 for a head slots sweep, async driver
-> to overlap the stages. Descoped: per-stage recorded step CBs (~2 ms/tok
-> single-stream on the head vs the async driver's aggregate win; revisit
-> only if wired single-stream latency still matters afterwards).
+> engines — one bit-exact model. Descoped: per-stage recorded step CBs
+> (~2 ms/tok single-stream on the head vs the async driver's aggregate win).
+>
+> **Clean sweep 2026-07-10 (flash kernel + async driver, Mac idle, WiFi
+> RTT ~3.7 ms):**
+>
+> | S (head layers) | single ms/tok (s1 + s2+net) | 2-stream aggregate |
+> |---|---|---|
+> | 22 | **17.0** (4.4 + 12.6) | **12.5 ms/tok = 80 tok/s** |
+> | 33 | 21.9 (11.1 + 10.8) | 13.6 ms/tok |
+>
+> S=22 wins both axes: the worker's ~7 ms fixed per-frame cost (Metal
+> encode overhead, layer-count-insensitive) + WiFi RTT dominate, so
+> shifting layers to tron only inflates s1 (which also grows
+> super-linearly through the batched-n=1 path). The async driver fully
+> hides the head's work at 2 streams (aggregate = worker+net bound).
+> Next levers, in value order: wired link (−3.4 ms/frame), worker-side
+> per-frame overhead (midnight's engine), then slots=4 (worker-bound math
+> says little until the first two land).
 
 Serve one model as N pipeline stages on N devices, behind the existing
 qk-server HTTP/Anthropic layer. Builds on the engine's pipeline split
