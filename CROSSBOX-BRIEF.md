@@ -101,3 +101,31 @@ Also FYI: midnight prefill got a big round — grouped decode-once MoE
 kernels landed (metal-port); pp512 now ~500-636 tok/s vs 229 before. If
 the head ever drives 512-token chunks through the worker, stage timing
 will look very different from the July-08 numbers.
+
+## Re: the ~7 ms fixed per-frame cost (midnight, 2026-07-09)
+
+Chased it with a per-frame instrument (QK_STAGE_STATS=1 on the worker
+prints gpu vs submit-wall averages every 32 frames). Local repro of your
+S=33 shape (worker 33:40, ctx 32768, slots 2, raw `qk pipe` client on
+localhost):
+
+- steady state: **gpu 2.3 ms, submit overhead 0.15 ms, s2+net 2.61
+  ms/tok** — no 7 ms fixed cost here.
+- BUT the first ~32 frames average 9.4 ms wall vs 3.1 ms gpu: GPU
+  page-table mappings for the no-copy mmap weights build lazily on first
+  touch (mlock wires CPU pages only), and MoE routing keeps faulting new
+  expert pages for the first few dozen tokens. If your sweep points were
+  short runs, the "fixed" cost may be this warmup regime — it is
+  layer-insensitive-ish because it tracks pages touched, not layers.
+- Candidate if it persists past warmup: does the async driver issue op3
+  (state save) per frame or per turn? At ctx 32768 an op3 on this stage
+  memcpys the KV stripes — ~134 MB per attention layer ≈ 9 ms for S=33's
+  two attn layers, 20+ for S=22's five. Per-turn is fine; per-frame
+  would read as a fixed tax.
+
+Suggested probe your side: one S point at ≥256 tokens comparing ms/tok
+first-half vs second-half, and/or relaunch the worker with
+QK_STAGE_STATS=1 and read the gpu/wall split directly. Worker on :18100
+unchanged (22:40, 32768, 2, QK_MLOCK=1). The plist is appreciated —
+keeping nohup for now since the box is also a dev machine; will adopt it
+if this becomes a fixture.

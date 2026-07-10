@@ -2079,6 +2079,7 @@ struct qk_engine {
     WB bONorm{nil}, bHeadW{nil}, bEmbdW{nil};
 
     uint32_t maxB = 0;
+    double lastCbGpu = 0, lastCbWall = 0;
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
@@ -2814,8 +2815,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             }
         }
         [enc endEncoding];
+        auto tw0 = std::chrono::steady_clock::now();
         [cb commit];
         [cb waitUntilCompleted];
+        lastCbGpu = cb.GPUEndTime - cb.GPUStartTime;
+        lastCbWall = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
     }
     if (wantLogits)
         memcpy(logits.data(),
@@ -2823,6 +2827,13 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                (size_t)vocab * 4);
     if (argmaxOut) memcpy(argmaxOut, bbTok.contents, (size_t)n * 4);
     if (hiddenOut) memcpy(hiddenOut, bbXin.contents, (size_t)n * nEmbd * 4);   // UMA
+    if (getenv("QK_STAGE_STATS")) {
+        static double gSum = 0, wSum = 0; static uint32_t nCall = 0;
+        gSum += lastCbGpu; wSum += lastCbWall; nCall++;
+        if (nCall % 32 == 0)
+            fprintf(stderr, "[stage] n=%u calls=%u gpu %.2f | submit-wall %.2f ms avg\n",
+                    n, nCall, gSum * 1e3 / nCall, wSum * 1e3 / nCall);
+    }
 }
 
 int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
