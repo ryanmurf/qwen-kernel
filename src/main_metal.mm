@@ -2081,7 +2081,7 @@ struct qk_engine {
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
     id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4,
-        pMoeDG4, pMoeDG6, pMoeDR;
+        pMoeDG4, pMoeDG6, pMoeDGH4, pMoeDGH6, pMoeDR;
     id<MTLBuffer> bbStart, bbATok, bbASlot, bbMDy;
     // Grouped (decode-once) MoE gate+up for prefill chunks. Variants:
     // 1 = v1 read-once (SLOWER — kept as bit-exact control); 2 = v2 f32
@@ -2274,6 +2274,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeGuG4 = getPipe(c, "moe_grouped", "moe_gu_grouped4", 0);
     pMoeDG4  = getPipe(c, "moe_down_grouped", "moe_down_grouped_iq4", 0);
     pMoeDG6  = getPipe(c, "moe_down_grouped", "moe_down_grouped_q6k", 0);
+    pMoeDGH4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_iq4", 0);
+    pMoeDGH6 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_q6k", 0);
     pMoeDR   = getPipe(c, "moe_down_grouped", "moe_down_reduce", 0);
     if (const char* mg = getenv("QK_MOE_GROUPED")) { moeGrouped = atoi(mg); moeGroupN = 0; }
     if (const char* mn = getenv("QK_MOE_GROUP_N")) moeGroupN = (uint32_t)atoi(mn);
@@ -2595,13 +2597,15 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     }
     if (hiddenIn) memcpy(bbXin.contents, hiddenIn, (size_t)n * nEmbd * 4);   // UMA
     else memcpy(bbIds.contents, toks, (size_t)n * 4);
-    // QK_PREFILL_SKIP=proj|moe|dn|attn: drop that stage class from the chunk
+    // QK_PREFILL_SKIP=proj|moe|dn|attn|gu|down: drop that stage class
     // (results are WRONG — timing isolation only)
     static const char* skip = getenv("QK_PREFILL_SKIP");
     const bool skProj = skip && strstr(skip, "proj");
     const bool skMoe  = skip && strstr(skip, "moe");
     const bool skDn   = skip && strstr(skip, "dn");
     const bool skAttn = skip && strstr(skip, "attn");
+    const bool skGu   = skip && strstr(skip, "gu");
+    const bool skDown = skip && strstr(skip, "down");
     if (wantLogits) logits.resize(vocab);
     if (base == 0) resetSlot(slot);
     // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
@@ -2714,6 +2718,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, 512, 256, 8, n};
                 dspz(pMoeGrp, {bbMSel, bbStart, bbATok, bbASlot}, &pcg, 20, 1, 256, 1);
                 bar();
+                if (!skGu) {
                 if (moeGrouped == 4)
                     dspz(pMoeGuG4, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
                                     bbASlot, bbMH}, &pcv, 16, 257 * (512 / 32), 128, 1);
@@ -2727,16 +2732,26 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     dspz(pMoeGuG, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
                                    bbASlot, bbMH}, &pcv, 16, (257 * 512 + nsg - 1) / nsg,
                          thrN, 1);
+                }
                 bar();
-                dspz(L.downQ6 ? pMoeDG6 : pMoeDG4,
-                     {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
-                     &pcv, 16, 257 * (nEmbd / 32), 128, 1);
+                if (!skDown) {
+                if (moeGrouped == 3)
+                    dspz(L.downQ6 ? pMoeDGH6 : pMoeDGH4,
+                         {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
+                         &pcv, 16, 257 * (nEmbd / 64), 256, 1);
+                else
+                    dspz(L.downQ6 ? pMoeDG6 : pMoeDG4,
+                         {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
+                         &pcv, 16, 257 * (nEmbd / 32), 128, 1);
                 bar();
                 dspz(pMoeDR, {bbMDy, bbMSel, bbMY}, &pcv, 16, (nEmbd + 255) / 256, 256, n);
+                }
             } else {
+                if (!skGu)
                 dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
                      (9 * 512 + nsg - 1) / nsg, thrN, n);
                 bar();
+                if (!skDown)
                 dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY},
                      &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
             }
@@ -3475,19 +3490,28 @@ int main(int argc, char** argv) {
             std::vector<float> lS, lB;
             printf("prefillbench: serial (N per-token forwards) vs batched (1 forward), ctx=%u\n", ctx);
             printf("  %-6s %10s %10s %8s %10s\n", "N", "serial_ms", "batch_ms", "speedup", "tok/s_bat");
+            // QK_PB_ONLY=<N>: run just that row; QK_PB_NOSERIAL=1: skip the
+            // serial column (stage-isolation runs don't need it and it's hot)
+            const char* pbOnly = getenv("QK_PB_ONLY");
+            const bool pbNoSer = getenv("QK_PB_NOSERIAL") != nullptr;
             for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u, 192u, 256u, 384u, 512u}) {
                 if (N > cap) continue;
+                if (pbOnly && N != (uint32_t)atoi(pbOnly)) continue;
                 std::mt19937 rng(1234);
                 std::vector<uint32_t> toks(N);
                 for (uint32_t i = 0; i < N; i++) toks[i] = rng() % (e->vocab - 16) + 4;
                 e->prefillBatchLast(toks.data(), N, 0, lB);   // warm
-                e->serialPrefillLogits(toks.data(), N, 1, lS);
-                auto t0 = std::chrono::steady_clock::now();
-                e->serialPrefillLogits(toks.data(), N, 1, lS);
+                double sMs = 0;
+                if (!pbNoSer) {
+                    e->serialPrefillLogits(toks.data(), N, 1, lS);
+                    auto t0 = std::chrono::steady_clock::now();
+                    e->serialPrefillLogits(toks.data(), N, 1, lS);
+                    auto t1 = std::chrono::steady_clock::now();
+                    sMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                }
                 auto t1 = std::chrono::steady_clock::now();
                 e->prefillBatchLast(toks.data(), N, 0, lB);
                 auto t2 = std::chrono::steady_clock::now();
-                double sMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 double bMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
                 printf("  %-6u %10.2f %10.2f %7.2fx %10.0f\n", N, sMs, bMs, sMs / bMs, N / (bMs / 1000.0));
             }
