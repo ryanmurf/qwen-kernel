@@ -127,6 +127,19 @@ everything above (admission, slots, trimming, SSE) is untouched.
    Deployment must not set those envs on either stage; the server warns if
    it sees them alongside `--split-next`.
 
+   Design note for cross-turn reuse in split mode (task #30): driver-side
+   "warm slot" continuation does NOT work — the gated-DeltaNet state cannot
+   rewind, and the fed history is never an exact token prefix of the next
+   turn's prompt (the re-rendered `<|im_end|>` was never generated;
+   retokenization of generated text can drift). Reuse requires the
+   history-boundary snapshot mirrored on the worker: additive engine ABI
+   `qk_state_save/qk_state_load(slot, idx)` over the existing copyStripes /
+   pcache-entry machinery, wire ops op3/op4 carrying `{slot, idx}` (hello
+   magic bumps to "qkp2"), and a head-side token-key table mapping cached
+   prefixes to snapshot indices. The head snapshots both sides at
+   `snap_prefix` during prefill; the next turn restores both sides and
+   prefills only its delta.
+
 ## Correctness gates (mirror the engine harness)
 
 1. `qk pipe` GEN parity already proves the math; the server gate is
