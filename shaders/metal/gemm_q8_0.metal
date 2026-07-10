@@ -194,10 +194,12 @@ kernel void gemm_q8_0_sg(device const block_q8_0* wb [[buffer(0)]],
 }
 
 // f16-fragment variant: W dequantized to half, X staged as half, f32
-// accumulate — the same precision class as llama.cpp Metal prefill
-// (validated downstream by prefillcmp argmax-exactness + CLI parity).
-// BK=64 fits in threadgroup memory at half width: Wsh 128x66h=16.9K,
-// Xsh 64x66h=8.4K.
+// accumulate — llama.cpp Metal's prefill precision class (accepted via
+// prefillcmp argmax-exactness + prefilldecode HANDOFF EXACT). 256 threads
+// = 8 simdgroups; each owns a 16-row band (2 fragment-rows x 8 cols).
+// C fragments store DIRECTLY to Y[N][M] via transposed simdgroup_store —
+// no threadgroup bounce. Safe: M is always a multiple of 8 here, and Y
+// rows up to ceil(N/64)*64 exist (bb buffers are maxB-sized, 64 | maxB).
 constant uint SKH = 66u;
 
 kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
@@ -206,10 +208,9 @@ kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
                         constant GemmPC&         pc [[buffer(3)]],
                         uint3 tid3  [[thread_position_in_threadgroup]],
                         uint3 tgpig [[threadgroup_position_in_grid]],
-                        uint  sgid  [[simdgroup_index_in_threadgroup]],
-                        uint  slid  [[thread_index_in_simdgroup]])
+                        uint  sgid  [[simdgroup_index_in_threadgroup]])
 {
-    const uint tid = tid3.x;              // 0..127 (4 simdgroups)
+    const uint tid = tid3.x;              // 0..255 (8 simdgroups)
     const uint rowBase = tgpig.x * BM;
     const uint tokBase = tgpig.z * BN;
     const uint kb = pc.K >> 5;
@@ -217,14 +218,14 @@ kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
     threadgroup half Wsh[BM * SKH];
     threadgroup half Xsh[BN * SKH];
 
-    simdgroup_float8x8 acc[4][8];
-    for (uint i = 0; i < 4; ++i)
+    simdgroup_float8x8 acc[2][8];
+    for (uint i = 0; i < 2; ++i)
         for (uint j = 0; j < 8; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
 
     for (uint b0 = 0u; b0 < kb; b0 += 2u) {
-        for (uint r = tid; r < BM * 2u; r += 128u) {   // 128 rows x 2 blocks
-            const uint rr = r & (BM - 1u);
-            const uint bi = r >> 7;
+        {   // 256 threads stage 128 rows x 2 blocks: one block each
+            const uint rr = tid & (BM - 1u);
+            const uint bi = tid >> 7;
             const uint wr = rowBase + rr;
             const uint woff = rr * SKH + bi * 32u;
             if (wr < pc.M && b0 + bi < kb) {
@@ -242,7 +243,7 @@ kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
                 for (uint i = 0u; i < 32u; ++i) Wsh[woff + i] = 0.0h;
             }
         }
-        for (uint idx = tid; idx < BN * 64u; idx += 128u) {
+        for (uint idx = tid; idx < BN * 64u; idx += 256u) {
             const uint tt = idx >> 6;
             const uint kk = idx & 63u;
             const uint xt = tokBase + tt;
@@ -252,12 +253,105 @@ kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint kf = 0u; kf < 8u; ++kf) {
-            simdgroup_half8x8 a[4];
-            for (uint mr = 0u; mr < 4u; ++mr)
-                simdgroup_load(a[mr], &Wsh[(sgid * 32u + mr * 8u) * SKH + kf * 8u], SKH);
+            simdgroup_half8x8 a[2];
+            for (uint mr = 0u; mr < 2u; ++mr)
+                simdgroup_load(a[mr], &Wsh[(sgid * 16u + mr * 8u) * SKH + kf * 8u], SKH);
             for (uint nc = 0u; nc < 8u; ++nc) {
                 simdgroup_half8x8 bfr;
                 simdgroup_load(bfr, &Xsh[(nc * 8u) * SKH + kf * 8u], SKH, ulong2(0, 0), true);
+                for (uint mr = 0u; mr < 2u; ++mr)
+                    simdgroup_multiply_accumulate(acc[mr][nc], a[mr], bfr, acc[mr][nc]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // store via per-simd threadgroup bounce. (A direct transposed device
+    // simdgroup_store was blamed for a 21/36 prefillcmp failure that turned
+    // out to be a host thread-count mismatch — the direct store is untested
+    // in isolation and worth revisiting; the bounce is proven.)
+    threadgroup float outb[8 * 8 * 9];
+    for (uint mr = 0u; mr < 2u; ++mr) {
+        for (uint nc = 0u; nc < 8u; ++nc) {
+            threadgroup float* buf = &outb[sgid * (8u * 9u)];
+            simdgroup_store(acc[mr][nc], buf, 9u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint row0 = rowBase + sgid * 16u + mr * 8u;
+            const uint tok0 = tokBase + nc * 8u;
+            const uint fi = tid3.y * 0u + ((tid & 31u) >> 2);
+            const uint fj = ((tid & 31u) & 3u) * 2u;
+            for (uint jj = 0u; jj < 2u; ++jj) {
+                const uint row = row0 + fi;
+                const uint tok = tok0 + fj + jj;
+                if (row < pc.M && tok < pc.N)
+                    y[(ulong)tok * pc.M + row] = buf[fi * 9u + fj + jj];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// bisect variant: half fragments with the EXACT BK=32 staging of the
+// passing f32 twin — isolates two-block staging vs half-fragment math.
+constant uint SKH2 = 34u;
+
+kernel void gemm_q8_0_h32(device const block_q8_0* wb [[buffer(0)]],
+                          device const float*      x  [[buffer(1)]],
+                          device float*            y  [[buffer(2)]],
+                          constant GemmPC&         pc [[buffer(3)]],
+                          uint3 tid3  [[thread_position_in_threadgroup]],
+                          uint3 tgpig [[threadgroup_position_in_grid]],
+                          uint  sgid  [[simdgroup_index_in_threadgroup]],
+                          uint  slid  [[thread_index_in_simdgroup]])
+{
+    const uint tid = tid3.x;
+    const uint rowBase = tgpig.x * BM;
+    const uint tokBase = tgpig.z * BN;
+    const uint kb = pc.K >> 5;
+
+    threadgroup half Wsh[BM * SKH2];
+    threadgroup half Xsh[BN * SKH2];
+    threadgroup float outb[4 * 8 * 9];
+
+    simdgroup_float8x8 acc[4][8];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 8; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
+
+    for (uint b = 0u; b < kb; ++b) {
+        for (uint r = tid; r < BM; r += 128u) {
+            const uint wr = rowBase + r;
+            const uint woff = r * SKH2;
+            if (wr < pc.M) {
+                device const block_q8_0& blk = wb[(ulong)wr * kb + b];
+                const half d = blk.d;
+                device const packed_char4* qp = (device const packed_char4*)blk.qs;
+                for (uint i = 0u; i < 8u; ++i) {
+                    const char4 q = char4(qp[i]);
+                    Wsh[woff + 4u*i + 0u] = d * half(q.x);
+                    Wsh[woff + 4u*i + 1u] = d * half(q.y);
+                    Wsh[woff + 4u*i + 2u] = d * half(q.z);
+                    Wsh[woff + 4u*i + 3u] = d * half(q.w);
+                }
+            } else {
+                for (uint i = 0u; i < 32u; ++i) Wsh[woff + i] = 0.0h;
+            }
+        }
+        for (uint idx = tid; idx < BN * 32u; idx += 128u) {
+            const uint tt = idx >> 5;
+            const uint kk = idx & 31u;
+            const uint xt = tokBase + tt;
+            const uint xk = (b << 5) + kk;
+            Xsh[tt * SKH2 + kk] = (xt < pc.N && xk < pc.K) ? half(x[(ulong)xt * pc.K + xk]) : 0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kf = 0u; kf < 4u; ++kf) {
+            simdgroup_half8x8 a[4];
+            for (uint mr = 0u; mr < 4u; ++mr)
+                simdgroup_load(a[mr], &Wsh[(sgid * 32u + mr * 8u) * SKH2 + kf * 8u], SKH2);
+            for (uint nc = 0u; nc < 8u; ++nc) {
+                simdgroup_half8x8 bfr;
+                simdgroup_load(bfr, &Xsh[(nc * 8u) * SKH2 + kf * 8u], SKH2, ulong2(0, 0), true);
                 for (uint mr = 0u; mr < 4u; ++mr)
                     simdgroup_multiply_accumulate(acc[mr][nc], a[mr], bfr, acc[mr][nc]);
             }
@@ -265,7 +359,6 @@ kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    threadgroup float outb[4 * 8 * 9];
     for (uint mr = 0u; mr < 4u; ++mr) {
         for (uint nc = 0u; nc < 8u; ++nc) {
             threadgroup float* buf = &outb[sgid * (8u * 9u)];

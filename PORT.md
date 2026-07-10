@@ -420,12 +420,22 @@ and the z-per-token MoE are the gaps.
 | simdgroup_float8x8, BK=32 | 1.03 TFLOPS | 1.39 TFLOPS | PASS 2e-3 — **slower**: f32 MMA ≈ scalar on Apple + fragment-store tail |
 | simdgroup_half8x8, BK=64 | — | — | **FAIL 0.9 rel — bug** (structural, not f16 rounding; bisect vs the passing f32 twin next: BK=64 two-block staging is the delta) |
 
-Engine ships the exact scalar kernel (QK_GEMM=sg|h opt-in). prefillbench:
-219–247 tok/s at chunks 64–256 = 2.6–2.9× serial. B1's ≥4× and B2's 1452
-need: fixed f16 fragments (llama.cpp precedent — our greedy parity already
-holds against THEIR f16 prefill, and prefillcmp/prefilldecode/CLI gates
-decide acceptance), then expert-grouped MoE GEMM (today each token re-reads
-its own experts: 128×10.9 MB/layer with only ~14% SLC dedup).
+UPDATE (same day): the half8x8 "bug" was three things at once, now
+resolved: (1) the synthetic 1e-2 tolerance is unpassable for ANY f16-input
+GEMM under cancellation (llama.cpp's own prefill would fail it) — the real
+gate is model-logit argmax-exactness; (2) a rewrite to 8 simdgroups + BK=64
++ direct transposed device simdgroup_store regressed the gates, which was
+finally a HOST bug — dispatching the 256-thread kernel with 128 threads
+(half the simds never staged/computed); (3) with threads fixed and the
+proven bounce store, **gemm_q8_0_h is the engine default**: prefillcmp
+36/36 TOKEN-EXACT (worst rel logit 0.073 — llama.cpp's f16 precision
+class), prefilldecode HANDOFF EXACT, prefillbench **285–318 tok/s =
+3.6–3.85× serial** cold, ~3.0–3.5× thermally soaked. QK_GEMM=scalar forces
+the bit-exact f32 path (247 tok/s).
+
+Remaining to B1's 4× and B2's 1452: expert-grouped MoE GEMM (each token
+still re-reads its own experts: 128×10.9 MB/layer, ~14% SLC dedup) and
+dn_step_batch occupancy; then head-to-head pp512.
 
 Budget at N=128 (530 ms/chunk): projections ≈180 ms (scalar GEMM), MoE
 ≈180 ms (ungrouped expert reads), dn_step_batch ≈60–120 ms (32 tgs,
