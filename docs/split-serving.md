@@ -20,7 +20,9 @@
 > tok/s streamed end-to-end at 200 tokens. Two GPU vendors, two APIs, two
 > engines — one bit-exact model. Follow-ons: wired link, S balance sweep
 > (22 was near-even), worker slots=4 for a head slots sweep, async driver
-> to overlap the stages.
+> to overlap the stages. Descoped: per-stage recorded step CBs (~2 ms/tok
+> single-stream on the head vs the async driver's aggregate win; revisit
+> only if wired single-stream latency still matters afterwards).
 
 Serve one model as N pipeline stages on N devices, behind the existing
 qk-server HTTP/Anthropic layer. Builds on the engine's pipeline split

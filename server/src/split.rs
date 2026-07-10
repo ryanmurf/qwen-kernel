@@ -51,6 +51,12 @@ pub struct WorkerLink {
     n_embd: usize,
     expect: WorkerExpect,
     stream: Option<TcpStream>,
+    // Reply sizes (in ids) for op1 frames sent but not yet answered — the
+    // worker processes frames strictly in order, so replies match FIFO.
+    // Pipelining rule: at most 2 in flight (a 1 MiB prefill frame fits the
+    // socket buffers; replies are <= 512 B so the worker never blocks on
+    // writing one, hence no deadlock).
+    pending: VecDeque<u32>,
 }
 
 impl WorkerLink {
@@ -60,6 +66,7 @@ impl WorkerLink {
             n_embd: expect.n_embd as usize,
             expect,
             stream: None,
+            pending: VecDeque::new(),
         }
     }
 
@@ -119,45 +126,83 @@ impl WorkerLink {
     /// connection: it is dropped and the next call reconnects fresh (safe —
     /// sequences always restart at base 0, which resets the worker slot).
     pub fn run(&mut self, slot: u32, base: u32, hidden: &[f32], ids_out: &mut Vec<u32>) -> Result<()> {
-        let result = self.run_inner(slot, base, hidden, ids_out);
-        if result.is_err() {
-            self.stream = None;
-        }
-        result
+        self.send_run(slot, base, hidden)?;
+        self.recv_ids(ids_out)
     }
 
-    fn run_inner(
-        &mut self,
-        slot: u32,
-        base: u32,
-        hidden: &[f32],
-        ids_out: &mut Vec<u32>,
-    ) -> Result<()> {
-        let n = hidden.len() / self.n_embd;
-        let stream = self.stream()?;
-        let mut frame = Vec::with_capacity(16 + hidden.len() * 4);
-        for word in [1u32, slot, n as u32, base] {
-            frame.extend_from_slice(&word.to_le_bytes());
+    /// Fire an op1 frame without waiting for the reply (pipelining: the
+    /// worker computes it while the head computes the next chunk/slot).
+    pub fn send_run(&mut self, slot: u32, base: u32, hidden: &[f32]) -> Result<()> {
+        let n = (hidden.len() / self.n_embd) as u32;
+        let result = (|| {
+            let stream = self.stream()?;
+            let mut frame = Vec::with_capacity(16 + hidden.len() * 4);
+            for word in [1u32, slot, n, base] {
+                frame.extend_from_slice(&word.to_le_bytes());
+            }
+            for value in hidden {
+                frame.extend_from_slice(&value.to_le_bytes());
+            }
+            stream.write_all(&frame).context("split worker write")
+        })();
+        match result {
+            Ok(()) => {
+                self.pending.push_back(n);
+                Ok(())
+            }
+            Err(err) => {
+                self.poison();
+                Err(err)
+            }
         }
-        for value in hidden {
-            frame.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Receive the oldest in-flight frame's ids (FIFO order).
+    pub fn recv_ids(&mut self, ids_out: &mut Vec<u32>) -> Result<()> {
+        let Some(n) = self.pending.front().copied() else {
+            anyhow::bail!("split worker recv with nothing in flight");
+        };
+        let result = (|| {
+            let stream = self.stream()?;
+            let mut reply = vec![0u8; n as usize * 4];
+            stream.read_exact(&mut reply).context("split worker read")?;
+            ids_out.clear();
+            ids_out.extend(
+                reply
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            );
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.pending.pop_front();
+                Ok(())
+            }
+            Err(err) => {
+                self.poison();
+                Err(err)
+            }
         }
-        stream.write_all(&frame).context("split worker write")?;
-        let mut reply = vec![0u8; n * 4];
-        stream.read_exact(&mut reply).context("split worker read")?;
-        ids_out.clear();
-        ids_out.extend(
-            reply
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        );
-        Ok(())
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn poison(&mut self) {
+        self.stream = None;
+        self.pending.clear();
     }
 
     /// State snapshot save (op 3) / load (op 4) of `slot` to/from the
     /// worker's snapshot entry `idx`. Mirrors the head-side qk_state_save/
-    /// load so both stages' states move together.
+    /// load so both stages' states move together. Must not interleave with
+    /// in-flight op1 frames (replies would misalign).
     pub fn state_op(&mut self, save: bool, slot: u32, idx: u32) -> Result<()> {
+        if !self.pending.is_empty() {
+            anyhow::bail!("state_op with {} run frames in flight", self.pending.len());
+        }
         let result = (|| {
             let stream = self.stream()?;
             let mut frame = [0u8; 16];
@@ -175,7 +220,7 @@ impl WorkerLink {
             Ok(())
         })();
         if result.is_err() {
-            self.stream = None;
+            self.poison();
         }
         result
     }
@@ -223,6 +268,9 @@ fn apply_sample(state: &mut SlotState, id: u32, eos: u32) -> bool {
 /// Chunked prefill of `prompt[start..end)` through both stages from
 /// base=start (start 0 resets the slot on both engines; start>0 continues
 /// restored state); returns the worker's id after position end-1.
+/// PIPELINED: the frame for chunk k is in flight while the head computes
+/// chunk k+1, so wall time ≈ max(head, worker) per chunk, not the sum.
+/// Returns with nothing in flight.
 #[allow(clippy::too_many_arguments)]
 fn split_prefill(
     head: &mut Engine,
@@ -241,9 +289,16 @@ fn split_prefill(
         hidden.clear();
         hidden.resize(chunk.len() * n_embd, 0.0);
         head.stage_run(slot, Some(chunk), None, base, Some(hidden.as_mut_slice()), None)?;
-        link.run(slot, base, hidden, ids)?;
-        last = ids.last().copied();
+        link.send_run(slot, base, hidden)?;
+        while link.in_flight() > 1 {
+            link.recv_ids(ids)?;
+            last = ids.last().copied();
+        }
         base += chunk.len() as u32;
+    }
+    while link.in_flight() > 0 {
+        link.recv_ids(ids)?;
+        last = ids.last().copied();
     }
     last.context("split prefill produced no ids")
 }
@@ -465,8 +520,13 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
         }
 
         if any_active {
-            // One token per active slot per pass (round-robin fairness).
+            // One token per active slot per pass, PIPELINED: fire every
+            // slot's frame after its local stage (phase 1) so the worker
+            // computes slot A while the head computes slot B; collect the
+            // replies in send order (phase 2). Worker+net time hides behind
+            // local compute whenever >1 slot is active.
             let mut failure: Option<String> = None;
+            let mut stepped: Vec<usize> = Vec::with_capacity(n_slots);
             for (slot, state) in slots.iter_mut().enumerate() {
                 let Some((slot_state, seq)) = state.as_mut() else {
                     continue;
@@ -476,7 +536,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 }
                 hidden.clear();
                 hidden.resize(n_embd, 0.0);
-                let step = head
+                let sent = head
                     .stage_run(
                         slot as u32,
                         Some(&[seq.next]),
@@ -485,9 +545,24 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                         Some(hidden.as_mut_slice()),
                         None,
                     )
-                    .and_then(|()| link.run(slot as u32, seq.pos, &hidden, &mut ids));
-                match step {
+                    .and_then(|()| link.send_run(slot as u32, seq.pos, &hidden));
+                match sent {
+                    Ok(()) => stepped.push(slot),
+                    Err(err) => {
+                        failure = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+            for slot in stepped {
+                if failure.is_some() {
+                    break;
+                }
+                match link.recv_ids(&mut ids) {
                     Ok(()) => {
+                        let Some((slot_state, seq)) = slots[slot].as_mut() else {
+                            continue;
+                        };
                         seq.pos += 1;
                         let id = ids[0];
                         if apply_sample(slot_state, id, eos) {
@@ -495,14 +570,10 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                         }
                         match flush_slot(slot_state) {
                             FlushOutcome::Live => {}
-                            FlushOutcome::Drained => *state = None,
-                            FlushOutcome::Closed => *state = None,
+                            FlushOutcome::Drained | FlushOutcome::Closed => slots[slot] = None,
                         }
                     }
-                    Err(err) => {
-                        failure = Some(err.to_string());
-                        break;
-                    }
+                    Err(err) => failure = Some(err.to_string()),
                 }
             }
             if let Some(message) = failure {
