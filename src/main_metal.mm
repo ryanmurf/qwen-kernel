@@ -840,6 +840,7 @@ static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
     id<MTLBuffer> bH2 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
     id<MTLBuffer> bH3 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
     id<MTLBuffer> bH4 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
+    id<MTLBuffer> bH5 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
     id<MTLBuffer> bStart = createBuf(c, 258 * 4, nullptr, true);
     id<MTLBuffer> bATok = createBuf(c, (size_t)n * 9 * 4, nullptr, true);
     id<MTLBuffer> bASlot = createBuf(c, (size_t)n * 9 * 4, nullptr, true);
@@ -852,6 +853,7 @@ static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
     id<MTLComputePipelineState> pG2  = getPipe(c, "moe_grouped", "moe_gu_grouped2", 0);
     id<MTLComputePipelineState> pG3  = getPipe(c, "moe_grouped", "moe_gu_grouped3", 0);
     id<MTLComputePipelineState> pG4  = getPipe(c, "moe_grouped", "moe_gu_grouped4", 0);
+    id<MTLComputePipelineState> pG5  = getPipe(c, "moe_grouped", "moe_gu_grouped5", 0);
 
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, nFf, nExp, nUsed};
     struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, nFf, nExp, nUsed, n};
@@ -865,9 +867,9 @@ static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
         [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, z)
             threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
     };
-    auto runAll = [&](bool bench) -> std::array<double, 5> {
-        std::array<double, 5> ms{0, 0, 0, 0, 0};
-        for (int which = 0; which < 5; which++) {
+    auto runAll = [&](bool bench) -> std::array<double, 6> {
+        std::array<double, 6> ms{0, 0, 0, 0, 0, 0};
+        for (int which = 0; which < 6; which++) {
             @autoreleasepool {
                 id<MTLCommandBuffer> cb = [c.queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc =
@@ -888,9 +890,12 @@ static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
                         else if (which == 3)
                             dsp(enc, pG3, {bGE, bUE, bGS, bUS, bX, bStart, bATok, bASlot, bH3},
                                 &pcv, 16, (nExp + 1) * (nFf / 64), 256, 1);
-                        else
+                        else if (which == 4)
                             dsp(enc, pG4, {bGE, bUE, bGS, bUS, bX, bStart, bATok, bASlot, bH4},
                                 &pcv, 16, (nExp + 1) * (nFf / 32), 128, 1);
+                        else
+                            dsp(enc, pG5, {bGE, bUE, bGS, bUS, bX, bStart, bATok, bASlot, bH5},
+                                &pcv, 16, (nExp + 1) * (nFf / 32), 128, (n + 31) / 32);
                     }
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
@@ -909,12 +914,13 @@ static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
     const float* h2 = (const float*)bH2.contents;
     const float* h3 = (const float*)bH3.contents;
     const float* h4 = (const float*)bH4.contents;
+    const float* h5 = (const float*)bH5.contents;
     double rms = 0;
     for (size_t i = 0; i < (size_t)n * hs; i++) rms += (double)h0[i] * h0[i];
     rms = std::sqrt(rms / ((size_t)n * hs));
     const double floorD = std::max(1e-4, 1e-3 * rms);
     uint32_t diff1 = 0;
-    double maxRel2 = 0, maxRel3 = 0, maxRel4 = 0;
+    double maxRel2 = 0, maxRel3 = 0, maxRel4 = 0, maxRel5 = 0;
     size_t argRel2 = 0, argRel3 = 0;
     for (size_t i = 0; i < (size_t)n * hs; i++) {
         if (h1[i] != h0[i]) diff1++;
@@ -927,6 +933,9 @@ static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
         rel = std::fabs((double)h4[i] - h0[i]) /
               std::max(floorD, (double)std::fabs(h0[i]));
         maxRel4 = std::max(maxRel4, rel);
+        rel = std::fabs((double)h5[i] - h0[i]) /
+              std::max(floorD, (double)std::fabs(h0[i]));
+        maxRel5 = std::max(maxRel5, rel);
     }
     printf("v1 (bit-exact control): %u/%zu entries differ -> %s\n",
            diff1, (size_t)n * hs, diff1 ? "FAIL" : "PASS");
@@ -937,12 +946,13 @@ static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
            "(h0=%g h3=%g)\n", maxRel3, argRel3 / hs, (argRel3 % hs) / nFf,
            argRel3 % nFf, h0[argRel3], h3[argRel3]);
     printf("v4 (f32 wide):          max_rel = %.3g\n", maxRel4);
+    printf("v5 (f16 occ 32-row):    max_rel = %.3g\n", maxRel5);
 
     if (iters > 0) {
         runAll(true);
         auto ms = runAll(true);
-        printf("bench (%u iters): ungrouped %.3f ms | v1 %.3f ms | v2 %.3f ms | v3 %.3f ms | v4 %.3f ms\n",
-               iters, ms[0], ms[1], ms[2], ms[3], ms[4]);
+        printf("bench (%u iters): ungrouped %.3f ms | v1 %.3f ms | v2 %.3f ms | v3 %.3f ms | v4 %.3f ms | v5 %.3f ms\n",
+               iters, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5]);
     }
     return diff1 == 0;
 }
@@ -2083,7 +2093,7 @@ struct qk_engine {
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
-    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4,
+    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4, pMoeGuG5,
         pMoeDG4, pMoeDG6, pMoeDGH4, pMoeDGH6, pMoeDR, pLogG;
     id<MTLBuffer> bbStart, bbATok, bbASlot, bbMDy;
     // Grouped (decode-once) MoE gate+up for prefill chunks. Variants:
@@ -2294,6 +2304,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeGuG2 = getPipe(c, "moe_grouped", "moe_gu_grouped2", 0);
     pMoeGuG3 = getPipe(c, "moe_grouped", "moe_gu_grouped3", 0);
     pMoeGuG4 = getPipe(c, "moe_grouped", "moe_gu_grouped4", 0);
+    pMoeGuG5 = getPipe(c, "moe_grouped", "moe_gu_grouped5", 0);
     pMoeDG4  = getPipe(c, "moe_down_grouped", "moe_down_grouped_iq4", 0);
     pMoeDG6  = getPipe(c, "moe_down_grouped", "moe_down_grouped_q6k", 0);
     pMoeDGH4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_iq4", 0);
@@ -2765,7 +2776,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 dspz(pMoeGrp, {bbMSel, bbStart, bbATok, bbASlot}, &pcg, 20, 1, 256, 1);
                 bar();
                 if (!skGu) {
-                if (moeGrouped == 4)
+                if (moeGrouped == 5)
+                    dspz(pMoeGuG5, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
+                                    bbASlot, bbMH}, &pcv, 16, 257 * (512 / 32), 128,
+                         (n + 31) / 32);
+                else if (moeGrouped == 4)
                     dspz(pMoeGuG4, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
                                     bbASlot, bbMH}, &pcv, 16, 257 * (512 / 32), 128, 1);
                 else if (moeGrouped == 3)
@@ -2781,7 +2796,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 }
                 bar();
                 if (!skDown) {
-                if (moeGrouped == 3)
+                if (moeGrouped == 3 || moeGrouped == 5)
                     dspz(L.downQ6 ? pMoeDGH6 : pMoeDGH4,
                          {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
                          &pcv, 16, 257 * (nEmbd / 64), 256, 1);
