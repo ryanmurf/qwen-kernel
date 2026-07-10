@@ -2094,7 +2094,7 @@ struct qk_engine {
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
     id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4, pMoeGuG5,
-        pMoeDG4, pMoeDG6, pMoeDGH4, pMoeDGH6, pMoeDR, pLogG;
+        pMoeDG4, pMoeDG6, pMoeDGH4, pMoeDGH6, pMoeDGP4, pMoeDGP6, pMoeDR, pLogG;
     id<MTLBuffer> bbStart, bbATok, bbASlot, bbMDy;
     // Grouped (decode-once) MoE gate+up for prefill chunks. Variants:
     // 1 = v1 read-once (SLOWER — kept as bit-exact control); 2 = v2 f32
@@ -2312,6 +2312,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeDG6  = getPipe(c, "moe_down_grouped", "moe_down_grouped_q6k", 0);
     pMoeDGH4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_iq4", 0);
     pMoeDGH6 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_q6k", 0);
+    pMoeDGP4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_p_iq4", 0);
+    pMoeDGP6 = getPipe(c, "moe_down_grouped", "moe_down_grouped_p_q6k", 0);
     pMoeDR   = getPipe(c, "moe_down_grouped", "moe_down_reduce", 0);
     pLogG    = getPipe(c, "moe_logits", "moe_logits_gemm", 0);
     if (const char* mg = getenv("QK_MOE_GROUPED")) { moeGrouped = atoi(mg); moeGroupN = 0; }
@@ -2799,7 +2801,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 }
                 bar();
                 if (!skDown) {
-                if (moeGrouped == 3 || moeGrouped == 5)
+                if (moeGrouped == 5)
+                    dspz(L.downQ6 ? pMoeDGP6 : pMoeDGP4,
+                         {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
+                         &pcv, 16, 257 * (nEmbd / 64), 128, (n + 31) / 32);
+                else if (moeGrouped == 3)
                     dspz(L.downQ6 ? pMoeDGH6 : pMoeDGH4,
                          {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
                          &pcv, 16, 257 * (nEmbd / 64), 256, 1);
