@@ -462,12 +462,12 @@ Scorecard today (this box, this GGUF) and the plan to flip every ✗:
 | axis | llama.cpp | qk | plan |
 |---|---|---|---|
 | decode 1-stream | 84.2 tok/s | **120.5 ✓** (parity ✓) | stretch to 150 (C3) |
-| prefill batched | 1452 tok/s | ✗ serial ~110 | B1 ≥4× serial, B2 GEMM ≥1452 |
-| serving/multi-slot | llama-server | ✗ none yet | A1-A5 (M5) |
-| agg. throughput | --parallel N | ✗ | B3 z-axis slots ≥ llama.cpp |
+| prefill batched | 1452 tok/s | **318** (argmax-exact, 3.85× serial) | B: grouped-MoE GEMM next |
+| serving/multi-slot | llama-server | **✓ full stack + CLI round trip** | done (M5) |
+| agg. throughput | --parallel N | **146.3 tok/s @ 8 slots** (1.74× their 1-stream) | B3 head-to-head pending |
+| long ctx | 256k | **✓ 32k engine / 29.8k proven live** | C2 f16 KV for headroom |
 | load time / RSS | mmap no-copy | ✗ 15 GB copy | C1 no-copy MTLBuffer + offsets |
-| long ctx | 256k | ✗ tmax 128, fa cap 1024 | C2 srv attention kernels, f16 KV, ctx 16k |
-| quality | reference | ✓ token-exact | keep: parity gate on every change |
+| quality | reference | ✓ token-exact everywhere | parity gate on every change |
 
 **Phase A — serving foundation (M5):**
 A1 port batch/srv kernels: gemm_q8_0, fa_prep/attn_batch, fa_prep/attn_srv,
