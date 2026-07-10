@@ -200,7 +200,7 @@ kernel void gemm_q8_0_sg(device const block_q8_0* wb [[buffer(0)]],
 // C fragments store DIRECTLY to Y[N][M] via transposed simdgroup_store —
 // no threadgroup bounce. Safe: M is always a multiple of 8 here, and Y
 // rows up to ceil(N/64)*64 exist (bb buffers are maxB-sized, 64 | maxB).
-constant uint SKH = 66u;
+constant uint SKH = 68u;   // 8B-aligned rows for half4 staging stores
 
 kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
                         device const float*      x  [[buffer(1)]],
@@ -228,27 +228,25 @@ kernel void gemm_q8_0_h(device const block_q8_0* wb [[buffer(0)]],
             const uint bi = tid >> 7;
             const uint wr = rowBase + rr;
             const uint woff = rr * SKH + bi * 32u;
+            threadgroup half4* w4 = (threadgroup half4*)&Wsh[woff];
             if (wr < pc.M && b0 + bi < kb) {
                 device const block_q8_0& blk = wb[(ulong)wr * kb + b0 + bi];
                 const half d = blk.d;
                 device const packed_char4* qp = (device const packed_char4*)blk.qs;
-                for (uint i = 0u; i < 8u; ++i) {
-                    const char4 q = char4(qp[i]);
-                    Wsh[woff + 4u*i + 0u] = d * half(q.x);
-                    Wsh[woff + 4u*i + 1u] = d * half(q.y);
-                    Wsh[woff + 4u*i + 2u] = d * half(q.z);
-                    Wsh[woff + 4u*i + 3u] = d * half(q.w);
-                }
+                for (uint i = 0u; i < 8u; ++i)
+                    w4[i] = d * half4(char4(qp[i]));
             } else {
-                for (uint i = 0u; i < 32u; ++i) Wsh[woff + i] = 0.0h;
+                for (uint i = 0u; i < 8u; ++i) w4[i] = half4(0.0h);
             }
         }
-        for (uint idx = tid; idx < BN * 64u; idx += 256u) {
+        for (uint idx = tid * 4u; idx < BN * 64u; idx += 256u * 4u) {
             const uint tt = idx >> 6;
             const uint kk = idx & 63u;
             const uint xt = tokBase + tt;
             const uint xk = (b0 << 5) + kk;
-            Xsh[tt * SKH + kk] = (xt < pc.N && xk < pc.K) ? half(x[(ulong)xt * pc.K + xk]) : 0.0h;
+            ((threadgroup half4*)&Xsh[tt * SKH + kk])[0] = (xt < pc.N && xk < pc.K)
+                ? half4(*(device const packed_float4*)(x + (ulong)xt * pc.K + xk))
+                : half4(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -376,5 +374,93 @@ kernel void gemm_q8_0_h32(device const block_q8_0* wb [[buffer(0)]],
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
+    }
+}
+
+// Wide-token variant for large-N prefill: BM=64 x BN=128 (vs h's 128x64).
+// Same f16 staging/precision class; W-decode per output element HALVES
+// because each staged 64-row tile is multiplied against 128 token columns.
+// 8 simdgroups: each owns an 8-row band x all 16 column fragments.
+// Grid: x = ceil(M/64), z = ceil(N/128). QK_GEMM=h2.
+constant uint BM2 = 64u, BN2 = 128u;
+
+kernel void gemm_q8_0_h2(device const block_q8_0* wb [[buffer(0)]],
+                         device const float*      x  [[buffer(1)]],
+                         device float*            y  [[buffer(2)]],
+                         constant GemmPC&         pc [[buffer(3)]],
+                         uint3 tid3  [[thread_position_in_threadgroup]],
+                         uint3 tgpig [[threadgroup_position_in_grid]],
+                         uint  sgid  [[simdgroup_index_in_threadgroup]])
+{
+    const uint tid = tid3.x;              // 0..255 (8 simdgroups)
+    const uint rowBase = tgpig.x * BM2;
+    const uint tokBase = tgpig.z * BN2;
+    const uint kb = pc.K >> 5;
+
+    threadgroup half Wsh[BM2 * SKH];
+    threadgroup half Xsh[BN2 * SKH];
+    threadgroup float outb[8u * 72u];
+
+    simdgroup_float8x8 acc[16];
+    for (uint j = 0u; j < 16u; ++j) acc[j] = simdgroup_float8x8(0.0f);
+
+    // staging assignment: (row, block, half-block) per thread
+    const uint rr = tid >> 2;             // 0..63
+    const uint sbi = (tid >> 1) & 1u;     // block within BK=64 chunk
+    const uint shf = tid & 1u;            // 16-elem half of the block
+
+    for (uint b0 = 0u; b0 < kb; b0 += 2u) {
+        {
+            const uint wr = rowBase + rr;
+            threadgroup half4* w4 =
+                (threadgroup half4*)&Wsh[rr * SKH + sbi * 32u + shf * 16u];
+            if (wr < pc.M && b0 + sbi < kb) {
+                device const block_q8_0& blk = wb[(ulong)wr * kb + b0 + sbi];
+                const half d = blk.d;
+                device const packed_char4* qp =
+                    (device const packed_char4*)&blk.qs[shf * 16u];
+                for (uint i = 0u; i < 4u; ++i)
+                    w4[i] = d * half4(char4(qp[i]));
+            } else {
+                for (uint i = 0u; i < 4u; ++i) w4[i] = half4(0.0h);
+            }
+        }
+        for (uint idx = tid * 4u; idx < BN2 * 64u; idx += 256u * 4u) {
+            const uint tt = idx >> 6;
+            const uint kk = idx & 63u;
+            const uint xt = tokBase + tt;
+            const uint xk = (b0 << 5) + kk;
+            ((threadgroup half4*)&Xsh[tt * SKH + kk])[0] = (xt < pc.N && xk < pc.K)
+                ? half4(*(device const packed_float4*)(x + (ulong)xt * pc.K + xk))
+                : half4(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kf = 0u; kf < 8u; ++kf) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, &Wsh[(sgid * 8u) * SKH + kf * 8u], SKH);
+            for (uint nc = 0u; nc < 16u; ++nc) {
+                simdgroup_half8x8 bfr;
+                simdgroup_load(bfr, &Xsh[(nc * 8u) * SKH + kf * 8u], SKH, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc[nc], a, bfr, acc[nc]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* buf = &outb[sgid * 72u];
+    const uint fi = (tid & 31u) >> 2;
+    const uint fj0 = (tid & 3u) * 2u;
+    for (uint nc = 0u; nc < 16u; ++nc) {
+        simdgroup_store(acc[nc], buf, 9u);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const uint row = rowBase + sgid * 8u + fi;
+        const uint tok0 = tokBase + nc * 8u;
+        for (uint jj = 0u; jj < 2u; ++jj) {
+            const uint tok = tok0 + fj0 + jj;
+            if (row < pc.M && tok < pc.N)
+                y[(ulong)tok * pc.M + row] = buf[fi * 9u + fj0 + jj];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
