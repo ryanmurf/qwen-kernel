@@ -24,6 +24,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -2210,13 +2211,30 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     initMtl(c, "libqk");
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     {   // ONE no-copy buffer over the mmap: zero weight copies at open.
+        // QK_COPY_WEIGHTS=1: copy the GGUF into a device-owned shared buffer
+        // instead (RSS +16.6 GB) — probe for mmap-residency overhead.
         const size_t psz = (size_t)getpagesize();
         const size_t len = (g.size() + psz - 1) & ~(psz - 1);
-        gbuf = [c.dev newBufferWithBytesNoCopy:(void*)g.base()
-                                        length:len
-                                       options:MTLResourceStorageModeShared |
-                                               MTLResourceHazardTrackingModeUntracked
-                                   deallocator:nil];
+        if (getenv("QK_COPY_WEIGHTS")) {
+            gbuf = [c.dev newBufferWithLength:len
+                                      options:MTLResourceStorageModeShared |
+                                              MTLResourceHazardTrackingModeUntracked];
+            if (!gbuf) return fail("qk_open: weight copy alloc failed");
+            memcpy(gbuf.contents, g.base(), g.size());
+        } else {
+            gbuf = [c.dev newBufferWithBytesNoCopy:(void*)g.base()
+                                            length:len
+                                           options:MTLResourceStorageModeShared |
+                                                   MTLResourceHazardTrackingModeUntracked
+                                       deallocator:nil];
+            // QK_MLOCK=1: wire the mapping. No-copy weights degrade 2-6x
+            // after memory-pressure evictions (per-submit GPU rewiring of
+            // faulted pages, sys-time bound) and do NOT self-heal; mlock
+            // keeps zero-copy AND immunity. Serving configs want this.
+            if (getenv("QK_MLOCK") && mlock(g.base(), g.size()) != 0)
+                fprintf(stderr, "qk_open: mlock failed (%s) — continuing unwired\n",
+                        strerror(errno));
+        }
         if (!gbuf) return fail("qk_open: newBufferWithBytesNoCopy failed");
     }
     auto WOFF = [&](const GgufTensor* t) -> WB {
@@ -2548,13 +2566,25 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         if (!nAct) break;
 
         @autoreleasepool {
+            auto he0 = std::chrono::steady_clock::now();
             id<MTLCommandBuffer> cb = [c.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc =
                 [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
             encodeStep(enc, maxZ);
             [enc endEncoding];
+            auto he1 = std::chrono::steady_clock::now();
             [cb commit];
             [cb waitUntilCompleted];
+            auto he2 = std::chrono::steady_clock::now();
+            if (getenv("QK_STEP_STATS")) {
+                static double gpuSum = 0, encSum = 0, waitSum = 0; static uint32_t nStep = 0;
+                gpuSum += cb.GPUEndTime - cb.GPUStartTime; nStep++;
+                encSum += std::chrono::duration<double>(he1 - he0).count();
+                waitSum += std::chrono::duration<double>(he2 - he1).count();
+                if (nStep % 64 == 0)
+                    fprintf(stderr, "[step] n=%u gpu %.2f | encode %.2f | commit+wait %.2f ms avg\n",
+                            nStep, gpuSum * 1e3 / nStep, encSum * 1e3 / nStep, waitSum * 1e3 / nStep);
+            }
         }
 
         for (uint32_t s = 0; s < nSlots; s++) {

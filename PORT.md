@@ -604,6 +604,46 @@ re-mirrored from main, qk_state_n/save/load implemented over the pcache
 snap buffers, gates (a)/(b) token-exact incl. reconnect, live worker on
 :18100 relaunched on the new build.
 
+### B3 — multi-slot aggregate: beats llama-server --parallel at every N (2026-07-09)
+
+| concurrent streams | llama-server --parallel (tok/s agg) | qk serve-test (tok/s agg) | qk / llama |
+|---|---|---|---|
+| 1 | 80.1 | 96.8 | 1.21× |
+| 2 | 114.5 | 149.8 | **1.31×** |
+| 4 | 135.2 | 182.1 | **1.35×** |
+| 8 | 149.8 | 195.7 | **1.31×** |
+
+Protocol: same 21-token prompt, greedy, N simultaneous streams; llama =
+N concurrent /completion requests (temperature 0, warmed server, box
+solo); qk = `serve-test <ids> 256 <N>` with QK_MLOCK=1, box solo.
+Scaling 1→8: qk 2.02×, llama 1.87×. Both sides are weight-read-bound at
+8 slots; our decode re-reads weights per slot (GEMV z=slots) — a
+slot-batched decode GEMV (read a weight row once, dot 8 slot
+activations) is the named lever for the next tier (~1.5× aggregate
+ceiling at 8 slots by active-bytes math). Steady-state single-stream
+serving decode: 9.1 ms/step GPU ≈ 110 tok/s (engine) vs caseToken's
+8.37 — the 0.75 ms is fa_srv slot indirection + argmax; llama tg128 is
+84.2.
+
+**Operational pathology found on the way (cost half a day of confusing
+numbers): no-copy mmap weights degrade 2–6× after ANY memory-pressure
+event** (here: llama-server's 17 GB residency for the head-to-head,
+plus an 8-slot ctx-16384 llama config pushing swap to 6.3 GB). Evicted
+GGUF pages make every subsequent submit re-wire GPU mappings — 0.04 s
+user / 1.87 s sys per 4 s of serving, steps 9 ms → 20–50 ms — and it
+does NOT self-heal even at 84% free RAM (page cache warm ≠ GPU wired).
+caseToken was immune (it copies weights into device buffers), which is
+how the "regression" was isolated to the buffer policy. Fixes, both
+landed: `QK_MLOCK=1` wires the mapping (zero-copy preserved — the
+serving config; the :18100 worker now runs with it) and
+`QK_COPY_WEIGHTS=1` copies into a device-owned buffer (RSS +16.6 GB,
+llama.cpp-equivalent policy). Default stays plain no-copy mmap (C1's
+318 MB RSS) — same trade llama.cpp makes without --mlock. House rule:
+serving/benchmark configs set QK_MLOCK=1; any anomalous slowdown gets
+`/usr/bin/time -l` first (high sys = rewiring signature).
+`QK_STEP_STATS=1` prints per-step gpu/encode/wait breakdown from
+stepChunk for exactly this kind of triage.
+
 ## C1 — no-copy weights: 15.5 GB RSS → 318 MB (2026-07-09)
 
 The engine now wraps the entire GGUF mmap in ONE
