@@ -70,6 +70,8 @@ class Gguf {
     }
 
     const std::map<std::string, GgufTensor>& tensors() const { return tensors_; }
+    const uint8_t* base() const { return base_; }
+    size_t size() const { return size_; }
 
   private:
     const uint8_t* base_ = nullptr;

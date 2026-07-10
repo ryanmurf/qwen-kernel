@@ -442,6 +442,23 @@ Budget at N=128 (530 ms/chunk): projections ≈180 ms (scalar GEMM), MoE
 serial over Tn — low occupancy by design, state in registers), attention +
 small ops ≈50 ms.
 
+## C1 — no-copy weights: 15.5 GB RSS → 318 MB (2026-07-09)
+
+The engine now wraps the entire GGUF mmap in ONE
+`newBufferWithBytesNoCopy` MTLBuffer (page-aligned by mmap; length rounded
+up to the page). Every weight binding became a (buffer, offset) pair via a
+`WB` wrapper that converts implicitly from a plain buffer, so activation
+bindings didn't change textually; per-tensor offsets come straight from
+the GGUF parse (32-byte aligned, satisfying setBuffer's float4 needs).
+State/activation buffers stay allocated.
+
+Measured (serve-test process): **maximum RSS 318 MB, peak footprint
+508 MB** — weights stream from file-backed pages on demand, zero copies at
+open, no double residency. Output token-exact; prefilldecode HANDOFF
+EXACT and prefillcmp 36/36 re-verified after the binding surgery. This is
+now BETTER than llama.cpp's mmap path (which still faults the whole model
+into its own dirty pages for GPU residency on load).
+
 ### Method notes (M0)
 
 - llama.cpp built in-tree at `../llama.cpp` (fresh clone of master, same-day);
@@ -466,7 +483,7 @@ Scorecard today (this box, this GGUF) and the plan to flip every ✗:
 | serving/multi-slot | llama-server | **✓ full stack + CLI round trip** | done (M5) |
 | agg. throughput | --parallel N | **146.3 tok/s @ 8 slots** (1.74× their 1-stream) | B3 head-to-head pending |
 | long ctx | 256k | **✓ 32k engine / 29.8k proven live** | C2 f16 KV for headroom |
-| load time / RSS | mmap no-copy | ✗ 15 GB copy | C1 no-copy MTLBuffer + offsets |
+| load time / RSS | mmap no-copy | **✓ 318 MB RSS, zero-copy open** | done (C1) |
 | quality | reference | ✓ token-exact everywhere | parity gate on every change |
 
 **Phase A — serving foundation (M5):**

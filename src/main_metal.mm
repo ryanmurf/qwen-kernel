@@ -1847,9 +1847,21 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
 // token-parity-validated against llama.cpp. On UMA, prefix-cache snapshots,
 // state resets and carry seeding are plain memcpy/memset — no staging.
 
+// (buffer, offset) pair for weight bindings: weights live at offsets inside
+// ONE no-copy MTLBuffer wrapping the GGUF mmap (zero copies at open, no
+// double residency). Implicitly constructible from a plain buffer so
+// activation bindings read unchanged.
+struct WB {
+    id<MTLBuffer> b;
+    NSUInteger o;
+    WB(id<MTLBuffer> buf) : b(buf), o(0) {}
+    WB(id<MTLBuffer> buf, NSUInteger off) : b(buf), o(off) {}
+};
+
 struct qk_engine {
     MtlCtx c{};
     Gguf g;
+    id<MTLBuffer> gbuf;   // no-copy view of the whole GGUF mmap
     uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
     bool shareFork = false;
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
@@ -1865,18 +1877,21 @@ struct qk_engine {
 
     struct Layer {
         bool rec = false, downQ6 = false;
-        id<MTLBuffer> aNorm, pn;
-        id<MTLBuffer> qkvW, zW, alW, beW, dt, av, ker, sn, outW;   // rec
-        id<MTLBuffer> wq, wk, wv, qn, kn, wo;                       // attn
-        id<MTLBuffer> mgi, mgis, mge, mue, mde, mgs, mus, mds;      // moe
+        WB aNorm{nil}, pn{nil};
+        WB qkvW{nil}, zW{nil}, alW{nil}, beW{nil}, dt{nil}, av{nil}, ker{nil},
+           sn{nil}, outW{nil};                                       // rec
+        WB wq{nil}, wk{nil}, wv{nil}, qn{nil}, kn{nil}, wo{nil};     // attn
+        WB mgi{nil}, mgis{nil}, mge{nil}, mue{nil}, mde{nil}, mgs{nil},
+           mus{nil}, mds{nil};                                       // moe
         id<MTLBuffer> st1, st2;      // per-slot state: rec=(conv,S) attn=(kc,vc)
         size_t ps1 = 0, ps2 = 0;     // per-slot byte stride
     };
     std::vector<Layer> layers;
 
     id<MTLBuffer> bXin, bXn, bBig, bMid, bKin, bVin, bGb, bAtt, bAttnOut, bY, bXn2,
-        bML, bMH, bMSel, bMY, bONorm, bHeadW, bLogits, bEmbdW, bRope, bAV, bAI,
+        bML, bMH, bMSel, bMY, bLogits, bRope, bAV, bAI,
         bTok, bRbScratch, bSlotIn, bSlotPos;
+    WB bONorm{nil}, bHeadW{nil}, bEmbdW{nil};
 
     uint32_t maxB = 0;
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
@@ -1986,6 +2001,19 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         return fail("qk_open: bad config");
     initMtl(c, "libqk");
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
+    {   // ONE no-copy buffer over the mmap: zero weight copies at open.
+        const size_t psz = (size_t)getpagesize();
+        const size_t len = (g.size() + psz - 1) & ~(psz - 1);
+        gbuf = [c.dev newBufferWithBytesNoCopy:(void*)g.base()
+                                        length:len
+                                       options:MTLResourceStorageModeShared |
+                                               MTLResourceHazardTrackingModeUntracked
+                                   deallocator:nil];
+        if (!gbuf) return fail("qk_open: newBufferWithBytesNoCopy failed");
+    }
+    auto WOFF = [&](const GgufTensor* t) -> WB {
+        return WB{gbuf, (NSUInteger)((const uint8_t*)t->data - g.base())};
+    };
     const GgufTensor* tEmbd = g.find("token_embd.weight");
     const GgufTensor* tONorm = g.find("output_norm.weight");
     const GgufTensor* tHead = g.find("output.weight");
@@ -2048,10 +2076,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bMH = createBuf(c, (size_t)nB * 9 * 512 * 4, nullptr, true);
     bMSel = createBuf(c, (size_t)nB * 128, nullptr, true);
     bMY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
-    bONorm = createBuf(c, nEmbd * 4, tONorm->data, true);
-    bHeadW = createBuf(c, (size_t)vocab * rbE, tHead->data, true);
+    bONorm = WOFF(tONorm);
+    bHeadW = WOFF(tHead);
     bLogits = createBuf(c, (size_t)nB * vocab * 4, nullptr, true);
-    bEmbdW = createBuf(c, (size_t)vocab * rbE, tEmbd->data, true);
+    bEmbdW = WOFF(tEmbd);
     bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
     bAV = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
     bAI = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
@@ -2107,9 +2135,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         auto T = [&](const char* suffix) -> const GgufTensor* {
             snprintf(nb, sizeof nb, "blk.%u.%s", il, suffix); return g.find(nb);
         };
-        auto W = [&](const GgufTensor* t, size_t n) -> id<MTLBuffer> {
-            return createBuf(c, n, t ? (const void*)t->data : nullptr, true);
-        };
+        auto W = [&](const GgufTensor* t, size_t) -> WB { return WOFF(t); };
         MoeT moe;
         if (!loadMoeT(g, il, moe)) return fail("qk_open: MoE tensors missing");
         L.downQ6 = moe.downQ6;
@@ -2177,11 +2203,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
 // -> 40 layers (srv attention) -> head -> argmax into bTok.
 void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
     auto dsp = [&](id<MTLComputePipelineState> pso,
-                   std::initializer_list<id<MTLBuffer>> bufs,
+                   std::initializer_list<WB> bufs,
                    const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr) {
         [enc setComputePipelineState:pso];
         uint32_t i = 0;
-        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        for (const WB& b : bufs) [enc setBuffer:b.b offset:b.o atIndex:i++];
         [enc setBytes:pc length:pcSize atIndex:i];
         [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, zdim)
             threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
@@ -2241,7 +2267,7 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
         dsp(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bMH, bMSel, bMY}, &pcv, 16,
             (nEmbd + nsg - 1) / nsg, thrN);
         bar();
-        id<MTLBuffer> nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
+        WB nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
         dsp(pAddN, {bY, bMY, nextNorm, bXin, bXn}, &pcRms, 8, 1, 256);
         bar();
     }
@@ -2343,16 +2369,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         id<MTLComputeCommandEncoder> enc =
             [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         auto dspz = [&](id<MTLComputePipelineState> pso,
-                        std::initializer_list<id<MTLBuffer>> bufs,
-                        std::initializer_list<size_t> offs,
+                        std::initializer_list<WB> bufs,
                         const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr, uint32_t z) {
             [enc setComputePipelineState:pso];
             uint32_t i = 0;
-            auto ob = offs.begin();
-            for (id<MTLBuffer> b : bufs) {
-                size_t o = ob != offs.end() ? *ob++ : 0;
-                [enc setBuffer:b offset:o atIndex:i++];
-            }
+            for (const WB& b : bufs) [enc setBuffer:b.b offset:b.o atIndex:i++];
             [enc setBytes:pc length:pcSize atIndex:i];
             [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, z)
                 threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
@@ -2375,19 +2396,19 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         struct { uint32_t M, K, N; } pcG;
 
         // projection: tiled GEMM for n>=48 (weight reads amortized), else z=n GEMV
-        auto proj = [&](id<MTLBuffer> W, id<MTLBuffer> X, id<MTLBuffer> Y,
+        auto proj = [&](WB W, id<MTLBuffer> X, id<MTLBuffer> Y,
                         uint32_t M, uint32_t K, bool isOut) {
             if (n >= 48) {
                 pcG = {M, K, n};
-                dspz(pGemmB, {W, X, Y}, {}, &pcG, 12, (M + 127) / 128, gemmThreads, (n + 63) / 64);
+                dspz(pGemmB, {W, X, Y}, &pcG, 12, (M + 127) / 128, gemmThreads, (n + 63) / 64);
             } else {
                 pcP = {M, K};
-                dspz(isOut ? pGemvO : pGemvA, {W, X, Y}, {}, &pcP, 8,
+                dspz(isOut ? pGemvO : pGemvA, {W, X, Y}, &pcP, 8,
                      isOut ? (M + 1) / 2 : (M + 3) / 4, 256, n);
             }
         };
 
-        dspz(pEmb, {bEmbdW, bbIds, bbXin, layers[0].aNorm, bbXn}, {}, &pcE, 16, 1, 256, n);
+        dspz(pEmb, {bEmbdW, bbIds, bbXin, layers[0].aNorm, bbXn}, &pcE, 16, 1, 256, n);
         bar();
         for (uint32_t il = 0; il < nLayer; il++) {
             Layer& L = layers[il];
@@ -2395,17 +2416,17 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             if (L.rec) {
                 proj(L.qkvW, bbXn, bbBig, chQkv, nEmbd, false);
                 proj(L.zW, bbXn, bbMid, dIn, nEmbd, false);
-                dspz(pAbB, {bbXn, L.alW, L.beW, L.dt, L.av, bbGb}, {}, &pcAbB, 12,
+                dspz(pAbB, {bbXn, L.alW, L.beW, L.dt, L.av, bbGb}, &pcAbB, 12,
                      (2 * hV + nsg - 1) / nsg, thrN, n);
                 bar();
-                dspz(pConvB, {bbCarry, bbBig, L.ker, bbConvOut, L.st1},
-                     {(size_t)il * chQkv * 3 * 4, 0, 0, 0, so1},
+                dspz(pConvB, {WB{bbCarry, (NSUInteger)il * chQkv * 3 * 4}, bbBig, L.ker,
+                              bbConvOut, WB{L.st1, so1}},
                      &pcConvB, 20, chQkv / dS, dS, n);
                 bar();
-                dspz(pStepB, {bbConvOut, bbGb, bbO, L.st2}, {0, 0, 0, so2},
+                dspz(pStepB, {bbConvOut, bbGb, bbO, WB{L.st2, so2}},
                      &pcStepB, 16, hV, dS, 1);
                 bar();
-                dspz(pGateB, {bbO, L.sn, bbMid, bbAtt}, {}, &pcGateB, 16,
+                dspz(pGateB, {bbO, L.sn, bbMid, bbAtt}, &pcGateB, 16,
                      (hV + nsg - 1) / nsg, thrN, n);
                 bar();
                 proj(L.outW, bbAtt, bbAttnOut, nEmbd, dIn, true);
@@ -2414,33 +2435,33 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 proj(L.wk, bbXn, bbKin, hKV * dh, nEmbd, false);
                 proj(L.wv, bbXn, bbVin, hKV * dh, nEmbd, false);
                 bar();
-                dspz(pPrepB, {bbBig, bbKin, bbVin, L.qn, L.kn, bbMid, L.st1, L.st2, bRope},
-                     {0, 0, 0, 0, 0, 0, so1, so2, 0}, &pcFaB, 40, hQ + 2 * hKV, 256, n);
+                dspz(pPrepB, {bbBig, bbKin, bbVin, L.qn, L.kn, bbMid, WB{L.st1, so1},
+                              WB{L.st2, so2}, bRope}, &pcFaB, 40, hQ + 2 * hKV, 256, n);
                 bar();
-                dspz(pAttnB, {bbMid, L.st1, L.st2, bbBig, bbAtt},
-                     {0, so1, so2, 0, 0}, &pcFaB, 40, hQ, 256, n);
+                dspz(pAttnB, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
+                     &pcFaB, 40, hQ, 256, n);
                 bar();
                 proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true);
             }
             bar();
-            dspz(pMoeLA, {L.mgi, L.mgis, bbXin, bbAttnOut, L.pn, bbML, bbY, bbXn2}, {},
+            dspz(pMoeLA, {L.mgi, L.mgis, bbXin, bbAttnOut, L.pn, bbML, bbY, bbXn2},
                  &pcv5, 20, (257 + nsg - 1) / nsg, thrN, n);
             bar();
-            dspz(pMoeS, {bbML, bbMSel}, {}, &pcv, 16, 1, 32, n);
+            dspz(pMoeS, {bbML, bbMSel}, &pcv, 16, 1, 32, n);
             bar();
-            dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, {}, &pcv, 16,
+            dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
                  (9 * 512 + nsg - 1) / nsg, thrN, n);
             bar();
-            dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY}, {},
+            dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY},
                  &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
             bar();
-            id<MTLBuffer> nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
-            dspz(pAddN, {bbY, bbMY, nextNorm, bbXin, bbXn}, {}, &pcRms, 8, 1, 256, n);
+            WB nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
+            dspz(pAddN, {bbY, bbMY, nextNorm, bbXin, bbXn}, &pcRms, 8, 1, 256, n);
             bar();
         }
         if (wantLogits) {
             struct { uint32_t m, k; } pcHead{vocab, nEmbd};
-            dspz(pHead, {bHeadW, bbXn, bbLogits}, {}, &pcHead, 8, (vocab + 3) / 4, 64, n);
+            dspz(pHead, {bHeadW, bbXn, bbLogits}, &pcHead, 8, (vocab + 3) / 4, 64, n);
         }
         [enc endEncoding];
         [cb commit];
