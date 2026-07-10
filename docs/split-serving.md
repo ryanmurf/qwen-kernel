@@ -8,8 +8,19 @@
 > stop_reason); (2) streamed ≡ non-streamed; (3) worker killed mid-stream →
 > partial tokens + clean SSE `error` / HTTP 500, head survives, next request
 > after worker restart reconnects lazily and succeeds; (4) two concurrent
-> sequences both match their unsplit references. P3 (bigger-ctx/slots
-> deployment shape) is an open experiment.
+> sequences both match their unsplit references.
+>
+> **P3 CROSS-BOX: PASSED 2026-07-10.** tron (RX 7900 XT, Vulkan, layers
+> [0,22)) drove midnight (M4 Max, Metal engine from the metal-port branch,
+> layers [22,40), `qk pipe-worker :18100`, ctx 32768) over WiFi:
+> `qk pipe` GEN **token-exact** vs the single-GPU reference, and the full
+> `qk-server --split-next` HTTP path **byte-identical** (text + usage).
+> Decode 17.2 ms/tok engine-level (s1 5.1 + s2+net 12.1; worker compute
+> ~5 ms, WiFi RTT ~4.3 ms avg is the tax — wire the Mac for ~0.3 ms), 50
+> tok/s streamed end-to-end at 200 tokens. Two GPU vendors, two APIs, two
+> engines — one bit-exact model. Follow-ons: wired link, S balance sweep
+> (22 was near-even), worker slots=4 for a head slots sweep, async driver
+> to overlap the stages.
 
 Serve one model as N pipeline stages on N devices, behind the existing
 qk-server HTTP/Anthropic layer. Builds on the engine's pipeline split
