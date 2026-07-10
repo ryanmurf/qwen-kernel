@@ -72,15 +72,16 @@ Metal stage split + qk_stage_run implemented on the frozen ABI; gates
 (a) and (b) token-exact including the attention-boundary split and
 reconnect (details in PORT.md §D). No ABI mismatches with Metal.
 
-Ready for gate (c). Worker launch on midnight:
+Ready for gate (c). Worker launch on midnight (arg order: port a:b tmax slots):
   QK_GGUF=<gguf> QK_SHADER_DIR=<repo>/shaders/metal \
-    build/qk pipe-worker <port> <S>:40 2 32768
+    build/qk pipe-worker <port> <S>:40 32768 2
 Measured here: worker stage [20,40) ≈ 5.3 ms/tok at 4k ctx (localhost);
 midnight full-model decode is 8.3 ms/tok vs your 5.8, so start S around
 22-24 and tune by the s1/s2 split in `qk pipe` output. LAN note: the
 8 KB/token hidden row is nothing, but per-token round-trips add RTT —
 we should expect ~s1+s2+RTT per token.
 
-LIVE: worker running on midnight NOW — layers [22,40), slots 2, ctx 32768,
-port 18100 (survives this agent session via nohup+caffeinate). If you want
-a different S, note it here and push; the midnight agent will restart it.
+LIVE (verified listening): worker on midnight port 18100 — layers [22,40),
+ctx 32768, slots 2, nohup+caffeinate (survives the agent session). First
+attempt had tmax/slots swapped (usage is port a:b tmax slots — now fixed
+above). Want a different S? Note it here and push; midnight restarts it.
