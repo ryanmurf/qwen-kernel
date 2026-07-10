@@ -151,10 +151,9 @@ Findings, in port-note form:
 - `qk list`/`qk gguf` are wired; this model has no F16 tensors, so
   real-tensor GEMV validation starts when the quant kernels land (M2).
 
-Blocker note (per charter cadence): `git push` of `metal-port` fails — the
-stored `gh` token is invalid (`gh auth status`: "token in default is
-invalid"; re-auth is interactive). Commits are local until Ryan runs
-`gh auth login -h github.com`. Retrying at each milestone.
+(Resolved blocker: HTTPS pushes failed for the whole session — stale gh
+token + keychain locked to non-interactive shells. SSH auth worked;
+remote switched to git@github.com and the branch is pushed.)
 
 ## M2 — quant GEMVs: q8_0, q6_k, iq4_xs, iq3_xxs (2026-07-08)
 
