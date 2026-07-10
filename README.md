@@ -90,7 +90,7 @@ specialization is where the speed comes from.
 cd server && cargo build --release
 QK_SHADER_DIR=../build/shaders ./target/release/server \
     --model /path/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf \
-    --engine-lib ../build/libqk.so --port 8080 --slots 2 --ctx 16384 --chunk 8
+    --engine-lib ../build/libqk.so --port 8080 --slots 2 --ctx 32768 --chunk 8
 ```
 
 Engine CLI (`./build/qk …`) — benchmarks and correctness harnesses:
