@@ -24,7 +24,7 @@ struct block_iq4_xs {
 
 layout(std430, binding = 0) readonly buffer BufW { block_iq4_xs dw[]; };
 layout(std430, binding = 1) readonly buffer BufH { float h[]; };
-struct SelT { uint ids[8]; float w[8]; float wShared; float pad[15]; };
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
 layout(std430, binding = 2) readonly buffer Sel { SelT sel[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 

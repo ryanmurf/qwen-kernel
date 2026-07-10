@@ -20,8 +20,8 @@ struct block_q8_0 {
 layout(std430, binding = 0) readonly buffer BufW { block_q8_0 dw[]; };
 layout(std430, binding = 1) readonly buffer BufH { float h[]; };
 layout(std430, binding = 2) readonly buffer Sel {
-    uint  ids[8];
-    float w[8];
+    uint  ids[16];
+    float w[16];
     float wShared;
 };
 layout(std430, binding = 3) buffer BufY { float y[]; };
