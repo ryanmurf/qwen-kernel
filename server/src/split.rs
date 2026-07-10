@@ -30,11 +30,12 @@ const IO_TIMEOUT: Duration = Duration::from_secs(120);
 /// re-chunks internally at its own batch cap, so this only bounds frame size.
 const CHUNK: usize = 128;
 
-/// Connection hello ("qkp1"): client sends the magic, worker replies
+/// Connection hello: client sends the magic, worker replies
 /// `{magic, layer_first, layer_end, n_layer, n_embd, n_slots, n_ctx}` —
 /// mixed builds or a mis-split worker fail loudly at connect instead of
-/// streaming garbage. Bump on any wire change.
-const PIPE_MAGIC: u32 = 0x716b_7031;
+/// streaming garbage. Bump on any wire change. qkp2 = qkp1 + state ops
+/// (op3 save / op4 load, snapshot idx in the n field, 4-byte status reply).
+const PIPE_MAGIC: u32 = 0x716b_7032;
 
 /// What the head requires of the worker, checked against its hello.
 pub struct WorkerExpect {
@@ -153,6 +154,32 @@ impl WorkerLink {
         Ok(())
     }
 
+    /// State snapshot save (op 3) / load (op 4) of `slot` to/from the
+    /// worker's snapshot entry `idx`. Mirrors the head-side qk_state_save/
+    /// load so both stages' states move together.
+    pub fn state_op(&mut self, save: bool, slot: u32, idx: u32) -> Result<()> {
+        let result = (|| {
+            let stream = self.stream()?;
+            let mut frame = [0u8; 16];
+            for (i, word) in [if save { 3u32 } else { 4 }, slot, idx, 0].iter().enumerate() {
+                frame[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            stream.write_all(&frame).context("split worker state write")?;
+            let mut status = [0u8; 4];
+            stream
+                .read_exact(&mut status)
+                .context("split worker state read")?;
+            if u32::from_le_bytes(status) != 0 {
+                anyhow::bail!("worker state {} failed", if save { "save" } else { "load" });
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.stream = None;
+        }
+        result
+    }
+
     /// Best-effort goodbye so the worker logs a clean disconnect.
     pub fn bye(&mut self) {
         if let Some(stream) = self.stream.as_mut() {
@@ -193,21 +220,24 @@ fn apply_sample(state: &mut SlotState, id: u32, eos: u32) -> bool {
     true
 }
 
-/// Chunked prefill through both stages; returns the first generated token
-/// (the worker's id after the final prompt position). base 0 resets the slot
-/// on both engines.
+/// Chunked prefill of `prompt[start..end)` through both stages from
+/// base=start (start 0 resets the slot on both engines; start>0 continues
+/// restored state); returns the worker's id after position end-1.
+#[allow(clippy::too_many_arguments)]
 fn split_prefill(
     head: &mut Engine,
     link: &mut WorkerLink,
     slot: u32,
     prompt: &[u32],
+    start: u32,
+    end: u32,
     n_embd: usize,
     hidden: &mut Vec<f32>,
     ids: &mut Vec<u32>,
 ) -> Result<u32> {
-    let mut base = 0u32;
+    let mut base = start;
     let mut last = None;
-    for chunk in prompt.chunks(CHUNK) {
+    for chunk in prompt[start as usize..end as usize].chunks(CHUNK) {
         hidden.clear();
         hidden.resize(chunk.len() * n_embd, 0.0);
         head.stage_run(slot, Some(chunk), None, base, Some(hidden.as_mut_slice()), None)?;
@@ -216,6 +246,129 @@ fn split_prefill(
         base += chunk.len() as u32;
     }
     last.context("split prefill produced no ids")
+}
+
+/// Driver-side snapshot registry: which token prefix lives in each engine
+/// snapshot entry (the same index on the head and the worker — states move
+/// together). Mirrors the single-box engine's pcache, but keyed host-side.
+struct SnapEntry {
+    tokens: Vec<u32>,
+    lru: u64,
+}
+
+/// Longest registered strict prefix of `prompt` (>= 8 tokens), as
+/// (entry index, prefix length).
+fn best_snap(snaps: &[Option<SnapEntry>], prompt: &[u32]) -> Option<(u32, u32)> {
+    let mut best: Option<(u32, u32)> = None;
+    for (idx, entry) in snaps.iter().enumerate() {
+        let Some(e) = entry else { continue };
+        let len = e.tokens.len();
+        if len < 8 || len >= prompt.len() || best.is_some_and(|(_, l)| len as u32 <= l) {
+            continue;
+        }
+        if e.tokens[..] == prompt[..len] {
+            best = Some((idx as u32, len as u32));
+        }
+    }
+    best
+}
+
+/// Admit one job: restore the longest snapshotted prefix if any (both
+/// stages), prefill the remainder, and take a history-boundary snapshot at
+/// job-specified `snap_prefix` on the way through. Returns the first
+/// generated token.
+#[allow(clippy::too_many_arguments)]
+fn split_admit(
+    head: &mut Engine,
+    link: &mut WorkerLink,
+    slot: u32,
+    prompt: &[u32],
+    snap_prefix: u32,
+    snaps: &mut [Option<SnapEntry>],
+    lru_clock: &mut u64,
+    n_embd: usize,
+    hidden: &mut Vec<f32>,
+    ids: &mut Vec<u32>,
+) -> Result<u32> {
+    let np = prompt.len() as u32;
+    let mut start = 0u32;
+    if let Some((idx, len)) = best_snap(snaps, prompt) {
+        match head
+            .state_load(slot, idx)
+            .and_then(|()| link.state_op(false, slot, idx))
+        {
+            Ok(()) => {
+                start = len;
+                *lru_clock += 1;
+                if let Some(e) = snaps[idx as usize].as_mut() {
+                    e.lru = *lru_clock;
+                }
+            }
+            Err(err) => {
+                // Fall back to a cold prefill; the restore may have half
+                // happened, but base=0 resets both stages anyway.
+                tracing::warn!("split-cache restore failed, going cold: {err}");
+                start = 0;
+            }
+        }
+    }
+    let mut snap_at = if snap_prefix > start && snap_prefix < np && !snaps.is_empty() {
+        snap_prefix
+    } else {
+        0
+    };
+    let first = if snap_at > 0 {
+        // Prefill to the history boundary, snapshot BOTH stages there, then
+        // finish the prompt — the next turn restores at the boundary and
+        // prefills only its delta. The phase boundary holds even if the
+        // snapshot fails (re-feeding fed tokens would corrupt DeltaNet state).
+        let boundary = snap_at;
+        split_prefill(head, link, slot, prompt, start, boundary, n_embd, hidden, ids)?;
+        let idx = pick_entry(snaps);
+        match head
+            .state_save(slot, idx)
+            .and_then(|()| link.state_op(true, slot, idx))
+        {
+            Ok(()) => {
+                *lru_clock += 1;
+                snaps[idx as usize] = Some(SnapEntry {
+                    tokens: prompt[..boundary as usize].to_vec(),
+                    lru: *lru_clock,
+                });
+            }
+            Err(err) => {
+                // Snapshot is an optimization; the request itself proceeds.
+                tracing::warn!("split-cache snapshot failed: {err}");
+                snaps[idx as usize] = None;
+                snap_at = 0;
+            }
+        }
+        split_prefill(head, link, slot, prompt, boundary, np, n_embd, hidden, ids)?
+    } else {
+        split_prefill(head, link, slot, prompt, start, np, n_embd, hidden, ids)?
+    };
+    tracing::info!(
+        "[split-cache] slot={slot} prompt={np} reuse={start} prefill={} snap={snap_at}",
+        np - start
+    );
+    Ok(first)
+}
+
+/// LRU entry choice: first empty slot, else the least recently used.
+fn pick_entry(snaps: &[Option<SnapEntry>]) -> u32 {
+    let mut idx = 0u32;
+    let mut best = u64::MAX;
+    for (i, e) in snaps.iter().enumerate() {
+        match e {
+            None => return i as u32,
+            Some(s) if s.lru < best => {
+                best = s.lru;
+                idx = i as u32;
+            }
+            _ => {}
+        }
+    }
+    idx
 }
 
 /// Split-mode replacement for `run_engine_thread`: same queue/flush/
@@ -231,6 +384,12 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
     let mut slots: Vec<Option<(SlotState, Seq)>> = (0..n_slots).map(|_| None).collect();
     let mut hidden = Vec::new();
     let mut ids = Vec::new();
+    // Cross-turn snapshot registry (0 entries when the engine lib predates
+    // the snapshot ABI — the feature just stays off). Cleared on any worker
+    // link failure: a restarted worker has lost its half of every snapshot,
+    // and a blip is indistinguishable from a restart.
+    let mut snaps: Vec<Option<SnapEntry>> = (0..head.state_n()).map(|_| None).collect();
+    let mut lru_clock = 0u64;
 
     loop {
         if slots.iter().all(Option::is_none) && queue.is_empty() {
@@ -256,11 +415,14 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 continue;
             }
             let Some(job) = queue.pop_front() else { break };
-            match split_prefill(
+            match split_admit(
                 &mut head,
                 &mut link,
                 slot as u32,
                 &job.prompt_ids,
+                job.snap_prefix,
+                &mut snaps,
+                &mut lru_clock,
                 n_embd,
                 &mut hidden,
                 &mut ids,
@@ -276,6 +438,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 }
                 Err(err) => {
                     let _ = job.events.try_send(SlotEvent::Error(err.to_string()));
+                    snaps.iter_mut().for_each(|e| *e = None);
                 }
             }
         }
@@ -344,7 +507,9 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
             }
             if let Some(message) = failure {
                 // Worker (or head engine) state is unknown; fail everything
-                // that was still generating. Finished slots keep draining.
+                // that was still generating and void the snapshot registry
+                // (a restarted worker lost its half). Finished slots drain.
+                snaps.iter_mut().for_each(|e| *e = None);
                 for state in slots.iter_mut() {
                     let Some((slot_state, _)) = state.as_mut() else {
                         continue;

@@ -56,6 +56,19 @@ spec:
           value: "1"              # ~1.5x on echo-heavy turns, neutral otherwise)
         - name: QK_SPEC_LOG       # one [spec] stats line per request that speculated
           value: "1"
+        # Prefix-cache depth. Each entry is a HOST (GTT) snapshot of a slot's
+        # full KV+recurrent state — ~1.31 GiB at ctx 32768, allocated at open —
+        # so this is the pod's dominant host-memory knob (16 was a leftover
+        # experiment costing 21 GiB of GTT for nothing; 6 covers a few
+        # interleaved sessions' history-boundary snapshots at ~7.9 GiB).
+        - name: QK_PCACHE
+          value: "6"
+        - name: QK_PCACHE_LOG     # one [pcache] reuse-stats line per request
+          value: "1"
+        - name: QK_MAX_TOOL_CHARS # cap a single tool_result before context-fit trimming
+          value: "4000"
+        - name: QK_STATS_FILE     # [spec]/[pcache] lines append here and survive pod
+          value: "/stats/qk-stats.log"  # restarts (kubectl logs reset on every bounce)
         # Batched prefill flushes its command buffer every QK_SUBMIT_LAYERS layers
         # (engine default 8) so no single vkQueueSubmit can outlive amdgpu's ~10 s
         # gfx-ring timeout (the 2026-07-06 VK_ERROR_DEVICE_LOST crash loop). Set
@@ -75,6 +88,8 @@ spec:
           readOnly: true
         - mountPath: /dev/dri
           name: dri
+        - mountPath: /stats
+          name: stats
       volumes:
       - hostPath:
           path: /home/ryan/intellij/ggerganov/llama.cpp
@@ -84,3 +99,7 @@ spec:
           path: /dev/dri
           type: Directory
         name: dri
+      - hostPath:
+          path: /var/lib/qk-stats
+          type: DirectoryOrCreate
+        name: stats

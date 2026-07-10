@@ -19,7 +19,7 @@ typedef struct qk_engine qk_engine;
 
 typedef struct qk_config {
     uint32_t n_slots; /* max concurrent sequences, 1..16 */
-    uint32_t n_ctx;   /* per-slot capacity (prompt + generated), 64..4096 */
+    uint32_t n_ctx;   /* per-slot capacity (prompt + generated), 64..32768 */
     uint32_t chunk;   /* GPU steps per host sync, 1..32 */
 } qk_config;
 
@@ -99,6 +99,17 @@ uint32_t qk_n_embd(const qk_engine *e);      /* hidden row width (floats)   */
 int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
                  const float *hidden_in, uint32_t n, uint32_t base,
                  float *hidden_out, uint32_t *ids_out);
+
+/* Driver-managed state snapshots (split serving's cross-turn reuse): copy a
+ * slot's full recurrent state (KV + DeltaNet + conv, this stage's layers) to
+ * or from host snapshot entry `idx` (0 <= idx < qk_state_n; entry count is
+ * the QK_PCACHE knob, default 3). The caller owns the index space and the
+ * mapping to token prefixes. ONLY meaningful on split engines — on an
+ * unsplit engine the internal prefix cache uses the same entries and will
+ * clobber them. Returns 0 on success, negative on bad args. */
+uint32_t qk_state_n(const qk_engine *e);
+int qk_state_save(qk_engine *e, uint32_t slot, uint32_t idx);
+int qk_state_load(qk_engine *e, uint32_t slot, uint32_t idx);
 
 #ifdef __cplusplus
 }

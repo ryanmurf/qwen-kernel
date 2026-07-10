@@ -95,6 +95,17 @@ uint32_t qk_layer_end(const qk_engine *e)   { return e->l_end; }
 uint32_t qk_n_layer(const qk_engine *e)     { (void)e; return QK_NLAYER; }
 uint32_t qk_n_embd(const qk_engine *e)      { (void)e; return QK_NEMBD; }
 
+/* State snapshots: the stub's stage math is stateless (ids derive from the
+ * fed token alone), so save/load only validate bounds — enough to test the
+ * driver's snapshot choreography. 3 entries, like the engine's default. */
+uint32_t qk_state_n(const qk_engine *e) { (void)e; return 3; }
+int qk_state_save(qk_engine *e, uint32_t slot, uint32_t idx) {
+    return (!e || slot >= e->cfg.n_slots || idx >= 3) ? -1 : 0;
+}
+int qk_state_load(qk_engine *e, uint32_t slot, uint32_t idx) {
+    return (!e || slot >= e->cfg.n_slots || idx >= 3) ? -1 : 0;
+}
+
 int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
                  const float *hidden_in, uint32_t n, uint32_t base,
                  float *hidden_out, uint32_t *ids_out) {
