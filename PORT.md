@@ -444,6 +444,17 @@ half-precision and multiply all its tokens GEMM-style (the gemm_q8_0_h
 structure with an assignment gather). Kernels + QK_MOE_GROUPED env kept
 for that next round.
 
+**Thermal methodology (Ryan flagged lap-throttling):** this box visibly
+sags under sustained load (+22% on the serial baseline during the long
+GEMM session: 1543→1890 ms), so single-shot cross-run comparisons are
+unsafe. House rule from here: perf verdicts run **A/B/A interleaved with
+the serial column as thermal control**. The grouped-MoE verdict re-ran
+under that protocol — control 1548/1548/1557 ms (±0.5%, stable), grouped
+508.6 vs ungrouped 407.7/419.8 ms — confirmed slower on merit, not heat.
+Instant GPU throttle probe: `qk f16 8192 8192 100` vs the ~518–546 GB/s
+cool reference (516.6 measured = full speed). For record runs: hard
+surface, not a lap.
+
 Budget at N=128 (530 ms/chunk): projections ≈180 ms (scalar GEMM), MoE
 ≈180 ms (ungrouped expert reads), dn_step_batch ≈60–120 ms (32 tgs,
 serial over Tn — low occupancy by design, state in registers), attention +
