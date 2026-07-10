@@ -42,7 +42,8 @@ set(SHADERS gemv_f16 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs
     rmsnorm dn_ab dn_conv dn_qknorm dn_step dn_gate add_rmsnorm vec_add
     fa_prep fa_attn argmax1 argmax2 embed_q6k add_rms3 moe_down_q8b dn_convn
     fa_prep_srv fa_attn_srv gemm_q8_0 fa_prep_batch fa_attn_batch
-    dn_ab_batch dn_conv_batch dn_step_batch dn_gate_batch)
+    dn_ab_batch dn_conv_batch dn_step_batch dn_gate_batch
+    moe_gateup_iq4 gemm_iq4_xs embed_q8_0)
 set(SPV_FILES "")
 foreach(s ${SHADERS})
     add_custom_command(

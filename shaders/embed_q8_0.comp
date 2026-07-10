@@ -1,0 +1,35 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Embedding lookup: dequantize token_embd row ids[idx] (Q8_0) into x.
+// One workgroup; thread per 32-element block.
+
+layout(local_size_x = 256) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly  buffer BufW { block_q8_0 wb[]; };
+layout(std430, binding = 1) readonly  buffer BufI { uint ids[]; };
+layout(std430, binding = 2) writeonly buffer BufX { float x[]; };
+
+layout(push_constant) uniform PC { uint kdim; uint idx; uint perReq; } pc;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint kb = pc.kdim / 32u;
+    uint rq = gl_WorkGroupID.z;
+    uint ro = rq * pc.kdim;
+    uint base = ids[pc.idx + pc.perReq * rq] * kb;
+    for (uint b = t; b < kb; b += 256u) {
+        float d = float(wb[base + b].d);
+        uint xo = b * 32u;
+        for (uint i = 0u; i < 32u; ++i)
+            x[ro + xo + i] = d * float(int(wb[base + b].qs[i]));
+    }
+}

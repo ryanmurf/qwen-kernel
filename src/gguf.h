@@ -95,12 +95,24 @@ class Gguf {
     const uint8_t* base() const { return base_; }
     size_t size() const { return size_; }
 
+    // Scalar-int and string KVs captured during parse (shard 1 holds them all).
+    uint64_t kvInt(const std::string& key, uint64_t def) const {
+        auto it = kvInt_.find(key);
+        return it == kvInt_.end() ? def : it->second;
+    }
+    std::string kvStr(const std::string& key, const std::string& def) const {
+        auto it = kvStr_.find(key);
+        return it == kvStr_.end() ? def : it->second;
+    }
+
   private:
     const uint8_t* base_ = nullptr;
     size_t size_ = 0, pos_ = 0;
     uint64_t alignment_ = 32;
     uint64_t splitTensorsTotal_ = 0;
     std::map<std::string, GgufTensor> tensors_;
+    std::map<std::string, uint64_t> kvInt_;
+    std::map<std::string, std::string> kvStr_;
     std::vector<std::pair<const uint8_t*, size_t>> maps_;  // keeps every shard mapped
 
     bool openOne(const std::string& path, uint16_t* splitCountOut) {
@@ -160,7 +172,9 @@ class Gguf {
         for (uint64_t i = 0; i < nKv; i++) {
             std::string key = rdStr();
             uint32_t t = rd<uint32_t>();
+            if (t == 8) { kvStr_[key] = rdStr(); continue; }
             uint64_t v = skipValue(t);
+            if (t <= 5 || t == 7 || t == 10 || t == 11) kvInt_[key] = v;  // scalar ints/bool, not f32/f64
             if (key == "general.alignment" && v) alignment_ = v;
             if (key == "split.count" && splitCountOut) *splitCountOut = (uint16_t)v;
             if (key == "split.tensors.count") splitTensorsTotal_ = v;
