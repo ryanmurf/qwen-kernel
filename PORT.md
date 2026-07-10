@@ -460,6 +460,82 @@ Budget at N=128 (530 ms/chunk): projections ≈180 ms (scalar GEMM), MoE
 serial over Tn — low occupancy by design, state in registers), attention +
 small ops ≈50 ms.
 
+### Phase B round 2 — head tax + decode-once grouped MoE (2026-07-09)
+
+**Head tax (found by accident, worth more than the thing I was looking
+for):** `prefillBatchLast` dispatched the output head (248320×2048 Q6_K
+GEMV ≈ 417 MB of weight reads) with **z = n — once per prefill position**
+whenever `wantLogits` was set, then copied out only the last row. The
+serving path never paid it (`wantLogits=false`), but every prefill
+benchmark did — and llama.cpp's pp512 computes ONE logit row. Fix:
+logits-only callers get the head for the last row only (`argmaxOut`
+callers keep z=n — the pipe wire contract returns n greedy ids per
+frame). prefillcmp bit-identical after (36/36 @ 0.073). N=128 chunk:
+435 → 354 ms. **B1 (≥4× serial) passes at 4.26–4.69× with everything
+else unchanged.**
+
+**Decode-once grouped MoE, done right this time.** v1 (read-once) failed
+because `iq3_g32` sat inside the token loop — same decode ALU, only DRAM
+locality. The fix is hoisting the dequant: stage the expert row-tile in
+threadgroup memory once per K-chunk, multiply all its gathered tokens via
+simdgroup MMA. Four variants in `moe_grouped.metal`, selected by
+QK_MOE_GROUPED (env forces the variant at all n; default = v4 at chunk
+n ≥ 192, QK_MOE_GROUP_N tunes):
+
+| variant | shape | precision | moegcmp/layer n=512 (uniform sel) | notes |
+|---|---|---|---|---|
+| ungrouped | row-per-simd | f32 exact | 13.95 ms | prior default |
+| 1 | read-once loop | bitwise = ungrouped | 14.63 ms | control |
+| 2 | 32 rows × 8 cols | f32 MMA | 11.92 ms | exactness probe |
+| 3 | 64 × 32, f16 stage | h-GEMM / mul_mm_id class | **6.06 ms** | record config |
+| 4 | 32 × 32, f32 | f32 MMA | 9.55 ms | **DEFAULT** (n ≥ 192) |
+
+Scaling (uniform routing = grouping's worst case): v3 is 0.91× at n=128,
+1.51× at 256, 2.31× at 512, 2.69× at 1024 — decode amortization grows
+with tokens-per-expert, exactly the mul_mm_id curve. Grouping below
+n≈192 loses; hence the threshold.
+
+**Correctness chain** (`qk moegcmp` = 4-way GPU-vs-GPU h diff on one
+layer, random x + uniform distinct routing):
+- v1 bitwise: 0/2359296 entries differ at n=512.
+- v2/v4 vs ungrouped: max_rel ~4e-3 AT NEAR-ZERO h entries (abs ~4e-7)
+  — f32 summation-order class. With scalar projections the whole model
+  is **prefillcmp 36/36, worst rel 8e-6 (v2) / 7.4e-4 (v4)**: grouped
+  semantics are exact; h-GEMM noise is the only f16 in the pipeline.
+- v3 f16: same class as the shipping h-GEMM (max_rel at cancellation
+  zeros, abs ~2e-4).
+- Under the default h-GEMM, forced-grouped prefillcmp reads 35/36 (v2,
+  v4): the flipped cell (N=48 seed=42, argmax margin 0.042) is a
+  random-token near-tie where baseline noise 0.073 already dominates —
+  ANY reordering rolls that die. The gate for grouped work is therefore
+  the compound: moegcmp isolation + scalar-proj 36/36 + serving parity.
+- Serving parity, forced v4 at all n: ids1/2/3 TOKEN-EXACT vs llama.cpp
+  refs, prefilldecode HANDOFF EXACT.
+- **Long-prompt gate (the one that exercises default grouping): 1040
+  natural tokens (PORT.md head via llama /tokenize), QK_MAXB=512 → two
+  full 512-token grouped chunks + 15 serial; 64 greedy tokens
+  TOKEN-EXACT vs llama-server temperature-0 for ungrouped, default-v4
+  AND v3-f16.** (v3 does flip 1 token in 244 on the SMALL-prompt suite
+  — prompt3 token 43 — recorded; that's why v3 stays opt-in.)
+
+**Engine numbers at N=512 single chunk (QK_MAXB=512), interleaved with
+serial control, lap-thermal so ratios are the hard data:**
+
+| config | batch ms | speedup vs own serial | tok/s |
+|---|---|---|---|
+| ungrouped | 2239–2388 | 4.32–4.69× | 214–229 |
+| v4 default | 1567–1726 | **5.68–5.69×** | 297–327 |
+| v3 record | 1438–1661 | **6.20–6.51×** | 309–356 |
+
+pp512 standing: **~310–356 tok/s vs llama.cpp 1452 — gap 4.1×** (was
+6.3× at the start of the round). Next fat, in order: grouped DOWN
+projection (still ungrouped; ~40% of remaining MoE decode), attention at
+512 (fa_attn_batch is O(N²) — N=512 batch runs at 4.4 ms/tok vs 2.8 at
+N=128, so something quadratic-ish is growing), then dn/select/logits
+small ops. Contamination note: one bench triple was invalidated by a
+leftover llama-server holding 17 GB (kill %1 in a fresh shell is a
+no-op — check `ps`, not job tables); numbers above are from clean runs.
+
 ## C1 — no-copy weights: 15.5 GB RSS → 318 MB (2026-07-09)
 
 The engine now wraps the entire GGUF mmap in ONE
