@@ -1909,7 +1909,9 @@ struct qk_engine {
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
-    id<MTLComputePipelineState> pRms;
+    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG;
+    id<MTLBuffer> bbStart, bbATok, bbASlot;
+    bool moeGrouped = false;  // QK_MOE_GROUPED=1: read-once grouped gu (measured SLOWER — see PORT.md)
 
     struct Slot {
         bool active = false;
@@ -2085,6 +2087,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         pGemmB = getPipe(c, "gemm_q8_0", fn, 0);
         gemmThreads = !strcmp(fn, "gemm_q8_0_sg") ? 128 : 256;  // sg is 4-simd; scalar+h are 256
     }
+    pMoeGrp = getPipe(c, "moe_grouped", "moe_group", 0);
+    pMoeGuG = getPipe(c, "moe_grouped", "moe_gu_grouped", nsg);
+    if (const char* mg = getenv("QK_MOE_GROUPED")) moeGrouped = atoi(mg) != 0;
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 float4s");
 
     bXin = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
@@ -2165,6 +2170,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         bbTok = createBuf(c, (size_t)cap * 4, nullptr, true);
     }
     bbIds = createBuf(c, (size_t)cap * 4, nullptr, true);
+    bbStart = createBuf(c, 258 * 4, nullptr, true);
+    bbATok = createBuf(c, (size_t)cap * 9 * 4, nullptr, true);
+    bbASlot = createBuf(c, (size_t)cap * 9 * 4, nullptr, true);
     bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, nullptr, true);
     memset(bbCarry.contents, 0, (size_t)nLayer * chQkv * 3 * 4);
 
@@ -2399,6 +2407,13 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     }
     if (hiddenIn) memcpy(bbXin.contents, hiddenIn, (size_t)n * nEmbd * 4);   // UMA
     else memcpy(bbIds.contents, toks, (size_t)n * 4);
+    // QK_PREFILL_SKIP=proj|moe|dn|attn: drop that stage class from the chunk
+    // (results are WRONG — timing isolation only)
+    static const char* skip = getenv("QK_PREFILL_SKIP");
+    const bool skProj = skip && strstr(skip, "proj");
+    const bool skMoe  = skip && strstr(skip, "moe");
+    const bool skDn   = skip && strstr(skip, "dn");
+    const bool skAttn = skip && strstr(skip, "attn");
     if (wantLogits) logits.resize(vocab);
     if (base == 0) resetSlot(slot);
     // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
@@ -2444,6 +2459,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         // projection: tiled GEMM for n>=48 (weight reads amortized), else z=n GEMV
         auto proj = [&](WB W, id<MTLBuffer> X, id<MTLBuffer> Y,
                         uint32_t M, uint32_t K, bool isOut) {
+            if (skProj) return;
             if (n >= 48) {
                 pcG = {M, K, n};
                 dspz(pGemmB, {W, X, Y}, &pcG, 12, (M + 127) / 128, gemmThreads, (n + 63) / 64);
@@ -2471,6 +2487,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 dspz(pAbB, {bbXn, L.alW, L.beW, L.dt, L.av, bbGb}, &pcAbB, 12,
                      (2 * hV + nsg - 1) / nsg, thrN, n);
                 bar();
+                if (!skDn) {
                 dspz(pConvB, {WB{bbCarry, (NSUInteger)il * chQkv * 3 * 4}, bbBig, L.ker,
                               bbConvOut, WB{L.st1, so1}},
                      &pcConvB, 20, chQkv / dS, dS, n);
@@ -2481,32 +2498,45 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 dspz(pGateB, {bbO, L.sn, bbMid, bbAtt}, &pcGateB, 16,
                      (hV + nsg - 1) / nsg, thrN, n);
                 bar();
+                }
                 proj(L.outW, bbAtt, bbAttnOut, nEmbd, dIn, true);
             } else {
                 proj(L.wq, bbXn, bbBig, chQkv, nEmbd, false);
                 proj(L.wk, bbXn, bbKin, hKV * dh, nEmbd, false);
                 proj(L.wv, bbXn, bbVin, hKV * dh, nEmbd, false);
                 bar();
+                if (!skAttn) {
                 dspz(pPrepB, {bbBig, bbKin, bbVin, L.qn, L.kn, bbMid, WB{L.st1, so1},
                               WB{L.st2, so2}, bRope}, &pcFaB, 40, hQ + 2 * hKV, 256, n);
                 bar();
                 dspz(pAttnB, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
                      &pcFaB, 40, hQ, 256, n);
                 bar();
+                }
                 proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true);
             }
             bar();
             dspz(pMoeLA, {L.mgi, L.mgis, bbXin, bbAttnOut, L.pn, bbML, bbY, bbXn2},
                  &pcv5, 20, (257 + nsg - 1) / nsg, thrN, n);
             bar();
+            if (!skMoe) {
             dspz(pMoeS, {bbML, bbMSel}, &pcv, 16, 1, 32, n);
             bar();
-            dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
-                 (9 * 512 + nsg - 1) / nsg, thrN, n);
+            if (moeGrouped) {
+                struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, 512, 256, 8, n};
+                dspz(pMoeGrp, {bbMSel, bbStart, bbATok, bbASlot}, &pcg, 20, 1, 256, 1);
+                bar();
+                dspz(pMoeGuG, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok, bbASlot, bbMH},
+                     &pcv, 16, (257 * 512 + nsg - 1) / nsg, thrN, 1);
+            } else {
+                dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
+                     (9 * 512 + nsg - 1) / nsg, thrN, n);
+            }
             bar();
             dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY},
                  &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
             bar();
+            }
             WB nextNorm = il + 1 < lEnd ? layers[il + 1].aNorm : bONorm;
             dspz(pAddN, {bbY, bbMY, nextNorm, bbXin, bbXn}, &pcRms, 8, 1, 256, n);
             bar();
