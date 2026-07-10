@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -774,6 +775,166 @@ static bool caseMoe(MtlCtx& c, uint32_t layer, uint32_t iters) {
     return pass;
 }
 
+
+// moegcmp: batched gate+up GPU-vs-GPU isolation — same random x/sel through
+// the ungrouped kernel, grouped v1 (bit-exact control), and grouped v2
+// (decode-once MMA); diffs the h tensors directly. Separates kernel bugs
+// from whole-model noise when prefillcmp moves.
+static bool caseMoeGrp(MtlCtx& c, uint32_t layer, uint32_t n, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    char nb[128];
+    auto T = [&](const char* suffix) -> const GgufTensor* {
+        snprintf(nb, sizeof nb, "blk.%u.%s", layer, suffix);
+        const GgufTensor* t = g.find(nb);
+        if (!t) fprintf(stderr, "missing tensor %s\n", nb);
+        return t;
+    };
+    const GgufTensor* tGE = T("ffn_gate_exps.weight");
+    const GgufTensor* tUE = T("ffn_up_exps.weight");
+    const GgufTensor* tGS = T("ffn_gate_shexp.weight");
+    const GgufTensor* tUS = T("ffn_up_shexp.weight");
+    if (!tGE || !tUE || !tGS || !tUS) return false;
+    if (tGE->type != GGML_IQ3_XXS || tUE->type != GGML_IQ3_XXS ||
+        tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0) {
+        fprintf(stderr, "layer %u tensor types don't match the compiled kernels\n", layer);
+        return false;
+    }
+    const uint32_t nEmbd = (uint32_t)tGE->ne[0];
+    const uint32_t nFf   = (uint32_t)tGE->ne[1];
+    const uint32_t nExp  = (uint32_t)tGE->ne[2];
+    const uint32_t nUsed = 8;
+    const uint32_t hs = (nUsed + 1) * nFf;
+    printf("\n== moegcmp blk.%u  n=%u  n_embd=%u n_ff=%u experts=%u top-%u + shared ==\n",
+           layer, n, nEmbd, nFf, nExp, nUsed);
+
+    // synthetic inputs: gate+up reads only x and sel.ids (weights unused here)
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> xs((size_t)n * nEmbd);
+    for (auto& v : xs) v = nd(rng);
+    struct SelH { uint32_t ids[8]; float w[8]; float wShared; float pad[15]; };
+    std::vector<SelH> sel(n);
+    for (uint32_t t = 0; t < n; t++) {
+        std::vector<uint32_t> pool(nExp);
+        for (uint32_t e = 0; e < nExp; e++) pool[e] = e;
+        for (uint32_t s = 0; s < nUsed; s++) {
+            uint32_t j = s + rng() % (nExp - s);
+            std::swap(pool[s], pool[j]);
+            sel[t].ids[s] = pool[s];
+            sel[t].w[s] = 0.125f;
+        }
+        sel[t].wShared = 0.5f;
+    }
+
+    const size_t rbGE = ggmlRowBytes(GGML_IQ3_XXS, nEmbd);
+    const size_t rbGS = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t szGE = (size_t)nExp * nFf * rbGE, szGS = (size_t)nFf * rbGS;
+    id<MTLBuffer> bGE = createBuf(c, szGE, tGE->data, true), bUE = createBuf(c, szGE, tUE->data, true);
+    id<MTLBuffer> bGS = createBuf(c, szGS, tGS->data, true), bUS = createBuf(c, szGS, tUS->data, true);
+    id<MTLBuffer> bX = createBuf(c, xs.size() * 4, xs.data(), true);
+    id<MTLBuffer> bSel = createBuf(c, (size_t)n * 128, sel.data(), true);
+    id<MTLBuffer> bH0 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
+    id<MTLBuffer> bH1 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
+    id<MTLBuffer> bH2 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
+    id<MTLBuffer> bH3 = createBuf(c, (size_t)n * hs * 4, nullptr, true);
+    id<MTLBuffer> bStart = createBuf(c, 258 * 4, nullptr, true);
+    id<MTLBuffer> bATok = createBuf(c, (size_t)n * 9 * 4, nullptr, true);
+    id<MTLBuffer> bASlot = createBuf(c, (size_t)n * 9 * 4, nullptr, true);
+
+    const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
+    const uint32_t thrN = nsg * 32;
+    id<MTLComputePipelineState> pGu  = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    id<MTLComputePipelineState> pGrp = getPipe(c, "moe_grouped", "moe_group", 0);
+    id<MTLComputePipelineState> pG1  = getPipe(c, "moe_grouped", "moe_gu_grouped", nsg);
+    id<MTLComputePipelineState> pG2  = getPipe(c, "moe_grouped", "moe_gu_grouped2", 0);
+    id<MTLComputePipelineState> pG3  = getPipe(c, "moe_grouped", "moe_gu_grouped3", 0);
+
+    struct { uint32_t a, b, cc, d; } pcv{nEmbd, nFf, nExp, nUsed};
+    struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, nFf, nExp, nUsed, n};
+    auto dsp = [&](id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso,
+                   std::initializer_list<id<MTLBuffer>> bufs, const void* pc, uint32_t pcSz,
+                   uint32_t tgs, uint32_t thr, uint32_t z) {
+        [enc setComputePipelineState:pso];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:pc length:pcSz atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, z)
+            threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+    };
+    auto runAll = [&](bool bench) -> std::array<double, 4> {
+        std::array<double, 4> ms{0, 0, 0, 0};
+        for (int which = 0; which < 4; which++) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc =
+                    [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                for (uint32_t it = 0; it < (bench ? iters : 1); it++) {
+                    if (which == 0) {
+                        dsp(enc, pGu, {bGE, bUE, bGS, bUS, bX, bSel, bH0}, &pcv, 16,
+                            (hs + nsg - 1) / nsg, thrN, n);
+                    } else {
+                        dsp(enc, pGrp, {bSel, bStart, bATok, bASlot}, &pcg, 20, 1, 256, 1);
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        if (which == 1)
+                            dsp(enc, pG1, {bGE, bUE, bGS, bUS, bX, bStart, bATok, bASlot, bH1},
+                                &pcv, 16, ((nExp + 1) * nFf + nsg - 1) / nsg, thrN, 1);
+                        else if (which == 2)
+                            dsp(enc, pG2, {bGE, bUE, bGS, bUS, bX, bStart, bATok, bASlot, bH2},
+                                &pcv, 16, (nExp + 1) * (nFf / 32), 128, 1);
+                        else
+                            dsp(enc, pG3, {bGE, bUE, bGS, bUS, bX, bStart, bATok, bASlot, bH3},
+                                &pcv, 16, (nExp + 1) * (nFf / 64), 256, 1);
+                    }
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                ms[which] = (cb.GPUEndTime - cb.GPUStartTime) * 1e3 / (bench ? iters : 1);
+            }
+        }
+        return ms;
+    };
+    runAll(false);
+
+    const float* h0 = (const float*)bH0.contents;
+    const float* h1 = (const float*)bH1.contents;
+    const float* h2 = (const float*)bH2.contents;
+    const float* h3 = (const float*)bH3.contents;
+    double rms = 0;
+    for (size_t i = 0; i < (size_t)n * hs; i++) rms += (double)h0[i] * h0[i];
+    rms = std::sqrt(rms / ((size_t)n * hs));
+    const double floorD = std::max(1e-4, 1e-3 * rms);
+    uint32_t diff1 = 0;
+    double maxRel2 = 0, maxRel3 = 0;
+    size_t argRel2 = 0, argRel3 = 0;
+    for (size_t i = 0; i < (size_t)n * hs; i++) {
+        if (h1[i] != h0[i]) diff1++;
+        double rel = std::fabs((double)h2[i] - h0[i]) /
+                     std::max(floorD, (double)std::fabs(h0[i]));
+        if (rel > maxRel2) { maxRel2 = rel; argRel2 = i; }
+        rel = std::fabs((double)h3[i] - h0[i]) /
+              std::max(floorD, (double)std::fabs(h0[i]));
+        if (rel > maxRel3) { maxRel3 = rel; argRel3 = i; }
+    }
+    printf("v1 (bit-exact control): %u/%zu entries differ -> %s\n",
+           diff1, (size_t)n * hs, diff1 ? "FAIL" : "PASS");
+    printf("v2 (f32 decode-once):   max_rel = %.3g at [tok=%zu slot=%zu r=%zu] "
+           "(h0=%g h2=%g)\n", maxRel2, argRel2 / hs, (argRel2 % hs) / nFf,
+           argRel2 % nFf, h0[argRel2], h2[argRel2]);
+    printf("v3 (f16 wide):          max_rel = %.3g at [tok=%zu slot=%zu r=%zu] "
+           "(h0=%g h3=%g)\n", maxRel3, argRel3 / hs, (argRel3 % hs) / nFf,
+           argRel3 % nFf, h0[argRel3], h3[argRel3]);
+
+    if (iters > 0) {
+        runAll(true);
+        auto ms = runAll(true);
+        printf("bench (%u iters): ungrouped %.3f ms | v1 %.3f ms | v2 %.3f ms | v3 %.3f ms\n",
+               iters, ms[0], ms[1], ms[2], ms[3]);
+    }
+    return diff1 == 0;
+}
 
 // ---------- MoE tensor set + CPU reference (shared by moe/block modes) ----------
 
@@ -1909,9 +2070,12 @@ struct qk_engine {
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
-    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG;
+    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3;
     id<MTLBuffer> bbStart, bbATok, bbASlot;
-    bool moeGrouped = false;  // QK_MOE_GROUPED=1: read-once grouped gu (measured SLOWER — see PORT.md)
+    // QK_MOE_GROUPED: 0 = ungrouped; 1 = v1 read-once (measured SLOWER — see
+    // PORT.md); 2 = v2 decode-once MMA (dequant expert tile to tg half once,
+    // multiply all its tokens GEMM-style).
+    int moeGrouped = 0;
 
     struct Slot {
         bool active = false;
@@ -2087,9 +2251,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         pGemmB = getPipe(c, "gemm_q8_0", fn, 0);
         gemmThreads = !strcmp(fn, "gemm_q8_0_sg") ? 128 : 256;  // sg is 4-simd; scalar+h are 256
     }
-    pMoeGrp = getPipe(c, "moe_grouped", "moe_group", 0);
-    pMoeGuG = getPipe(c, "moe_grouped", "moe_gu_grouped", nsg);
-    if (const char* mg = getenv("QK_MOE_GROUPED")) moeGrouped = atoi(mg) != 0;
+    pMoeGrp  = getPipe(c, "moe_grouped", "moe_group", 0);
+    pMoeGuG  = getPipe(c, "moe_grouped", "moe_gu_grouped", nsg);
+    pMoeGuG2 = getPipe(c, "moe_grouped", "moe_gu_grouped2", 0);
+    pMoeGuG3 = getPipe(c, "moe_grouped", "moe_gu_grouped3", 0);
+    if (const char* mg = getenv("QK_MOE_GROUPED")) moeGrouped = atoi(mg);
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 float4s");
 
     bXin = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
@@ -2526,8 +2692,16 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, 512, 256, 8, n};
                 dspz(pMoeGrp, {bbMSel, bbStart, bbATok, bbASlot}, &pcg, 20, 1, 256, 1);
                 bar();
-                dspz(pMoeGuG, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok, bbASlot, bbMH},
-                     &pcv, 16, (257 * 512 + nsg - 1) / nsg, thrN, 1);
+                if (moeGrouped >= 3)
+                    dspz(pMoeGuG3, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
+                                    bbASlot, bbMH}, &pcv, 16, 257 * (512 / 64), 256, 1);
+                else if (moeGrouped == 2)
+                    dspz(pMoeGuG2, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
+                                    bbASlot, bbMH}, &pcv, 16, 257 * (512 / 32), 128, 1);
+                else
+                    dspz(pMoeGuG, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
+                                   bbASlot, bbMH}, &pcv, 16, (257 * 512 + nsg - 1) / nsg,
+                         thrN, 1);
             } else {
                 dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
                      (9 * 512 + nsg - 1) / nsg, thrN, n);
@@ -2542,8 +2716,13 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             bar();
         }
         if (wantLogits || argmaxOut) {
+            // per-position ids (argmaxOut: stageRun wire contract) need the
+            // head for every row; logits-only callers need just the LAST row
+            // — the z=n head is ~417 MB of Q6_K weight reads PER ROW.
+            const uint32_t nh = argmaxOut ? n : 1;
             struct { uint32_t m, k; } pcHead{vocab, nEmbd};
-            dspz(pHead, {bHeadW, bbXn, bbLogits}, &pcHead, 8, (vocab + 3) / 4, 64, n);
+            dspz(pHead, {bHeadW, nh == 1 ? WB{bbXn, (NSUInteger)(n - 1) * nEmbd * 4} : WB{bbXn},
+                         bbLogits}, &pcHead, 8, (vocab + 3) / 4, 64, nh);
             if (argmaxOut) {
                 bar();
                 const uint32_t amWgs = (vocab + 4095) / 4096;
@@ -2559,7 +2738,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         [cb waitUntilCompleted];
     }
     if (wantLogits)
-        memcpy(logits.data(), (uint8_t*)bbLogits.contents + (size_t)(n - 1) * vocab * 4,
+        memcpy(logits.data(),
+               (uint8_t*)bbLogits.contents + (argmaxOut ? (size_t)(n - 1) * vocab * 4 : 0),
                (size_t)vocab * 4);
     if (argmaxOut) memcpy(argmaxOut, bbTok.contents, (size_t)n * 4);
     if (hiddenOut) memcpy(hiddenOut, bbXin.contents, (size_t)n * nEmbd * 4);   // UMA
@@ -3264,7 +3444,7 @@ int main(int argc, char** argv) {
             std::vector<float> lS, lB;
             printf("prefillbench: serial (N per-token forwards) vs batched (1 forward), ctx=%u\n", ctx);
             printf("  %-6s %10s %10s %8s %10s\n", "N", "serial_ms", "batch_ms", "speedup", "tok/s_bat");
-            for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u, 192u, 256u}) {
+            for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u, 192u, 256u, 384u, 512u}) {
                 if (N > cap) continue;
                 std::mt19937 rng(1234);
                 std::vector<uint32_t> toks(N);
@@ -3377,6 +3557,8 @@ int main(int argc, char** argv) {
             ok = caseGguf(c, argv[2], argU(3, 100));
         } else if (mode == "moe") {
             ok = caseMoe(c, argU(2, 0), argU(3, 200));
+        } else if (mode == "moegcmp") {
+            ok = caseMoeGrp(c, argU(2, 0), argU(3, 128), argU(4, 50));
         } else if (mode == "block") {
             ok = caseBlock(c, argU(2, 0), argU(3, 3), argU(4, 200));
         } else if (mode == "ablock") {
