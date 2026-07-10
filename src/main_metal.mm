@@ -652,7 +652,8 @@ static bool caseMoe(MtlCtx& c, uint32_t layer, uint32_t iters) {
     const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
     id<MTLComputePipelineState> pLogits = getPipe(c, "moe_logits", "moe_logits", nsg);
     id<MTLComputePipelineState> pSelect = getPipe(c, "moe_select", "moe_select", 0);
-    id<MTLComputePipelineState> pGu     = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    id<MTLComputePipelineState> pGu     = getPipe(c, "moe_gateup_all",
+        guIq4 ? "moe_gateup_all_iq4" : "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pDn     = downQ6 ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
                                                  : getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
 
@@ -2096,11 +2097,19 @@ struct qk_engine {
     id<MTLComputePipelineState> pGemvA, pGemvO, pAb, pStep, pPrep, pAttn, pMoeS,
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
+    // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
+    id<MTLComputePipelineState> pGemv4, pGemmB4, pMoeGu4, pMoeGuG4i, pMoeGuG5i;
+    std::vector<id<MTLBuffer>> extraBufs;   // host-built weights (ssm_ba split)
+    struct WeightWin { const uint8_t* base; size_t len; id<MTLBuffer> buf; };
+    std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
     uint32_t gemmThreads = 256;
     uint32_t gemmBM = 128, gemmBN = 64;
 
     struct Layer {
         bool rec = false, downQ6 = false;
+        // per-projection quant flags: true = IQ4_XS weight (dispatch the *4
+        // pipe). p1 = qkv|q, p2 = z|k, p3 = v, wo = ssm_out|attn_output.
+        bool iq4P1 = false, iq4P2 = false, iq4P3 = false, iq4Wo = false;
         WB aNorm{nil}, pn{nil};
         WB qkvW{nil}, zW{nil}, alW{nil}, beW{nil}, dt{nil}, av{nil}, ker{nil},
            sn{nil}, outW{nil};                                       // rec
@@ -2273,24 +2282,106 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                                               MTLResourceHazardTrackingModeUntracked];
             if (!gbuf) return fail("qk_open: weight copy alloc failed");
             memcpy(gbuf.contents, g.base(), g.size());
-        } else {
+        } else if (len <= c.dev.maxBufferLength &&
+                   !getenv("QK_WIN_MAX")) {   // QK_WIN_MAX=<GB>: force windows (debug)
             gbuf = [c.dev newBufferWithBytesNoCopy:(void*)g.base()
                                             length:len
                                            options:MTLResourceStorageModeShared |
                                                    MTLResourceHazardTrackingModeUntracked
                                        deallocator:nil];
-            // QK_MLOCK=1: wire the mapping. No-copy weights degrade 2-6x
-            // after memory-pressure evictions (per-submit GPU rewiring of
-            // faulted pages, sys-time bound) and do NOT self-heal; mlock
-            // keeps zero-copy AND immunity. Serving configs want this.
-            if (getenv("QK_MLOCK") && mlock(g.base(), g.size()) != 0)
-                fprintf(stderr, "qk_open: mlock failed (%s) — continuing unwired\n",
-                        strerror(errno));
+        } else {
+            // window the mapping: sort tensors by address, cut windows at
+            // tensor boundaries so no tensor straddles one
+            std::vector<const GgufTensor*> ts;
+            for (const auto& kv : g.tensors()) ts.push_back(&kv.second);
+            std::sort(ts.begin(), ts.end(), [](const GgufTensor* a, const GgufTensor* b) {
+                return a->data < b->data;
+            });
+            size_t maxLen = (size_t)c.dev.maxBufferLength & ~(psz - 1);
+            if (const char* wm = getenv("QK_WIN_MAX"))
+                maxLen = std::min(maxLen, ((size_t)atol(wm) << 30) & ~(psz - 1));
+            size_t i = 0;
+            while (i < ts.size()) {
+                const uint8_t* w0 = (const uint8_t*)((uintptr_t)ts[i]->data & ~(uintptr_t)(psz - 1));
+                size_t j = i;
+                const uint8_t* end = nullptr;
+                while (j < ts.size()) {
+                    const GgufTensor* t = ts[j];
+                    size_t bytes = ggmlRowBytes((GgmlType)t->type, (uint32_t)t->ne[0]) *
+                                   t->ne[1] * t->ne[2] * t->ne[3];
+                    const uint8_t* e = t->data + bytes;
+                    if ((size_t)(e - w0) > maxLen) break;
+                    end = e;
+                    j++;
+                }
+                if (j == i) return fail("qk_open: tensor larger than maxBufferLength");
+                size_t wlen = ((size_t)(end - w0) + psz - 1) & ~(psz - 1);
+                id<MTLBuffer> wb = [c.dev newBufferWithBytesNoCopy:(void*)w0
+                                                            length:wlen
+                                                           options:MTLResourceStorageModeShared |
+                                                                   MTLResourceHazardTrackingModeUntracked
+                                                       deallocator:nil];
+                if (!wb) return fail("qk_open: weight window alloc failed");
+                gwin.push_back({w0, wlen, wb});
+                i = j;
+            }
+            fprintf(stderr, "qk_open: %zu weight windows over %.1f GB\n",
+                    gwin.size(), g.size() / 1e9);
         }
-        if (!gbuf) return fail("qk_open: newBufferWithBytesNoCopy failed");
+        if (!gbuf && gwin.empty()) return fail("qk_open: newBufferWithBytesNoCopy failed");
+        // QK_MLOCK=1: wire the mapping. No-copy weights degrade 2-6x
+        // after memory-pressure evictions (per-submit GPU rewiring of
+        // faulted pages, sys-time bound) and do NOT self-heal; mlock
+        // keeps zero-copy AND immunity. Serving configs want this.
+        // A split stage wires only its OWNED tensors (the 80B file is
+        // 42.8 GB — whole-file mlock next to another worker would wire
+        // most of RAM); full-model engines wire the whole mapping.
+        if (getenv("QK_MLOCK")) {
+            if (!splitStage()) {
+                if (mlock(g.base(), g.size()) != 0)
+                    fprintf(stderr, "qk_open: mlock failed (%s) — continuing unwired\n",
+                            strerror(errno));
+            } else {
+                size_t wired = 0;
+                auto lockT = [&](const GgufTensor* t) {
+                    if (!t) return;
+                    size_t bytes = ggmlRowBytes((GgmlType)t->type, (uint32_t)t->ne[0]) *
+                                   t->ne[1] * t->ne[2] * t->ne[3];
+                    if (mlock((void*)t->data, bytes) == 0) wired += bytes;
+                };
+                for (const auto& kv : g.tensors()) {
+                    const std::string& nm = kv.first;
+                    bool own = false;
+                    if (nm.rfind("blk.", 0) == 0) {
+                        uint32_t il = (uint32_t)atoi(nm.c_str() + 4);
+                        own = il >= lFirst && il < lEnd;
+                    } else {
+                        own = (firstStage() && nm == "token_embd.weight") ||
+                              (lastStage() && (nm == "output.weight" ||
+                                               nm == "output_norm.weight"));
+                    }
+                    if (own) lockT(&kv.second);
+                }
+                fprintf(stderr, "qk_open: stage mlock wired %.1f GB\n", wired / 1e9);
+            }
+        }
     }
+    // The 80B file (42.8 GB) exceeds maxBufferLength (~36 GB on this device),
+    // so one no-copy buffer over the whole mmap is impossible. Split the
+    // mapping into page-aligned no-copy WINDOWS cut at tensor boundaries and
+    // resolve each tensor to (window buffer, offset).
+    if (!gbuf && !gwin.empty()) {}  // (windows built below when needed)
     auto WOFF = [&](const GgufTensor* t) -> WB {
-        return WB{gbuf, (NSUInteger)((const uint8_t*)t->data - g.base())};
+        if (gbuf) return WB{gbuf, (NSUInteger)((const uint8_t*)t->data - g.base())};
+        // windows are page-padded and can overlap at the seams — pick one that
+        // contains the ENTIRE tensor, not just its first byte
+        const size_t bytes = ggmlRowBytes((GgmlType)t->type, (uint32_t)t->ne[0]) *
+                             t->ne[1] * t->ne[2] * t->ne[3];
+        for (const auto& w : gwin)
+            if (t->data >= w.base && t->data + bytes <= w.base + w.len)
+                return WB{w.buf, (NSUInteger)(t->data - w.base)};
+        fprintf(stderr, "qk_open: tensor outside every weight window\n");
+        abort();
     };
     const GgufTensor* tEmbd = g.find("token_embd.weight");
     const GgufTensor* tONorm = g.find("output_norm.weight");
@@ -2311,6 +2402,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         ffE = (uint32_t)tge0->ne[1];
         if (nExp < nUsed || nExp > 512 || ffE % 256 != 0)
             return fail("qk_open: expert shape unsupported (n_expert <= 512, n_ff_exp %% 256)");
+        guIq4 = tge0->type == GGML_IQ4_XS;   // uniform per file (loadMoeT re-checks per layer)
     }
     const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
@@ -2363,6 +2455,13 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeGuG3 = getPipe(c, "moe_grouped", "moe_gu_grouped3", 0);
     pMoeGuG4 = getPipe(c, "moe_grouped", "moe_gu_grouped4", 0);
     pMoeGuG5 = getPipe(c, "moe_grouped", "moe_gu_grouped5", 0);
+    if (guIq4) {
+        pGemv4    = getPipe(c, "gemv_iq4_xs", "gemv_iq4_xs", 2);   // NSG=2: 64 thr, 4 rows/tg
+        pGemmB4   = getPipe(c, "gemm_iq4_xs", "gemm_iq4_xs_hp", 0);
+        pMoeGu4   = getPipe(c, "moe_gateup_all", "moe_gateup_all_iq4", nsg);
+        pMoeGuG4i = getPipe(c, "moe_grouped", "moe_gu_grouped4_iq4", 0);
+        pMoeGuG5i = getPipe(c, "moe_grouped", "moe_gu_grouped5_iq4", 0);
+    }
     pMoeDG4  = getPipe(c, "moe_down_grouped", "moe_down_grouped_iq4", 0);
     pMoeDG6  = getPipe(c, "moe_down_grouped", "moe_down_grouped_q6k", 0);
     pMoeDGH4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_iq4", 0);
@@ -2468,6 +2567,20 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             snprintf(nb, sizeof nb, "blk.%u.%s", il, suffix); return g.find(nb);
         };
         auto W = [&](const GgufTensor* t, size_t) -> WB { return WOFF(t); };
+        // Dense projection: Q8_0 (35B) or IQ4_XS (80B; attn_v stays Q8_0
+        // there). Missing tensor or other type is a hard error.
+        bool denseBad = false;
+        auto Wd = [&](const char* suffix, bool& iq4) -> WB {
+            const GgufTensor* t = T(suffix);
+            if (!t || (t->type != GGML_Q8_0 && t->type != GGML_IQ4_XS)) {
+                fprintf(stderr, "blk.%u.%s: missing or unsupported dense type\n", il, suffix);
+                denseBad = true;
+                iq4 = false;
+                return WB{gbuf, 0};
+            }
+            iq4 = t->type == GGML_IQ4_XS;
+            return WOFF(t);
+        };
         MoeT moe;
         if (!loadMoeT(g, il, moe)) return fail("qk_open: MoE tensors missing");
         L.downQ6 = moe.downQ6;
@@ -2475,25 +2588,55 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         L.aNorm = W(T("attn_norm.weight"), nEmbd * 4);
         L.pn = W(T("post_attention_norm.weight"), nEmbd * 4);
         if (L.rec) {
-            L.qkvW = W(T("attn_qkv.weight"), (size_t)chQkv * rbQ8e);
-            L.zW = W(T("attn_gate.weight"), (size_t)dIn * rbQ8e);
-            L.alW = W(T("ssm_alpha.weight"), (size_t)hV * nEmbd * 4);
-            L.beW = W(T("ssm_beta.weight"), (size_t)hV * nEmbd * 4);
+            L.qkvW = Wd("attn_qkv.weight", L.iq4P1);
+            L.zW = Wd("attn_gate.weight", L.iq4P2);
+            if (T("ssm_alpha.weight")) {
+                L.alW = W(T("ssm_alpha.weight"), (size_t)hV * nEmbd * 4);
+                L.beW = W(T("ssm_beta.weight"), (size_t)hV * nEmbd * 4);
+            } else {
+                // qwen3next fuses the two: ssm_ba [nEmbd, 2*hV], interleaved
+                // per k-head group g: rows g*4+{0,1} = beta (v-heads 2g,2g+1),
+                // rows g*4+{2,3} = alpha (llama.cpp qwen3next view split).
+                // Tiny tensor — dequant on the host, de-interleave into the
+                // engine's split alpha/beta layout; dn_ab is unchanged.
+                const GgufTensor* tBa = T("ssm_ba.weight");
+                if (!tBa || tBa->ne[0] != nEmbd || tBa->ne[1] != 2 * hV)
+                    return fail("qk_open: missing ssm_alpha/ssm_beta/ssm_ba");
+                std::vector<float> row(nEmbd), al((size_t)hV * nEmbd), be((size_t)hV * nEmbd);
+                size_t rbBa = ggmlRowBytes(tBa->type, nEmbd);
+                for (uint32_t r = 0; r < 2 * hV; r++) {
+                    const uint8_t* src = tBa->data + (size_t)r * rbBa;
+                    if (tBa->type == GGML_F32) memcpy(row.data(), src, nEmbd * 4);
+                    else if (tBa->type == GGML_IQ4_XS)
+                        dequant_row_iq4_xs((const block_iq4_xs*)src, row.data(), nEmbd);
+                    else if (tBa->type == GGML_Q8_0)
+                        dequant_row_q8_0((const block_q8_0*)src, row.data(), nEmbd);
+                    else return fail("qk_open: ssm_ba type unsupported");
+                    uint32_t grp = r >> 2, sub = r & 3;
+                    float* dst = (sub < 2 ? be.data() : al.data()) +
+                                 ((size_t)grp * 2 + (sub & 1)) * nEmbd;
+                    memcpy(dst, row.data(), (size_t)nEmbd * 4);
+                }
+                extraBufs.push_back(createBuf(c, al.size() * 4, al.data(), true));
+                L.alW = WB{extraBufs.back(), 0};
+                extraBufs.push_back(createBuf(c, be.size() * 4, be.data(), true));
+                L.beW = WB{extraBufs.back(), 0};
+            }
             L.dt = W(T("ssm_dt.bias"), hV * 4);
             L.av = W(T("ssm_a"), hV * 4);
             L.ker = W(T("ssm_conv1d.weight") ? T("ssm_conv1d.weight") : T("ssm_conv1d"),
                       (size_t)chQkv * 4 * 4);
             L.sn = W(T("ssm_norm.weight"), dS * 4);
-            L.outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
+            L.outW = Wd("ssm_out.weight", L.iq4Wo);
             L.ps1 = (size_t)chQkv * 3 * 4;
             L.ps2 = (size_t)hV * dS * dS * 4;
         } else {
-            L.wq = W(T("attn_q.weight"), (size_t)chQkv * rbQ8e);
-            L.wk = W(T("attn_k.weight"), (size_t)hKV * dh * rbQ8e);
-            L.wv = W(T("attn_v.weight"), (size_t)hKV * dh * rbQ8e);
+            L.wq = Wd("attn_q.weight", L.iq4P1);
+            L.wk = Wd("attn_k.weight", L.iq4P2);
+            L.wv = Wd("attn_v.weight", L.iq4P3);
             L.qn = W(T("attn_q_norm.weight"), dh * 4);
             L.kn = W(T("attn_k_norm.weight"), dh * 4);
-            L.wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
+            L.wo = Wd("attn_output.weight", L.iq4Wo);
             L.ps1 = (size_t)hKV * tmax * dh * 4;
             L.ps2 = (size_t)hKV * tmax * dh * 4;
         }
@@ -2509,6 +2652,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         L.mgs = W(moe.gs, (size_t)moe.nFf * moe.rbGS);
         L.mus = W(moe.us, (size_t)moe.nFf * moe.rbGS);
         L.mds = W(moe.ds, (size_t)moe.nEmbd * moe.rbDS);
+        if (denseBad) return fail("qk_open: dense projection tensor missing or bad type");
     }
 
     snapOff1.resize(nLayer);
@@ -2566,26 +2710,33 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
         if (L.rec) {
-            dsp(pGemvA, {L.qkvW, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
-            dsp(pGemvA, {L.zW, bXn, bMid}, &pcZ, 8, dIn / 4, 256);
+            if (L.iq4P1) dsp(pGemv4, {L.qkvW, bXn, bBig}, &pcQkv, 8, chQkv / 4, 64);
+            else         dsp(pGemvA, {L.qkvW, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+            if (L.iq4P2) dsp(pGemv4, {L.zW, bXn, bMid}, &pcZ, 8, dIn / 4, 64);
+            else         dsp(pGemvA, {L.zW, bXn, bMid}, &pcZ, 8, dIn / 4, 256);
             dsp(pAb, {bXn, L.alW, L.beW, L.dt, L.av, bGb}, &pcAb, 8,
                 (2 * hV + nsg - 1) / nsg, thrN);
             bar();
             dsp(pStep, {bBig, L.st1, L.ker, bGb, L.st2, bMid, L.sn, bAtt},
                 &pcStep, 16, hV, dS);
             bar();
-            dsp(pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+            if (L.iq4Wo) dsp(pGemv4, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
+            else         dsp(pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
         } else {
-            dsp(pGemvA, {L.wq, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
-            dsp(pGemvA, {L.wk, bXn, bKin}, &pcKV, 8, hKV * dh / 4, 256);
-            dsp(pGemvA, {L.wv, bXn, bVin}, &pcKV, 8, hKV * dh / 4, 256);
+            if (L.iq4P1) dsp(pGemv4, {L.wq, bXn, bBig}, &pcQkv, 8, chQkv / 4, 64);
+            else         dsp(pGemvA, {L.wq, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+            if (L.iq4P2) dsp(pGemv4, {L.wk, bXn, bKin}, &pcKV, 8, hKV * dh / 4, 64);
+            else         dsp(pGemvA, {L.wk, bXn, bKin}, &pcKV, 8, hKV * dh / 4, 256);
+            if (L.iq4P3) dsp(pGemv4, {L.wv, bXn, bVin}, &pcKV, 8, hKV * dh / 4, 64);
+            else         dsp(pGemvA, {L.wv, bXn, bVin}, &pcKV, 8, hKV * dh / 4, 256);
             bar();
             dsp(pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.st1, L.st2, bRope, bSlotPos},
                 &pcFa, 32, hQ + 2 * hKV, 256);
             bar();
             dsp(pAttn, {bMid, L.st1, L.st2, bBig, bAtt, bSlotPos}, &pcFa, 32, hQ, 256);
             bar();
-            dsp(pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+            if (L.iq4Wo) dsp(pGemv4, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
+            else         dsp(pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
         }
         bar();
         dsp(pMoeLA, {L.mgi, L.mgis, bXin, bAttnOut, L.pn, bML, bY, bXn2}, &pcv5, 20,
@@ -2593,8 +2744,8 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
         bar();
         dsp(pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
         bar();
-        dsp(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bXn2, bMSel, bMH}, &pcv, 16,
-            ((nUsed + 1) * ffE + nsg - 1) / nsg, thrN);
+        dsp(guIq4 ? pMoeGu4 : pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bXn2, bMSel, bMH},
+            &pcv, 16, ((nUsed + 1) * ffE + nsg - 1) / nsg, thrN);
         bar();
         dsp(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bMH, bMSel, bMY}, &pcv, 16,
             (nEmbd + nsg - 1) / nsg, thrN);
@@ -2756,16 +2907,22 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
 
         // projection: tiled GEMM for n>=48 (weight reads amortized), else z=n GEMV
         auto proj = [&](WB W, id<MTLBuffer> X, id<MTLBuffer> Y,
-                        uint32_t M, uint32_t K, bool isOut) {
+                        uint32_t M, uint32_t K, bool isOut, bool iq4) {
             if (skProj) return;
             if (n >= 48) {
                 pcG = {M, K, n};
-                dspz(pGemmB, {W, X, Y}, &pcG, 12, (M + gemmBM - 1) / gemmBM, gemmThreads,
-                     (n + gemmBN - 1) / gemmBN);
+                if (iq4)
+                    dspz(pGemmB4, {W, X, Y}, &pcG, 12, (M + 63) / 64, 128, (n + 31) / 32);
+                else
+                    dspz(pGemmB, {W, X, Y}, &pcG, 12, (M + gemmBM - 1) / gemmBM, gemmThreads,
+                         (n + gemmBN - 1) / gemmBN);
             } else {
                 pcP = {M, K};
-                dspz(isOut ? pGemvO : pGemvA, {W, X, Y}, &pcP, 8,
-                     isOut ? (M + 1) / 2 : (M + 3) / 4, 256, n);
+                if (iq4)
+                    dspz(pGemv4, {W, X, Y}, &pcP, 8, (M + 3) / 4, 64, n);
+                else
+                    dspz(isOut ? pGemvO : pGemvA, {W, X, Y}, &pcP, 8,
+                         isOut ? (M + 1) / 2 : (M + 3) / 4, 256, n);
             }
         };
 
@@ -2781,8 +2938,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             Layer& L = layers[il];
             size_t so1 = (size_t)slot * L.ps1, so2 = (size_t)slot * L.ps2;
             if (L.rec) {
-                proj(L.qkvW, bbXn, bbBig, chQkv, nEmbd, false);
-                proj(L.zW, bbXn, bbMid, dIn, nEmbd, false);
+                proj(L.qkvW, bbXn, bbBig, chQkv, nEmbd, false, L.iq4P1);
+                proj(L.zW, bbXn, bbMid, dIn, nEmbd, false, L.iq4P2);
                 dspz(pAbB, {bbXn, L.alW, L.beW, L.dt, L.av, bbGb}, &pcAbB, 12,
                      (2 * hV + nsg - 1) / nsg, thrN, n);
                 bar();
@@ -2798,11 +2955,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      (hV + nsg - 1) / nsg, thrN, n);
                 bar();
                 }
-                proj(L.outW, bbAtt, bbAttnOut, nEmbd, dIn, true);
+                proj(L.outW, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
             } else {
-                proj(L.wq, bbXn, bbBig, chQkv, nEmbd, false);
-                proj(L.wk, bbXn, bbKin, hKV * dh, nEmbd, false);
-                proj(L.wv, bbXn, bbVin, hKV * dh, nEmbd, false);
+                proj(L.wq, bbXn, bbBig, chQkv, nEmbd, false, L.iq4P1);
+                proj(L.wk, bbXn, bbKin, hKV * dh, nEmbd, false, L.iq4P2);
+                proj(L.wv, bbXn, bbVin, hKV * dh, nEmbd, false, L.iq4P3);
                 bar();
                 if (!skAttn) {
                 dspz(pPrepB, {bbBig, bbKin, bbVin, L.qn, L.kn, bbMid, WB{L.st1, so1},
@@ -2812,7 +2969,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      &pcFaB, 40, hQ, 256, n);
                 bar();
                 }
-                proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true);
+                proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
             }
             bar();
             if (moeGrouped && n >= moeGroupN) {
@@ -2837,9 +2994,13 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 bar();
                 if (!skGu) {
                 if (moeGrouped == 5)
-                    dspz(pMoeGuG5, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
-                                    bbASlot, bbMH}, &pcv, 16, (nExp + 1) * (ffE / 32), 128,
+                    dspz(guIq4 ? pMoeGuG5i : pMoeGuG5,
+                         {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
+                          bbASlot, bbMH}, &pcv, 16, (nExp + 1) * (ffE / 32), 128,
                          (n + 31) / 32);
+                else if (guIq4)   // 80B: every other variant maps to the f32 iq4 twin
+                    dspz(pMoeGuG4i, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
+                                     bbASlot, bbMH}, &pcv, 16, (nExp + 1) * (ffE / 32), 128, 1);
                 else if (moeGrouped == 4)
                     dspz(pMoeGuG4, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
                                     bbASlot, bbMH}, &pcv, 16, (nExp + 1) * (ffE / 32), 128, 1);
@@ -2873,7 +3034,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 }
             } else {
                 if (!skGu)
-                dspz(pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
+                dspz(guIq4 ? pMoeGu4 : pMoeGu,
+                     {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
                      ((nUsed + 1) * ffE + nsg - 1) / nsg, thrN, n);
                 bar();
                 if (!skDown)

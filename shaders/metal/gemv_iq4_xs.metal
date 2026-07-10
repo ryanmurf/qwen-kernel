@@ -28,7 +28,6 @@ kernel void gemv_iq4_xs(device const block_iq4_xs* wb  [[buffer(0)]],
                         device const float*        x   [[buffer(1)]],
                         device float*              y   [[buffer(2)]],
                         constant uint2&            mk  [[buffer(3)]],
-                        threadgroup float*         shf [[threadgroup(0)]],
                         uint3 tgpig [[threadgroup_position_in_grid]],
                         uint  sgid  [[simdgroup_index_in_threadgroup]],
                         uint  slid  [[thread_index_in_simdgroup]])
@@ -37,6 +36,11 @@ kernel void gemv_iq4_xs(device const block_iq4_xs* wb  [[buffer(0)]],
     const uint K   = mk.y;
     const uint nb  = K / 256u;
     const uint first_row = (tgpig.x * NSG + sgid) * 2u;
+    const uint rq  = tgpig.z;            // grid z batches queries
+    x += (ulong)rq * K;
+    y += (ulong)rq * M;
+
+    threadgroup float shf[32];
 
     // stage the nonlinear codebook once per threadgroup
     if (sgid == 0) shf[slid] = (float)kvalues_iq4nl[slid % 16u];
