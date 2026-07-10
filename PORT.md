@@ -52,6 +52,55 @@ over the first ~32 frames vs op3-per-frame KV-stripe memcpy ≈ 9 ms at
 32k ctx — probes in CROSSBOX-BRIEF.md, QK_STAGE_STATS=1 on the worker
 reads the split directly).
 
+## 2026-07-10 (later): packed-block round + 80B port — both landed
+
+### pp512: 834 -> 1213 tok/s (llama gap 1.74x -> 1.19x)
+Root cause of the mul_mm gap found by benching llama's OWN kernels at our exact
+shapes (test-backend-ops perf, scratch cases, since reverted): their per-op
+mul_mat_id beat ours 1.45x and their dense q8 GEMM 12.0 vs our 8.2 TFLOPS at
+2048x2048 N=512 — generic inner-loop deficit, not MoE-specific. The difference:
+llama stages shared tiles as PACKED 64-half 8x8 blocks so every simdgroup_load
+is contiguous stride-8; ours were strided (68) with transposed B loads.
+Three commits, each gated (parity ids1-4 + long, prefillcmp, moegcmp):
+- moe_gu_grouped5 (a776c5b): packed tiles + token tiles on grid z. Kernel
+  4.79 -> 3.09 ms at n=512; pp512 1044.
+- gemm_q8_0_hp (5da0a53): packed proj GEMM, 525.8 -> 360.2 us = 11.9 TFLOPS
+  (llama parity at 356.7); promoted to default (QK_GEMM=h keeps old). pp512 1129.
+- moe_down_grouped_p (efef4ff): packed down kernels. pp512 1212/1213
+  interleaved (v3 control 903/904). Config: QK_MOE_GROUPED=5 (+ default hp gemm).
+Budget before the round (N=512 isolation): gu 225.4 / proj 139.9 / down 82.7 /
+dn 65.4 / attn 19.4 / resid 57.8 ms of 590.6. The packed rounds attacked the
+first three. Remaining named levers: DN chunked delta rule (65 ms), residual
+bucket, attn. llama 1443.7 +/- 7.4 re-measured same day.
+
+### 80B port (PORT-80B-BRIEF.md, mirror of tron 99cdedf): DONE, worker live
+- Pass 1 (45f7823): GGUF-driven shapes (48L/512E/top-10 from KVs+tensors),
+  SelT widened to ids[16]/w[16] = 160 B across select/group/all consumers,
+  runtime MoE buffers/push constants. 35B green (parity, parity-long, moegcmp
+  values unchanged, caseMoe 1.2e-5).
+- Pass 2 (5ad107b): embed_q8_0, moe_gateup_all_iq4, grouped iq4 twins (v4/v5),
+  gemm_iq4_xs_hp, gemv_iq4_xs z-batching, per-projection Q8_0|IQ4_XS pipe
+  flags, ssm_ba dequant + de-interleave (beta rows g*4+{0,1}, alpha g*4+{2,3}).
+  Gates: 80B caseMoe blk 0 PASS (sel exact, max_rel 1.1e-4 — tron saw 5.5e-5
+  Vulkan-side, same class), ablock blk 3 BIT-EXACT (exercises iq4 P1/P2 + q8
+  attn_v + iq4 wo), serve smoke coherent + deterministic.
+- Two Metal-specific infra pieces the 42.8 GB file forced:
+  * weight WINDOWS — file > maxBufferLength (~36 GB): mmap split into
+    page-aligned no-copy buffers cut at tensor boundaries. Boundary-page
+    seam bug (first-byte window match read past the window -> all-zero
+    logits) fixed by whole-tensor containment; QK_WIN_MAX=<GB> forces
+    windows for debugging; 35B token-exact through 4 forced windows.
+  * stage-scoped QK_MLOCK — a split stage wires only owned tensors
+    (whole-file mlock would have wired 58 GB next to the 35B worker).
+- Workers: :18100 35B 22:40 UNTOUCHED (rss 15.5 GB). :18200 80B 12:48
+  nCtx 32768 2 slots, 2 windows, stage mlock 32.0 GB, rss ~30 GB.
+  Total wired ~48 GB / 64.
+- For tron: worker is up per the brief ('report the worker up' -> task #43
+  head wiring). Token-exact refs vs refs-80b/ref{1..3}.json still owed —
+  run them over the wire once the head connects, or ship the ref files and
+  I'll gate locally. caseToken ('token' mode) is still 35B-only (q6k embed +
+  q8 proj assumptions); serve/stage paths are the gated ones.
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
