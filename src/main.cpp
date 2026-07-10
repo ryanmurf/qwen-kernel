@@ -786,28 +786,31 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     const GgufTensor* tUS  = T("ffn_up_shexp.weight");
     const GgufTensor* tDS  = T("ffn_down_shexp.weight");
     if (!tGI || !tGIS || !tGE || !tUE || !tDE || !tGS || !tUS || !tDS) return false;
+    const bool guIq4 = tGE->type == GGML_IQ4_XS && tUE->type == GGML_IQ4_XS;
+    const bool guIq3 = tGE->type == GGML_IQ3_XXS && tUE->type == GGML_IQ3_XXS;
     if (tGI->type != GGML_F32 || tGIS->type != GGML_F32 ||
-        tGE->type != GGML_IQ3_XXS || tUE->type != GGML_IQ3_XXS ||
+        (!guIq3 && !guIq4) ||
         (tDE->type != GGML_IQ4_XS && tDE->type != GGML_Q6_K) ||
         tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0 || tDS->type != GGML_Q8_0) {
         fprintf(stderr, "layer %u tensor types don't match the compiled kernels\n", layer);
         return false;
     }
-    const bool downQ6 = tDE->type == GGML_Q6_K;  // layers 34/38/39 in this GGUF
+    const bool downQ6 = tDE->type == GGML_Q6_K;  // deep layers in the 35B GGUF
 
     const uint32_t nEmbd = (uint32_t)tGE->ne[0];
     const uint32_t nFf   = (uint32_t)tGE->ne[1];
     const uint32_t nExp  = (uint32_t)tGE->ne[2];
-    const uint32_t nUsed = 8;
-    if (nExp > 256) {
-        fprintf(stderr, "n_expert %u > 256 not supported by moe_select\n", nExp);
+    const uint32_t nUsed =
+        (uint32_t)g.kvInt(g.kvStr("general.architecture", "") + ".expert_used_count", 8);
+    if (nExp > 512 || nUsed > 16) {
+        fprintf(stderr, "n_expert %u / top-%u exceeds moe_select limits (512/16)\n", nExp, nUsed);
         return false;
     }
-    printf("\n== moe blk.%u  n_embd=%u n_ff=%u experts=%u top-%u + shared ==\n",
-           layer, nEmbd, nFf, nExp, nUsed);
+    printf("\n== moe blk.%u  n_embd=%u n_ff=%u experts=%u top-%u + shared  gate/up=%s ==\n",
+           layer, nEmbd, nFf, nExp, nUsed, guIq4 ? "IQ4_XS" : "IQ3_XXS");
 
     auto x = randomX(nEmbd);
-    const size_t rbGE = ggmlRowBytes(GGML_IQ3_XXS, nEmbd);
+    const size_t rbGE = ggmlRowBytes(tGE->type, nEmbd);
     const size_t rbDE = ggmlRowBytes(tDE->type, nFf);
     const size_t rbGS = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbDS = ggmlRowBytes(GGML_Q8_0, nFf);
@@ -822,8 +825,8 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
         for (uint32_t k = 0; k < nEmbd; k++) a += (double)gi[(size_t)e * nEmbd + k] * x[k];
         logit[e] = a;
     }
-    uint32_t ids[8];
-    double wsel[8];
+    uint32_t ids[16];
+    double wsel[16];
     {
         std::vector<uint32_t> order(nExp);
         for (uint32_t e = 0; e < nExp; e++) order[e] = e;
@@ -843,15 +846,18 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
 
     auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };
     std::vector<float> yref(nEmbd, 0.f), tmpE(nEmbd), tmpF(nFf), hrow(nFf);
+    auto dqGU = [&](const GgufTensor* t, uint32_t e, uint32_t r, float* out) {
+        const uint8_t* row = t->data + ((size_t)e * nFf + r) * rbGE;
+        if (guIq4) dequant_row_iq4_xs((const block_iq4_xs*)row, out, nEmbd);
+        else       dequant_row_iq3_xxs((const block_iq3_xxs*)row, out, nEmbd);
+    };
     for (uint32_t s = 0; s < nUsed; s++) {
         uint32_t e = ids[s];
         for (uint32_t r = 0; r < nFf; r++) {
-            dequant_row_iq3_xxs((const block_iq3_xxs*)(tGE->data + ((size_t)e * nFf + r) * rbGE),
-                                tmpE.data(), nEmbd);
+            dqGU(tGE, e, r, tmpE.data());
             double ga = 0;
             for (uint32_t k = 0; k < nEmbd; k++) ga += (double)tmpE[k] * x[k];
-            dequant_row_iq3_xxs((const block_iq3_xxs*)(tUE->data + ((size_t)e * nFf + r) * rbGE),
-                                tmpE.data(), nEmbd);
+            dqGU(tUE, e, r, tmpE.data());
             double ua = 0;
             for (uint32_t k = 0; k < nEmbd; k++) ua += (double)tmpE[k] * x[k];
             hrow[r] = (float)(silu(ga) * ua);
@@ -884,7 +890,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     // ---- GPU setup ----
     Pipe pLogits = makePipe(c, "moe_logits.spv", 3, 16);
     Pipe pSelect = makePipe(c, "moe_select.spv", 4, 16);
-    Pipe pGuIq3  = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
+    Pipe pGuIq3  = makePipe(c, guIq4 ? "moe_gateup_iq4.spv" : "moe_gateup_iq3.spv", 5, 16);
     Pipe pGuQ8   = makePipe(c, "moe_gateup_q8.spv", 4, 16);
     Pipe pDnIq4  = makePipe(c, downQ6 ? "moe_down_q6k.spv" : "moe_down_iq4.spv", 4, 16);
     Pipe pDnQ8   = makePipe(c, "moe_down_q8.spv", 4, 16);
@@ -893,7 +899,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     const size_t szGE = (size_t)nExp * nFf * rbGE, szDE = (size_t)nExp * nEmbd * rbDE;
     const size_t szGS = (size_t)nFf * rbGS, szDS = (size_t)nEmbd * rbDS;
     const size_t szX = (size_t)nEmbd * 4, szY = (size_t)nEmbd * 4;
-    const size_t szH = (size_t)(nUsed + 1) * nFf * 4, szSel = 128, szL = (size_t)nExp * 4;
+    const size_t szH = (size_t)(nUsed + 1) * nFf * 4, szSel = 160, szL = (size_t)nExp * 4;
 
     const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     Buf bGI = createBuf(c, szGI, stor, true), bGIS = createBuf(c, szGIS, stor, true);
@@ -1028,7 +1034,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
 
     std::vector<float> ygpu(nEmbd);
     memcpy(ygpu.data(), mapped, szY);
-    struct SelOut { uint32_t ids[8]; float w[8]; float wShared; } selGpu;
+    struct SelOut { uint32_t ids[16]; float w[16]; float wShared; } selGpu;
     memcpy(&selGpu, (const uint8_t*)mapped + szY, sizeof(selGpu));
 
     bool selOk = true;
@@ -1101,7 +1107,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
 struct MoeT {
     const GgufTensor *gi, *gis, *ge, *ue, *de, *gs, *us, *ds;
     uint32_t nEmbd, nFf, nExp, nUsed;
-    bool downQ6;
+    bool downQ6, guIq4;
     size_t rbGE, rbDE, rbGS, rbDS;
 };
 
@@ -1123,8 +1129,10 @@ static bool loadMoeT(Gguf& g, uint32_t layer, MoeT& m) {
         fprintf(stderr, "layer %u: missing MoE tensors\n", layer);
         return false;
     }
+    bool guIq3 = m.ge->type == GGML_IQ3_XXS && m.ue->type == GGML_IQ3_XXS;
+    m.guIq4 = m.ge->type == GGML_IQ4_XS && m.ue->type == GGML_IQ4_XS;
     if (m.gi->type != GGML_F32 || m.gis->type != GGML_F32 ||
-        m.ge->type != GGML_IQ3_XXS || m.ue->type != GGML_IQ3_XXS ||
+        (!guIq3 && !m.guIq4) ||
         (m.de->type != GGML_IQ4_XS && m.de->type != GGML_Q6_K) ||
         m.gs->type != GGML_Q8_0 || m.us->type != GGML_Q8_0 || m.ds->type != GGML_Q8_0) {
         fprintf(stderr, "layer %u: unexpected MoE tensor types\n", layer);
@@ -1133,9 +1141,15 @@ static bool loadMoeT(Gguf& g, uint32_t layer, MoeT& m) {
     m.nEmbd = (uint32_t)m.ge->ne[0];
     m.nFf = (uint32_t)m.ge->ne[1];
     m.nExp = (uint32_t)m.ge->ne[2];
-    m.nUsed = 8;
+    // top-k from the file (35B: 8, 80B: 10); kernels are sized for <= 16
+    std::string arch = g.kvStr("general.architecture", "");
+    m.nUsed = (uint32_t)g.kvInt(arch + ".expert_used_count", 8);
+    if (m.nUsed < 1 || m.nUsed > 16 || m.nUsed > m.nExp) {
+        fprintf(stderr, "layer %u: expert_used_count %u unsupported\n", layer, m.nUsed);
+        return false;
+    }
     m.downQ6 = m.de->type == GGML_Q6_K;
-    m.rbGE = ggmlRowBytes(GGML_IQ3_XXS, m.nEmbd);
+    m.rbGE = ggmlRowBytes(m.ge->type, m.nEmbd);
     m.rbDE = ggmlRowBytes(m.de->type, m.nFf);
     m.rbGS = ggmlRowBytes(GGML_Q8_0, m.nEmbd);
     m.rbDS = ggmlRowBytes(GGML_Q8_0, m.nFf);
@@ -1143,8 +1157,8 @@ static bool loadMoeT(Gguf& g, uint32_t layer, MoeT& m) {
 }
 
 struct MoeRefSel {
-    uint32_t ids[8];
-    double w[8];
+    uint32_t ids[16];
+    double w[16];
     double wShared;
 };
 
@@ -1178,15 +1192,18 @@ static void moeCpuRef(const MoeT& m, const float* x, float* yout, MoeRefSel* sel
     auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };
     std::vector<float> tmpE(m.nEmbd), tmpF(m.nFf), hrow(m.nFf);
     for (uint32_t o = 0; o < m.nEmbd; o++) yout[o] = 0.f;
+    auto dqGU = [&](const GgufTensor* t, uint32_t e, uint32_t r, float* out) {
+        const uint8_t* row = t->data + ((size_t)e * m.nFf + r) * m.rbGE;
+        if (m.guIq4) dequant_row_iq4_xs((const block_iq4_xs*)row, out, m.nEmbd);
+        else         dequant_row_iq3_xxs((const block_iq3_xxs*)row, out, m.nEmbd);
+    };
     for (uint32_t s = 0; s < m.nUsed; s++) {
         uint32_t e = sel.ids[s];
         for (uint32_t r = 0; r < m.nFf; r++) {
-            dequant_row_iq3_xxs((const block_iq3_xxs*)(m.ge->data + ((size_t)e * m.nFf + r) * m.rbGE),
-                                tmpE.data(), m.nEmbd);
+            dqGU(m.ge, e, r, tmpE.data());
             double ga = 0;
             for (uint32_t k = 0; k < m.nEmbd; k++) ga += (double)tmpE[k] * x[k];
-            dequant_row_iq3_xxs((const block_iq3_xxs*)(m.ue->data + ((size_t)e * m.nFf + r) * m.rbGE),
-                                tmpE.data(), m.nEmbd);
+            dqGU(m.ue, e, r, tmpE.data());
             double ua = 0;
             for (uint32_t k = 0; k < m.nEmbd; k++) ua += (double)tmpE[k] * x[k];
             hrow[r] = (float)(silu(ga) * ua);
@@ -2698,7 +2715,13 @@ struct qk_engine {
     bool shareFork = false;  // QK_FORK: cache each fresh prompt's prefill so same-prompt requests fork it
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
     static constexpr uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
-    static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64, nLayer = 40;
+    static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64;
+    // Model-shape knobs that differ between Qwen3.6-35B (40/256/8) and
+    // Qwen3-Next-80B (48/512/10); read from GGUF KVs / tensor shapes in open().
+    // The tensor DIMS above are identical across both models by construction.
+    uint32_t nLayer = 40, nExp = 256, nUsed = 8, ffE = 512;
+    bool guIq4 = false;   // routed gate/up experts are IQ4_XS (80B) vs IQ3_XXS (35B)
+    bool embQ8 = false;   // token_embd is Q8_0 (80B repack) vs Q6_K (35B)
     float eps = 1e-6f;
     // Pipeline split (QK_LAYERS=a:b): this engine owns layers [lFirst, lEnd).
     // First stage also owns the embedding; last stage owns norm+head+argmax.
@@ -2713,9 +2736,16 @@ struct qk_engine {
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pGate, pGemvO, pAddN, pPrep, pAttn, pMoeL,
         pMoeS, pMoeGU, pMoeGUs, pMoeDn4, pMoeDn6, pMoeDnsB, pAdd3, pHead, pAm1, pAm2, pEmb;
     Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
+    // IQ4_XS twins of the dense-projection / routed-gateup pipes (80B weights).
+    // Identical bindings and push constants — only the in-shader dequant differs,
+    // so descriptor sets stay layout-compatible with the Q8_0 pipes.
+    Pipe pGemvA4, pGemvO4, pMoeGU4, pGemmB4;
 
     struct Layer {
         bool rec = false, downQ6 = false;
+        // per-projection quant flags: true = IQ4_XS weight (dispatch the *4 pipe).
+        // p1 = qkv|q, p2 = z|k, p3 = v, wo = ssm_out|attn_output.
+        bool iq4P1 = false, iq4P2 = false, iq4P3 = false, iq4Wo = false;
         std::vector<Buf> bufs;
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sGate, sWo, sAddN,
             sPrep, sAttn, sMoeL, sMoeS, sMoeGU, sMoeGUs, sMoeDn, sMoeDns, sAdd3;
@@ -3022,39 +3052,70 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     // VRAM (~32K at 4 slots on a 20 GB card), not shared memory.
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 32768 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
+    initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
+    if (!g.open(path)) return fail("qk_open: cannot open GGUF");
+    // Model-shape KVs (arch-prefixed): 35B = qwen35moe 40/8, 80B = qwen3next 48/10.
+    const std::string arch = g.kvStr("general.architecture", "");
+    nLayer = (uint32_t)g.kvInt(arch + ".block_count", nLayer);
+    if (nLayer < 1 || nLayer > 256) return fail("qk_open: bad block_count");
+    nUsed = (uint32_t)g.kvInt(arch + ".expert_used_count", nUsed);
+    if (nUsed < 1 || nUsed > 16) return fail("qk_open: expert_used_count > 16 unsupported");
+    eosTok = (uint32_t)g.kvInt("tokenizer.ggml.eos_token_id", eosTok);
+    bosTok = (uint32_t)g.kvInt("tokenizer.ggml.bos_token_id", bosTok);
+    lEnd = nLayer;  // full model by default (the member init used the pre-open default)
     // QK_LAYERS=a:b — pipeline-split stage owning layers [a,b). Driven via
     // qk_stage_run only (slot_start/step_chunk are disabled on a split engine).
     if (const char* v = getenv("QK_LAYERS")) {
         unsigned a = 0, b = 0;
         if (sscanf(v, "%u:%u", &a, &b) == 2 && a < b && b <= nLayer) { lFirst = a; lEnd = b; }
-        else return fail("qk_open: bad QK_LAYERS (want a:b with 0 <= a < b <= 40)");
+        else {
+            snprintf(err, errLen, "qk_open: bad QK_LAYERS (want a:b with 0 <= a < b <= %u)", nLayer);
+            return false;
+        }
     }
-    initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
-    if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     const GgufTensor* tEmbd = g.find("token_embd.weight");
     const GgufTensor* tONorm = g.find("output_norm.weight");
     const GgufTensor* tHead = g.find("output.weight");
-    if (!tEmbd || !tONorm || !tHead || tEmbd->type != GGML_Q6_K || tHead->type != GGML_Q6_K)
+    if (!tEmbd || !tONorm || !tHead ||
+        (tEmbd->type != GGML_Q6_K && tEmbd->type != GGML_Q8_0) || tHead->type != GGML_Q6_K)
         return fail("qk_open: missing/unexpected embd/head tensors");
+    embQ8 = tEmbd->type == GGML_Q8_0;
     vocab = (uint32_t)tHead->ne[1];
+    // Routed-expert counts from the first owned layer's tensors (uniform per file).
+    {
+        char nb0[96];
+        snprintf(nb0, sizeof nb0, "blk.%u.ffn_gate_inp.weight", lFirst);
+        const GgufTensor* tgi0 = g.find(nb0);
+        snprintf(nb0, sizeof nb0, "blk.%u.ffn_gate_exps.weight", lFirst);
+        const GgufTensor* tge0 = g.find(nb0);
+        if (!tgi0 || !tge0) return fail("qk_open: missing router tensors");
+        nExp = (uint32_t)tgi0->ne[1];
+        ffE = (uint32_t)tge0->ne[1];
+        if (nExp < nUsed || nExp > 512 || ffE % 256 != 0)
+            return fail("qk_open: expert shape unsupported (n_expert <= 512, n_ff_exp % 256)");
+    }
     const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
-    const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);
+    const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);        // head rows (always Q6_K)
+    const size_t rbEmb = ggmlRowBytes(tEmbd->type, nEmbd);    // embd rows (Q6_K or Q8_0)
     const uint32_t nB = nSlots, tmax = nCtx;
 
     pRms = makePipe(c, "rmsnorm.spv", 3, 8);
     pGemvA = makePipe(c, "gemv_q8_0.spv", 3, 8, 64);
+    pGemvA4 = makePipe(c, "gemv_iq4_xs.spv", 3, 8, 64);
     pAb = makePipe(c, "dn_ab.spv", 6, 8);
     pConvN = makePipe(c, "dn_convn.spv", 4, 16);
     pStep = makePipe(c, "dn_step.spv", 4, 12);
     pGate = makePipe(c, "dn_gate.spv", 4, 12);
     pGemvO = makePipe(c, "gemv_q8_0.spv", 3, 8, 128);
+    pGemvO4 = makePipe(c, "gemv_iq4_xs.spv", 3, 8, 128);
     pAddN = makePipe(c, "add_rmsnorm.spv", 5, 8);
     pPrep = makePipe(c, "fa_prep_srv.spv", 10, 32);
     pAttn = makePipe(c, "fa_attn_srv.spv", 6, 32);
     pMoeL = makePipe(c, "moe_logits.spv", 3, 16);
     pMoeS = makePipe(c, "moe_select.spv", 4, 16);
     pMoeGU = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
+    pMoeGU4 = makePipe(c, "moe_gateup_iq4.spv", 5, 16);
     pMoeGUs = makePipe(c, "moe_gateup_q8.spv", 4, 16);
     pMoeDn4 = makePipe(c, "moe_down_iq4.spv", 4, 16);
     pMoeDn6 = makePipe(c, "moe_down_q6k.spv", 4, 16);
@@ -3063,7 +3124,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pHead = makePipe(c, "gemv_q6_k.spv", 3, 8, 128);
     pAm1 = makePipe(c, "argmax1.spv", 3, 8);
     pAm2 = makePipe(c, "argmax2.spv", 3, 4);
-    pEmb = makePipe(c, "embed_q6k.spv", 3, 12);
+    pEmb = makePipe(c, embQ8 ? "embed_q8_0.spv" : "embed_q6k.spv", 3, 12);
     pPrepB = makePipe(c, "fa_prep_batch.spv", 9, 40);
     pAttnB = makePipe(c, "fa_attn_batch.spv", 5, 40);
     pAbB = makePipe(c, "dn_ab_batch.spv", 6, 12);
@@ -3071,6 +3132,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pStepB = makePipe(c, "dn_step_batch.spv", 4, 16);   // +delta-rule S seed/persist (decode handoff)
     pGateB = makePipe(c, "dn_gate_batch.spv", 4, 16);
     pGemmB = makePipe(c, "gemm_q8_0.spv", 3, 12);  // batched projections (weight reads amortized)
+    pGemmB4 = makePipe(c, "gemm_iq4_xs.spv", 3, 12);
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 vec4s; dState must be <= 128");
 
     const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -3088,9 +3150,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     bY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
-    bML = createBuf(c, (size_t)nB * 256 * 4, stor, true);
-    bMH = createBuf(c, (size_t)nB * 9 * 512 * 4, stor, true);
-    bMSel = createBuf(c, (size_t)nB * 128, stor, true);
+    bML = createBuf(c, (size_t)nB * nExp * 4, stor, true);
+    bMH = createBuf(c, (size_t)nB * (nUsed + 1) * ffE * 4, stor, true);
+    bMSel = createBuf(c, (size_t)nB * 160, stor, true);   // sizeof(SelT): ids[16]+w[16]+wShared+pad[7]
     bMY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     bMY2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     // bONorm always exists (a non-last stage binds it as the throwaway next-norm
@@ -3106,7 +3168,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         bTok = createBuf(c, (size_t)nB * 4, storSrc, true);
         bSamp = createBuf(c, (size_t)nB * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);  // readback
     }
-    if (firstStage()) bEmbdW = createBuf(c, (size_t)vocab * rbE, stor, true);
+    if (firstStage()) bEmbdW = createBuf(c, (size_t)vocab * rbEmb, stor, true);
     bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, stor, true);
     bSlotIn = createBuf(c, (size_t)nB * 4, stor, false);   // host-visible, host-written each step
     bSlotPos = createBuf(c, (size_t)nB * 4, stor, false);
@@ -3153,7 +3215,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         upload(bRope, rope.data(), rope.size() * 4);
     }
     if (lastStage()) upload(bHeadW, tHead->data, (size_t)vocab * rbE);
-    if (firstStage()) upload(bEmbdW, tEmbd->data, (size_t)vocab * rbE);
+    if (firstStage()) upload(bEmbdW, tEmbd->data, (size_t)vocab * rbEmb);
 
     VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -3202,9 +3264,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbAttnOut = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbY = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbXn2 = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
-    bbML = createBuf(c, (size_t)cap * 256 * 4, stor, true);
-    bbMH = createBuf(c, (size_t)cap * 9 * 512 * 4, stor, true);
-    bbMSel = createBuf(c, (size_t)cap * 128, stor, true);
+    bbML = createBuf(c, (size_t)cap * nExp * 4, stor, true);
+    bbMH = createBuf(c, (size_t)cap * (nUsed + 1) * ffE * 4, stor, true);
+    bbMSel = createBuf(c, (size_t)cap * 160, stor, true);
     bbMY = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbMY2 = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     if (lastStage()) bbLogits = createBuf(c, (size_t)cap * vocab * 4, storSrc, true);
@@ -3237,24 +3299,74 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             upload(L.bufs.back(), t ? t->data : nullptr, n);
             return L.bufs.back().buf;
         };
+        auto Wp = [&](const void* p, size_t n) -> VkBuffer {  // host-built weights (ba de-interleave)
+            L.bufs.push_back(createBuf(c, n, storSrc, true));
+            upload(L.bufs.back(), p, n);
+            return L.bufs.back().buf;
+        };
+        // Dense projection: Q8_0 (35B) or IQ4_XS (80B; attn_v stays Q8_0 there).
+        // Missing tensor or any other type is a hard error — W(null) would
+        // silently upload zeros.
+        bool denseBad = false;
+        auto Wd = [&](const char* suffix, uint32_t K, size_t rows, bool& iq4) -> VkBuffer {
+            const GgufTensor* t = T(suffix);
+            if (!t || (t->type != GGML_Q8_0 && t->type != GGML_IQ4_XS)) {
+                fprintf(stderr, "blk.%u.%s: missing or unsupported dense type\n", il, suffix);
+                denseBad = true;
+                iq4 = false;
+                return W(nullptr, rows * ggmlRowBytes(GGML_Q8_0, K));
+            }
+            iq4 = t->type == GGML_IQ4_XS;
+            return W(t, rows * ggmlRowBytes(t->type, K));
+        };
         MoeT moe;
         if (!loadMoeT(g, il, moe)) return fail("qk_open: MoE tensors missing");
         L.downQ6 = moe.downQ6;
+        guIq4 = moe.guIq4;   // uniform across layers (checked per layer by loadMoeT)
         L.rec = T("ssm_a") != nullptr;
         VkBuffer aNorm = W(T("attn_norm.weight"), nEmbd * 4);
         VkBuffer pn = W(T("post_attention_norm.weight"), nEmbd * 4);
         L.aNormBuf = aNorm;
         if (L.rec) {
-            VkBuffer qkvW = W(T("attn_qkv.weight"), (size_t)chQkv * rbQ8e);
-            VkBuffer zW = W(T("attn_gate.weight"), (size_t)dIn * rbQ8e);
-            VkBuffer alW = W(T("ssm_alpha.weight"), (size_t)hV * nEmbd * 4);
-            VkBuffer beW = W(T("ssm_beta.weight"), (size_t)hV * nEmbd * 4);
+            VkBuffer qkvW = Wd("attn_qkv.weight", nEmbd, chQkv, L.iq4P1);
+            VkBuffer zW = Wd("attn_gate.weight", nEmbd, dIn, L.iq4P2);
+            VkBuffer alW, beW;
+            if (T("ssm_alpha.weight")) {
+                alW = W(T("ssm_alpha.weight"), (size_t)hV * nEmbd * 4);
+                beW = W(T("ssm_beta.weight"), (size_t)hV * nEmbd * 4);
+            } else {
+                // qwen3next fuses the two: ssm_ba [nEmbd, 2*hV], interleaved per
+                // k-head group g: rows g*4+{0,1} = beta (v-heads 2g, 2g+1),
+                // rows g*4+{2,3} = alpha (llama.cpp qwen3next view split). The
+                // tensor is tiny — dequant to F32 on the host and de-interleave
+                // into the engine's split alpha/beta layout; dn_ab is unchanged.
+                const GgufTensor* tBa = T("ssm_ba.weight");
+                if (!tBa || tBa->ne[0] != nEmbd || tBa->ne[1] != 2 * hV)
+                    return fail("qk_open: missing ssm_alpha/ssm_beta/ssm_ba");
+                std::vector<float> row(nEmbd), al((size_t)hV * nEmbd), be((size_t)hV * nEmbd);
+                size_t rbBa = ggmlRowBytes(tBa->type, nEmbd);
+                for (uint32_t r = 0; r < 2 * hV; r++) {
+                    const uint8_t* src = tBa->data + (size_t)r * rbBa;
+                    if (tBa->type == GGML_F32) memcpy(row.data(), src, nEmbd * 4);
+                    else if (tBa->type == GGML_IQ4_XS)
+                        dequant_row_iq4_xs((const block_iq4_xs*)src, row.data(), nEmbd);
+                    else if (tBa->type == GGML_Q8_0)
+                        dequant_row_q8_0((const block_q8_0*)src, row.data(), nEmbd);
+                    else return fail("qk_open: ssm_ba type unsupported");
+                    uint32_t grp = r >> 2, sub = r & 3;
+                    float* dst = (sub < 2 ? be.data() : al.data()) +
+                                 ((size_t)grp * 2 + (sub & 1)) * nEmbd;
+                    memcpy(dst, row.data(), (size_t)nEmbd * 4);
+                }
+                alW = Wp(al.data(), al.size() * 4);
+                beW = Wp(be.data(), be.size() * 4);
+            }
             VkBuffer dt = W(T("ssm_dt.bias"), hV * 4);
             VkBuffer av = W(T("ssm_a"), hV * 4);
             VkBuffer ker = W(T("ssm_conv1d.weight") ? T("ssm_conv1d.weight") : T("ssm_conv1d"),
                              (size_t)chQkv * 4 * 4);
             VkBuffer sn = W(T("ssm_norm.weight"), dS * 4);
-            VkBuffer outW = W(T("ssm_out.weight"), (size_t)nEmbd * rbQ8i);
+            VkBuffer outW = Wd("ssm_out.weight", dIn, nEmbd, L.iq4Wo);
             // +1 stripe: the spec-decode verify scratch (stripe index nSlots).
             // Verify rounds are engine-thread-serial, so one shared scratch
             // stripe serves every slot (~63 MB total across the 30 rec layers).
@@ -3287,12 +3399,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             BL.sGate = mkSet(pGateB, {bbO.buf, sn, bbMid.buf, bbAtt.buf});
             BL.sWo = mkSet(pGemvO, {outW, bbAtt.buf, bbAttnOut.buf});
         } else {
-            VkBuffer wq = W(T("attn_q.weight"), (size_t)chQkv * rbQ8e);
-            VkBuffer wk = W(T("attn_k.weight"), (size_t)hKV * dh * rbQ8e);
-            VkBuffer wv = W(T("attn_v.weight"), (size_t)hKV * dh * rbQ8e);
+            VkBuffer wq = Wd("attn_q.weight", nEmbd, chQkv, L.iq4P1);
+            VkBuffer wk = Wd("attn_k.weight", nEmbd, (size_t)hKV * dh, L.iq4P2);
+            VkBuffer wv = Wd("attn_v.weight", nEmbd, (size_t)hKV * dh, L.iq4P3);
             VkBuffer qn = W(T("attn_q_norm.weight"), dh * 4);
             VkBuffer kn = W(T("attn_k_norm.weight"), dh * 4);
-            VkBuffer wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
+            VkBuffer wo = Wd("attn_output.weight", dIn, nEmbd, L.iq4Wo);
             VkBuffer kc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
             VkBuffer vc = W(nullptr, (size_t)nB * hKV * tmax * dh * 4);
             L.st1 = kc; L.ps1 = (size_t)hKV * tmax * dh * 4;
@@ -3314,6 +3426,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             BL.sAttn = mkSet(pAttnB, {bbMid.buf, kc, vc, bbBig.buf, bbAtt.buf});
             BL.sWo = mkSet(pGemvO, {wo, bbAtt.buf, bbAttnOut.buf});
         }
+        if (denseBad) return fail("qk_open: dense projection tensor missing or bad type");
         VkBuffer mgi = W(moe.gi, (size_t)moe.nExp * nEmbd * 4);
         VkBuffer mgis = W(moe.gis, nEmbd * 4);
         VkBuffer mge = W(moe.ge, (size_t)moe.nExp * moe.nFf * moe.rbGE);
@@ -3325,14 +3438,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         L.sAddN = mkSet(pAddN, {bXin.buf, bAttnOut.buf, pn, bY.buf, bXn2.buf});
         L.sMoeL = mkSet(pMoeL, {mgi, bXn2.buf, bML.buf});
         L.sMoeS = mkSet(pMoeS, {bML.buf, mgis, bXn2.buf, bMSel.buf});
-        L.sMoeGU = mkSet(pMoeGU, {mge, mue, bXn2.buf, bMSel.buf, bMH.buf});
+        L.sMoeGU = mkSet(guIq4 ? pMoeGU4 : pMoeGU, {mge, mue, bXn2.buf, bMSel.buf, bMH.buf});
         L.sMoeGUs = mkSet(pMoeGUs, {mgs, mus, bXn2.buf, bMH.buf});
         L.sMoeDn = mkSet(L.downQ6 ? pMoeDn6 : pMoeDn4, {mde, bMH.buf, bMSel.buf, bMY.buf});
         L.sMoeDns = mkSet(pMoeDnsB, {mds, bMH.buf, bMSel.buf, bMY2.buf});
         BL.sAddN = mkSet(pAddN, {bbXin.buf, bbAttnOut.buf, pn, bbY.buf, bbXn2.buf});
         BL.sMoeL = mkSet(pMoeL, {mgi, bbXn2.buf, bbML.buf});
         BL.sMoeS = mkSet(pMoeS, {bbML.buf, mgis, bbXn2.buf, bbMSel.buf});
-        BL.sMoeGU = mkSet(pMoeGU, {mge, mue, bbXn2.buf, bbMSel.buf, bbMH.buf});
+        BL.sMoeGU = mkSet(guIq4 ? pMoeGU4 : pMoeGU, {mge, mue, bbXn2.buf, bbMSel.buf, bbMH.buf});
         BL.sMoeGUs = mkSet(pMoeGUs, {mgs, mus, bbXn2.buf, bbMH.buf});
         BL.sMoeDn = mkSet(L.downQ6 ? pMoeDn6 : pMoeDn4, {mde, bbMH.buf, bbMSel.buf, bbMY.buf});
         BL.sMoeDns = mkSet(pMoeDnsB, {mds, bbMH.buf, bbMSel.buf, bbMY2.buf});
@@ -3437,7 +3550,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     struct { uint32_t ch, d, qkch; float e; } pcConvN{chQkv, dS, 2 * hK * dS, eps};
     struct { uint32_t d, hk, hv; } pcStep{dS, hK, hV};
     struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
-    struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
+    struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
     struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; }
         pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase};
     const uint32_t amWgs = (vocab + 4095) / 4096;
@@ -3460,8 +3573,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
         if (L.rec) {
-            disp(pGemvA, L.sP1, (chQkv + 3) / 4, &pcQkv, 8);
-            disp(pGemvA, L.sP2, (dIn + 3) / 4, &pcZ, 8);
+            disp(L.iq4P1 ? pGemvA4 : pGemvA, L.sP1, (chQkv + 3) / 4, &pcQkv, 8);
+            disp(L.iq4P2 ? pGemvA4 : pGemvA, L.sP2, (dIn + 3) / 4, &pcZ, 8);
             disp(pAb, L.sAb, 2 * hV, &pcAb, 8);
             barrier();
             disp(pConvN, L.sConv, chQkv / dS, &pcConvN, 16);
@@ -3470,27 +3583,27 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             barrier();
             disp(pGate, L.sGate, hV, &pcGate, 12);
             barrier();
-            disp(pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
+            disp(L.iq4Wo ? pGemvO4 : pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
         } else {
-            disp(pGemvA, L.sP1, (chQkv + 3) / 4, &pcQkv, 8);
-            disp(pGemvA, L.sP2, (hKV * dh + 3) / 4, &pcKV, 8);
-            disp(pGemvA, L.sP3, (hKV * dh + 3) / 4, &pcKV, 8);
+            disp(L.iq4P1 ? pGemvA4 : pGemvA, L.sP1, (chQkv + 3) / 4, &pcQkv, 8);
+            disp(L.iq4P2 ? pGemvA4 : pGemvA, L.sP2, (hKV * dh + 3) / 4, &pcKV, 8);
+            disp(L.iq4P3 ? pGemvA4 : pGemvA, L.sP3, (hKV * dh + 3) / 4, &pcKV, 8);
             barrier();
             disp(pPrep, L.sPrep, hQ + 2 * hKV, &pcFa, 32);
             barrier();
             disp(pAttn, L.sAttn, hQ, &pcFa, 32);
             barrier();
-            disp(pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
+            disp(L.iq4Wo ? pGemvO4 : pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
         }
         barrier();
         disp(pAddN, L.sAddN, 1, &pcRms, 8);
         barrier();
-        disp(pMoeL, L.sMoeL, 256, &pcv, 16);
-        disp(pMoeGUs, L.sMoeGUs, 512, &pcv, 16);
+        disp(pMoeL, L.sMoeL, nExp, &pcv, 16);
+        disp(pMoeGUs, L.sMoeGUs, ffE, &pcv, 16);
         barrier();
         disp(pMoeS, L.sMoeS, 1, &pcv, 16);
         barrier();
-        disp(pMoeGU, L.sMoeGU, 8 * 512, &pcv, 16);
+        disp(guIq4 ? pMoeGU4 : pMoeGU, L.sMoeGU, nUsed * ffE, &pcv, 16);
         barrier();
         disp(L.downQ6 ? pMoeDn6 : pMoeDn4, L.sMoeDn, nEmbd, &pcv, 16);
         disp(pMoeDnsB, L.sMoeDns, nEmbd, &pcv, 16);
@@ -3817,23 +3930,25 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     // Reuses the gemv projection sets ({W,X,Y} storage buffers) — layout-compatible.
     // Reads each weight ONCE for all n tokens (vs gemv's n re-reads). K%32==0 (holds
     // for nEmbd=2048, dIn=4096). grid (ceil(M/128),1,ceil(n/64)) per gemm_q8_0.comp.
-    auto gemmProj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K) {
+    auto gemmProj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K, bool iq4) {
         struct { uint32_t M, K, N; } pcg{M, K, n};
-        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pGemmB.p);
-        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pGemmB.pl, 0, 1, &ds, 0, nullptr);
-        vkCmdPushConstants(c.cb, pGemmB.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pcg);
+        Pipe& pg = iq4 ? pGemmB4 : pGemmB;
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.p);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.pl, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(c.cb, pg.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pcg);
         vkCmdDispatch(c.cb, (M + 127) / 128, 1, (n + 63) / 64);
     };
     // Optimal projection per chunk width: the 128x64-tiled GEMM amortizes weight
     // reads and wins for wide chunks, but wastes work when n fills <1 N-tile; the
     // per-token GEMV (dispatched z=n) is faster below the measured ~48-token
     // crossover. isOut picks the wo pipe (tpr=128) vs the qkv/kv pipe (tpr=64).
+    // iq4 routes to the IQ4_XS twin of the same-shape pipe (80B dense weights).
     struct { uint32_t m, k; } pcProj;
-    auto proj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K, bool isOut) {
-        if (n >= 48) { gemmProj(ds, M, K); return; }
+    auto proj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K, bool isOut, bool iq4) {
+        if (n >= 48) { gemmProj(ds, M, K, iq4); return; }
         pcProj = {M, K};
-        if (isOut) disp(pGemvO, ds, (M + 1) / 2, &pcProj, 8);
-        else       disp(pGemvA, ds, (M + 3) / 4, &pcProj, 8);
+        if (isOut) disp(iq4 ? pGemvO4 : pGemvO, ds, (M + 1) / 2, &pcProj, 8);
+        else       disp(iq4 ? pGemvA4 : pGemvA, ds, (M + 3) / 4, &pcProj, 8);
     };
 
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
@@ -3844,7 +3959,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         pcConvB{chQkv, dS, 2 * hK * dS, eps, n};
     struct { uint32_t dState, hK_, hV_, Tn; } pcStepB{dS, hK, hV, n};
     struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
-    struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
+    struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
     struct { uint32_t tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t base, Tn, qbase; }
         pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, base, n, 0};
     struct { uint32_t k, idx, pr; } pcE{nEmbd, 0, 1};
@@ -3881,8 +3996,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         BLayer& BL = blayers[il];
         zdim = n;
         if (L.rec) {
-            proj(BL.sP1, chQkv, nEmbd, false);
-            proj(BL.sP2, dIn, nEmbd, false);
+            proj(BL.sP1, chQkv, nEmbd, false, L.iq4P1);
+            proj(BL.sP2, dIn, nEmbd, false, L.iq4P2);
             disp(pAbB, BL.sAb, 2 * hV, &pcAbB, 12);
             barrier();
             disp(pConvB, BL.sConv, chQkv / dS, &pcConvB, 20);
@@ -3893,11 +4008,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             barrier();
             disp(pGateB, BL.sGate, hV, &pcGateB, 16);
             barrier();
-            proj(BL.sWo, nEmbd, dIn, true);
+            proj(BL.sWo, nEmbd, dIn, true, L.iq4Wo);
         } else {
-            proj(BL.sP1, chQkv, nEmbd, false);
-            proj(BL.sP2, hKV * dh, nEmbd, false);
-            proj(BL.sP3, hKV * dh, nEmbd, false);
+            proj(BL.sP1, chQkv, nEmbd, false, L.iq4P1);
+            proj(BL.sP2, hKV * dh, nEmbd, false, L.iq4P2);
+            proj(BL.sP3, hKV * dh, nEmbd, false, L.iq4P3);
             barrier();
             disp(pPrepB, BL.sPrep, hQ + 2 * hKV, &pcFaB, 40);
             barrier();
@@ -3923,17 +4038,17 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 zdim = n;
             }
             barrier();
-            proj(BL.sWo, nEmbd, dIn, true);
+            proj(BL.sWo, nEmbd, dIn, true, L.iq4Wo);
         }
         barrier();
         disp(pAddN, BL.sAddN, 1, &pcRms, 8);
         barrier();
-        disp(pMoeL, BL.sMoeL, 256, &pcv, 16);
-        disp(pMoeGUs, BL.sMoeGUs, 512, &pcv, 16);
+        disp(pMoeL, BL.sMoeL, nExp, &pcv, 16);
+        disp(pMoeGUs, BL.sMoeGUs, ffE, &pcv, 16);
         barrier();
         disp(pMoeS, BL.sMoeS, 1, &pcv, 16);
         barrier();
-        disp(pMoeGU, BL.sMoeGU, 8 * 512, &pcv, 16);
+        disp(guIq4 ? pMoeGU4 : pMoeGU, BL.sMoeGU, nUsed * ffE, &pcv, 16);
         barrier();
         disp(L.downQ6 ? pMoeDn6 : pMoeDn4, BL.sMoeDn, nEmbd, &pcv, 16);
         disp(pMoeDnsB, BL.sMoeDns, nEmbd, &pcv, 16);
@@ -4081,7 +4196,7 @@ __attribute__((visibility("default"))) uint32_t qk_eos_token(const qk_engine* e)
 __attribute__((visibility("default"))) uint32_t qk_bos_token(const qk_engine* e) { return e->bosTok; }
 __attribute__((visibility("default"))) uint32_t qk_layer_first(const qk_engine* e) { return e->lFirst; }
 __attribute__((visibility("default"))) uint32_t qk_layer_end(const qk_engine* e) { return e->lEnd; }
-__attribute__((visibility("default"))) uint32_t qk_n_layer(const qk_engine* e) { return qk_engine::nLayer; }
+__attribute__((visibility("default"))) uint32_t qk_n_layer(const qk_engine* e) { return e->nLayer; }
 __attribute__((visibility("default"))) uint32_t qk_n_embd(const qk_engine* e) { return qk_engine::nEmbd; }
 
 __attribute__((visibility("default")))
@@ -4669,7 +4784,15 @@ int main(int argc, char** argv) {
             return true;
         };
         struct PipeHdr { uint32_t op, slot, n, base; };
-        const uint32_t nEmbd = qk_engine::nEmbd, nLay = qk_engine::nLayer;
+        const uint32_t nEmbd = qk_engine::nEmbd;
+        // Layer count comes from the GGUF header (35B: 40, 80B: 48) — needed
+        // before any engine exists to parse/validate the stage boundaries.
+        uint32_t nLay = 40;
+        {
+            Gguf gh;
+            if (gh.open(ggufPath()))
+                nLay = (uint32_t)gh.kvInt(gh.kvStr("general.architecture", "") + ".block_count", 40);
+        }
         // Connection hello: client sends the magic; worker replies
         // {magic, lFirst, lEnd, nLayer, nEmbd, nSlots, nCtx} so mismatched
         // builds/splits fail loudly instead of streaming garbage. Bump the
