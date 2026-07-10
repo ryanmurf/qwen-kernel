@@ -30,28 +30,84 @@ const IO_TIMEOUT: Duration = Duration::from_secs(120);
 /// re-chunks internally at its own batch cap, so this only bounds frame size.
 const CHUNK: usize = 128;
 
+/// Connection hello ("qkp1"): client sends the magic, worker replies
+/// `{magic, layer_first, layer_end, n_layer, n_embd, n_slots, n_ctx}` —
+/// mixed builds or a mis-split worker fail loudly at connect instead of
+/// streaming garbage. Bump on any wire change.
+const PIPE_MAGIC: u32 = 0x716b_7031;
+
+/// What the head requires of the worker, checked against its hello.
+pub struct WorkerExpect {
+    pub layer_first: u32, // = head's layer_end (contiguous split)
+    pub n_layer: u32,     // worker must run through the final layer
+    pub n_embd: u32,
+    pub n_slots: u32, // worker must cover at least the head's slots…
+    pub n_ctx: u32,   // …and context
+}
+
 pub struct WorkerLink {
     addr: String,
     n_embd: usize,
+    expect: WorkerExpect,
     stream: Option<TcpStream>,
 }
 
 impl WorkerLink {
-    pub fn new(addr: String, n_embd: usize) -> Self {
+    pub fn new(addr: String, expect: WorkerExpect) -> Self {
         Self {
             addr,
-            n_embd,
+            n_embd: expect.n_embd as usize,
+            expect,
             stream: None,
         }
     }
 
     fn stream(&mut self) -> Result<&mut TcpStream> {
         if self.stream.is_none() {
-            let stream = TcpStream::connect(&self.addr)
+            let mut stream = TcpStream::connect(&self.addr)
                 .with_context(|| format!("cannot connect to split worker {}", self.addr))?;
             stream.set_nodelay(true)?;
             stream.set_read_timeout(Some(IO_TIMEOUT))?;
             stream.set_write_timeout(Some(IO_TIMEOUT))?;
+            stream
+                .write_all(&PIPE_MAGIC.to_le_bytes())
+                .context("split worker hello write")?;
+            let mut raw = [0u8; 28];
+            stream
+                .read_exact(&mut raw)
+                .context("split worker hello read (old/foreign build?)")?;
+            let mut hello = [0u32; 7];
+            for (word, bytes) in hello.iter_mut().zip(raw.chunks_exact(4)) {
+                *word = u32::from_le_bytes(bytes.try_into().expect("4-byte chunk"));
+            }
+            let e = &self.expect;
+            if hello[0] != PIPE_MAGIC {
+                anyhow::bail!("split worker hello: bad magic {:#010x}", hello[0]);
+            }
+            if hello[1] != e.layer_first
+                || hello[2] != e.n_layer
+                || hello[3] != e.n_layer
+                || hello[4] != e.n_embd
+                || hello[5] < e.n_slots
+                || hello[6] < e.n_ctx
+            {
+                anyhow::bail!(
+                    "split worker mismatch: layers [{}, {}) of {}, n_embd {}, slots {}, ctx {} \
+                     (head needs layers [{}, {}) of {}, n_embd {}, slots >= {}, ctx >= {})",
+                    hello[1],
+                    hello[2],
+                    hello[3],
+                    hello[4],
+                    hello[5],
+                    hello[6],
+                    e.layer_first,
+                    e.n_layer,
+                    e.n_layer,
+                    e.n_embd,
+                    e.n_slots,
+                    e.n_ctx
+                );
+            }
             self.stream = Some(stream);
         }
         Ok(self.stream.as_mut().expect("just connected"))

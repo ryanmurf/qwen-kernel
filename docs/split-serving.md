@@ -23,13 +23,17 @@ explicitly out of scope — our stage transport is our own.
 
 ## Why (and why now)
 
-- **Near term, one box**: layers `[0,20)` + `[20,40)` hold ~8.5 GB per stage
-  vs ~15.4 GB whole. Freed VRAM per node = KV budget: slots/ctx can grow well
-  past today's slots=2/ctx=16384 ceiling — at the cost of ~2× single-stream
-  decode latency (6.4–6.7 ms/tok both stages on one 7900 XT vs 5.8 serial).
-- **End game, two boxes**: tron (RDNA3/Vulkan) + midnight (M4 Max/Metal, port
-  in flight — M5 milestone is "same ABI, server unmodified"). The engine is
-  hard-wired to Qwen3.6-35B-A3B today, so cross-box split first means more
+- **One box = staging only.** Two stages on the same GPU still hold the full
+  weight set between them (~15.4 GB + ~0.5 GB overhead) and the same total
+  KV — there is **no capacity win on a single card**, and both stages
+  serialize on the same hardware, so no throughput win either. The
+  single-box shape exists to validate the choreography (which it did:
+  token-exact, all failure drills green) at ~6.4–6.7 ms/tok vs 5.8 serial.
+- **The win is per-NODE, i.e. cross-box**: tron (RDNA3/Vulkan) + midnight
+  (M4 Max/Metal, port at M5 — same ABI, server unmodified). Each node then
+  holds ~half the weights (~8.5 GB), freeing ~7 GB per node for KV: slots/ctx
+  can grow well past today's slots=2/ctx=16384 ceiling. The engine is
+  hard-wired to Qwen3.6-35B-A3B, so cross-box split first means more
   slots/ctx/headroom for *this* model; larger models additionally need a
   second hard-wired architecture, which is its own project.
 
@@ -74,9 +78,12 @@ client ── HTTP ──> qk-server (HEAD)                     qk pipe-worker (
   every position exactly once per slot in order. `base==0` resets the slot on
   the worker (that IS slot_start); cancel needs no message (the next sequence
   on that slot starts at base 0 and resets).
-- No version/hello handshake in v1: both ends are built from the same tree.
-  Add a magic u32 + layer-range echo when the Metal worker lands (mixed
-  builds become possible).
+- Connection hello (added ahead of the Metal worker): the client sends magic
+  `0x716b7031` ("qkp1"); the worker replies `{magic, layer_first, layer_end,
+  n_layer, n_embd, n_slots, n_ctx}`. The head requires a contiguous split
+  reaching the final layer, matching n_embd, and worker slots/ctx covering
+  its own — so mixed builds or a mis-launched worker fail loudly at connect,
+  never mid-stream. Bump the magic on any wire change.
 
 ## Head-side server changes (the actual work)
 

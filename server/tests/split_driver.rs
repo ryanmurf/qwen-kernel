@@ -30,12 +30,26 @@ fn lcg(prev: u32) -> u32 {
     (prev.wrapping_mul(1_103_515_245).wrapping_add(12_345)) % 248_000
 }
 
-/// Minimal `qk pipe-worker` in Rust: one connection at a time, op1 frames of
+const PIPE_MAGIC: u32 = 0x716b_7031;
+
+/// Minimal `qk pipe-worker` in Rust: hello on connect, then op1 frames of
 /// hidden rows in, greedy ids out, until the peer disconnects or says op2.
-fn serve_worker(mut engine: Engine, listener: TcpListener) {
+/// `hello_n_embd` lets a test advertise a mismatched topology.
+fn serve_worker(mut engine: Engine, listener: TcpListener, hello_n_embd: u32) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         stream.set_nodelay(true).ok();
+        let mut magic = [0u8; 4];
+        if stream.read_exact(&mut magic).is_err() || u32::from_le_bytes(magic) != PIPE_MAGIC {
+            continue;
+        }
+        let mut hello = Vec::new();
+        for word in [PIPE_MAGIC, 20, 40, 40, hello_n_embd, CFG.n_slots, CFG.n_ctx] {
+            hello.extend_from_slice(&word.to_le_bytes());
+        }
+        if stream.write_all(&hello).is_err() {
+            continue;
+        }
         serve_conn(&mut engine, &mut stream);
     }
 }
@@ -108,7 +122,14 @@ fn split_driver_serves_the_serial_stream() {
     let worker_engine = open_stub();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    thread::spawn(move || serve_worker(worker_engine, listener));
+    thread::spawn(move || serve_worker(worker_engine, listener, N_EMBD as u32));
+
+    // A second worker advertising the wrong n_embd: the hello must reject it.
+    unsafe { std::env::set_var("QK_LAYERS", "20:40") };
+    let bad_engine = open_stub();
+    let bad_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let bad_addr = bad_listener.local_addr().expect("addr").to_string();
+    thread::spawn(move || serve_worker(bad_engine, bad_listener, 8));
 
     // Misconfigurations are rejected at startup, before serving anything:
     // a split engine with no --split-next…
@@ -167,6 +188,22 @@ fn split_driver_serves_the_serial_stream() {
     let (tokens, _) = run_job(&engine, &sem, long, 2);
     assert_eq!(tokens, vec![lcg(11), lcg(lcg(11))]);
 
+    engine.shutdown();
+
+    // Topology-mismatch worker: the hello rejects it with a clear error.
+    unsafe { std::env::set_var("QK_LAYERS", "0:20") };
+    let engine = EngineThread::start(
+        Path::new(env!("QK_STUB_LIB")),
+        Path::new("/dev/null"),
+        CFG,
+        Some(bad_addr),
+    )
+    .expect("head starts (hello happens lazily)");
+    unsafe { std::env::remove_var("QK_LAYERS") };
+    let (tokens, finish) = run_job(&engine, &sem, vec![3, 9, 11], 4);
+    assert!(tokens.is_empty());
+    let err = finish.expect_err("mismatched worker must be rejected");
+    assert!(err.contains("mismatch"), "{err}");
     engine.shutdown();
 
     // Dead worker: requests fail with an Error event; startup still succeeds

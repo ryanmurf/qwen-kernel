@@ -4624,6 +4624,11 @@ int main(int argc, char** argv) {
         };
         struct PipeHdr { uint32_t op, slot, n, base; };
         const uint32_t nEmbd = qk_engine::nEmbd, nLay = qk_engine::nLayer;
+        // Connection hello: client sends the magic; worker replies
+        // {magic, lFirst, lEnd, nLayer, nEmbd, nSlots, nCtx} so mismatched
+        // builds/splits fail loudly instead of streaming garbage. Bump the
+        // magic ("qkp2"...) on any wire change.
+        const uint32_t kPipeMagic = 0x716b7031;  // "qkp1"
         char err[256] = {0};
 
         if (mode == "pipe-worker") {
@@ -4653,6 +4658,16 @@ int main(int argc, char** argv) {
                 int fd = accept(ls, nullptr, nullptr);
                 if (fd < 0) continue;
                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                uint32_t cmagic = 0;
+                if (!readAll(fd, &cmagic, 4) || cmagic != kPipeMagic) {
+                    fprintf(stderr, "[pipe-worker] bad hello magic %08x — old/foreign client?\n",
+                            cmagic);
+                    close(fd);
+                    continue;
+                }
+                uint32_t hello[7] = {kPipeMagic, e->lFirst, e->lEnd, nLay, nEmbd,
+                                     e->nSlots,  e->nCtx};
+                if (!writeAll(fd, hello, sizeof hello)) { close(fd); continue; }
                 fprintf(stderr, "[pipe-worker] client connected\n");
                 PipeHdr h;
                 while (readAll(fd, &h, sizeof h) && h.op == 1) {
@@ -4726,6 +4741,21 @@ int main(int argc, char** argv) {
             freeaddrinfo(res);
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            uint32_t magic = kPipeMagic, hello[7];
+            if (!writeAll(fd, &magic, 4) || !readAll(fd, hello, sizeof hello) ||
+                hello[0] != kPipeMagic) {
+                fprintf(stderr, "pipe: worker hello failed (old/foreign build?)\n");
+                return 1;
+            }
+            if (hello[1] != split || hello[2] != nLay || hello[3] != nLay || hello[4] != nEmbd ||
+                hello[5] < 1 || hello[6] < tmax) {
+                fprintf(stderr,
+                        "pipe: worker mismatch: layers [%u,%u) of %u, n_embd %u, slots %u, ctx %u "
+                        "(need [%u,%u) of %u, n_embd %u, ctx >= %u)\n",
+                        hello[1], hello[2], hello[3], hello[4], hello[5], hello[6], split, nLay,
+                        nLay, nEmbd, tmax);
+                return 1;
+            }
         } else {
             snprintf(lay, sizeof lay, "%u:%u", split, nLay);
             setenv("QK_LAYERS", lay, 1);

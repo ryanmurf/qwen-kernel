@@ -161,7 +161,16 @@ impl EngineThread {
                     info.n_layer,
                     addr
                 );
-                Some(crate::split::WorkerLink::new(addr, info.n_embd as usize))
+                Some(crate::split::WorkerLink::new(
+                    addr,
+                    crate::split::WorkerExpect {
+                        layer_first: info.end,
+                        n_layer: info.n_layer,
+                        n_embd: info.n_embd,
+                        n_slots,
+                        n_ctx,
+                    },
+                ))
             }
             None => {
                 if let Some(info) = engine.stage_info() {
