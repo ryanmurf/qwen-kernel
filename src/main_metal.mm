@@ -2084,7 +2084,7 @@ struct qk_engine {
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
     id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4,
-        pMoeDG4, pMoeDG6, pMoeDGH4, pMoeDGH6, pMoeDR;
+        pMoeDG4, pMoeDG6, pMoeDGH4, pMoeDGH6, pMoeDR, pLogG;
     id<MTLBuffer> bbStart, bbATok, bbASlot, bbMDy;
     // Grouped (decode-once) MoE gate+up for prefill chunks. Variants:
     // 1 = v1 read-once (SLOWER — kept as bit-exact control); 2 = v2 f32
@@ -2299,6 +2299,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeDGH4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_iq4", 0);
     pMoeDGH6 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_q6k", 0);
     pMoeDR   = getPipe(c, "moe_down_grouped", "moe_down_reduce", 0);
+    pLogG    = getPipe(c, "moe_logits", "moe_logits_gemm", 0);
     if (const char* mg = getenv("QK_MOE_GROUPED")) { moeGrouped = atoi(mg); moeGroupN = 0; }
     if (const char* mn = getenv("QK_MOE_GROUP_N")) moeGroupN = (uint32_t)atoi(mn);
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 float4s");
@@ -2743,8 +2744,18 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true);
             }
             bar();
-            dspz(pMoeLA, {L.mgi, L.mgis, bbXin, bbAttnOut, L.pn, bbML, bbY, bbXn2},
-                 &pcv5, 20, (257 + nsg - 1) / nsg, thrN, n);
+            if (moeGrouped && n >= moeGroupN) {
+                // grouped regime: residual+norm via add_rmsnorm (same y/xn2 as
+                // the fused kernel), router logits as one f32 GEMM
+                dspz(pAddN, {bbXin, bbAttnOut, L.pn, bbY, bbXn2}, &pcRms, 8, 1, 256, n);
+                bar();
+                struct { uint32_t M, K, N; } pcLg{257, nEmbd, n};
+                dspz(pLogG, {L.mgi, L.mgis, bbXn2, bbML}, &pcLg, 12, (257 + 31) / 32, 128,
+                     (n + 31) / 32);
+            } else {
+                dspz(pMoeLA, {L.mgi, L.mgis, bbXin, bbAttnOut, L.pn, bbML, bbY, bbXn2},
+                     &pcv5, 20, (257 + nsg - 1) / nsg, thrN, n);
+            }
             bar();
             if (!skMoe) {
             dspz(pMoeS, {bbML, bbMSel}, &pcv, 16, 1, 32, n);
