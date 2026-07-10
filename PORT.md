@@ -5,6 +5,47 @@ Port of the qk engine (Vulkan/RDNA3) to Metal on a MacBook Pro M4 Max
 `Qwen3.6-35B-A3B-UD-Q3_K_M.gguf` (15.45 GiB, unsloth UD-Q3_K_M). Charter:
 `../GOAL.md`. Branch: `metal-port`.
 
+## Scorecard snapshot vs llama.cpp Metal — 2026-07-10 (for Ryan)
+
+Same box, same GGUF, greedy. All qk numbers lap-thermal (cool-state where
+noted); the plugged-in hard-surface record run is still owed.
+
+| axis | llama.cpp | qk | qk/llama |
+|---|---|---|---|
+| decode 1-stream, engine (tg128-equiv) | 84.2 tok/s | **119.7** (8.36 ms/tok) | **1.42×** |
+| decode 1-stream, serving path | 80.1 | **~110** steady (9.1 ms GPU/step) | **1.31×** |
+| aggregate 2 / 4 / 8 streams | 114.5 / 135.2 / 149.8 | **149.8 / 182.1 / 195.7** | **1.31 / 1.35 / 1.31×** |
+| pp512 (parity-exact config, v4) | 1452 | ~510 | 0.35× |
+| pp512 (record config, v3 = llama's f16 class) | 1452 | **744** cool | **0.51×** |
+| prefill vs own serial (B1 ≥4×) | — | 6.5–7.5× | gate PASSED |
+| weights RSS at open | ~17 GB | **318 MB** (no-copy; mlock opt-in for serving) | — |
+| ctx in production | — | 32768 (cross-box worker; 29.8k-tok real prompt served) | — |
+| correctness | reference | prefillcmp 36/36; 4 prompts token-exact vs llama refs (incl. 1040-tok through 512-chunks); handoff exact; cross-box byte-identical | — |
+
+**Since M5:** prefill head-tax fix (the z=n output head — B1 passed on the
+spot); decode-once grouped MoE (v2 f32-proof, v3 f16 record, v4 f32 default
+at chunk ≥192) + grouped down + vectorized staging → pp512 229 → 744;
+B3 aggregate beats llama-server --parallel at every N; qkp2 wire + state
+ABI same-day; mmap-eviction pathology found and fixed (QK_MLOCK /
+QK_COPY_WEIGHTS — no-copy weights degrade 2–6× after memory-pressure
+events and don't self-heal); bisect infra (tests/ parity fixtures +
+scripts/bisect_gate.sh, ~6 s/step).
+
+**pp512 gap = 1.95× and fully budgeted** (N=512 chunk, ms): grouped
+gate+up 230, projections 139 (GEMM-saturated at 10.4 TFLOPs), misc/logits
+113, grouped down 87, DeltaNet chain 76, attention 32. Named levers:
+mul_mm_id-class register-tiled dequant for gate+up, chunked delta-rule for
+DN, GEMM-ified router logits. This is deep-kernel work, in progress.
+
+**Cross-box worker:** local steady state (S=33 shape, ctx 32768): stage
+GPU 2.3 ms + 0.15 ms submit, s2+net 2.61 ms/tok — the 7–9 ms fixed
+per-frame cost tron measures does NOT reproduce with a raw client past
+warmup. With RTT now 1.26 ms it's the dominant cross-box lever; two
+candidates are with tron to discriminate (first-touch GPU page mappings
+over the first ~32 frames vs op3-per-frame KV-stripe memcpy ≈ 9 ms at
+32k ctx — probes in CROSSBOX-BRIEF.md, QK_STAGE_STATS=1 on the worker
+reads the split directly).
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
