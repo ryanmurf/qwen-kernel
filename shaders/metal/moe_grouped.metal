@@ -15,7 +15,7 @@ constant uint NSG [[function_constant(0)]];
 
 // One-threadgroup counting sort of the n*(nUsed) routed assignments over
 // 256 experts, plus the shared expert as virtual expert 256 holding every
-// token. Outputs: start[258] prefix offsets, aTok/aSlot assignment lists.
+// token. Outputs: start[n_expert+2] prefix offsets, aTok/aSlot assignment lists.
 struct GroupPC { uint n_embd; uint n_ff; uint n_expert; uint n_used; uint n; };
 
 kernel void moe_group(device const SelT* sel   [[buffer(0)]],
@@ -27,9 +27,10 @@ kernel void moe_group(device const SelT* sel   [[buffer(0)]],
 {
     const uint n = pc.n;
     const uint tid = tid3.x;   // 256 threads
-    threadgroup atomic_uint cnt[257];
-    threadgroup atomic_uint cur[257];
-    for (uint e = tid; e < 257u; e += 256u) {
+    threadgroup atomic_uint cnt[513];        // n_expert (<=512) + shared
+    threadgroup atomic_uint cur[513];
+    const uint ne1 = pc.n_expert + 1u;
+    for (uint e = tid; e < ne1; e += 256u) {
         atomic_store_explicit(&cnt[e], 0u, memory_order_relaxed);
         atomic_store_explicit(&cur[e], 0u, memory_order_relaxed);
     }
@@ -41,11 +42,11 @@ kernel void moe_group(device const SelT* sel   [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         uint acc = 0;
-        for (uint e = 0; e < 257u; ++e) {
+        for (uint e = 0; e < ne1; ++e) {
             start[e] = acc;
-            acc += (e == 256u) ? n : atomic_load_explicit(&cnt[e], memory_order_relaxed);
+            acc += (e == pc.n_expert) ? n : atomic_load_explicit(&cnt[e], memory_order_relaxed);
         }
-        start[257] = acc;
+        start[ne1] = acc;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < n * pc.n_used; i += 256u) {
@@ -56,7 +57,7 @@ kernel void moe_group(device const SelT* sel   [[buffer(0)]],
         aSlot[pos] = s;
     }
     for (uint i = tid; i < n; i += 256u) {          // shared expert: all tokens
-        aTok[start[256] + i] = i;
+        aTok[start[pc.n_expert] + i] = i;
         aSlot[start[256] + i] = pc.n_used;
     }
 }
