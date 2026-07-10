@@ -274,6 +274,13 @@ fn render_prompt(req: &MessagesReq) -> Result<String> {
                 out.push_str(&render_assistant_content(&message.content)?);
                 out.push_str("<|im_end|>\n");
             }
+            // Claude Code >= 2.2 sends system reminders as in-messages system
+            // turns (older CLIs only used the top-level `system` field).
+            "system" => {
+                out.push_str("<|im_start|>system\n");
+                out.push_str(&render_user_content(&message.content)?);
+                out.push_str("<|im_end|>\n");
+            }
             role => {
                 return Err(ServerError::bad_request(format!(
                     "unsupported message role: {role}"
@@ -1214,6 +1221,28 @@ mod tests {
         let prompt = render_prompt(&req).expect("renders");
         assert!(prompt.starts_with("<|im_start|>system\nYou are terse.<|im_end|>\n"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n{\"color\":"));
+    }
+
+    #[test]
+    fn renders_in_messages_system_turns() {
+        // Claude Code >= 2.2 injects system reminders as system-role entries
+        // inside `messages`, alongside the top-level `system` field.
+        let req = req_from_json(json!({
+            "max_tokens": 16,
+            "system": "You are terse.",
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": [
+                    { "type": "text", "text": "<system-reminder>stay on task</system-reminder>" }
+                ]},
+                { "role": "user", "content": "continue" }
+            ]
+        }));
+        let prompt = render_prompt(&req).expect("renders");
+        assert!(prompt.contains(
+            "<|im_start|>system\n<system-reminder>stay on task</system-reminder><|im_end|>\n\
+             <|im_start|>user\ncontinue<|im_end|>\n"
+        ));
     }
 
     #[test]
