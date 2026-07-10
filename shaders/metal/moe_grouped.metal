@@ -294,6 +294,139 @@ constant uint G3N = 32u;   // token columns per pass
 constant uint G3K = 64u;   // K elems staged per chunk
 constant uint G3S = 66u;   // padded half stride
 
+// v4 (decode-once, wide, f32, QK_MOE_GROUPED=4): v3's 32-token-column shape
+// with v2's f32 exactness — 32x32 tile in 25 KB. Captures most of the
+// grouping win while keeping the MoE contribution at summation-order noise,
+// so the serve-test/llama parity gates stay green (total noise = h-GEMM
+// class, unchanged from the shipping default).
+constant uint G4M = 32u;
+constant uint G4N = 32u;
+constant uint G4K = 64u;
+constant uint G4S = 65u;
+
+kernel void moe_gu_grouped4(device const block_iq3_xxs* gwE   [[buffer(0)]],
+                            device const block_iq3_xxs* uwE   [[buffer(1)]],
+                            device const block_q8_0*    gwS   [[buffer(2)]],
+                            device const block_q8_0*    uwS   [[buffer(3)]],
+                            device const float*         x     [[buffer(4)]],
+                            device const uint*          start [[buffer(5)]],
+                            device const uint*          aTok  [[buffer(6)]],
+                            device const uint*          aSlot [[buffer(7)]],
+                            device float*               h     [[buffer(8)]],
+                            constant MoePC&             pc    [[buffer(9)]],
+                            uint3 tid3  [[thread_position_in_threadgroup]],
+                            uint3 tgpig [[threadgroup_position_in_grid]],
+                            uint  sgid  [[simdgroup_index_in_threadgroup]],
+                            uint  slid  [[thread_index_in_simdgroup]])
+{
+    const uint tid = tid3.x;                 // 0..127, 4 simdgroups
+    const uint nrt = pc.n_ff / G4M;          // row tiles per expert
+    const uint e  = tgpig.x / nrt;           // 0..255 routed, 256 shared
+    const uint rt = tgpig.x % nrt;
+    const uint s0 = start[e], c = start[e + 1u] - s0;
+    if (c == 0u) return;
+
+    const uint K = pc.n_embd;
+    const uint hs = (pc.n_used + 1u) * pc.n_ff;
+    const uint row0 = rt * G4M;
+
+    threadgroup float WgSh[G4M * G4S];
+    threadgroup float WuSh[G4M * G4S];
+    threadgroup float Xsh[G4N * G4S];
+    threadgroup float outb[4u * 144u];       // per-simd G(72)|U(72) bounce
+
+    const uint smat = tid >> 6;              // 0 = gate, 1 = up
+    const uint srow = (tid >> 1) & 31u;
+    const uint sgrp = tid & 1u;
+    threadgroup float* dst = (smat ? WuSh : WgSh) + srow * G4S + sgrp * 32u;
+
+    for (uint t0 = 0u; t0 < c; t0 += G4N) {
+        simdgroup_float8x8 accG[4], accU[4];
+        for (uint i = 0u; i < 4u; ++i) {
+            accG[i] = simdgroup_float8x8(0.0f);
+            accU[i] = simdgroup_float8x8(0.0f);
+        }
+
+        for (uint k0 = 0u; k0 < K; k0 += G4K) {
+            const uint g32 = (k0 >> 5) + sgrp;           // global 32-group
+            const uint row = row0 + srow;
+            if (e < pc.n_expert) {                       // routed: IQ3_XXS
+                device const block_iq3_xxs* mat = smat ? uwE : gwE;
+                device const block_iq3_xxs& blk =
+                    mat[((ulong)e * pc.n_ff + row) * (K >> 8) + (g32 >> 3)];
+                const uint ib32 = g32 & 7u;
+                const uint ao = 64u + 4u * ib32;
+                const uint aux = uint(blk.qs[ao]) | (uint(blk.qs[ao + 1u]) << 8u) |
+                                 (uint(blk.qs[ao + 2u]) << 16u) | (uint(blk.qs[ao + 3u]) << 24u);
+                const float db = float(blk.d) * (0.5f + float(aux >> 28u)) * 0.5f;
+                for (uint l = 0u; l < 4u; ++l) {
+                    const uint signs = iq_signbyte((aux >> (7u * l)) & 127u);
+                    const uint g1 = iq3xxs_grid[blk.qs[ib32 * 8u + 2u * l]];
+                    const uint g2 = iq3xxs_grid[blk.qs[ib32 * 8u + 2u * l + 1u]];
+                    for (uint j = 0u; j < 4u; ++j) {
+                        dst[l * 8u + j] = db * float((g1 >> (8u * j)) & 255u) *
+                                          (((signs >> j) & 1u) ? -1.0f : 1.0f);
+                        dst[l * 8u + 4u + j] = db * float((g2 >> (8u * j)) & 255u) *
+                                               (((signs >> (4u + j)) & 1u) ? -1.0f : 1.0f);
+                    }
+                }
+            } else {                                     // shared: Q8_0
+                device const block_q8_0* mat = smat ? uwS : gwS;
+                device const block_q8_0& blk = mat[(ulong)row * (K >> 5) + g32];
+                const float d = float(blk.d);
+                device const packed_char4* qp = (device const packed_char4*)blk.qs;
+                for (uint i = 0u; i < 8u; ++i) {
+                    const char4 q = char4(qp[i]);
+                    dst[4u * i + 0u] = d * float(q.x);
+                    dst[4u * i + 1u] = d * float(q.y);
+                    dst[4u * i + 2u] = d * float(q.z);
+                    dst[4u * i + 3u] = d * float(q.w);
+                }
+            }
+            for (uint idx = tid; idx < G4N * G4K; idx += 128u) {
+                const uint tt = idx >> 6, kk = idx & 63u;
+                const uint ti = t0 + tt;
+                Xsh[tt * G4S + kk] = ti < c
+                    ? x[(ulong)aTok[s0 + ti] * K + k0 + kk] : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint kf = 0u; kf < G4K / 8u; ++kf) {
+                simdgroup_float8x8 ag, au;
+                simdgroup_load(ag, &WgSh[(sgid * 8u) * G4S + kf * 8u], G4S);
+                simdgroup_load(au, &WuSh[(sgid * 8u) * G4S + kf * 8u], G4S);
+                for (uint nc = 0u; nc < 4u; ++nc) {
+                    simdgroup_float8x8 bfr;
+                    simdgroup_load(bfr, &Xsh[(nc * 8u) * G4S + kf * 8u], G4S, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(accG[nc], ag, bfr, accG[nc]);
+                    simdgroup_multiply_accumulate(accU[nc], au, bfr, accU[nc]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float* bufG = &outb[sgid * 144u];
+        threadgroup float* bufU = bufG + 72u;
+        const uint fi = slid >> 2, fj0 = (slid & 3u) * 2u;
+        for (uint nc = 0u; nc < 4u; ++nc) {
+            simdgroup_store(accG[nc], bufG, 9u);
+            simdgroup_store(accU[nc], bufU, 9u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint jj = 0u; jj < 2u; ++jj) {
+                const uint ti = t0 + nc * 8u + fj0 + jj;
+                if (ti < c) {
+                    const uint i = s0 + ti;
+                    const float g = bufG[fi * 9u + fj0 + jj];
+                    const float u = bufU[fi * 9u + fj0 + jj];
+                    h[(ulong)aTok[i] * hs + aSlot[i] * pc.n_ff + row0 + sgid * 8u + fi] =
+                        (g / (1.0f + exp(-g))) * u;
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 kernel void moe_gu_grouped3(device const block_iq3_xxs* gwE   [[buffer(0)]],
                             device const block_iq3_xxs* uwE   [[buffer(1)]],
                             device const block_q8_0*    gwS   [[buffer(2)]],
