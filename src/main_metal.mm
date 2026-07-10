@@ -2291,13 +2291,16 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         // class; accepted via prefillcmp 36/36 argmax + prefilldecode HANDOFF
         // EXACT). QK_GEMM=scalar forces the bit-exact f32 path.
         const char* gv = getenv("QK_GEMM");
-        const char* fn = "gemm_q8_0_h";
+        const char* fn = "gemm_q8_0_hp";
         if (gv && !strcmp(gv, "scalar")) fn = "gemm_q8_0";
+        if (gv && !strcmp(gv, "h")) fn = "gemm_q8_0_h";
         if (gv && !strcmp(gv, "sg")) fn = "gemm_q8_0_sg";
         if (gv && !strcmp(gv, "h2")) fn = "gemm_q8_0_h2";
+        if (gv && !strcmp(gv, "hp")) fn = "gemm_q8_0_hp";
         pGemmB = getPipe(c, "gemm_q8_0", fn, 0);
         gemmThreads = !strcmp(fn, "gemm_q8_0_sg") ? 128 : 256;  // sg is 4-simd; scalar+h are 256
         if (!strcmp(fn, "gemm_q8_0_h2")) { gemmBM = 64; gemmBN = 128; }
+        if (!strcmp(fn, "gemm_q8_0_hp")) { gemmBM = 64; gemmBN = 32; gemmThreads = 128; }
     }
     pMoeGrp  = getPipe(c, "moe_grouped", "moe_group", 0);
     pMoeGuG  = getPipe(c, "moe_grouped", "moe_gu_grouped", nsg);
@@ -3058,9 +3061,11 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
     if (gv && !strcmp(gv, "h")) fn = "gemm_q8_0_h";
     if (gv && !strcmp(gv, "h32")) fn = "gemm_q8_0_h32";
     if (gv && !strcmp(gv, "h2")) fn = "gemm_q8_0_h2";
+    if (gv && !strcmp(gv, "hp")) fn = "gemm_q8_0_hp";
     bool scalar = !strcmp(fn, "gemm_q8_0");
-    const uint32_t tBM = !strcmp(fn, "gemm_q8_0_h2") ? 64 : 128;
-    const uint32_t tBN = !strcmp(fn, "gemm_q8_0_h2") ? 128 : 64;
+    const bool hp = !strcmp(fn, "gemm_q8_0_hp");
+    const uint32_t tBM = !strcmp(fn, "gemm_q8_0_h2") ? 64 : hp ? 64 : 128;
+    const uint32_t tBN = !strcmp(fn, "gemm_q8_0_h2") ? 128 : hp ? 32 : 64;
     id<MTLComputePipelineState> pso = getPipe(c, "gemm_q8_0", fn, 0);
     printf("variant: %s\n", fn);
     id<MTLBuffer> bW = createBuf(c, nb * sizeof(block_q8_0), blocks.data());
@@ -3074,7 +3079,7 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
         [enc setBuffer:bY offset:0 atIndex:2];
         [enc setBytes:&pc length:12 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake((M + tBM - 1) / tBM, 1, (N + tBN - 1) / tBN)
-            threadsPerThreadgroup:MTLSizeMake(!strcmp(fn, "gemm_q8_0_sg") ? 128 : 256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(!strcmp(fn, "gemm_q8_0_sg") || hp ? 128 : 256, 1, 1)];
     };
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [c.queue commandBuffer];
