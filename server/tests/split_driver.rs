@@ -1,0 +1,192 @@
+//! Split-serving driver against the deterministic stub: an in-process "worker"
+//! (stub engine, layers [20,40)) serves the pipe-worker frame protocol over
+//! TCP while EngineThread runs the head stage (layers [0,20)) through the
+//! split driver. The emitted stream must equal the stub's serial LCG rule.
+//! Single #[test]: this binary mutates QK_LAYERS (process-global env).
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
+use std::thread;
+
+use server::engine::{EngineThread, FinishReason, Job, SlotEvent};
+use server::ffi::{Engine, QkConfig};
+use tokio::sync::{Semaphore, mpsc};
+
+const CFG: QkConfig = QkConfig {
+    n_slots: 2,
+    n_ctx: 64,
+    chunk: 4,
+};
+const N_EMBD: usize = 4; // stub's hidden row width
+
+fn open_stub() -> Engine {
+    Engine::open(Path::new(env!("QK_STUB_LIB")), Path::new("/dev/null"), CFG)
+        .expect("stub engine opens")
+}
+
+fn lcg(prev: u32) -> u32 {
+    (prev.wrapping_mul(1_103_515_245).wrapping_add(12_345)) % 248_000
+}
+
+/// Minimal `qk pipe-worker` in Rust: one connection at a time, op1 frames of
+/// hidden rows in, greedy ids out, until the peer disconnects or says op2.
+fn serve_worker(mut engine: Engine, listener: TcpListener) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        stream.set_nodelay(true).ok();
+        serve_conn(&mut engine, &mut stream);
+    }
+}
+
+fn serve_conn(engine: &mut Engine, stream: &mut TcpStream) {
+    loop {
+        let mut header = [0u8; 16];
+        if stream.read_exact(&mut header).is_err() {
+            return;
+        }
+        let word = |i: usize| u32::from_le_bytes(header[i * 4..i * 4 + 4].try_into().unwrap());
+        let (op, slot, n, base) = (word(0), word(1), word(2) as usize, word(3));
+        if op != 1 {
+            return;
+        }
+        let mut payload = vec![0u8; n * N_EMBD * 4];
+        if stream.read_exact(&mut payload).is_err() {
+            return;
+        }
+        let hidden: Vec<f32> = payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let mut ids = vec![0u32; n];
+        engine
+            .stage_run(slot, None, Some(&hidden), base, None, Some(&mut ids))
+            .expect("worker stage_run");
+        let mut reply = Vec::with_capacity(n * 4);
+        for id in &ids {
+            reply.extend_from_slice(&id.to_le_bytes());
+        }
+        if stream.write_all(&reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// Submit one prompt and collect (tokens, finish) off the event channel.
+fn run_job(
+    engine: &EngineThread,
+    sem: &Arc<Semaphore>,
+    prompt: Vec<u32>,
+    max_gen: u32,
+) -> (Vec<u32>, Result<FinishReason, String>) {
+    let (tx, mut rx) = mpsc::channel(64);
+    engine
+        .handle()
+        .submit(Job {
+            prompt_ids: prompt,
+            max_gen,
+            snap_prefix: 0,
+            events: tx,
+            permit: sem.clone().try_acquire_owned().expect("permit"),
+        })
+        .expect("submit");
+    let mut tokens = Vec::new();
+    loop {
+        match rx.blocking_recv().expect("engine dropped channel early") {
+            SlotEvent::Tokens(t) => tokens.extend(t),
+            SlotEvent::Done { reason } => return (tokens, Ok(reason)),
+            SlotEvent::Error(e) => return (tokens, Err(e)),
+        }
+    }
+}
+
+#[test]
+fn split_driver_serves_the_serial_stream() {
+    // Worker: stub engine holding layers [20,40) behind the frame protocol.
+    unsafe { std::env::set_var("QK_LAYERS", "20:40") };
+    let worker_engine = open_stub();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    thread::spawn(move || serve_worker(worker_engine, listener));
+
+    // Misconfigurations are rejected at startup, before serving anything:
+    // a split engine with no --split-next…
+    unsafe { std::env::set_var("QK_LAYERS", "0:20") };
+    let Err(err) =
+        EngineThread::start(Path::new(env!("QK_STUB_LIB")), Path::new("/dev/null"), CFG, None)
+    else {
+        panic!("split engine without --split-next must fail")
+    };
+    assert!(err.to_string().contains("--split-next"), "{err}");
+
+    // Head: stub engine holding layers [0,20), split driver to the worker.
+    let engine = EngineThread::start(
+        Path::new(env!("QK_STUB_LIB")),
+        Path::new("/dev/null"),
+        CFG,
+        Some(addr),
+    )
+    .expect("head starts");
+    unsafe { std::env::remove_var("QK_LAYERS") };
+
+    // …and --split-next with an unsplit engine.
+    let Err(err) = EngineThread::start(
+        Path::new(env!("QK_STUB_LIB")),
+        Path::new("/dev/null"),
+        CFG,
+        Some("127.0.0.1:1".into()),
+    ) else {
+        panic!("--split-next with an unsplit engine must fail")
+    };
+    assert!(err.to_string().contains("head stage"), "{err}");
+
+    let sem = Arc::new(Semaphore::new(4));
+
+    // Happy path: the emitted stream is exactly the stub's serial LCG chain.
+    let (tokens, finish) = run_job(&engine, &sem, vec![3, 9, 11], 6);
+    let mut expect = Vec::new();
+    let mut prev = 11u32;
+    for _ in 0..6 {
+        prev = lcg(prev);
+        expect.push(prev);
+    }
+    assert_eq!(tokens, expect);
+    assert_eq!(finish, Ok(FinishReason::Limit));
+
+    // Slot + connection reuse: a second sequence starts clean at base 0.
+    let (tokens, finish) = run_job(&engine, &sem, vec![42, 7, 100, 11], 3);
+    assert_eq!(tokens, vec![lcg(11), lcg(lcg(11)), lcg(lcg(lcg(11)))]);
+    assert_eq!(finish, Ok(FinishReason::Limit));
+
+    // A prompt longer than the head's prefill chunk still chains correctly
+    // (CHUNK=128 in split.rs; n_ctx=64 here, so use 40 tokens ending in 11 —
+    // multiple stage_run chunks inside the engine, one frame per 128 anyway).
+    let mut long = vec![5u32; 39];
+    long.push(11);
+    let (tokens, _) = run_job(&engine, &sem, long, 2);
+    assert_eq!(tokens, vec![lcg(11), lcg(lcg(11))]);
+
+    engine.shutdown();
+
+    // Dead worker: requests fail with an Error event; startup still succeeds
+    // (the link connects lazily) and the thread survives to serve the error.
+    unsafe { std::env::set_var("QK_LAYERS", "0:20") };
+    let dead_port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").to_string()
+    }; // listener dropped: nothing serves this port
+    let engine = EngineThread::start(
+        Path::new(env!("QK_STUB_LIB")),
+        Path::new("/dev/null"),
+        CFG,
+        Some(dead_port),
+    )
+    .expect("head starts even with the worker down");
+    unsafe { std::env::remove_var("QK_LAYERS") };
+    let (tokens, finish) = run_job(&engine, &sem, vec![3, 9, 11], 4);
+    assert!(tokens.is_empty());
+    let err = finish.expect_err("job against a dead worker must error");
+    assert!(err.contains("split worker"), "{err}");
+    engine.shutdown();
+}

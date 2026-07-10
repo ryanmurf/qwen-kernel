@@ -4628,13 +4628,16 @@ int main(int argc, char** argv) {
 
         if (mode == "pipe-worker") {
             if (argc < 3) {
-                fprintf(stderr, "usage: qk pipe-worker <port> [a:b=20:40] [tmax=4096]\n");
+                fprintf(stderr,
+                        "usage: qk pipe-worker <port> [a:b=20:40] [tmax=4096] [slots=1]\n"
+                        "       (slots/tmax must cover the head server's --slots/--ctx)\n");
                 return 1;
             }
             uint16_t port = (uint16_t)atoi(argv[2]);
             setenv("QK_LAYERS", argc > 3 ? argv[3] : "20:40", 1);
             uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 4096;
-            qk_config cfg{1, tmax, 8};
+            uint32_t wslots = argc > 5 ? (uint32_t)atoi(argv[5]) : 1;
+            qk_config cfg{wslots, tmax, 8};
             qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
             if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
             int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1;

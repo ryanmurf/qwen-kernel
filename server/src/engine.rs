@@ -49,24 +49,43 @@ pub enum FinishReason {
     Limit,
 }
 
-struct SlotState {
-    events: tokio_mpsc::Sender<SlotEvent>,
-    emitted: u32,
-    max_gen: u32,
+// Shared with the split-mode driver (split.rs), which reproduces the exact
+// same event/backpressure semantics over a different forward path.
+pub(crate) struct SlotState {
+    pub(crate) events: tokio_mpsc::Sender<SlotEvent>,
+    pub(crate) emitted: u32,
+    pub(crate) max_gen: u32,
     // Generation is over (EOS/limit); the slot lingers only to drain `pending`.
-    finished: bool,
+    pub(crate) finished: bool,
     // Events the engine produced but the consumer has not yet accepted. The
     // engine thread is shared across all slots, so it must never block on a
     // single slow/stalled SSE consumer: a full channel would freeze every
     // other slot too (head-of-line block). Instead we buffer here and retry
     // with `try_send` each tick. Growth is bounded by `max_gen` tokens, and a
     // consumer that closes its channel drops the slot outright.
-    pending: VecDeque<SlotEvent>,
+    pub(crate) pending: VecDeque<SlotEvent>,
     _permit: OwnedSemaphorePermit,
 }
 
+impl SlotState {
+    pub(crate) fn new(
+        events: tokio_mpsc::Sender<SlotEvent>,
+        max_gen: u32,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            events,
+            emitted: 0,
+            max_gen,
+            finished: false,
+            pending: VecDeque::new(),
+            _permit: permit,
+        }
+    }
+}
+
 // Outcome of trying to hand a slot's buffered events to its consumer.
-enum FlushOutcome {
+pub(crate) enum FlushOutcome {
     // Consumer is keeping up (or merely backed up); keep the slot around.
     Live,
     // Nothing left to deliver and generation is finished: release the slot.
@@ -77,7 +96,7 @@ enum FlushOutcome {
 
 // Push buffered events to the consumer without ever blocking the engine
 // thread. On a full channel we stop and try again next tick.
-fn flush_slot(state: &mut SlotState) -> FlushOutcome {
+pub(crate) fn flush_slot(state: &mut SlotState) -> FlushOutcome {
     use tokio_mpsc::error::TrySendError;
     while let Some(ev) = state.pending.pop_front() {
         match state.events.try_send(ev) {
@@ -97,7 +116,17 @@ fn flush_slot(state: &mut SlotState) -> FlushOutcome {
 }
 
 impl EngineThread {
-    pub fn start(lib: &Path, model: &Path, cfg: QkConfig) -> anyhow::Result<Self> {
+    /// `split_next`: split-serving worker address (docs/split-serving.md).
+    /// When set, this process must hold the HEAD stage (`QK_LAYERS=0:S`) and
+    /// generation is driven by the split driver instead of qk_step_chunk.
+    pub fn start(
+        lib: &Path,
+        model: &Path,
+        cfg: QkConfig,
+        split_next: Option<String>,
+    ) -> anyhow::Result<Self> {
+        use anyhow::{Context, bail};
+
         // Open the engine exactly once (the model is ~16 GB of VRAM); read the
         // resolved config off it, then move it into the engine thread. Opening a
         // throwaway "probe" engine here would transiently double VRAM use.
@@ -107,10 +136,54 @@ impl EngineThread {
         let chunk = engine.chunk();
         let n_vocab = engine.n_vocab();
 
+        let split = match split_next {
+            Some(addr) => {
+                let info = engine
+                    .stage_info()
+                    .context("--split-next requires an engine library with the stage ABI")?;
+                if !info.is_first() || info.is_last() {
+                    bail!(
+                        "--split-next: engine must be the head stage (QK_LAYERS=0:S, S < {}), got layers [{}, {})",
+                        info.n_layer,
+                        info.first,
+                        info.end
+                    );
+                }
+                for var in ["QK_FORK", "QK_SPEC"] {
+                    if std::env::var_os(var).is_some() {
+                        tracing::warn!("{var} is unsupported in split mode v1 and will not engage");
+                    }
+                }
+                tracing::info!(
+                    "split serving: head layers [0, {}) local, layers [{}, {}) via {}",
+                    info.end,
+                    info.end,
+                    info.n_layer,
+                    addr
+                );
+                Some(crate::split::WorkerLink::new(addr, info.n_embd as usize))
+            }
+            None => {
+                if let Some(info) = engine.stage_info() {
+                    if info.is_split() {
+                        bail!(
+                            "engine owns layers [{}, {}) (QK_LAYERS) but --split-next was not given",
+                            info.first,
+                            info.end
+                        );
+                    }
+                }
+                None
+            }
+        };
+
         let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("qk-engine".to_owned())
-            .spawn(move || run_engine_thread(engine, rx))
+            .spawn(move || match split {
+                Some(link) => crate::split::run_split_engine_thread(engine, link, rx),
+                None => run_engine_thread(engine, rx),
+            })
             .map_err(anyhow::Error::from)?;
         Ok(Self {
             handle: EngineHandle {

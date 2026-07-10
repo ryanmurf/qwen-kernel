@@ -103,7 +103,7 @@ qk warm <ids> <n>        # prefix-cache TTFT demo        qk serve-test <ids> <n>
 qk prefillcmp|prefillbench|prefilldecode   # batched-prefill exactness / timing / handoff
 qk verify <ids> <n> [K,..]   # spec-decode verify rounds (oracle draft): exactness + c(K)
 qk pipe <ids> <n> [split] [tmax] [host:port]   # pipeline-split parity/timing (2 stages)
-qk pipe-worker <port> [a:b] [tmax]             # serve one stage over TCP
+qk pipe-worker <port> [a:b] [tmax] [slots]     # serve one stage over TCP
 qk list [filter]         # tensors in the GGUF
 ```
 
@@ -132,6 +132,8 @@ Env knobs:
   landscape assessment (llama.cpp era) and MoE verify economics
 - [`docs/spec-decode-qk-plan.md`](docs/spec-decode-qk-plan.md) — design +
   implementation plan for speculation in this engine
+- [`docs/split-serving.md`](docs/split-serving.md) — split-model serving
+  (head + `pipe-worker` stages, `--split-next`)
 - [`deploy/README.md`](deploy/README.md) — single-GPU switchable deployment
 
 ## Notes

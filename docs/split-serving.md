@@ -1,5 +1,16 @@
 # Split-model serving — design (task #19)
 
+> **STATUS 2026-07-10: P0–P2 shipped.** `--split-next` + the split driver
+> (`server/src/split.rs`) are live; offline coverage via the stub
+> (`tests/split_driver.rs`). All four gates passed on the 7900 XT
+> (head `QK_LAYERS=0:20` + `qk pipe-worker 20:40`, ctx 8192, slots 2):
+> (1) split `/v1/messages` byte-identical to unsplit (text, usage,
+> stop_reason); (2) streamed ≡ non-streamed; (3) worker killed mid-stream →
+> partial tokens + clean SSE `error` / HTTP 500, head survives, next request
+> after worker restart reconnects lazily and succeeds; (4) two concurrent
+> sequences both match their unsplit references. P3 (bigger-ctx/slots
+> deployment shape) is an open experiment.
+
 Serve one model as N pipeline stages on N devices, behind the existing
 qk-server HTTP/Anthropic layer. Builds on the engine's pipeline split
 (`QK_LAYERS=a:b` + `qk_stage_run`, commit 240c63e), which is validated
