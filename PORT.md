@@ -488,6 +488,14 @@ contending in one process); use the worker for real numbers. For tron
 — s2 on midnight measured ~5.3 ms/tok at split 20 with 4k ctx; balance S
 per the brief using tron's ~5.8 ms/tok full-model decode.
 
+**Gate (c) PASSED (tron-driven, 2026-07-10): midnight served tron's
+qk-server over the LAN token-exact at pipe level and byte-identical
+through the full `--split-next` HTTP path. 17.2 ms/tok engine-level
+(midnight stage ~5 ms + WiFi RTT ~4.3 ms), 50 tok/s streamed. Two GPU
+vendors — RDNA3 head, Apple Metal worker — one bit-exact model.**
+Follow-ons (wired link, S sweep, slots=4 worker) tracked on the tron
+side; the midnight worker stays up on :18100.
+
 One false alarm worth recording: an apparent engine-vs-reference
 divergence on prompt 3 was a stale memory of the PRE-fix (accidentally
 sampled) reference — the regenerated greedy ref matches the engine
