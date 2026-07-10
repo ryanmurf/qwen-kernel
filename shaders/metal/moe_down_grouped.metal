@@ -231,3 +231,196 @@ kernel void moe_down_reduce(device const float* dY  [[buffer(0)]],
     acc += sel[rq].wShared * base[pc.n_used * pc.n_embd];
     y[(ulong)rq * pc.n_embd + d] = acc;
 }
+
+// ---- f16 tier (QK_MOE_GROUPED=3 record config): 64x32 tiles, 256 threads,
+// half staging (gemm_q8_0_h / mul_mm_id precision class). Each thread
+// stages 16 elements per chunk: IQ4_XS splits into nibble planes, Q6_K into
+// its native 16-elem scale groups, Q8_0 into block halves.
+constant uint DHM = 64u;
+constant uint DHN = 32u;
+constant uint DHK = 64u;
+constant uint DHS = 66u;
+
+static inline void iq4_stage16h(device const block_iq4_xs* mat, ulong rowBlocks,
+                                uint row, uint g32, uint h16, threadgroup half* dst) {
+    device const block_iq4_xs& blk = mat[(ulong)row * rowBlocks + (g32 >> 3u)];
+    const uint ib = g32 & 7u;
+    const uint slb = uint(blk.scales_l[ib >> 1u]);
+    const uint sh  = uint(blk.scales_h);
+    const int  ls  = int(((slb >> (4u * (ib & 1u))) & 0xFu) |
+                         (((sh >> (2u * ib)) & 3u) << 4u)) - 32;
+    const float dl = float(blk.d) * float(ls);
+    device const packed_uchar4* qp = (device const packed_uchar4*)&blk.qs[ib * 16u];
+    for (uint j = 0u; j < 4u; ++j) {
+        const uchar4 q = uchar4(qp[j]);
+        const uint4 nib = h16 ? (uint4(q) >> 4u) : (uint4(q) & 0xFu);
+        dst[4u * j + 0u] = half(dl * float(kvalues_iq4nl[nib.x]));
+        dst[4u * j + 1u] = half(dl * float(kvalues_iq4nl[nib.y]));
+        dst[4u * j + 2u] = half(dl * float(kvalues_iq4nl[nib.z]));
+        dst[4u * j + 3u] = half(dl * float(kvalues_iq4nl[nib.w]));
+    }
+}
+
+static inline void q6k_stage16h(device const block_q6_K* mat, ulong rowBlocks,
+                                uint row, uint g32, uint h16, threadgroup half* dst) {
+    device const block_q6_K& blk = mat[(ulong)row * rowBlocks + (g32 >> 3u)];
+    const float d = float(blk.d);
+    const uint gg = (g32 & 7u) * 2u + h16;
+    const uint hh = gg >> 3u;
+    const uint r  = (gg & 7u) >> 1u;
+    const uint is = gg & 1u;
+    const float sc = float(int(blk.scales[hh * 8u + r * 2u + is]));
+    const uint qlBase = hh * 64u + (r & 1u) * 32u + is * 16u;
+    const uint qhBase = hh * 32u + is * 16u;
+    const uint shift  = r * 2u;
+    const bool hi     = r >= 2u;
+    device const packed_uchar4* qlp = (device const packed_uchar4*)&blk.ql[qlBase];
+    device const packed_uchar4* qhp = (device const packed_uchar4*)&blk.qh[qhBase];
+    const float ds = d * sc;
+    for (uint i = 0u; i < 4u; ++i) {
+        const uchar4 qlv = uchar4(qlp[i]);
+        const uchar4 qhv = uchar4(qhp[i]);
+        const uint4 lo = hi ? (uint4(qlv) >> 4u) : (uint4(qlv) & 0xFu);
+        const int4  q  = int4(lo | (((uint4(qhv) >> shift) & 3u) << 4u)) - 32;
+        dst[4u * i + 0u] = half(ds * float(q.x));
+        dst[4u * i + 1u] = half(ds * float(q.y));
+        dst[4u * i + 2u] = half(ds * float(q.z));
+        dst[4u * i + 3u] = half(ds * float(q.w));
+    }
+}
+
+static inline void q8_stage16h(device const block_q8_0* mat, ulong rowBlocks,
+                               uint row, uint g32, uint h16, threadgroup half* dst) {
+    device const block_q8_0& blk = mat[(ulong)row * rowBlocks + g32];
+    const half d = blk.d;
+    device const packed_char4* qp = (device const packed_char4*)&blk.qs[h16 * 16u];
+    for (uint i = 0u; i < 4u; ++i) {
+        const char4 q = char4(qp[i]);
+        dst[4u * i + 0u] = d * half(q.x);
+        dst[4u * i + 1u] = d * half(q.y);
+        dst[4u * i + 2u] = d * half(q.z);
+        dst[4u * i + 3u] = d * half(q.w);
+    }
+}
+
+template <typename BLK, bool ISQ6>
+static inline void down_grouped_body_h(device const BLK*        dwE,
+                                       device const block_q8_0* dwS,
+                                       device const float*      h,
+                                       device const uint*       start,
+                                       device const uint*       aTok,
+                                       device const uint*       aSlot,
+                                       device float*            dY,
+                                       constant MoePC&          pc,
+                                       threadgroup half*        Wsh,
+                                       threadgroup half*        Xsh,
+                                       threadgroup float*       outb,
+                                       uint tid, uint tgx, uint sgid, uint slid)
+{
+    const uint nrt = pc.n_embd / DHM;
+    const uint e  = tgx / nrt;
+    const uint rt = tgx % nrt;
+    const uint s0 = start[e], c = start[e + 1u] - s0;
+    if (c == 0u) return;
+
+    const uint K  = pc.n_ff;
+    const uint hs = (pc.n_used + 1u) * pc.n_ff;
+    const uint row0 = rt * DHM;
+
+    const uint srow = tid >> 2;              // 0..63
+    const uint sgrp = (tid >> 1) & 1u;       // 32-group within chunk
+    const uint sh16 = tid & 1u;              // 16-elem half within group
+    threadgroup half* dst = Wsh + srow * DHS + sgrp * 32u + sh16 * 16u;
+
+    for (uint t0 = 0u; t0 < c; t0 += DHN) {
+        simdgroup_float8x8 acc[4];
+        for (uint i = 0u; i < 4u; ++i) acc[i] = simdgroup_float8x8(0.0f);
+
+        for (uint k0 = 0u; k0 < K; k0 += DHK) {
+            const uint g32 = (k0 >> 5) + sgrp;
+            const uint row = row0 + srow;
+            if (e < pc.n_expert) {
+                device const BLK* mat = dwE + (ulong)e * pc.n_embd * (K >> 8);
+                if (ISQ6) q6k_stage16h((device const block_q6_K*)mat, K >> 8, row, g32, sh16, dst);
+                else      iq4_stage16h((device const block_iq4_xs*)mat, K >> 8, row, g32, sh16, dst);
+            } else {
+                q8_stage16h(dwS, K >> 5, row, g32, sh16, dst);
+            }
+            for (uint idx = tid; idx < DHN * DHK; idx += 256u) {
+                const uint tt = idx >> 6, kk = idx & 63u;
+                const uint ti = t0 + tt;
+                Xsh[tt * DHS + kk] = ti < c
+                    ? half(h[(ulong)aTok[s0 + ti] * hs + aSlot[s0 + ti] * pc.n_ff + k0 + kk])
+                    : 0.0h;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint kf = 0u; kf < DHK / 8u; ++kf) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, &Wsh[(sgid * 8u) * DHS + kf * 8u], DHS);
+                for (uint nc = 0u; nc < 4u; ++nc) {
+                    simdgroup_half8x8 bfr;
+                    simdgroup_load(bfr, &Xsh[(nc * 8u) * DHS + kf * 8u], DHS, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(acc[nc], a, bfr, acc[nc]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float* buf = &outb[sgid * 72u];
+        const uint fi = slid >> 2, fj0 = (slid & 3u) * 2u;
+        for (uint nc = 0u; nc < 4u; ++nc) {
+            simdgroup_store(acc[nc], buf, 9u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint jj = 0u; jj < 2u; ++jj) {
+                const uint ti = t0 + nc * 8u + fj0 + jj;
+                if (ti < c) {
+                    const uint i = s0 + ti;
+                    dY[((ulong)aTok[i] * (pc.n_used + 1u) + aSlot[i]) * pc.n_embd +
+                       row0 + sgid * 8u + fi] = buf[fi * 9u + fj0 + jj];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+kernel void moe_down_grouped_h_iq4(device const block_iq4_xs* dwE   [[buffer(0)]],
+                                   device const block_q8_0*   dwS   [[buffer(1)]],
+                                   device const float*        h     [[buffer(2)]],
+                                   device const uint*         start [[buffer(3)]],
+                                   device const uint*         aTok  [[buffer(4)]],
+                                   device const uint*         aSlot [[buffer(5)]],
+                                   device float*              dY    [[buffer(6)]],
+                                   constant MoePC&            pc    [[buffer(7)]],
+                                   uint3 tid3  [[thread_position_in_threadgroup]],
+                                   uint3 tgpig [[threadgroup_position_in_grid]],
+                                   uint  sgid  [[simdgroup_index_in_threadgroup]],
+                                   uint  slid  [[thread_index_in_simdgroup]])
+{
+    threadgroup half  Wsh[DHM * DHS];
+    threadgroup half  Xsh[DHN * DHS];
+    threadgroup float outb[8u * 72u];
+    down_grouped_body_h<block_iq4_xs, false>(dwE, dwS, h, start, aTok, aSlot, dY, pc,
+                                             Wsh, Xsh, outb, tid3.x, tgpig.x, sgid, slid);
+}
+
+kernel void moe_down_grouped_h_q6k(device const block_q6_K* dwE   [[buffer(0)]],
+                                   device const block_q8_0* dwS   [[buffer(1)]],
+                                   device const float*      h     [[buffer(2)]],
+                                   device const uint*       start [[buffer(3)]],
+                                   device const uint*       aTok  [[buffer(4)]],
+                                   device const uint*       aSlot [[buffer(5)]],
+                                   device float*            dY    [[buffer(6)]],
+                                   constant MoePC&          pc    [[buffer(7)]],
+                                   uint3 tid3  [[thread_position_in_threadgroup]],
+                                   uint3 tgpig [[threadgroup_position_in_grid]],
+                                   uint  sgid  [[simdgroup_index_in_threadgroup]],
+                                   uint  slid  [[thread_index_in_simdgroup]])
+{
+    threadgroup half  Wsh[DHM * DHS];
+    threadgroup half  Xsh[DHN * DHS];
+    threadgroup float outb[8u * 72u];
+    down_grouped_body_h<block_q6_K, true>(dwE, dwS, h, start, aTok, aSlot, dY, pc,
+                                          Wsh, Xsh, outb, tid3.x, tgpig.x, sgid, slid);
+}
