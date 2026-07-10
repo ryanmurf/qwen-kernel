@@ -34,9 +34,19 @@
 > shifting layers to tron only inflates s1 (which also grows
 > super-linearly through the batched-n=1 path). The async driver fully
 > hides the head's work at 2 streams (aggregate = worker+net bound).
-> Next levers, in value order: wired link (−3.4 ms/frame), worker-side
-> per-frame overhead (midnight's engine), then slots=4 (worker-bound math
-> says little until the first two land).
+>
+> **WIRED (2026-07-10, RTT 4.3→1.26 ms; WiFi had degraded to 18 ms avg
+> that day):**
+>
+> | link | single (engine) | single (HTTP) | 2-stream aggregate |
+> |---|---|---|---|
+> | WiFi | 17.0 ms/tok | ~19 ms/tok | 12.5 ms/tok (80 tok/s) |
+> | wired | **10.7 ms/tok** (s1 4.2 + s2+net 6.6) | ~13.4 ms/tok | **9.5 ms/tok (105 tok/s)** |
+>
+> Token-exact throughout. Still worker-bound under load (~8-9 ms effective
+> per frame back-to-back), so slots=4 stays pointless until midnight's
+> per-frame overhead shrinks — that's the single remaining lever.
+> qk-server-split.yaml now targets the wired IP (192.168.0.75).
 
 Serve one model as N pipeline stages on N devices, behind the existing
 qk-server HTTP/Anthropic layer. Builds on the engine's pipeline split
