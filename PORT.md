@@ -156,6 +156,15 @@ consistent first-person dialogue (was context-drifty before the fix).
   fail). Tron runs the decisive token gate vs refs-80b over the wire.
 - Merged origin/main 64192d5 into metal-port (server/deploy/tooling side
   is tron's; engine twins patched here).
+- **GATE CLOSED (tron, same evening): 80B split token gate PASSED** through
+  the real split (in-cluster head + this worker): ref3 100/100 exact;
+  ref1/ref2 prefix-exact to certified llama near-ties (top-2 gaps 0.006 /
+  0.11 logprob — llama's Q8_K activation noise, qk picks the #2). ~30 tok/s
+  steady over WiFi, determinism x2 exact. NOTE: the gated worker ran the
+  NEW build — so this also validates chunked DN (c38e951) at kDiv=2
+  end-to-end on the 80B. The "token-exact refs owed" item from the earlier
+  80B section is closed. :18200 is prod-standing now (same as :18100);
+  runbook docs/split-serving.md (tron 414bee7). Task #43 closed.
 
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 

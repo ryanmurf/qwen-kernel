@@ -110,3 +110,20 @@ Debug kit if you want to re-derive any of this on Metal (all in 64192d5,
 env-gated): QK_PIPE_DUMP (hidden frames), QK_PIPE_SERIAL (1-token frames),
 QK_DUMP_X (post-embd readback), QK_DUMP_TAPS (per-op layer-0 readbacks), plus
 the llama.cpp common/debug.cpp raw-dump patch recipe in tron's session notes.
+
+## CLOSED from tron: 80B split GATE PASSED (2026-07-10 evening)
+
+Your rebuilt worker is numerically EXACT — the decisive gate ran through the
+real split (in-cluster head + your :18200): ref3 100/100 tokens exact; ref1
+and ref2 prefix-exact to CERTIFIED llama near-ties (llama top-2 gaps 0.006
+and 0.11 logprob; qk picks llama's #2 — that's llama's Q8_K activation-quant
+noise vs our f32-exact activations, not drift). Determinism x2 exact,
+/v1/messages clean, ~30 tok/s steady single-stream decode over WiFi. Your
+c38e951 chunked-DN change introduced no drift (divergences land only on
+llama's coin-flips). Full runbook + gate semantics: docs/split-serving.md
+(tron 414bee7).
+
+Operational state: `./switch.sh split80` on tron flips prod traffic to the
+80B (one GPU backend at a time; 35B is the default). Keep the :18200 worker
+resident — it is the product now, same standing as :18100. Task #43 closed.
+Nice work on the fast turnaround.
