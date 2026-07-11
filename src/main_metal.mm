@@ -1143,6 +1143,7 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     const uint32_t hV    = (uint32_t)tAv->ne[0];
     const uint32_t dS    = (uint32_t)tSN->ne[0];
     const uint32_t hK    = (chQkv - dIn) / dS / 2;
+    const uint32_t dnKDivH = 0;   // caseBlock is 35B-only (qwen35moe modulo)
     const float eps = 1e-6f;
     printf("\n== block blk.%u (deltanet)  n_embd=%u qkv=%u d_inner=%u v-heads=%u k-heads=%u d_state=%u ==\n",
            layer, nEmbd, chQkv, dIn, hV, hK, dS);
@@ -1218,7 +1219,7 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcOut{nEmbd, dIn};
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
-    struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
+    struct { uint32_t d, hk, hv; float e; uint32_t kd; } pcStep{dS, hK, hV, eps, dnKDivH};
     struct { uint32_t n; } pcAdd{nEmbd};
     struct { uint32_t a, b, cc, d; } pcv{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed};
     struct { uint32_t a, b, cc, d; float e; } pcv5{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed, eps};
@@ -1245,7 +1246,7 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
         dsp(enc, pGemvA, {bZW, bXn, bZ}, &pcZ, 8, dIn / 4, 256);
         dsp(enc, pAb, {bXn, bAlW, bBeW, bDt, bAv, bGb}, &pcAb, 8, (2 * hV + nsg - 1) / nsg, thrN);
         bar(enc);
-        dsp(enc, pStep, {bQkv, bConvSt, bKer, bGb, bS, bZ, bSN, bAtt}, &pcStep, 16, hV, dS);
+        dsp(enc, pStep, {bQkv, bConvSt, bKer, bGb, bS, bZ, bSN, bAtt}, &pcStep, 20, hV, dS);
         bar(enc);
         dsp(enc, pGemvO, {bOutW, bAtt, bAttnOut}, &pcOut, 8, nEmbd / 2, 256);
         bar(enc);
@@ -1776,6 +1777,7 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     const uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
     const uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64;
     const std::string arch = g.kvStr("general.architecture", "");
+    const uint32_t dnKDivH = (arch == "qwen3next") ? hV / hK : 0;
     const uint32_t nLayer = (uint32_t)g.kvInt(arch + ".block_count", 40);
     const uint32_t nUsed = (uint32_t)g.kvInt(arch + ".expert_used_count", 8);
     const GgufTensor* tge0 = g.find("blk.0.ffn_gate_exps.weight");
@@ -1917,7 +1919,7 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
         pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
-    struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
+    struct { uint32_t d, hk, hv; float e; uint32_t kd; } pcStep{dS, hK, hV, eps, dnKDivH};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
     struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, ffE, nExp, nUsed, eps};
     struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; }
@@ -1953,7 +1955,7 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
                     (2 * hV + nsg - 1) / nsg, thrN);
                 bar(enc);
                 dsp(enc, pStep, {bBig, L.convSt, L.ker, bGb, L.S, bMid, L.sn, bAtt},
-                    &pcStep, 16, hV, dS);
+                    &pcStep, 20, hV, dS);
                 bar(enc);
                 dsp(enc, pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
             } else {
@@ -2103,6 +2105,9 @@ struct qk_engine {
     id<MTLComputePipelineState> pDnKq, pDnSolve, pDnStepC;
     id<MTLBuffer> bbDnKQ, bbDnUW, bbDnAtt, bbDnEl;
     bool dnChunk = true;   // QK_DN_CHUNK=0 falls back to dn_step_batch
+    // DeltaNet GQA k-pairing: 0 = h % hK (qwen35moe), else h / kDiv
+    // (qwen3next: hV/hK = 2). Set from general.architecture at open.
+    uint32_t dnKDiv = 0;
     std::vector<id<MTLBuffer>> extraBufs;   // host-built weights (ssm_ba split)
     struct WeightWin { const uint8_t* base; size_t len; id<MTLBuffer> buf; };
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
@@ -2260,6 +2265,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     // Model-shape KVs (arch-prefixed): 35B = qwen35moe 40/8, 80B = qwen3next 48/10.
     const std::string arch = g.kvStr("general.architecture", "");
+    dnKDiv = (arch == "qwen3next") ? hV / hK : 0;
     nLayer = (uint32_t)g.kvInt(arch + ".block_count", nLayer);
     if (nLayer < 1 || nLayer > 256) return fail("qk_open: bad block_count");
     nUsed = (uint32_t)g.kvInt(arch + ".expert_used_count", nUsed);
@@ -2712,7 +2718,7 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
         pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
-    struct { uint32_t d, hk, hv; float e; } pcStep{dS, hK, hV, eps};
+    struct { uint32_t d, hk, hv; float e; uint32_t kd; } pcStep{dS, hK, hV, eps, dnKDiv};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
     struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, ffE, nExp, nUsed, eps};
     struct { uint32_t pos, tmax, dh_, nRot_, hQ_, hKV_; float e, fb; }
@@ -2735,7 +2741,7 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
                 (2 * hV + nsg - 1) / nsg, thrN);
             bar();
             dsp(pStep, {bBig, L.st1, L.ker, bGb, L.st2, bMid, L.sn, bAtt},
-                &pcStep, 16, hV, dS);
+                &pcStep, 20, hV, dS);
             bar();
             if (L.iq4Wo) dsp(pGemv4, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
             else         dsp(pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
@@ -2913,8 +2919,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         struct { uint32_t n, hv, Tn; } pcAbB{nEmbd, hV, n};
         struct { uint32_t channels, dState, qkCh; float e; uint32_t Tn; }
             pcConvB{chQkv, dS, 2 * hK * dS, eps, n};
-        struct { uint32_t dState, hK_, hV_, Tn; } pcStepB{dS, hK, hV, n};
-        struct { uint32_t dState, hK_, hV_, Tn; } pcDnC{dS, hK, hV, n};
+        struct { uint32_t dState, hK_, hV_, Tn, kd; } pcStepB{dS, hK, hV, n, dnKDiv};
+        struct { uint32_t dState, hK_, hV_, Tn, kd; } pcDnC{dS, hK, hV, n, dnKDiv};
         const uint32_t nChDn = (n + 63) / 64;
         struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
         struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
@@ -2968,16 +2974,16 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      &pcConvB, 20, chQkv / dS, dS, n);
                 bar();
                 if (dnChunk) {
-                    dspz(pDnKq, {bbConvOut, bbDnKQ}, &pcDnC, 16, hK, dS, nChDn);
+                    dspz(pDnKq, {bbConvOut, bbDnKQ}, &pcDnC, 20, hK, dS, nChDn);
                     bar();
                     dspz(pDnSolve, {bbConvOut, bbGb, bbDnKQ, bbDnUW, bbDnAtt, bbDnEl},
-                         &pcDnC, 16, hV, dS, nChDn);
+                         &pcDnC, 20, hV, dS, nChDn);
                     bar();
                     dspz(pDnStepC, {bbDnUW, bbDnAtt, bbDnEl, bbO, WB{L.st2, so2}},
-                         &pcDnC, 16, hV, dS, 2);   // z = state column panel
+                         &pcDnC, 20, hV, dS, 2);   // z = state column panel
                 } else {
                     dspz(pStepB, {bbConvOut, bbGb, bbO, WB{L.st2, so2}},
-                         &pcStepB, 16, hV, dS, 1);
+                         &pcStepB, 20, hV, dS, 1);
                 }
                 bar();
                 dspz(pGateB, {bbO, L.sn, bbMid, bbAtt}, &pcGateB, 16,
@@ -3422,14 +3428,14 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
     id<MTLComputePipelineState> pSolve = getPipe(c, "dn_chunk", "dn_chunk_solve", 0);
     id<MTLComputePipelineState> pStepC = getPipe(c, "dn_chunk", "dn_chunk_step", dS);
 
-    struct { uint32_t dS_, hK_, hV_, Tn; } pc{dS, hK, hV, 0};
+    struct { uint32_t dS_, hK_, hV_, Tn, kd; } pc{dS, hK, hV, 0, 0};
     auto encSeq = [&](id<MTLComputeCommandEncoder> enc) {
         [enc setComputePipelineState:pSeq];
         [enc setBuffer:bConv offset:0 atIndex:0];
         [enc setBuffer:bGb offset:0 atIndex:1];
         [enc setBuffer:bOa offset:0 atIndex:2];
         [enc setBuffer:bSa offset:0 atIndex:3];
-        [enc setBytes:&pc length:16 atIndex:4];
+        [enc setBytes:&pc length:20 atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
     };
@@ -3438,7 +3444,7 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
         [enc setComputePipelineState:pKq];
         [enc setBuffer:bConv offset:0 atIndex:0];
         [enc setBuffer:bKQ offset:0 atIndex:1];
-        [enc setBytes:&pc length:16 atIndex:2];
+        [enc setBytes:&pc length:20 atIndex:2];
         [enc dispatchThreadgroups:MTLSizeMake(hK, 1, nCh)
             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
         [enc setComputePipelineState:pSolve];
@@ -3448,7 +3454,7 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
         [enc setBuffer:bUW offset:0 atIndex:3];
         [enc setBuffer:bAtt offset:0 atIndex:4];
         [enc setBuffer:bEl offset:0 atIndex:5];
-        [enc setBytes:&pc length:16 atIndex:6];
+        [enc setBytes:&pc length:20 atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(hV, 1, nCh)
             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
         [enc setComputePipelineState:pStepC];
@@ -3457,7 +3463,7 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
         [enc setBuffer:bEl offset:0 atIndex:2];
         [enc setBuffer:bOb offset:0 atIndex:3];
         [enc setBuffer:bSb offset:0 atIndex:4];
-        [enc setBytes:&pc length:16 atIndex:5];
+        [enc setBytes:&pc length:20 atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 2)
             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
     };
@@ -3481,6 +3487,8 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
     };
 
     bool pass = true;
+    for (uint32_t kd : {0u, hV / hK}) {   // both GQA pairings (35B modulo, 80B consecutive)
+    pc.kd = kd;
     for (uint32_t Tn : {1u, 5u, 64u, 65u, 200u, TnMain}) {
         if (Tn > TnCap) continue;
         pc.Tn = Tn;
@@ -3494,9 +3502,11 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
                              st0.size());
         bool ok = relO < 5e-3 && relS < 5e-3;
         pass &= ok;
-        printf("  Tn=%-4u o max_rel %.3g | state max_rel %.3g -> %s\n",
-               Tn, relO, relS, ok ? "PASS" : "FAIL");
+        printf("  kDiv=%u Tn=%-4u o max_rel %.3g | state max_rel %.3g -> %s\n",
+               kd, Tn, relO, relS, ok ? "PASS" : "FAIL");
     }
+    }
+    pc.kd = 0;
 
     if (iters) {
         pc.Tn = TnMain;
@@ -3524,7 +3534,7 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
                         [enc setComputePipelineState:pKq];
                         [enc setBuffer:bConv offset:0 atIndex:0];
                         [enc setBuffer:bKQ offset:0 atIndex:1];
-                        [enc setBytes:&pc length:16 atIndex:2];
+                        [enc setBytes:&pc length:20 atIndex:2];
                         [enc dispatchThreadgroups:MTLSizeMake(hK, 1, nCh)
                             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
                     } else if (which == 1) {
@@ -3535,7 +3545,7 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
                         [enc setBuffer:bUW offset:0 atIndex:3];
                         [enc setBuffer:bAtt offset:0 atIndex:4];
                         [enc setBuffer:bEl offset:0 atIndex:5];
-                        [enc setBytes:&pc length:16 atIndex:6];
+                        [enc setBytes:&pc length:20 atIndex:6];
                         [enc dispatchThreadgroups:MTLSizeMake(hV, 1, nCh)
                             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
                     } else {
@@ -3545,7 +3555,7 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
                         [enc setBuffer:bEl offset:0 atIndex:2];
                         [enc setBuffer:bOb offset:0 atIndex:3];
                         [enc setBuffer:bSb offset:0 atIndex:4];
-                        [enc setBytes:&pc length:16 atIndex:5];
+                        [enc setBytes:&pc length:20 atIndex:5];
                         [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 2)
                             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
                     }

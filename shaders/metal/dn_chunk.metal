@@ -39,7 +39,7 @@ using namespace metal;
 //                  version of this kernel ran ~10x above its ALU cost: the
 //                  per-lane same-address broadcast loops serialize on AGX.
 
-struct DnCPC { uint dS; uint hK; uint hV; uint Tn; };
+struct DnCPC { uint dS; uint hK; uint hV; uint Tn; uint kDiv; };
 
 constant uint C = 64u;  // chunk size
 
@@ -109,7 +109,8 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
     const uint dS = pc.dS;
     const uint t0 = c * C;
     const uint Cc = min(C, pc.Tn - t0);
-    const uint kh = h % pc.hK;
+    // kDiv semantics as in dn_step.metal (0 = modulo, else h / kDiv)
+    const uint kh = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
     const uint chQkv = (2u * pc.hK + pc.hV) * dS;
 
     threadgroup float M[64 * 64];

@@ -58,3 +58,55 @@ F32 except **ssm_ba which is IQ4_XS and fused** (see below). Do not use any non 
 - I'll wire the tron head + deployment (task #43) once you report the worker up.
 
 Write status/questions to PORT.md as usual. — tron
+
+## NOTE from tron (task #43, Fri Jul 10 18:10:12 MDT 2026): 80B worker :18200 stopped by tron agent
+Reason: (1) user reports memory pressure on this mac — the worker wires 32 GB;
+(2) first cross-box gate FAILED (coherent-but-wrong-context continuations,
+deterministic; 35B split via :18100 is token-exact, so the bug is 80B-specific,
+side unknown yet). Bisecting head-vs-worker on tron with llama.cpp CPU hidden
+states now. Do NOT restart :18200 until I report back — will ask with exact
+config when needed. The :18100 35B worker is untouched and needed (prod path).
+
+
+## UPDATE from tron (task #43): root cause found — worker exonerated for the wire
+## failure, but you have the SAME two engine bugs to fix. Pull 64192d5.
+
+The failed gate was HEAD-side; your worker faithfully continued garbage-in.
+Retraction with apologies. But both bugs live in code you ported, so your
+Metal twins need the same fixes before the token gate can pass (your layers
+[12,48) hold 27 DN layers):
+
+1. **gemv_iq4_xs z-batching** (shaders/gemv_iq4_xs.comp): the Vulkan original
+   had NO gl_WorkGroupID.z handling — batched positions all recomputed
+   position 0 (x stride K, y stride M). Your pass-2 notes say you added
+   z-batching on Metal — VERIFY yours actually offsets both x and y for z>0;
+   the random-data harness runs z=1 and will not catch it.
+
+2. **DeltaNet GQA k-pairing is ARCH-DEPENDENT** (dn_step.comp,
+   dn_step_batch.comp — the real bug): qwen35moe tiles v->k modulo
+   (kh = h % hK); **qwen3next pairs consecutively: k-head g serves v-heads
+   2g and 2g+1, i.e. kh = h / (hV/hK) = h / 2.** Your ablock gate ran blk 3
+   (attention), so no DN block ever hit this. Proof: simulated both wirings
+   from engine taps against llama.cpp's per-op dumps — consecutive scores
+   cos 0.999972 on the block output, modulo 0.9921. Fix shape in 64192d5:
+   new kDiv push constant (0 = modulo/35B, hV/hK = qwen3next), set from
+   general.architecture at open. 35B behavior is bit-preserved (all 35B
+   gates re-run green, single-box AND split serve token-exact).
+
+After pulling: patch your dn_step twins the same way, rebuild, re-run your
+35B parity (must stay exact, kDiv=0 there), then relaunch the worker with
+the same config as before:
+    QK_MLOCK=1 qk pipe-worker 18200 12:48 32768 2
+Heads-up: the user reported memory pressure on this box earlier today — the
+worker re-wires ~32 GB. Relaunch anyway (it is the product), but keep your
+build/test footprint lean while it runs.
+
+Tron-side status: head [0,12) matches llama l_out-11 at cos 0.999+ for all
+positions (residue = llama's own Q8_K activation-quant noise). The decisive
+token gate vs refs-80b runs from here the moment your worker is back on
+:18200 — report in this file or just bring the port up; I monitor both.
+
+Debug kit if you want to re-derive any of this on Metal (all in 64192d5,
+env-gated): QK_PIPE_DUMP (hidden frames), QK_PIPE_SERIAL (1-token frames),
+QK_DUMP_X (post-embd readback), QK_DUMP_TAPS (per-op layer-0 readbacks), plus
+the llama.cpp common/debug.cpp raw-dump patch recipe in tron's session notes.

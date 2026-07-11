@@ -8,7 +8,7 @@ using namespace metal;
 
 struct AbBPC   { uint n; uint hv; uint Tn; };
 struct ConvBPC { uint channels; uint dState; uint qkCh; float eps; uint Tn; };
-struct StepBPC { uint dState; uint hK; uint hV; uint Tn; };
+struct StepBPC { uint dState; uint hK; uint hV; uint Tn; uint kDiv; };
 struct GateBPC { uint dState; uint hV; float eps; uint Tn; };
 
 constant uint NSG [[function_constant(0)]];
@@ -122,7 +122,8 @@ kernel void dn_step_batch(device const float* conv [[buffer(0)]],
     const uint dS = pc.dState;
     const uint nv = dS / 4u;
 
-    const uint kh = h % pc.hK;
+    // kDiv semantics as in dn_step.metal (0 = modulo, else h / kDiv)
+    const uint kh = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
     const float qScale = rsqrt(float(dS));
 
     threadgroup float4 qs4[64];

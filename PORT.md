@@ -101,6 +101,62 @@ bucket, attn. llama 1443.7 +/- 7.4 re-measured same day.
   I'll gate locally. caseToken ('token' mode) is still 35B-only (q6k embed +
   q8 proj assumptions); serve/stage paths are the gated ones.
 
+## 2026-07-10 (evening): chunked delta rule (pp512 1333, gap 1.08x) + tron's kDiv fix mirrored, worker relaunched
+
+### pp512: 1213 -> 1332/1333 tok/s (chunked gated delta rule, c38e951)
+dn_step_batch was the last token-serial kernel: 32 TGs looping all 512
+tokens with 2 barriers each. Replaced for batched prefill by the chunked
+delta rule (derivation in dn_chunk.metal header; llama.cpp's
+delta-net-base.cpp chunking is the same algebra): per 64-token chunk,
+(I+M)D = betaV - W S0^T with M strictly lower -> T=(I+M)^-1 distributes, so
+u~=T(betaV), w~=TW, Att are state-independent (parallel over head x chunk);
+the chunk-serial rest is 3 matmuls/chunk. Numbers (dncmp, Tn=512, 1 layer):
+- scalar chunk-serial kernel: 5769 us — WORSE than sequential (2845).
+  Finding 1: dynamically indexed thread-local scalar arrays (u[64], dcol[64])
+  spill to scratch; float4[16] with compile-time lanes promotes. Fixed solve
+  575->180 us, step barely moved.
+- Finding 2 (the big one): per-lane same-address loops — every thread
+  reading the same staged row (st4[t*nv+i], Att row) — serialize on AGX at
+  ~10x ALU cost. Phase-bisect: D-sweep 560 us, o-loop 1095 us, S-update
+  374 us against a ~47+70+47 us ALU model. No scalar layout fixes this;
+  the answer is the hardware path: simdgroup MMA (packed-block round redux).
+- dn_chunk_step v2: the 3 matmuls as simdgroup_float8x8 MMA, state streamed
+  from device (transpose-loads for S^T/D^T), solve pre-bakes {u~, -w~ (negated
+  so D-pass is pure multiply_accumulate), q~, K~, packed 8x8 Att, e^Llast},
+  diag-tile MMA folds the elast*S term, tgpig.z = 64-wide state column panel
+  (panels touch disjoint S rows -> 64 TGs). Step 2658 -> 607 us; chain
+  kq 376 + solve 303 + step 607 = 1336 us vs sequential 2845 (2.13x).
+Gates: dncmp o<=6.5e-4 / state<=4.9e-3 over Tn={1,5,64,65,200,512} (now both
+kDiv pairings), parity + parity-long token-exact, prefilldecode HANDOFF
+EXACT, prefillcmp 41/42 — the sole miss is the DOCUMENTED N=48 seed=42
+near-tie (margin 0.042, chunk-off control 42/42; historical flap case).
+pp512 batched-only A/B/A/B after 60s cooldown (QK_MOE_GROUPED=5, lap):
+430.4/430.2 ms (chunk off, =1190) -> 384.5/384.1 ms = 1332/1333 tok/s.
+Gap vs llama 1443.7: 1.083x. QK_DN_CHUNK=0 keeps the old path.
+Remaining DN headroom: kq 376 us (scalar dots; MMA-able), solve 303, and
+the step's 607 vs ~160 us flop model. Then residual bucket (57.8 ms),
+attn (19.4 ms).
+
+### tron 64192d5 mirrored: DN k-pairing is ARCH-DEPENDENT (+ gemv-z verified)
+Tron's cross-box gate failure was head-side, but both engine bugs live in
+ported code. (1) gemv_iq4_xs z-batching: our Metal port already offsets
+both x (rq*K) and y (rq*M) — verified, no change. (2) THE bug: qwen3next
+pairs v-heads consecutively onto k-heads (kh = h/2), not modulo
+(kh = h % hK, qwen35moe). Every 80B DN layer ran with wrong k/q rows —
+coherent-but-wrong generation; ablock gated blk 3 (attention) so no DN
+block was ever reffed, and dncmp/random harnesses use the same mapping on
+both sides so they can't see it. Mirror of tron's fix: kDiv push constant
+(0 = modulo, else h/kDiv) in dn_step, dn_step_batch, dn_chunk_solve
+(dn_chunk_kq/step never map v->k), set from general.architecture at open;
+dncmp now gates BOTH pairings vs dn_step_batch. 35B parity + parity-long
+re-run token-exact (kDiv=0 is bit-identical). 80B serve smoke now reads as
+consistent first-person dialogue (was context-drifty before the fix).
+- Worker :18200 relaunched per tron (same config, 12:48 32768 2, mlock)
+  after tron's agent stopped it 18:10 (user memory pressure + the gate
+  fail). Tron runs the decisive token gate vs refs-80b over the wire.
+- Merged origin/main 64192d5 into metal-port (server/deploy/tooling side
+  is tron's; engine twins patched here).
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
