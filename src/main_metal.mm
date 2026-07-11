@@ -2099,6 +2099,10 @@ struct qk_engine {
         pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemmB4, pMoeGu4, pMoeGuG4i, pMoeGuG5i;
+    // chunked delta rule (prefill DN): parallel kq/solve + chunk-serial step
+    id<MTLComputePipelineState> pDnKq, pDnSolve, pDnStepC;
+    id<MTLBuffer> bbDnKQ, bbDnUW, bbDnAtt, bbDnEl;
+    bool dnChunk = true;   // QK_DN_CHUNK=0 falls back to dn_step_batch
     std::vector<id<MTLBuffer>> extraBufs;   // host-built weights (ssm_ba split)
     struct WeightWin { const uint8_t* base; size_t len; id<MTLBuffer> buf; };
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
@@ -2433,6 +2437,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
     pStepB = getPipe(c, "dn_batch", "dn_step_batch", 0);
     pGateB = getPipe(c, "dn_batch", "dn_gate_batch", nsg);
+    if (const char* v = getenv("QK_DN_CHUNK")) dnChunk = atoi(v) != 0;
+    if (dnChunk) {
+        pDnKq    = getPipe(c, "dn_chunk", "dn_chunk_kq", 0);
+        pDnSolve = getPipe(c, "dn_chunk", "dn_chunk_solve", 0);
+        pDnStepC = getPipe(c, "dn_chunk", "dn_chunk_step", dS);   // fc(0)=dS
+    }
     {   // QK_GEMM=scalar|sg|h picks the prefill GEMM (default: exact scalar).
         // Default: the f16-fragment GEMM (llama.cpp Metal's prefill precision
         // class; accepted via prefillcmp 36/36 argmax + prefilldecode HANDOFF
@@ -2536,7 +2546,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbVin = createBuf(c, (size_t)cap * hKV * dh * 4, nullptr, true);
     bbGb = createBuf(c, (size_t)cap * 2 * hV * 4, nullptr, true);
     bbConvOut = createBuf(c, (size_t)cap * chQkv * 4, nullptr, true);
-    bbO = createBuf(c, (size_t)cap * dIn * 4, nullptr, true);
+    bbO = createBuf(c, (size_t)((cap + 63) / 64 * 64) * dIn * 4, nullptr, true);
     bbAtt = createBuf(c, (size_t)cap * dIn * 4, nullptr, true);
     bbAttnOut = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
     bbY = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
@@ -2558,6 +2568,13 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMDy = createBuf(c, (size_t)cap * (nUsed + 1) * nEmbd * 4, nullptr, true);
     bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, nullptr, true);
     memset(bbCarry.contents, 0, (size_t)nLayer * chQkv * 3 * 4);
+    if (dnChunk) {   // chunked-DN scratch: per (chunk, head) tiles, reused per layer
+        const size_t nChMax = (cap + 63) / 64;
+        bbDnKQ  = createBuf(c, nChMax * hK * 2 * 64 * 64 * 4, nullptr, true);
+        bbDnUW  = createBuf(c, nChMax * hV * 4 * 64 * (size_t)dS * 4, nullptr, true);
+        bbDnAtt = createBuf(c, nChMax * hV * 64 * 64 * 4, nullptr, true);
+        bbDnEl  = createBuf(c, nChMax * hV * 4, nullptr, true);
+    }
 
     layers.resize(nLayer);
     char nb[128];
@@ -2897,6 +2914,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         struct { uint32_t channels, dState, qkCh; float e; uint32_t Tn; }
             pcConvB{chQkv, dS, 2 * hK * dS, eps, n};
         struct { uint32_t dState, hK_, hV_, Tn; } pcStepB{dS, hK, hV, n};
+        struct { uint32_t dState, hK_, hV_, Tn; } pcDnC{dS, hK, hV, n};
+        const uint32_t nChDn = (n + 63) / 64;
         struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
         struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
         struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, ffE, nExp, nUsed, eps};
@@ -2948,8 +2967,18 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                               bbConvOut, WB{L.st1, so1}},
                      &pcConvB, 20, chQkv / dS, dS, n);
                 bar();
-                dspz(pStepB, {bbConvOut, bbGb, bbO, WB{L.st2, so2}},
-                     &pcStepB, 16, hV, dS, 1);
+                if (dnChunk) {
+                    dspz(pDnKq, {bbConvOut, bbDnKQ}, &pcDnC, 16, hK, dS, nChDn);
+                    bar();
+                    dspz(pDnSolve, {bbConvOut, bbGb, bbDnKQ, bbDnUW, bbDnAtt, bbDnEl},
+                         &pcDnC, 16, hV, dS, nChDn);
+                    bar();
+                    dspz(pDnStepC, {bbDnUW, bbDnAtt, bbDnEl, bbO, WB{L.st2, so2}},
+                         &pcDnC, 16, hV, dS, 2);   // z = state column panel
+                } else {
+                    dspz(pStepB, {bbConvOut, bbGb, bbO, WB{L.st2, so2}},
+                         &pcStepB, 16, hV, dS, 1);
+                }
                 bar();
                 dspz(pGateB, {bbO, L.sn, bbMid, bbAtt}, &pcGateB, 16,
                      (hV + nsg - 1) / nsg, thrN, n);
@@ -3340,6 +3369,196 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
         double wBytes = (double)nb * 34;
         printf("gpu: %8.1f µs/iter | %7.1f GFLOP/s | W %6.1f GB/s-equiv\n",
                ns / 1e3, flops / ns, wBytes / ns);
+    }
+    return pass;
+}
+
+// Chunked delta rule (dn_chunk_{kq,solve,step}) vs the sequential
+// dn_step_batch on random inputs with a NONZERO initial state. The sequential
+// kernel is the trusted reference (token-exact vs llama.cpp CPU end-to-end);
+// chunking is a floating-point reorder of the same math, so we gate on
+// max_rel over the o outputs and the final state.
+static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
+    const uint32_t dS = 128, hK = 16, hV = 32;
+    const uint32_t chQkv = (2 * hK + hV) * dS;
+    const uint32_t TnCap = std::max(TnMain, 512u);
+    printf("\n== dncmp  chunked delta rule vs dn_step_batch (dS=%u hK=%u hV=%u) ==\n",
+           dS, hK, hV);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> conv((size_t)TnCap * chQkv), gb((size_t)TnCap * 2 * hV),
+        st0((size_t)hV * dS * dS);
+    for (auto& v : conv) v = nd(rng);
+    for (uint32_t t = 0; t < TnCap; t++)   // L2-normalize q/k rows (dn_conv does)
+        for (uint32_t hh = 0; hh < 2 * hK; hh++) {
+            float* r = &conv[(size_t)t * chQkv + hh * dS];
+            float ss = 0;
+            for (uint32_t i = 0; i < dS; i++) ss += r[i] * r[i];
+            float sc = 1.0f / std::sqrt(std::max(ss, 1e-12f));
+            for (uint32_t i = 0; i < dS; i++) r[i] *= sc;
+        }
+    for (uint32_t t = 0; t < TnCap; t++)
+        for (uint32_t h = 0; h < hV; h++) {
+            gb[(size_t)t * 2 * hV + h] = -std::fabs(nd(rng)) * 1.5f;         // log decay <= 0
+            gb[(size_t)t * 2 * hV + hV + h] = 1.f / (1.f + std::exp(-nd(rng)));  // beta
+        }
+    for (auto& v : st0) v = 0.3f * nd(rng);
+
+    id<MTLBuffer> bConv = createBuf(c, conv.size() * 4, conv.data());
+    id<MTLBuffer> bGb = createBuf(c, gb.size() * 4, gb.data());
+    id<MTLBuffer> bSa = createBuf(c, st0.size() * 4);
+    id<MTLBuffer> bSb = createBuf(c, st0.size() * 4);
+    id<MTLBuffer> bOa = createBuf(c, (size_t)TnCap * hV * dS * 4);
+    id<MTLBuffer> bOb = createBuf(c, (size_t)TnCap * hV * dS * 4);
+    const size_t nChMax = (TnCap + 63) / 64;
+    id<MTLBuffer> bKQ = createBuf(c, nChMax * hK * 2 * 64 * 64 * 4);
+    id<MTLBuffer> bUW = createBuf(c, nChMax * hV * 4 * 64 * (size_t)dS * 4);
+    id<MTLBuffer> bAtt = createBuf(c, nChMax * hV * 64 * 64 * 4);
+    id<MTLBuffer> bEl = createBuf(c, nChMax * hV * 4);
+
+    id<MTLComputePipelineState> pSeq = getPipe(c, "dn_batch", "dn_step_batch", 0);
+    id<MTLComputePipelineState> pKq = getPipe(c, "dn_chunk", "dn_chunk_kq", 0);
+    id<MTLComputePipelineState> pSolve = getPipe(c, "dn_chunk", "dn_chunk_solve", 0);
+    id<MTLComputePipelineState> pStepC = getPipe(c, "dn_chunk", "dn_chunk_step", dS);
+
+    struct { uint32_t dS_, hK_, hV_, Tn; } pc{dS, hK, hV, 0};
+    auto encSeq = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:pSeq];
+        [enc setBuffer:bConv offset:0 atIndex:0];
+        [enc setBuffer:bGb offset:0 atIndex:1];
+        [enc setBuffer:bOa offset:0 atIndex:2];
+        [enc setBuffer:bSa offset:0 atIndex:3];
+        [enc setBytes:&pc length:16 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+    };
+    auto encChain = [&](id<MTLComputeCommandEncoder> enc) {
+        const uint32_t nCh = (pc.Tn + 63) / 64;
+        [enc setComputePipelineState:pKq];
+        [enc setBuffer:bConv offset:0 atIndex:0];
+        [enc setBuffer:bKQ offset:0 atIndex:1];
+        [enc setBytes:&pc length:16 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(hK, 1, nCh)
+            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+        [enc setComputePipelineState:pSolve];
+        [enc setBuffer:bConv offset:0 atIndex:0];
+        [enc setBuffer:bGb offset:0 atIndex:1];
+        [enc setBuffer:bKQ offset:0 atIndex:2];
+        [enc setBuffer:bUW offset:0 atIndex:3];
+        [enc setBuffer:bAtt offset:0 atIndex:4];
+        [enc setBuffer:bEl offset:0 atIndex:5];
+        [enc setBytes:&pc length:16 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, nCh)
+            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+        [enc setComputePipelineState:pStepC];
+        [enc setBuffer:bUW offset:0 atIndex:0];
+        [enc setBuffer:bAtt offset:0 atIndex:1];
+        [enc setBuffer:bEl offset:0 atIndex:2];
+        [enc setBuffer:bOb offset:0 atIndex:3];
+        [enc setBuffer:bSb offset:0 atIndex:4];
+        [enc setBytes:&pc length:16 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 2)
+            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+    };
+    auto runOnce = [&](bool chain) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];  // serial
+            chain ? encChain(enc) : encSeq(enc);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+    };
+    auto maxRel = [&](const float* a, const float* b, size_t nEl) {
+        double rms = 0;
+        for (size_t i = 0; i < nEl; i++) rms += (double)a[i] * a[i];
+        rms = std::sqrt(rms / nEl);
+        double floorD = std::max(1e-4, 1e-3 * rms), mr = 0;
+        for (size_t i = 0; i < nEl; i++)
+            mr = std::max(mr, std::fabs((double)a[i] - b[i]) /
+                                  std::max(floorD, (double)std::fabs(a[i])));
+        return mr;
+    };
+
+    bool pass = true;
+    for (uint32_t Tn : {1u, 5u, 64u, 65u, 200u, TnMain}) {
+        if (Tn > TnCap) continue;
+        pc.Tn = Tn;
+        memcpy(bSa.contents, st0.data(), st0.size() * 4);
+        memcpy(bSb.contents, st0.data(), st0.size() * 4);
+        runOnce(false);
+        runOnce(true);
+        double relO = maxRel((const float*)bOa.contents, (const float*)bOb.contents,
+                             (size_t)Tn * hV * dS);
+        double relS = maxRel((const float*)bSa.contents, (const float*)bSb.contents,
+                             st0.size());
+        bool ok = relO < 5e-3 && relS < 5e-3;
+        pass &= ok;
+        printf("  Tn=%-4u o max_rel %.3g | state max_rel %.3g -> %s\n",
+               Tn, relO, relS, ok ? "PASS" : "FAIL");
+    }
+
+    if (iters) {
+        pc.Tn = TnMain;
+        auto timeIt = [&](bool chain) -> double {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                for (uint32_t i = 0; i < iters; i++) chain ? encChain(enc) : encSeq(enc);
+                [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                return (cb.GPUEndTime - cb.GPUStartTime) * 1e9 / iters;
+            }
+        };
+        timeIt(false); double nsSeq = timeIt(false);
+        timeIt(true);  double nsCh = timeIt(true);
+        printf("gpu @Tn=%u: sequential %8.1f µs | chunked %8.1f µs | %.2fx\n",
+               TnMain, nsSeq / 1e3, nsCh / 1e3, nsSeq / nsCh);
+        // per-kernel split (encode one pipeline repeatedly)
+        auto timeOne = [&](uint32_t which) -> double {
+            const uint32_t nCh = (pc.Tn + 63) / 64;
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                for (uint32_t i = 0; i < iters; i++) {
+                    if (which == 0) {
+                        [enc setComputePipelineState:pKq];
+                        [enc setBuffer:bConv offset:0 atIndex:0];
+                        [enc setBuffer:bKQ offset:0 atIndex:1];
+                        [enc setBytes:&pc length:16 atIndex:2];
+                        [enc dispatchThreadgroups:MTLSizeMake(hK, 1, nCh)
+                            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+                    } else if (which == 1) {
+                        [enc setComputePipelineState:pSolve];
+                        [enc setBuffer:bConv offset:0 atIndex:0];
+                        [enc setBuffer:bGb offset:0 atIndex:1];
+                        [enc setBuffer:bKQ offset:0 atIndex:2];
+                        [enc setBuffer:bUW offset:0 atIndex:3];
+                        [enc setBuffer:bAtt offset:0 atIndex:4];
+                        [enc setBuffer:bEl offset:0 atIndex:5];
+                        [enc setBytes:&pc length:16 atIndex:6];
+                        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, nCh)
+                            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+                    } else {
+                        [enc setComputePipelineState:pStepC];
+                        [enc setBuffer:bUW offset:0 atIndex:0];
+                        [enc setBuffer:bAtt offset:0 atIndex:1];
+                        [enc setBuffer:bEl offset:0 atIndex:2];
+                        [enc setBuffer:bOb offset:0 atIndex:3];
+                        [enc setBuffer:bSb offset:0 atIndex:4];
+                        [enc setBytes:&pc length:16 atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 2)
+                            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+                    }
+                }
+                [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                return (cb.GPUEndTime - cb.GPUStartTime) * 1e9 / iters;
+            }
+        };
+        timeOne(0); double nsKq = timeOne(0);
+        timeOne(1); double nsSol = timeOne(1);
+        timeOne(2); double nsStp = timeOne(2);
+        printf("  split: kq %8.1f µs | solve %8.1f µs | step %8.1f µs\n",
+               nsKq / 1e3, nsSol / 1e3, nsStp / 1e3);
     }
     return pass;
 }
@@ -3994,6 +4213,8 @@ int main(int argc, char** argv) {
             ok = caseABlock(c, argU(2, 3), argU(3, 3), argU(4, 200));
         } else if (mode == "bgemm") {
             ok = caseBGemm(c, argU(2, 8192), argU(3, 2048), argU(4, 128), argU(5, 50));
+        } else if (mode == "dncmp") {
+            ok = caseDnChunk(c, argU(2, 512), argU(3, 30));
         } else if (mode == "token") {
             if (argc < 4) {
                 fprintf(stderr, "usage: qk token <ids-file> <nGen> [tmax]\n");
