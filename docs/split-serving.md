@@ -226,3 +226,44 @@ to flip client traffic (scales the other backends to 0 first; the
 - Split mode v1 serves without `QK_FORK`/`QK_SPEC` (the server warns if
   set); cross-turn reuse comes from the split driver's own boundary
   snapshots (`[split-cache]` log lines).
+
+## Qwen3-Next-80B-A3B-Instruct (the second split backend, 2026-07-10)
+
+The 42.8 GB IQ4_XS-qk repack (`/mnt/data/models/`, byte-identical copy in
+midnight's `models/`) cannot fit either box alone: tron head takes layers
+`[0,12)` (~12 GB VRAM incl. embd + 3 attn layers' KV at ctx 32768), midnight
+takes `[12,48)` (~32 GB wired) plus the final norm/head. Same qkp2 contract
+as the 35B split; everything above applies unchanged, plus:
+
+- Backend: `deploy/qk-server-split-80b.yaml`, flipped by `./switch.sh split80`.
+  Worker prereq on midnight: `QK_MLOCK=1 qk pipe-worker 18200 12:48 32768 2`.
+  The 35B :18100 worker is a separate process; both can be resident.
+- The server auto-detects the model shape: `qwen3next` arch, `qwen2`
+  pre-tokenizer, optional bos, and — user-visible — the generation cue:
+  Instruct templates get a plain `<|im_start|>assistant\n` (no think
+  scaffold). Hermes `<tool_call>` parsing is unchanged.
+- **Arch trap (cost us the first gate)**: qwen3next's DeltaNet pairs v-heads
+  *consecutively* with k-heads (k-head g serves v-heads 2g/2g+1) where
+  qwen35moe tiles modulo. `dn_step*`'s `kDiv` push constant carries this;
+  it is set from `general.architecture` at open. A wrong pairing produces
+  *coherent but wrong-context* generations (recurrent state compounds a
+  per-token error) — bisect with the QK_DUMP_* hooks against llama.cpp
+  eval-callback dumps (see 64192d5).
+
+### Gate semantics and results (commit 64192d5 + midnight ce3ef7f)
+
+Token-exactness vs llama.cpp greedy references is NOT byte-guaranteed for
+this model: llama quantizes activations (Q8_K) for its IQ4_XS matmuls while
+qk reads f32 activations (per-op checks put qk ~1e-6 from exact math, llama
+~1% off it). At a genuine near-tie the two legitimately pick different
+tokens. The gate is therefore: greedy prefix-exact up to a *certified*
+near-tie — every divergence must land on a position where llama's own top-2
+logprob gap is small (< ~0.15), with qk picking one of llama's top choices.
+
+Measured through the real split (in-cluster head, WiFi to midnight):
+- ref3: 100/100 tokens exact; ref1: exact to token 35 then a 0.006-logprob
+  tie (' the' vs ' Russia'); ref2: exact to 41 then a 0.11 tie. Text-prompt
+  path byte-identical to token-ids path (tokenizer parity).
+- Determinism x2 exact; /v1/messages round trip clean (`end_turn`).
+- Steady decode ~30 tok/s single-stream (256-token run, prefill excluded);
+  ~33 tok/s e2e on short runs.
