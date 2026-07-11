@@ -2085,6 +2085,9 @@ struct qk_engine {
     bool firstStage() const { return lFirst == 0; }
     bool lastStage() const { return lEnd == nLayer; }
     bool splitStage() const { return lFirst != 0 || lEnd != nLayer; }
+    // Rows bbLogits held after the most recent head+argmax pass — stageTopK
+    // reads the final row's logits from it (the sampling hook).
+    uint32_t lastRunRows = 0;
     static constexpr uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
     static constexpr uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64;
     // Model-shape knobs that differ between Qwen3.6-35B (40/256/8/512) and
@@ -2180,6 +2183,9 @@ struct qk_engine {
                           float* hiddenOut = nullptr);
     int stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
                  uint32_t base, float* hiddenOut, uint32_t* idsOut);
+    // Top-k (ids, logits) of the final position's row after a last-stage
+    // stageRun — the split driver's sampling hook (see qk_stage_topk in qk.h).
+    int stageTopK(uint32_t k, uint32_t* idsOut, float* valsOut);
     uint32_t serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
                                  std::vector<float>& logits);
     void resetSlot(uint32_t slot);
@@ -3088,6 +3094,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             // head for every row; logits-only callers need just the LAST row
             // — the z=n head is ~417 MB of Q6_K weight reads PER ROW.
             const uint32_t nh = argmaxOut ? n : 1;
+            lastRunRows = nh;
             struct { uint32_t m, k; } pcHead{vocab, nEmbd};
             dspz(pHead, {bHeadW, nh == 1 ? WB{bbXn, (NSUInteger)(n - 1) * nEmbd * 4} : WB{bbXn},
                          bbLogits}, &pcHead, 8, (vocab + 3) / 4, 64, nh);
@@ -3135,6 +3142,28 @@ int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hidden
                          base + off, lastStage() ? idsOut + off : nullptr,
                          hiddenIn ? hiddenIn + (size_t)off * nEmbd : nullptr,
                          hiddenOut ? hiddenOut + (size_t)off * nEmbd : nullptr);
+    }
+    return 0;
+}
+
+int qk_engine::stageTopK(uint32_t k, uint32_t* idsOut, float* valsOut) {
+    // Sampling hook: top-k (id, logit) of the FINAL position's row after a
+    // last-stage stageRun, descending. UMA read — bbLogits.contents is
+    // coherent after prefillBatchLast's waitUntilCompleted; the greedy path
+    // is untouched. NB lastRunRows is the head's nh (== n when argmaxOut).
+    if (!lastStage() || !idsOut || !valsOut || k < 1 || k > 256 || k > vocab) return -1;
+    if (!lastRunRows) return -2;
+    const float* row = (const float*)((const uint8_t*)bbLogits.contents +
+                                      (size_t)(lastRunRows - 1) * vocab * 4);
+    std::vector<uint32_t> idx(vocab);
+    for (uint32_t i = 0; i < vocab; i++) idx[i] = i;
+    std::nth_element(idx.begin(), idx.begin() + k, idx.end(),
+                     [row](uint32_t a, uint32_t b) { return row[a] > row[b]; });
+    std::sort(idx.begin(), idx.begin() + k,
+              [row](uint32_t a, uint32_t b) { return row[a] > row[b]; });
+    for (uint32_t i = 0; i < k; i++) {
+        idsOut[i] = idx[i];
+        valsOut[i] = row[idx[i]];
     }
     return 0;
 }
@@ -3217,6 +3246,12 @@ int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float*
                  uint32_t n, uint32_t base, float* hidden_out, uint32_t* ids_out) {
     if (!e) return -1;
     return e->stageRun(slot, toks, hidden_in, n, base, hidden_out, ids_out);
+}
+
+__attribute__((visibility("default")))
+int qk_stage_topk(qk_engine* e, uint32_t k, uint32_t* ids, float* vals) {
+    if (!e) return -1;
+    return e->stageTopK(k, ids, vals);
 }
 
 __attribute__((visibility("default")))
@@ -3620,7 +3655,7 @@ int main(int argc, char** argv) {
                 while (n) { ssize_t r = write(fd, b, n); if (r <= 0) return false; b += r; n -= (size_t)r; }
                 return true;
             };
-            struct PipeHdr { uint32_t op, slot, n, base; };
+            struct PipeHdr { uint32_t op, slot, n, base, topk; };
             const uint32_t nEmbd = qk_engine::nEmbd;
         // Layer count from the GGUF header (35B: 40, 80B: 48) — needed before
         // any engine exists to parse/validate the stage boundaries.
@@ -3635,7 +3670,9 @@ int main(int argc, char** argv) {
             // builds/splits fail loudly instead of streaming garbage. Bump the
             // magic on any wire change. qkp2 = qkp1 + state ops (op3 save /
             // op4 load, idx in the n field, 4-byte status reply).
-            const uint32_t kPipeMagic = 0x716b7032;  // "qkp2"
+            // qkp3 = qkp2 + 5th header word topk: op1 to a LAST stage
+            // replies n ids + topk (u32 id, f32 logit) pairs, descending.
+            const uint32_t kPipeMagic = 0x716b7033;  // "qkp3"
             char err[256] = {0};
 
             if (mode == "pipe-worker") {
@@ -3686,7 +3723,8 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         if (h.op != 1 || h.n < 1 || h.slot >= e->nSlots ||
-                            (size_t)h.base + h.n > e->nCtx)
+                            (size_t)h.base + h.n > e->nCtx ||
+                            h.topk > 256 || (h.topk && !e->lastStage()))
                             break;
                         int rc;
                         if (e->firstStage()) {
@@ -3705,6 +3743,22 @@ int main(int argc, char** argv) {
                         if (rc) { fprintf(stderr, "[pipe-worker] stage_run rc=%d\n", rc); break; }
                         bool ok2 = e->lastStage() ? writeAll(fd, ids.data(), (size_t)h.n * 4)
                                                   : writeAll(fd, hout.data(), hout.size() * 4);
+                        if (ok2 && h.topk) {
+                            // Sampling candidates: exactly h.topk (id, logit)
+                            // pairs for the final position — the head samples.
+                            std::vector<uint32_t> tid(h.topk);
+                            std::vector<float> tval(h.topk);
+                            if (e->stageTopK(h.topk, tid.data(), tval.data())) {
+                                fprintf(stderr, "[pipe-worker] stage_topk failed\n");
+                                break;
+                            }
+                            std::vector<uint8_t> pk((size_t)h.topk * 8);
+                            for (uint32_t i = 0; i < h.topk; i++) {
+                                memcpy(pk.data() + (size_t)i * 8, &tid[i], 4);
+                                memcpy(pk.data() + (size_t)i * 8 + 4, &tval[i], 4);
+                            }
+                            ok2 = writeAll(fd, pk.data(), pk.size());
+                        }
                         if (!ok2) break;
                     }
                     close(fd);
