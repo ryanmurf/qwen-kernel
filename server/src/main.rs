@@ -57,7 +57,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let metadata = gguf::read_metadata(&cli.model)?;
-    if metadata.architecture.as_deref() != Some("qwen35moe") {
+    if !matches!(
+        metadata.architecture.as_deref(),
+        Some("qwen35moe") | Some("qwen3next")
+    ) {
         tracing::warn!("unexpected model architecture: {:?}", metadata.architecture);
     }
     let tokenizer = Arc::new(Tokenizer::from_config(metadata.tokenizer)?);
@@ -66,6 +69,14 @@ async fn main() -> anyhow::Result<()> {
         CliTemplateMode::Builtin => TemplateMode::Builtin,
     };
     let chat_template = Arc::new(ChatTemplate::new(metadata.chat_template, template_mode));
+    tracing::info!(
+        "generation cue: {}",
+        if chat_template.gen_cue().contains("<think>") {
+            "think scaffold (Qwen3.6 shape)"
+        } else {
+            "plain assistant turn (instruct shape)"
+        }
+    );
     let engine_thread = EngineThread::start(
         &cli.engine_lib,
         &cli.model,

@@ -76,16 +76,19 @@ fn parse_metadata(reader: &mut impl GgufRead) -> Result<ModelMetadata> {
             "tokenizer.ggml.model must be gpt2",
         ));
     }
-    if tokenizer_pre != "qwen35" {
+    if !matches!(tokenizer_pre.as_str(), "qwen35" | "qwen2") {
         return Err(ServerError::bad_request(
-            "tokenizer.ggml.pre must be qwen35",
+            "tokenizer.ggml.pre must be qwen35 or qwen2",
         ));
     }
     let tokens = take_string_array(&kvs, "tokenizer.ggml.tokens")?;
     let token_types = take_i32_array(&kvs, "tokenizer.ggml.token_type")?;
     let merges = take_string_array(&kvs, "tokenizer.ggml.merges")?;
     let eos_token_id = take_u32(&kvs, "tokenizer.ggml.eos_token_id")?;
-    let bos_token_id = take_u32(&kvs, "tokenizer.ggml.bos_token_id")?;
+    // Qwen GGUFs with add_bos_token=false may omit the bos id entirely
+    // (Qwen3-Next-Instruct does); it is only consulted when add_bos_token is
+    // set, so any placeholder is safe.
+    let bos_token_id = take_u32(&kvs, "tokenizer.ggml.bos_token_id").unwrap_or(eos_token_id);
     let add_bos_token = take_bool(&kvs, "tokenizer.ggml.add_bos_token").unwrap_or(false);
     let chat_template = take_string(&kvs, "tokenizer.chat_template").ok();
 
@@ -93,8 +96,9 @@ fn parse_metadata(reader: &mut impl GgufRead) -> Result<ModelMetadata> {
         architecture,
         name,
         tokenizer_model,
-        tokenizer_pre,
+        tokenizer_pre: tokenizer_pre.clone(),
         tokenizer: TokenizerConfig {
+            pre: tokenizer_pre,
             tokens,
             token_types,
             merges,

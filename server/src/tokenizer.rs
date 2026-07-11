@@ -11,9 +11,14 @@ pub const TOKEN_USER_DEFINED: i32 = 4;
 pub const TOKEN_BYTE: i32 = 6;
 
 const QWEN35_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+// LLAMA_VOCAB_PRE_TYPE_QWEN2 (Qwen3-Next et al): same as qwen35 minus the
+// \p{M} combining-mark handling — identical on ASCII, diverges on decomposed
+// accents/Indic scripts. Both mirror llama.cpp's llama-vocab.cpp verbatim.
+const QWEN2_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 #[derive(Clone, Debug)]
 pub struct TokenizerConfig {
+    pub pre: String,
     pub tokens: Vec<String>,
     pub token_types: Vec<i32>,
     pub merges: Vec<String>,
@@ -51,8 +56,17 @@ impl Tokenizer {
                 "tokenizer token/type length mismatch",
             ));
         }
-        let regex = Regex::new(QWEN35_PATTERN)
-            .map_err(|err| ServerError::internal(format!("invalid qwen35 regex: {err}")))?;
+        let pattern = match config.pre.as_str() {
+            "qwen35" => QWEN35_PATTERN,
+            "qwen2" => QWEN2_PATTERN,
+            pre => {
+                return Err(ServerError::internal(format!(
+                    "unsupported tokenizer.ggml.pre: {pre}"
+                )))
+            }
+        };
+        let regex = Regex::new(pattern)
+            .map_err(|err| ServerError::internal(format!("invalid {} regex: {err}", config.pre)))?;
         let (byte_to_char, char_to_byte) = build_byte_maps();
         let token_to_id = config
             .tokens
@@ -385,6 +399,7 @@ mod tests {
     #[test]
     fn tiny_bpe() {
         let cfg = TokenizerConfig {
+            pre: "qwen35".to_owned(),
             tokens: vec!["a", "b", "ab", "c", "abc"]
                 .into_iter()
                 .map(str::to_owned)
@@ -401,13 +416,15 @@ mod tests {
 
     #[test]
     fn regex_covers_input() {
-        let re = Regex::new(QWEN35_PATTERN).expect("regex literal is valid");
-        let text = "I'm 你好\n  x!";
-        let mut joined = String::new();
-        for mat in re.find_iter(text) {
-            joined.push_str(mat.expect("regex match").as_str());
+        for pattern in [QWEN35_PATTERN, QWEN2_PATTERN] {
+            let re = Regex::new(pattern).expect("regex literal is valid");
+            let text = "I'm 你好\n  x!";
+            let mut joined = String::new();
+            for mat in re.find_iter(text) {
+                joined.push_str(mat.expect("regex match").as_str());
+            }
+            assert_eq!(joined, text);
         }
-        assert_eq!(joined, text);
     }
 
     #[test]

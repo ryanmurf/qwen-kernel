@@ -1,0 +1,108 @@
+# qk-server in SPLIT mode for Qwen3-Next-80B-A3B-Instruct (42.8 GB IQ4_XS-qk
+# repack): tron runs the HEAD stage (layers [0,12) ≈ 12 GB VRAM + the whole
+# serving brain) and forwards hidden rows to midnight's Metal pipe-worker on
+# :18200 (layers [12,48), ~32 GB wired). Same switch.sh contract as the other
+# backends: replicas starts at 0, the gemma-server Service selects
+# `gpu-llm: server`, and only ONE backend may be scaled up at a time
+# (`./switch.sh split80`).
+#
+# Worker prerequisite on midnight:
+#   QK_MLOCK=1 qk pipe-worker 18200 12:48 32768 2
+# The worker's slots/ctx must cover the head's; the qkp2 hello enforces it
+# loudly at connect. Startup ORDER does not matter — the head connects lazily
+# and a request against a down worker fails 5xx without killing the server.
+# The 35B worker on :18100 is a different process and is not involved.
+#
+# The model lives on the 4 TB volume (/mnt/data/models), NOT the llama.cpp
+# models hostPath the 35B backends mount. midnight holds a byte-identical
+# copy of the same repack; the qkp2 hello checks shape, not file identity.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qk-server-split-80b
+  namespace: gemma
+  labels:
+    app: qk-server-split-80b
+spec:
+  replicas: 0   # idle by default; ./switch.sh split80 scales it up
+  strategy:
+    type: Recreate   # same single-GPU overlap hazard as qk-server.yaml
+  selector:
+    matchLabels:
+      app: qk-server-split-80b
+  template:
+    metadata:
+      labels:
+        app: qk-server-split-80b
+        gpu-llm: server   # the gemma-server Service routes here when scaled up
+    spec:
+      containers:
+      - name: qk-server-split-80b
+        image: localhost:32000/qk-server:vulkan
+        imagePullPolicy: Always
+        args:
+        - --model
+        - /models/Qwen3-Next-80B-A3B-Instruct-IQ4_XS-qk.gguf
+        - --engine-lib
+        - /app/libqk.so
+        - --host
+        - "0.0.0.0"
+        - --port
+        - "8080"
+        # Head owns layers [0,12): ~10.9 GB weights+embd, plus KV for the 3
+        # attention layers in range (134 MB/layer/slot at ctx 32768) — ~12 GB
+        # VRAM total. The 12:48 boundary mirrors what the midnight worker
+        # serves; the hello rejects any drift.
+        - --slots
+        - "2"
+        - --ctx
+        - "32768"
+        - --chunk
+        - "8"
+        - --split-next
+        - REDACTED-LAN-IP:18200
+        env:
+        - name: QK_LAYERS
+          value: "0:12"
+        # Snapshot ENTRY COUNT for split cross-turn reuse (qk_state_n). Each
+        # entry is a host snapshot of this stage's state (~0.4 GiB at ctx
+        # 32768: 3 attn layers + DN share). The midnight worker runs the
+        # engine default (3); the counts must stay equal on both sides.
+        - name: QK_PCACHE
+          value: "3"
+        - name: QK_PCACHE_LOG
+          value: "1"
+        - name: QK_STATS_FILE
+          value: /stats/qk-stats.log
+        # NB: QK_FORK / QK_SPEC are unsupported in split mode v1 (the server
+        # warns and they never engage) — deliberately unset here.
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: 6Gi
+          limits:
+            memory: 16Gi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /models
+          name: models
+          readOnly: true
+        - mountPath: /dev/dri
+          name: dri
+        - mountPath: /stats
+          name: stats
+      volumes:
+      - hostPath:
+          path: /mnt/data/models
+          type: Directory
+        name: models
+      - hostPath:
+          path: /dev/dri
+          type: Directory
+        name: dri
+      - hostPath:
+          path: /var/lib/qk-stats
+          type: DirectoryOrCreate
+        name: stats
