@@ -3059,8 +3059,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
     shareFork = getenv("QK_FORK") != nullptr;
     // fa_attn_srv is flash-attention (tiled) now, so nCtx is bounded by KV-cache
-    // VRAM (~32K at 4 slots on a 20 GB card), not shared memory.
-    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 32768 || chunkN < 1 || chunkN > 32)
+    // VRAM, not shared memory: ~134 MB/attn-layer/slot at 32K, linear in nCtx.
+    // 65536 fits the split-80B shape on both boxes (head 3 attn layers ~1.6 GB,
+    // worker 9 layers ~4.8 GB at 2 slots); single-box 35B stays at 32768 by
+    // deployment config (measured VRAM fit on the 20 GB card).
+    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
     initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");

@@ -7,7 +7,7 @@
 # (`./switch.sh split80`).
 #
 # Worker prerequisite on midnight:
-#   QK_MLOCK=1 qk pipe-worker 18200 12:48 32768 2
+#   QK_MLOCK=1 qk pipe-worker 18200 12:48 65536 2
 # The worker's slots/ctx must cover the head's; the qkp3 hello enforces it
 # loudly at connect (a qkp2-era worker is rejected there — rebuild it when
 # bumping this image). Startup ORDER does not matter — the head connects
@@ -51,13 +51,17 @@ spec:
         - --port
         - "8080"
         # Head owns layers [0,12): ~10.9 GB weights+embd, plus KV for the 3
-        # attention layers in range (134 MB/layer/slot at ctx 32768) — ~12 GB
-        # VRAM total. The 12:48 boundary mirrors what the midnight worker
-        # serves; the hello rejects any drift.
+        # attention layers in range (268 MB/layer/slot at ctx 65536, linear)
+        # — ~12.8 GB VRAM total. ctx raised 32768 -> 65536 on 2026-07-11:
+        # claude-code-shaped sessions (~25k system prompt) lived at the old
+        # ceiling, and the context-fit trim there makes agents forget what
+        # they already ran (repeat-tool-call loops across turns). The 12:48
+        # boundary mirrors what the midnight worker serves; the hello
+        # rejects any drift.
         - --slots
         - "2"
         - --ctx
-        - "32768"
+        - "65536"
         - --chunk
         - "8"
         - --split-next
@@ -66,8 +70,8 @@ spec:
         - name: QK_LAYERS
           value: "0:12"
         # Snapshot ENTRY COUNT for split cross-turn reuse (qk_state_n). Each
-        # entry is a host snapshot of this stage's state (~0.4 GiB at ctx
-        # 32768: 3 attn layers + DN share). The midnight worker runs the
+        # entry is a host snapshot of this stage's state (~0.8 GiB at ctx
+        # 65536: 3 attn layers + DN share). The midnight worker runs the
         # engine default (3); the counts must stay equal on both sides.
         - name: QK_PCACHE
           value: "3"
@@ -91,7 +95,7 @@ spec:
         - containerPort: 8080
         resources:
           requests:
-            memory: 6Gi
+            memory: 8Gi
           limits:
             memory: 16Gi
         securityContext:

@@ -19,7 +19,7 @@ typedef struct qk_engine qk_engine;
 
 typedef struct qk_config {
     uint32_t n_slots; /* max concurrent sequences, 1..16 */
-    uint32_t n_ctx;   /* per-slot capacity (prompt + generated), 64..32768 */
+    uint32_t n_ctx;   /* per-slot capacity (prompt + generated), 64..65536 */
     uint32_t chunk;   /* GPU steps per host sync, 1..32 */
 } qk_config;
 
