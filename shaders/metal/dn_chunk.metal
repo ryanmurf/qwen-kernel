@@ -25,8 +25,9 @@ using namespace metal;
 // dncmp harness (random inputs + nonzero init state, o and final S).
 //
 // Three kernels:
-//   dn_chunk_kq    grid (hK, 1, nCh): raw dot tiles KK[t][s] (s<t) and
-//                  QK[t][s] = qScale (q_t.k_s) (s<=t) per k-head.
+//   dn_chunk_kq    grid (hK, 1, nCh): raw MMA dot tiles KK = K K^T and
+//                  QK = Q K^T per k-head (lower-triangle 8x8 tiles only;
+//                  qScale is folded into the solve's Att build).
 //   dn_chunk_solve grid (hV, 1, nCh): builds M, forward-substitutes u~/w~
 //                  (thread j owns column j: zero barriers in the solve).
 //                  Emits everything the chunk-serial kernel consumes, fully
@@ -52,7 +53,8 @@ kernel void dn_chunk_kq(device const float* conv [[buffer(0)]],
                         device float*       kq   [[buffer(1)]],
                         constant DnCPC&     pc   [[buffer(2)]],
                         uint3 tid3  [[thread_position_in_threadgroup]],
-                        uint3 tgpig [[threadgroup_position_in_grid]])
+                        uint3 tgpig [[threadgroup_position_in_grid]],
+                        uint  sgid  [[simdgroup_index_in_threadgroup]])
 {
     const uint kh = tgpig.x;
     const uint c  = tgpig.z;
@@ -61,35 +63,41 @@ kernel void dn_chunk_kq(device const float* conv [[buffer(0)]],
     const uint t0 = c * C;
     const uint Cc = min(C, pc.Tn - t0);
     const uint chQkv = (2u * pc.hK + pc.hV) * dS;
-    const float qScale = rsqrt(float(dS));
+    const uint nKT = dS / 8u;
 
-    threadgroup float kst[64 * 128];
-
-    const ulong kOff = (ulong)pc.hK * dS + (ulong)kh * dS;
-    for (uint t = 0u; t < Cc; ++t)
-        kst[t * dS + j] = conv[(ulong)(t0 + t) * chQkv + kOff + j];
+    // K chunk staged as packed 8x8 tiles (row-tile rt, col-tile ct) so every
+    // simdgroup_load is contiguous stride-8; rows >= Cc zeroed (blind MMA).
+    threadgroup float Ktg[64 * 128];
+    for (uint t = 0u; t < C; ++t)
+        Ktg[((t >> 3u) * nKT + (j >> 3u)) * 64u + (t & 7u) * 8u + (j & 7u)] =
+            t < Cc ? conv[(ulong)(t0 + t) * chQkv + (ulong)pc.hK * dS + (ulong)kh * dS + j]
+                   : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device float* kk = kq + ((ulong)(c * pc.hK + kh) * 2u) * (C * C);
     device float* qk = kk + C * C;
-    const uint nv = dS / 4u;
 
-    for (uint idx = j; idx < C * C; idx += dS) {
-        const uint t = idx >> 6u, s = idx & 63u;
-        if (t >= Cc || s > t) continue;
-        threadgroup const float4* ks = (threadgroup const float4*)(kst + s * dS);
-        if (s < t) {  // KK strictly lower (feeds M)
-            threadgroup const float4* kt = (threadgroup const float4*)(kst + t * dS);
-            float acc = 0.0f;
-            for (uint i = 0u; i < nv; ++i) acc += dot(kt[i], ks[i]);
-            kk[t * C + s] = acc;
+    // lower-triangle 8x8 output tiles (tt >= st): 36 of 64, split across simds
+    for (uint q = sgid; q < 36u; q += 4u) {
+        // unrank q -> (tt, st) with tt >= st
+        uint tt = 0u, acc = 0u;
+        while (acc + tt + 1u <= q) { acc += tt + 1u; ++tt; }
+        const uint st = q - acc;
+
+        simdgroup_float8x8 ck = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 cq = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kt = 0u; kt < nKT; ++kt) {
+            simdgroup_float8x8 ak, aq, bk;
+            simdgroup_load(ak, Ktg + (tt * nKT + kt) * 64u, 8u);
+            simdgroup_load(bk, Ktg + (st * nKT + kt) * 64u, 8u,
+                           ulong2(0, 0), true);   // K^T tile
+            simdgroup_multiply_accumulate(ck, ak, bk, ck);
+            simdgroup_load(aq, conv + (ulong)(t0 + tt * 8u) * chQkv +
+                                   (ulong)kh * dS + kt * 8u, chQkv);
+            simdgroup_multiply_accumulate(cq, aq, bk, cq);
         }
-        // QK lower + diag (feeds Att)
-        device const float4* qt =
-            (device const float4*)(conv + (ulong)(t0 + t) * chQkv + (ulong)kh * dS);
-        float acc = 0.0f;
-        for (uint i = 0u; i < nv; ++i) acc += dot(qt[i], ks[i]);
-        qk[t * C + s] = acc * qScale;
+        simdgroup_store(ck, kk + (tt * 8u) * C + st * 8u, C);
+        simdgroup_store(cq, qk + (tt * 8u) * C + st * 8u, C);
     }
 }
 
@@ -137,7 +145,7 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
         if (t < Cc && s <= t) {
             const float e = exp(Ltg[t] - Ltg[s]);
             if (s < t) m = Btg[t] * e * kk[idx];
-            a = e * qk[idx];
+            a = e * rsqrt(float(dS)) * qk[idx];   // qScale folded here (QK is raw)
         }
         M[idx] = m;
         // Att stored as packed 8x8 tiles for simdgroup_load in the step
@@ -189,8 +197,10 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
         for (uint l = 0u; l < 4u; ++l) {
             const uint t = g * 4u + l;
             if (t < Cc) {
-                uwO[t * dS + j] = uv[l];
-                uwO[C * dS + t * dS + j] = -wv[l];
+                const uint pk = ((t >> 3u) * (dS / 8u) + (j >> 3u)) * 64u +
+                                (t & 7u) * 8u + (j & 7u);
+                uwO[pk] = uv[l];
+                uwO[C * dS + pk] = -wv[l];
             }
         }
     }
@@ -198,20 +208,25 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
     // baked so the step kernel reads nothing but scratch. Rows >= Cc of all
     // four slots are zeroed: the step runs blind 8x8 tiles over the full
     // chunk and garbage rows would poison the MMA (0 * inf = NaN).
+    // all four slots are PACKED 8x8 tiles: (t/8 * dS/8 + j/8)*64 + ...
     const float qScale = rsqrt(float(dS));
     const float Llast = Ltg[Cc - 1u];
     const ulong qOff = (ulong)kh * dS;
     for (uint t = 0u; t < Cc; ++t) {
-        uwO[2u * C * dS + t * dS + j] =
+        const uint pk = ((t >> 3u) * (dS / 8u) + (j >> 3u)) * 64u +
+                        (t & 7u) * 8u + (j & 7u);
+        uwO[2u * C * dS + pk] =
             exp(Ltg[t]) * qScale * conv[(ulong)(t0 + t) * chQkv + qOff + j];
-        uwO[3u * C * dS + t * dS + j] =
+        uwO[3u * C * dS + pk] =
             exp(Llast - Ltg[t]) * conv[(ulong)(t0 + t) * chQkv + kOff + j];
     }
     for (uint t = Cc; t < C; ++t) {
-        uwO[t * dS + j] = 0.0f;
-        uwO[C * dS + t * dS + j] = 0.0f;
-        uwO[2u * C * dS + t * dS + j] = 0.0f;
-        uwO[3u * C * dS + t * dS + j] = 0.0f;
+        const uint pk = ((t >> 3u) * (dS / 8u) + (j >> 3u)) * 64u +
+                        (t & 7u) * 8u + (j & 7u);
+        uwO[pk] = 0.0f;
+        uwO[C * dS + pk] = 0.0f;
+        uwO[2u * C * dS + pk] = 0.0f;
+        uwO[3u * C * dS + pk] = 0.0f;
     }
     if (j == 0u) el[c * pc.hV + h] = exp(Llast);
 }
@@ -260,10 +275,10 @@ kernel void dn_chunk_step(device const float* uw  [[buffer(0)]],
             const uint st = q >> 3u, jt = q & 7u;
             if (jt >= nJT) continue;
             simdgroup_float8x8 cf;
-            simdgroup_load(cf, um + st * 8u * dS + jp0 + jt * 8u, dS);
+            simdgroup_load(cf, um + (st * nKT + jp0 / 8u + jt) * 64u, 8u);
             for (uint kt = 0u; kt < nKT; ++kt) {
                 simdgroup_float8x8 af, bf;
-                simdgroup_load(af, wm + st * 8u * dS + kt * 8u, dS);
+                simdgroup_load(af, wm + (st * nKT + kt) * 64u, 8u);
                 simdgroup_load(bf, S + (ulong)(jp0 + jt * 8u) * dS + kt * 8u, dS,
                                ulong2(0, 0), true);   // S^T tile
                 simdgroup_multiply_accumulate(cf, af, bf, cf);
@@ -279,7 +294,7 @@ kernel void dn_chunk_step(device const float* uw  [[buffer(0)]],
             simdgroup_float8x8 cf = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             for (uint kt = 0u; kt < nKT; ++kt) {
                 simdgroup_float8x8 af, bf;
-                simdgroup_load(af, qm + tt * 8u * dS + kt * 8u, dS);
+                simdgroup_load(af, qm + (tt * nKT + kt) * 64u, 8u);
                 simdgroup_load(bf, S + (ulong)(jp0 + jt * 8u) * dS + kt * 8u, dS,
                                ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(cf, af, bf, cf);
@@ -306,7 +321,7 @@ kernel void dn_chunk_step(device const float* uw  [[buffer(0)]],
                 simdgroup_float8x8 af, bf;
                 simdgroup_load(af, Dtg + (st * 8u + jt) * 64u, 8u,
                                ulong2(0, 0), true);   // D^T tile
-                simdgroup_load(bf, km + st * 8u * dS + it * 8u, dS);
+                simdgroup_load(bf, km + (st * nKT + it) * 64u, 8u);
                 simdgroup_multiply_accumulate(cf, af, bf, cf);
             }
             simdgroup_float8x8 sf;
