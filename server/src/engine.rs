@@ -27,8 +27,32 @@ pub struct Job {
     pub max_gen: u32,
     // History-boundary token count for the cross-turn KV snapshot (0 = disabled).
     pub snap_prefix: u32,
+    pub sampling: Sampling,
     pub events: tokio_mpsc::Sender<SlotEvent>,
     pub permit: OwnedSemaphorePermit,
+}
+
+/// Per-request sampling policy. `temp <= 0` means greedy — the default, and
+/// bit-identical to the pre-sampling engine/wire behavior (token gates rely
+/// on this). Sampling itself runs head-side in the split driver (split.rs);
+/// the single-box engine path is greedy-only and logs when asked otherwise.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sampling {
+    pub temp: f32,
+    pub top_p: f32,
+    pub seed: u64,
+}
+
+impl Sampling {
+    pub const GREEDY: Sampling = Sampling {
+        temp: 0.0,
+        top_p: 1.0,
+        seed: 0,
+    };
+
+    pub fn is_greedy(&self) -> bool {
+        self.temp <= 0.0
+    }
 }
 
 pub enum Cmd {
@@ -306,6 +330,15 @@ fn admit_jobs(engine: &mut Engine, queue: &mut VecDeque<Job>, slots: &mut [Optio
             break;
         };
         let events = job.events.clone();
+        if !job.sampling.is_greedy() {
+            // qk_step_chunk samples inside the engine's fused argmax chain;
+            // only the split driver can inject a sampled token. Serve greedy
+            // rather than fail — the request is still well-formed.
+            tracing::warn!(
+                "temperature={} requested but the single-box engine path is greedy-only; serving greedy",
+                job.sampling.temp
+            );
+        }
         match engine.slot_start(slot as u32, &job.prompt_ids, job.max_gen, job.snap_prefix) {
             Ok(()) => {
                 *state = Some(SlotState {

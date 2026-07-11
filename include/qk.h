@@ -100,6 +100,14 @@ int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
                  const float *hidden_in, uint32_t n, uint32_t base,
                  float *hidden_out, uint32_t *ids_out);
 
+/* After a last-stage qk_stage_run: copy out the top-k (ids, logits) of the
+ * FINAL position's logit row, descending (1 <= k <= 256). This is the
+ * sampling hook — the driver samples from these candidates and feeds its
+ * pick as the next position, so the engine itself stays sampler-free and
+ * the greedy path stays bit-identical.
+ * Returns 0 on success, negative on bad args / non-last stage / no run yet. */
+int qk_stage_topk(qk_engine *e, uint32_t k, uint32_t *ids, float *vals);
+
 /* Driver-managed state snapshots (split serving's cross-turn reuse): copy a
  * slot's full recurrent state (KV + DeltaNet + conv, this stage's layers) to
  * or from host snapshot entry `idx` (0 <= idx < qk_state_n; entry count is
