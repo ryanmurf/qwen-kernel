@@ -77,6 +77,11 @@ async fn main() -> anyhow::Result<()> {
             "plain assistant turn (instruct shape)"
         }
     );
+    tracing::info!(
+        "sampling policy: QK_TEMP_DEFAULT={} QK_TEMP_CAP={} (explicit temperature wins; 0/absent-with-no-default = greedy)",
+        std::env::var("QK_TEMP_DEFAULT").unwrap_or_else(|_| "0 (greedy)".into()),
+        std::env::var("QK_TEMP_CAP").unwrap_or_else(|_| "none".into()),
+    );
     let engine_thread = EngineThread::start(
         &cli.engine_lib,
         &cli.model,

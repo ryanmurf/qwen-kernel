@@ -5,10 +5,15 @@
 //! ids. EOS/limit decisions stay on the head, so `SlotEvent` semantics are
 //! identical to the serial driver in `engine.rs`.
 //!
-//! Wire frame (all u32 little-endian): header `{op, slot, n, base}`;
+//! Wire frame (all u32 little-endian): header `{op, slot, n, base, topk}`;
 //! op 1 payload = `n * n_embd` f32 hidden rows for positions `[base, base+n)`,
-//! reply = `n` u32 greedy ids; op 2 = goodbye (connection close). One frame in
-//! flight per connection — this matches the single engine thread on both ends.
+//! reply = `n` u32 greedy ids, then — iff `topk > 0` — `topk` (u32 id,
+//! f32 logit) pairs for the FINAL position, descending. The head samples from
+//! those candidates and feeds its pick as the next position, so sampling
+//! lives entirely on this side; a greedy request never sets `topk` and the
+//! worker's compute path is untouched. op 2 = goodbye (connection close).
+//! One frame in flight per connection — this matches the single engine
+//! thread on both ends.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -19,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::engine::{Cmd, FinishReason, FlushOutcome, SlotEvent, SlotState, flush_slot};
+use crate::engine::{Cmd, FinishReason, FlushOutcome, Sampling, SlotEvent, SlotState, flush_slot};
 use crate::ffi::Engine;
 
 /// Generous ceiling: a worker prefill chunk is <1 s on a healthy GPU, but a
@@ -35,7 +40,12 @@ const CHUNK: usize = 128;
 /// mixed builds or a mis-split worker fail loudly at connect instead of
 /// streaming garbage. Bump on any wire change. qkp2 = qkp1 + state ops
 /// (op3 save / op4 load, snapshot idx in the n field, 4-byte status reply).
-const PIPE_MAGIC: u32 = 0x716b_7032;
+/// qkp3 = qkp2 + the 5th header word `topk` (sampling candidates, see above).
+const PIPE_MAGIC: u32 = 0x716b_7033;
+
+/// Candidates requested per sampled token. Nucleus mass beyond the top 64 is
+/// negligible at sane temperatures; the reply stays a 512-byte tail.
+const TOPK: u32 = 64;
 
 /// What the head requires of the worker, checked against its hello.
 pub struct WorkerExpect {
@@ -51,12 +61,12 @@ pub struct WorkerLink {
     n_embd: usize,
     expect: WorkerExpect,
     stream: Option<TcpStream>,
-    // Reply sizes (in ids) for op1 frames sent but not yet answered — the
-    // worker processes frames strictly in order, so replies match FIFO.
-    // Pipelining rule: at most 2 in flight (a 1 MiB prefill frame fits the
-    // socket buffers; replies are <= 512 B so the worker never blocks on
-    // writing one, hence no deadlock).
-    pending: VecDeque<u32>,
+    // Reply shapes (n ids, topk pairs) for op1 frames sent but not yet
+    // answered — the worker processes frames strictly in order, so replies
+    // match FIFO. Pipelining rule: at most 2 in flight (a 1 MiB prefill
+    // frame fits the socket buffers; replies are <= 1 KiB so the worker
+    // never blocks on writing one, hence no deadlock).
+    pending: VecDeque<(u32, u32)>,
 }
 
 impl WorkerLink {
@@ -121,23 +131,16 @@ impl WorkerLink {
         Ok(self.stream.as_mut().expect("just connected"))
     }
 
-    /// Send hidden rows for positions `[base, base+n)` of `slot`; fill
-    /// `ids_out` with the worker's `n` greedy ids. Any failure poisons the
-    /// connection: it is dropped and the next call reconnects fresh (safe —
-    /// sequences always restart at base 0, which resets the worker slot).
-    pub fn run(&mut self, slot: u32, base: u32, hidden: &[f32], ids_out: &mut Vec<u32>) -> Result<()> {
-        self.send_run(slot, base, hidden)?;
-        self.recv_ids(ids_out)
-    }
-
     /// Fire an op1 frame without waiting for the reply (pipelining: the
     /// worker computes it while the head computes the next chunk/slot).
-    pub fn send_run(&mut self, slot: u32, base: u32, hidden: &[f32]) -> Result<()> {
+    /// `topk > 0` asks the worker to append that many (id, logit) sampling
+    /// candidates for the frame's final position.
+    pub fn send_run(&mut self, slot: u32, base: u32, hidden: &[f32], topk: u32) -> Result<()> {
         let n = (hidden.len() / self.n_embd) as u32;
         let result = (|| {
             let stream = self.stream()?;
-            let mut frame = Vec::with_capacity(16 + hidden.len() * 4);
-            for word in [1u32, slot, n, base] {
+            let mut frame = Vec::with_capacity(20 + hidden.len() * 4);
+            for word in [1u32, slot, n, base, topk] {
                 frame.extend_from_slice(&word.to_le_bytes());
             }
             for value in hidden {
@@ -147,7 +150,7 @@ impl WorkerLink {
         })();
         match result {
             Ok(()) => {
-                self.pending.push_back(n);
+                self.pending.push_back((n, topk));
                 Ok(())
             }
             Err(err) => {
@@ -157,9 +160,11 @@ impl WorkerLink {
         }
     }
 
-    /// Receive the oldest in-flight frame's ids (FIFO order).
-    pub fn recv_ids(&mut self, ids_out: &mut Vec<u32>) -> Result<()> {
-        let Some(n) = self.pending.front().copied() else {
+    /// Receive the oldest in-flight frame's reply (FIFO order): `n` ids into
+    /// `ids_out`, and the frame's `topk` candidates into `cands_out` (cleared
+    /// — so it holds candidates only right after a topk frame's reply).
+    pub fn recv_ids(&mut self, ids_out: &mut Vec<u32>, cands_out: &mut Vec<(u32, f32)>) -> Result<()> {
+        let Some((n, topk)) = self.pending.front().copied() else {
             anyhow::bail!("split worker recv with nothing in flight");
         };
         let result = (|| {
@@ -172,6 +177,19 @@ impl WorkerLink {
                     .chunks_exact(4)
                     .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
             );
+            cands_out.clear();
+            if topk > 0 {
+                let mut pairs = vec![0u8; topk as usize * 8];
+                stream
+                    .read_exact(&mut pairs)
+                    .context("split worker topk read")?;
+                cands_out.extend(pairs.chunks_exact(8).map(|b| {
+                    (
+                        u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                        f32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                    )
+                }));
+            }
             Ok(())
         })();
         match result {
@@ -205,8 +223,11 @@ impl WorkerLink {
         }
         let result = (|| {
             let stream = self.stream()?;
-            let mut frame = [0u8; 16];
-            for (i, word) in [if save { 3u32 } else { 4 }, slot, idx, 0].iter().enumerate() {
+            let mut frame = [0u8; 20];
+            for (i, word) in [if save { 3u32 } else { 4 }, slot, idx, 0, 0]
+                .iter()
+                .enumerate()
+            {
                 frame[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
             }
             stream.write_all(&frame).context("split worker state write")?;
@@ -228,7 +249,7 @@ impl WorkerLink {
     /// Best-effort goodbye so the worker logs a clean disconnect.
     pub fn bye(&mut self) {
         if let Some(stream) = self.stream.as_mut() {
-            let mut header = [0u8; 16];
+            let mut header = [0u8; 20];
             header[0] = 2;
             let _ = stream.write_all(&header);
         }
@@ -241,6 +262,69 @@ impl WorkerLink {
 struct Seq {
     pos: u32,
     next: u32,
+    sampling: Sampling,
+    rng: SplitMix64,
+}
+
+/// SplitMix64: tiny deterministic per-request stream (one draw per sampled
+/// token). Not cryptographic — it only has to decorrelate token draws.
+pub(crate) struct SplitMix64(u64);
+
+impl SplitMix64 {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    /// Uniform draw in [0, 1) with 53 mantissa bits.
+    pub(crate) fn next_f64(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Pick a token from `(id, logit)` candidates: softmax at `temp`, nucleus-
+/// truncate at `top_p` (mass relative to the K candidates — standard
+/// top-k-then-top-p semantics), then spend `r` in [0, 1) across the kept
+/// mass. Candidates arrive descending from the worker, but order is
+/// re-derived here so a mis-sorted peer degrades to correct-but-slower.
+pub(crate) fn sample_candidates(cands: &[(u32, f32)], temp: f32, top_p: f32, r: f64) -> u32 {
+    debug_assert!(!cands.is_empty());
+    let max = cands.iter().fold(f32::NEG_INFINITY, |m, c| m.max(c.1));
+    let temp = f64::from(temp.max(1e-4));
+    let weights: Vec<f64> = cands
+        .iter()
+        .map(|c| (f64::from(c.1 - max) / temp).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        weights[b]
+            .partial_cmp(&weights[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // Smallest descending prefix whose mass reaches top_p of the total.
+    let threshold = total * f64::from(top_p.clamp(1e-6, 1.0));
+    let mut kept = 0usize;
+    let mut mass = 0.0f64;
+    for &i in &order {
+        kept += 1;
+        mass += weights[i];
+        if mass >= threshold {
+            break;
+        }
+    }
+    let mut x = r.clamp(0.0, 1.0 - f64::EPSILON) * mass;
+    for &i in &order[..kept] {
+        if x < weights[i] {
+            return cands[i].0;
+        }
+        x -= weights[i];
+    }
+    cands[order[kept - 1]].0
 }
 
 /// Apply one sampled id to a slot: emit it unless it is EOS, finish on
@@ -270,7 +354,9 @@ fn apply_sample(state: &mut SlotState, id: u32, eos: u32) -> bool {
 /// restored state); returns the worker's id after position end-1.
 /// PIPELINED: the frame for chunk k is in flight while the head computes
 /// chunk k+1, so wall time ≈ max(head, worker) per chunk, not the sum.
-/// Returns with nothing in flight.
+/// Returns with nothing in flight. `topk > 0` requests sampling candidates
+/// on the FINAL frame; since replies are FIFO, `cands` holds that frame's
+/// candidates on return (recv clears it on every earlier reply).
 #[allow(clippy::too_many_arguments)]
 fn split_prefill(
     head: &mut Engine,
@@ -282,22 +368,27 @@ fn split_prefill(
     n_embd: usize,
     hidden: &mut Vec<f32>,
     ids: &mut Vec<u32>,
+    topk: u32,
+    cands: &mut Vec<(u32, f32)>,
 ) -> Result<u32> {
     let mut base = start;
     let mut last = None;
-    for chunk in prompt[start as usize..end as usize].chunks(CHUNK) {
+    let span = &prompt[start as usize..end as usize];
+    let n_chunks = span.chunks(CHUNK).count();
+    for (i, chunk) in span.chunks(CHUNK).enumerate() {
         hidden.clear();
         hidden.resize(chunk.len() * n_embd, 0.0);
         head.stage_run(slot, Some(chunk), None, base, Some(hidden.as_mut_slice()), None)?;
-        link.send_run(slot, base, hidden)?;
+        let want = if i + 1 == n_chunks { topk } else { 0 };
+        link.send_run(slot, base, hidden, want)?;
         while link.in_flight() > 1 {
-            link.recv_ids(ids)?;
+            link.recv_ids(ids, cands)?;
             last = ids.last().copied();
         }
         base += chunk.len() as u32;
     }
     while link.in_flight() > 0 {
-        link.recv_ids(ids)?;
+        link.recv_ids(ids, cands)?;
         last = ids.last().copied();
     }
     last.context("split prefill produced no ids")
@@ -331,7 +422,8 @@ fn best_snap(snaps: &[Option<SnapEntry>], prompt: &[u32]) -> Option<(u32, u32)> 
 /// Admit one job: restore the longest snapshotted prefix if any (both
 /// stages), prefill the remainder, and take a history-boundary snapshot at
 /// job-specified `snap_prefix` on the way through. Returns the first
-/// generated token.
+/// generated token — the worker's greedy pick, or a draw from its top-k
+/// candidates when the job samples.
 #[allow(clippy::too_many_arguments)]
 fn split_admit(
     head: &mut Engine,
@@ -339,12 +431,24 @@ fn split_admit(
     slot: u32,
     prompt: &[u32],
     snap_prefix: u32,
+    sampling: &Sampling,
+    rng: &mut SplitMix64,
     snaps: &mut [Option<SnapEntry>],
     lru_clock: &mut u64,
     n_embd: usize,
     hidden: &mut Vec<f32>,
     ids: &mut Vec<u32>,
 ) -> Result<u32> {
+    let topk = if sampling.is_greedy() { 0 } else { TOPK };
+    let mut cands: Vec<(u32, f32)> = Vec::new();
+    if topk > 0 {
+        tracing::info!(
+            "[sample] slot={slot} temp={} top_p={} seed={:#018x}",
+            sampling.temp,
+            sampling.top_p,
+            sampling.seed
+        );
+    }
     let np = prompt.len() as u32;
     let mut start = 0u32;
     if let Some((idx, len)) = best_snap(snaps, prompt) {
@@ -378,7 +482,9 @@ fn split_admit(
         // prefills only its delta. The phase boundary holds even if the
         // snapshot fails (re-feeding fed tokens would corrupt DeltaNet state).
         let boundary = snap_at;
-        split_prefill(head, link, slot, prompt, start, boundary, n_embd, hidden, ids)?;
+        split_prefill(
+            head, link, slot, prompt, start, boundary, n_embd, hidden, ids, 0, &mut cands,
+        )?;
         let idx = pick_entry(snaps);
         match head
             .state_save(slot, idx)
@@ -398,14 +504,26 @@ fn split_admit(
                 snap_at = 0;
             }
         }
-        split_prefill(head, link, slot, prompt, boundary, np, n_embd, hidden, ids)?
+        split_prefill(
+            head, link, slot, prompt, boundary, np, n_embd, hidden, ids, topk, &mut cands,
+        )?
     } else {
-        split_prefill(head, link, slot, prompt, start, np, n_embd, hidden, ids)?
+        split_prefill(
+            head, link, slot, prompt, start, np, n_embd, hidden, ids, topk, &mut cands,
+        )?
     };
     tracing::info!(
         "[split-cache] slot={slot} prompt={np} reuse={start} prefill={} snap={snap_at}",
         np - start
     );
+    if topk > 0 && !cands.is_empty() {
+        return Ok(sample_candidates(
+            &cands,
+            sampling.temp,
+            sampling.top_p,
+            rng.next_f64(),
+        ));
+    }
     Ok(first)
 }
 
@@ -439,6 +557,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
     let mut slots: Vec<Option<(SlotState, Seq)>> = (0..n_slots).map(|_| None).collect();
     let mut hidden = Vec::new();
     let mut ids = Vec::new();
+    let mut cands: Vec<(u32, f32)> = Vec::new();
     // Cross-turn snapshot registry (0 entries when the engine lib predates
     // the snapshot ABI — the feature just stays off). Cleared on any worker
     // link failure: a restarted worker has lost its half of every snapshot,
@@ -470,12 +589,15 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 continue;
             }
             let Some(job) = queue.pop_front() else { break };
+            let mut rng = SplitMix64::new(job.sampling.seed);
             match split_admit(
                 &mut head,
                 &mut link,
                 slot as u32,
                 &job.prompt_ids,
                 job.snap_prefix,
+                &job.sampling,
+                &mut rng,
                 &mut snaps,
                 &mut lru_clock,
                 n_embd,
@@ -488,6 +610,8 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                     let seq = Seq {
                         pos: job.prompt_ids.len() as u32,
                         next: if live { first } else { 0 },
+                        sampling: job.sampling,
+                        rng,
                     };
                     *state = Some((slot_state, seq));
                 }
@@ -536,6 +660,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 }
                 hidden.clear();
                 hidden.resize(n_embd, 0.0);
+                let topk = if seq.sampling.is_greedy() { 0 } else { TOPK };
                 let sent = head
                     .stage_run(
                         slot as u32,
@@ -545,7 +670,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                         Some(hidden.as_mut_slice()),
                         None,
                     )
-                    .and_then(|()| link.send_run(slot as u32, seq.pos, &hidden));
+                    .and_then(|()| link.send_run(slot as u32, seq.pos, &hidden, topk));
                 match sent {
                     Ok(()) => stepped.push(slot),
                     Err(err) => {
@@ -558,13 +683,22 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 if failure.is_some() {
                     break;
                 }
-                match link.recv_ids(&mut ids) {
+                match link.recv_ids(&mut ids, &mut cands) {
                     Ok(()) => {
                         let Some((slot_state, seq)) = slots[slot].as_mut() else {
                             continue;
                         };
                         seq.pos += 1;
-                        let id = ids[0];
+                        let id = if cands.is_empty() {
+                            ids[0]
+                        } else {
+                            sample_candidates(
+                                &cands,
+                                seq.sampling.temp,
+                                seq.sampling.top_p,
+                                seq.rng.next_f64(),
+                            )
+                        };
                         if apply_sample(slot_state, id, eos) {
                             seq.next = id;
                         }
@@ -600,4 +734,68 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
         }
     }
     link.bye();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn near_zero_temperature_is_greedy() {
+        let cands = vec![(7u32, 10.0f32), (3, 9.9), (5, 2.0)];
+        for r in [0.0, 0.3, 0.7, 0.999] {
+            assert_eq!(sample_candidates(&cands, 1e-4, 1.0, r), 7);
+        }
+    }
+
+    #[test]
+    fn tiny_top_p_keeps_only_the_head() {
+        let cands = vec![(7u32, 5.0f32), (3, 4.99), (5, 4.98)];
+        for r in [0.0, 0.5, 0.999] {
+            assert_eq!(sample_candidates(&cands, 1.0, 1e-6, r), 7);
+        }
+    }
+
+    #[test]
+    fn equal_logits_spread_by_draw() {
+        // Two equal candidates at top_p=1: r below/above 0.5 picks each side.
+        let cands = vec![(1u32, 3.0f32), (2, 3.0)];
+        assert_eq!(sample_candidates(&cands, 1.0, 1.0, 0.25), 1);
+        assert_eq!(sample_candidates(&cands, 1.0, 1.0, 0.75), 2);
+    }
+
+    #[test]
+    fn top_p_drops_the_tail() {
+        // Head carries ~73% of mass at temp 1 (gap of 1 nat); top_p=0.5
+        // keeps only it, so every draw returns the head.
+        let cands = vec![(9u32, 2.0f32), (4, 1.0)];
+        for r in [0.1, 0.6, 0.99] {
+            assert_eq!(sample_candidates(&cands, 1.0, 0.5, r), 9);
+        }
+        // top_p=1 with a high draw reaches the tail.
+        assert_eq!(sample_candidates(&cands, 1.0, 1.0, 0.9), 4);
+    }
+
+    #[test]
+    fn unsorted_candidates_still_sample_correctly() {
+        let cands = vec![(4u32, 1.0f32), (9, 2.0)]; // ascending — mis-sorted peer
+        for r in [0.1, 0.6, 0.99] {
+            assert_eq!(sample_candidates(&cands, 1.0, 0.5, r), 9);
+        }
+    }
+
+    #[test]
+    fn splitmix_is_deterministic_and_in_range() {
+        let mut a = SplitMix64::new(42);
+        let mut b = SplitMix64::new(42);
+        let mut c = SplitMix64::new(43);
+        let mut differs = false;
+        for _ in 0..64 {
+            let x = a.next_f64();
+            assert_eq!(x, b.next_f64());
+            assert!((0.0..1.0).contains(&x));
+            differs |= x != c.next_f64();
+        }
+        assert!(differs, "different seeds must produce different streams");
+    }
 }

@@ -8,10 +8,11 @@
 #
 # Worker prerequisite on midnight:
 #   QK_MLOCK=1 qk pipe-worker 18200 12:48 32768 2
-# The worker's slots/ctx must cover the head's; the qkp2 hello enforces it
-# loudly at connect. Startup ORDER does not matter — the head connects lazily
-# and a request against a down worker fails 5xx without killing the server.
-# The 35B worker on :18100 is a different process and is not involved.
+# The worker's slots/ctx must cover the head's; the qkp3 hello enforces it
+# loudly at connect (a qkp2-era worker is rejected there — rebuild it when
+# bumping this image). Startup ORDER does not matter — the head connects
+# lazily and a request against a down worker fails 5xx without killing the
+# server. The 35B worker on :18100 is a different process and not involved.
 #
 # The model lives on the 4 TB volume (/mnt/data/models), NOT the llama.cpp
 # models hostPath the 35B backends mount. midnight holds a byte-identical
@@ -60,7 +61,7 @@ spec:
         - --chunk
         - "8"
         - --split-next
-        - 192.168.0.75:18200
+        - 192.168.0.127:18200
         env:
         - name: QK_LAYERS
           value: "0:12"
@@ -74,6 +75,16 @@ spec:
           value: "1"
         - name: QK_STATS_FILE
           value: /stats/qk-stats.log
+        # Sampling policy (task #44): requests that OMIT temperature sample
+        # at 0.7 — this is what breaks deterministic greedy agent loops for
+        # clients that send no temperature at all. Explicit values are
+        # honored but clamped to 0.8; explicit 0 stays greedy, so token
+        # gates pin "temperature": 0 and remain exact. Sampling runs on the
+        # head; the qkp3 worker ships top-k candidates for sampled tokens.
+        - name: QK_TEMP_DEFAULT
+          value: "0.7"
+        - name: QK_TEMP_CAP
+          value: "0.8"
         # NB: QK_FORK / QK_SPEC are unsupported in split mode v1 (the server
         # warns and they never engage) — deliberately unset here.
         ports:
