@@ -2192,7 +2192,7 @@ struct qk_engine {
     void snapshotSlot(uint32_t slot);
     int matchPrefix(const uint32_t* prompt, uint32_t n);
     void restoreInto(uint32_t slot, int cacheIdx);
-    void copyStripes(uint32_t slot, uint8_t* snap, bool save);
+    void copyStripes(uint32_t slot, uint8_t* snap, bool save, uint32_t nTok = 0);
     void encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim);
 };
 
@@ -2204,12 +2204,31 @@ void qk_engine::resetSlot(uint32_t slot) {
     }
 }
 
-void qk_engine::copyStripes(uint32_t slot, uint8_t* snap, bool save) {
+void qk_engine::copyStripes(uint32_t slot, uint8_t* snap, bool save, uint32_t nTok) {
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
         if (!L.st1) continue;
         uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)slot * L.ps1;
         uint8_t* s2 = (uint8_t*)L.st2.contents + (size_t)slot * L.ps2;
+        // Attention KV stripes are [hKV][tmax][dh]: with a live token count,
+        // copy only each kv-heads first nTok rows so snapshot cost and
+        // resident pages track the conversation, not capacity. Recurrent
+        // (DeltaNet/conv) stripes always copy whole.
+        if (!L.rec && nTok && nTok < nCtx) {
+            size_t headBytes = L.ps1 / hKV;
+            size_t liveBytes = (size_t)nTok * dh * 4;
+            for (uint32_t h = 0; h < hKV; h++) {
+                size_t off = (size_t)h * headBytes;
+                if (save) {
+                    memcpy(snap + snapOff1[il] + off, s1 + off, liveBytes);
+                    memcpy(snap + snapOff2[il] + off, s2 + off, liveBytes);
+                } else {
+                    memcpy(s1 + off, snap + snapOff1[il] + off, liveBytes);
+                    memcpy(s2 + off, snap + snapOff2[il] + off, liveBytes);
+                }
+            }
+            continue;
+        }
         if (save) {
             memcpy(snap + snapOff1[il], s1, L.ps1);
             memcpy(snap + snapOff2[il], s2, L.ps2);
@@ -3230,15 +3249,15 @@ __attribute__((visibility("default"))) uint32_t qk_n_embd(const qk_engine* e) { 
 __attribute__((visibility("default")))
 uint32_t qk_state_n(const qk_engine* e) { return (uint32_t)e->pcache.size(); }
 
-int qk_state_save(qk_engine* e, uint32_t slot, uint32_t idx) {
+int qk_state_save(qk_engine* e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
     if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
-    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/true);
+    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/true, n_tok);
     return 0;
 }
 
-int qk_state_load(qk_engine* e, uint32_t slot, uint32_t idx) {
+int qk_state_load(qk_engine* e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
     if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
-    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/false);
+    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/false, n_tok);
     return 0;
 }
 
@@ -3717,8 +3736,8 @@ int main(int argc, char** argv) {
                     while (readAll(fd, &h, sizeof h) && h.op != 2) {
                         if (h.op == 3 || h.op == 4) {
                             // state save/load: idx rides in the n field; 4-byte status reply
-                            uint32_t rc = (uint32_t)(h.op == 3 ? qk_state_save(e, h.slot, h.n)
-                                                               : qk_state_load(e, h.slot, h.n));
+                            uint32_t rc = (uint32_t)(h.op == 3 ? qk_state_save(e, h.slot, h.n, h.topk)
+                                                               : qk_state_load(e, h.slot, h.n, h.topk));
                             if (!writeAll(fd, &rc, 4)) break;
                             continue;
                         }

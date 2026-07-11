@@ -116,8 +116,11 @@ int qk_stage_topk(qk_engine *e, uint32_t k, uint32_t *ids, float *vals);
  * unsplit engine the internal prefix cache uses the same entries and will
  * clobber them. Returns 0 on success, negative on bad args. */
 uint32_t qk_state_n(const qk_engine *e);
-int qk_state_save(qk_engine *e, uint32_t slot, uint32_t idx);
-int qk_state_load(qk_engine *e, uint32_t slot, uint32_t idx);
+/* n_tok: the snapshot live token count. Attention KV is copied only up to
+ * that many positions per kv-head (recurrent state always copies whole).
+ * 0 = full stripes. Pass the SAME n_tok on save and load. */
+int qk_state_save(qk_engine *e, uint32_t slot, uint32_t idx, uint32_t n_tok);
+int qk_state_load(qk_engine *e, uint32_t slot, uint32_t idx, uint32_t n_tok);
 
 #ifdef __cplusplus
 }
