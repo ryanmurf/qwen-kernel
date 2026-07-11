@@ -2265,7 +2265,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     auto fail = [&](const char* m) { if (err && errLen) snprintf(err, errLen, "%s", m); return false; };
     nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
     shareFork = getenv("QK_FORK") != nullptr;
-    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 32768 || chunkN < 1 || chunkN > 32)
+    if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
     initMtl(c, "libqk");
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
