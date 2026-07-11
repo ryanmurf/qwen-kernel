@@ -53,7 +53,7 @@ spec:
         - --chunk
         - "8"
         - --split-next
-        - 192.168.0.75:18100
+        - 192.168.0.127:18100
         env:
         - name: QK_LAYERS
           value: "0:22"

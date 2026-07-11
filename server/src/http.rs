@@ -17,7 +17,7 @@ use tokio::sync::{Semaphore, mpsc as tokio_mpsc};
 use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
-use crate::engine::{EngineHandle, FinishReason, Job, SlotEvent};
+use crate::engine::{EngineHandle, FinishReason, Job, Sampling, SlotEvent};
 use crate::template::{ChatMessage, ChatTemplate};
 use crate::tokenizer::Tokenizer;
 use crate::{Result, ServerError};
@@ -140,6 +140,9 @@ struct CompletionReq {
     stop: Vec<String>,
     #[serde(default)]
     return_tokens: bool,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -156,9 +159,10 @@ async fn completion(
 ) -> Result<Response> {
     require_json(&headers)?;
     let req: CompletionReq = parse_json(&body)?;
+    let sampling = resolve_sampling(req.temperature, req.top_p, req.seed);
     let generation = prepare_generation(&state, req.prompt, req.n_predict.or(req.max_tokens))?;
     if req.stream {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix, sampling)?;
         Ok(sse_response(stream_llama(
             state,
             rx,
@@ -168,7 +172,7 @@ async fn completion(
         ))
         .into_response())
     } else {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix, sampling)?;
         let completed = collect_generation(&state, rx, &req.stop).await?;
         Ok(Json(llama_completion_body(
             &state,
@@ -187,12 +191,13 @@ async fn openai_completion(
 ) -> Result<Response> {
     require_json(&headers)?;
     let req: CompletionReq = parse_json(&body)?;
+    let sampling = resolve_sampling(req.temperature, req.top_p, req.seed);
     let generation = prepare_generation(&state, req.prompt, req.n_predict.or(req.max_tokens))?;
     if req.stream {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix, sampling)?;
         Ok(sse_response(stream_openai_completion(state, rx, generation)).into_response())
     } else {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix, sampling)?;
         let completed = collect_generation(&state, rx, &req.stop).await?;
         let finish = if completed.finish == FinishKind::Limit {
             "length"
@@ -224,6 +229,9 @@ struct ChatReq {
     #[serde(default)]
     stop: Vec<String>,
     stream_options: Option<StreamOptions>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -258,6 +266,7 @@ async fn openai_chat_completion(
 ) -> Result<Response> {
     require_json(&headers)?;
     let req: ChatReq = parse_json(&body)?;
+    let sampling = resolve_sampling(req.temperature, req.top_p, req.seed);
     let messages = normalize_messages(req.messages)?;
     let prompt = state.chat_template.render(&messages, true)?;
     let generation = prepare_generation(
@@ -266,7 +275,7 @@ async fn openai_chat_completion(
         req.n_predict.or(req.max_tokens),
     )?;
     if req.stream {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix, sampling)?;
         let include_usage = req
             .stream_options
             .as_ref()
@@ -274,7 +283,7 @@ async fn openai_chat_completion(
             .unwrap_or(false);
         Ok(sse_response(stream_openai_chat(state, rx, generation, include_usage)).into_response())
     } else {
-        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix)?;
+        let rx = submit_generation(&state, &generation.prompt_ids, generation.max_gen, generation.snap_prefix, sampling)?;
         let completed = collect_generation(&state, rx, &req.stop).await?;
         let finish = if completed.finish == FinishKind::Limit {
             "length"
@@ -365,11 +374,56 @@ pub(crate) fn prepare_generation(
     })
 }
 
+/// Fold request-level sampling fields into a policy. Absent temperature
+/// falls back to QK_TEMP_DEFAULT (0 unless set — the historic greedy
+/// behavior); an explicit temperature always wins, so gates pin
+/// `"temperature": 0` regardless of deployment env. When sampling: `top_p`
+/// defaults to 0.95 (a sane nucleus when clients send only temperature),
+/// the seed comes from OS entropy unless pinned, and QK_TEMP_CAP (read
+/// once, like the default) lets ops clamp client-requested temperatures.
+pub(crate) fn resolve_sampling(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+) -> Sampling {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+    static ENV: OnceLock<(Option<f32>, f32)> = OnceLock::new();
+    let (cap, default_temp) = *ENV.get_or_init(|| {
+        let cap = std::env::var("QK_TEMP_CAP")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok());
+        let default_temp = std::env::var("QK_TEMP_DEFAULT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        (cap, default_temp)
+    });
+    let mut temp = temperature.unwrap_or(default_temp).max(0.0);
+    if let Some(cap) = cap {
+        temp = temp.min(cap);
+    }
+    if temp <= 0.0 {
+        return Sampling::GREEDY;
+    }
+    let seed = seed.unwrap_or_else(|| {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    });
+    Sampling {
+        temp,
+        top_p: top_p.unwrap_or(0.95).clamp(0.05, 1.0),
+        seed,
+    }
+}
+
 pub(crate) fn submit_generation(
     state: &AppState,
     prompt_ids: &[u32],
     max_gen: u32,
     snap_prefix: u32,
+    sampling: Sampling,
 ) -> Result<tokio_mpsc::Receiver<SlotEvent>> {
     let permit = state
         .queue
@@ -385,6 +439,7 @@ pub(crate) fn submit_generation(
             prompt_ids: prompt_ids.to_vec(),
             max_gen,
             snap_prefix,
+            sampling,
             events: tx,
             permit,
         })

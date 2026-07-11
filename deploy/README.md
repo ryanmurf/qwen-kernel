@@ -13,12 +13,19 @@ same endpoint — whichever pod is Ready receives traffic.
 - `qk-server`    — this repo's engine, `localhost:32000/qk-server:vulkan`
   (safe-Rust HTTP server over `libqk.so`; privileged + `/dev/dri`, model from
   the same `/models` hostPath)
+- `qk-server-split` — 35B split across tron (head, layers [0,22)) and
+  midnight's Metal pipe-worker on :18100 (see docs/split-serving.md)
+- `qk-server-split-80b` — Qwen3-Next-80B-A3B-Instruct (42.8 GB IQ4_XS-qk
+  repack, too big for one box) split across tron (head, layers [0,12), model
+  on the /mnt/data 4 TB volume) and midnight's worker on :18200
 
 ## Switch
 
 ```bash
-./deploy/switch.sh qk      # gemma-server -> 0, qk-server -> 1
-./deploy/switch.sh gemma   # qk-server -> 0, gemma-server -> 1
+./deploy/switch.sh qk      # single-box 35B (everything else -> 0)
+./deploy/switch.sh split   # 35B cross-box; worker prereq on midnight :18100
+./deploy/switch.sh split80 # 80B cross-box; worker prereq on midnight :18200
+./deploy/switch.sh gemma   # llama.cpp fallback
 ./deploy/switch.sh status
 ```
 

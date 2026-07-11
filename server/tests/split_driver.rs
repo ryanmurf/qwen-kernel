@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use server::engine::{EngineThread, FinishReason, Job, SlotEvent};
+use server::engine::{EngineThread, FinishReason, Job, Sampling, SlotEvent};
 use server::ffi::{Engine, QkConfig};
 use tokio::sync::{Semaphore, mpsc};
 
@@ -30,11 +30,12 @@ fn lcg(prev: u32) -> u32 {
     (prev.wrapping_mul(1_103_515_245).wrapping_add(12_345)) % 248_000
 }
 
-const PIPE_MAGIC: u32 = 0x716b_7032;
+const PIPE_MAGIC: u32 = 0x716b_7033;
 
-/// (op, slot, n_or_idx, base) of every frame the worker saw — the reuse test
-/// asserts turn 2 restores (op4) and prefills only its delta.
-type FrameLog = Arc<Mutex<Vec<(u32, u32, u32, u32)>>>;
+/// (op, slot, n_or_idx, base, topk) of every frame the worker saw — the reuse
+/// test asserts turn 2 restores (op4) and prefills only its delta; the
+/// sampling test asserts greedy frames never request candidates.
+type FrameLog = Arc<Mutex<Vec<(u32, u32, u32, u32, u32)>>>;
 
 /// Minimal `qk pipe-worker` in Rust: hello on connect, then op1 run frames /
 /// op3-op4 state frames until the peer disconnects or says op2.
@@ -60,13 +61,13 @@ fn serve_worker(mut engine: Engine, listener: TcpListener, hello_n_embd: u32, fr
 
 fn serve_conn(engine: &mut Engine, stream: &mut TcpStream, frames: &FrameLog) {
     loop {
-        let mut header = [0u8; 16];
+        let mut header = [0u8; 20];
         if stream.read_exact(&mut header).is_err() {
             return;
         }
         let word = |i: usize| u32::from_le_bytes(header[i * 4..i * 4 + 4].try_into().unwrap());
-        let (op, slot, n, base) = (word(0), word(1), word(2), word(3));
-        frames.lock().unwrap().push((op, slot, n, base));
+        let (op, slot, n, base, topk) = (word(0), word(1), word(2), word(3), word(4));
+        frames.lock().unwrap().push((op, slot, n, base, topk));
         match op {
             3 | 4 => {
                 let rc = if op == 3 {
@@ -93,9 +94,15 @@ fn serve_conn(engine: &mut Engine, stream: &mut TcpStream, frames: &FrameLog) {
                 engine
                     .stage_run(slot, None, Some(&hidden), base, None, Some(&mut ids))
                     .expect("worker stage_run");
-                let mut reply = Vec::with_capacity(n * 4);
+                let mut reply = Vec::with_capacity(n * 4 + topk as usize * 8);
                 for id in &ids {
                     reply.extend_from_slice(&id.to_le_bytes());
+                }
+                let last = *ids.last().unwrap();
+                for i in 0..topk {
+                    reply.extend_from_slice(&(last + i).to_le_bytes());
+                    let logit: f32 = if i < 4 { 5.0 } else { -20.0 };
+                    reply.extend_from_slice(&logit.to_le_bytes());
                 }
                 if stream.write_all(&reply).is_err() {
                     return;
@@ -130,6 +137,7 @@ fn run_job_snap(
             prompt_ids: prompt,
             max_gen,
             snap_prefix,
+            sampling: Sampling::GREEDY,
             events: tx,
             permit: sem.clone().try_acquire_owned().expect("permit"),
         })
@@ -232,7 +240,7 @@ fn split_driver_serves_the_serial_stream() {
         let f = frames.lock().unwrap();
         let turn1 = &f[mark..];
         assert!(
-            turn1.iter().any(|&(op, _, _, _)| op == 3),
+            turn1.iter().any(|&(op, _, _, _, _)| op == 3),
             "turn 1 must snapshot at the boundary: {turn1:?}"
         );
         // op1 frames must split exactly at the boundary (no re-fed tokens).
@@ -248,7 +256,7 @@ fn split_driver_serves_the_serial_stream() {
         let f = frames.lock().unwrap();
         let turn2 = &f[mark..];
         assert!(
-            turn2.iter().any(|&(op, _, _, _)| op == 4),
+            turn2.iter().any(|&(op, _, _, _, _)| op == 4),
             "turn 2 must restore the boundary snapshot: {turn2:?}"
         );
         // Prefill frames only (decode steps run at base >= |prompt|).
@@ -297,6 +305,7 @@ fn split_driver_serves_the_serial_stream() {
                 prompt_ids: prompt,
                 max_gen: 5,
                 snap_prefix: 0,
+                sampling: Sampling::GREEDY,
                 events: tx,
                 permit: sem.clone().try_acquire_owned().expect("permit"),
             })
@@ -318,6 +327,74 @@ fn split_driver_serves_the_serial_stream() {
             expect.push(prev);
         }
         assert_eq!(tokens, expect, "seed {seed}");
+    }
+
+    // ---- Sampling (the qkp3 topk path) ----
+    // Everything so far ran greedy: no op1 frame may have requested candidates.
+    {
+        let f = frames.lock().unwrap();
+        assert!(
+            f.iter().all(|fr| fr.0 != 1 || fr.4 == 0),
+            "greedy runs must never set topk"
+        );
+    }
+    // The mock offers 4 equal-logit candidates last..last+3 (rest at -20), so
+    // every sampled token sits within 4 of the greedy chain's pick, identical
+    // seeds replay identically, and distinct seeds diverge.
+    let sampled = |seed: u64| {
+        let (tx, mut rx) = mpsc::channel(64);
+        engine
+            .handle()
+            .submit(Job {
+                prompt_ids: vec![3, 9, 11],
+                max_gen: 8,
+                snap_prefix: 0,
+                sampling: Sampling {
+                    temp: 1.0,
+                    top_p: 1.0,
+                    seed,
+                },
+                events: tx,
+                permit: sem.clone().try_acquire_owned().expect("permit"),
+            })
+            .expect("submit");
+        let mut tokens = Vec::new();
+        loop {
+            match rx.blocking_recv().expect("events") {
+                SlotEvent::Tokens(t) => tokens.extend(t),
+                SlotEvent::Done { .. } => break,
+                SlotEvent::Error(e) => panic!("sampled job errored: {e}"),
+            }
+        }
+        tokens
+    };
+    let mark = frames.lock().unwrap().len();
+    let a1 = sampled(7);
+    let a2 = sampled(7);
+    let b = sampled(0xDEAD_BEEF);
+    assert_eq!(a1.len(), 8);
+    assert_eq!(a1, a2, "same seed must replay the same stream");
+    assert_ne!(a1, b, "different seeds must diverge (4-way tie each step)");
+    let mut prev = 11u32;
+    for &t in &a1 {
+        let g = lcg(prev);
+        assert!(
+            t.wrapping_sub(g) < 4,
+            "token {t} outside the candidate window of greedy {g}"
+        );
+        prev = t;
+    }
+    {
+        let f = frames.lock().unwrap();
+        let sf = &f[mark..];
+        assert!(
+            sf.iter().filter(|fr| fr.0 == 1 && fr.2 == 1).all(|fr| fr.4 > 0),
+            "sampled decode frames must request candidates: {sf:?}"
+        );
+        assert!(
+            sf.iter().any(|fr| fr.0 == 1 && fr.2 > 1 && fr.4 > 0),
+            "the final prefill frame must request candidates: {sf:?}"
+        );
     }
 
     engine.shutdown();

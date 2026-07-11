@@ -17,10 +17,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::engine::FinishReason;
+use crate::engine::{FinishReason, Sampling};
 use crate::http::{
     AppState, FinishKind, Generation, Prompt, StopDetector, collect_generation,
-    decode_tokens_lossless, parse_json, prepare_generation, require_json, submit_generation,
+    decode_tokens_lossless, parse_json, prepare_generation, require_json, resolve_sampling,
+    submit_generation,
 };
 use crate::{Result, ServerError};
 
@@ -62,6 +63,8 @@ pub struct MessagesReq {
     tools: Vec<ToolDef>,
     #[serde(default)]
     stop_sequences: Vec<String>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -718,6 +721,7 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
     let model = req.model.clone().unwrap_or_else(|| state.model_alias.clone());
     let prompt = fit_to_context(&state, &mut req)?;
     let specs = tool_specs(&req.tools);
+    let sampling = resolve_sampling(req.temperature, req.top_p, None);
     let mut generation = prepare_generation(&state, Prompt::Text(prompt.clone()), req.max_tokens)?;
     generation.snap_prefix = history_boundary(&state, &prompt);
     let rx = submit_generation(
@@ -725,6 +729,7 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
         &generation.prompt_ids,
         generation.max_gen,
         generation.snap_prefix,
+        sampling,
     )?;
     if req.stream {
         let job = StreamJob {
@@ -734,6 +739,7 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
             max_tokens: req.max_tokens,
             stops: req.stop_sequences,
             model,
+            sampling,
         };
         let stream = stream_messages(state, rx, job);
         return Ok(Sse::new(stream)
@@ -778,7 +784,7 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
                 prepare_generation(&state, Prompt::Text(next_prompt.clone()), req.max_tokens)
                     .and_then(|mut next| {
                         next.snap_prefix = history_boundary(&state, &next_prompt);
-                        submit_generation(&state, &next.prompt_ids, next.max_gen, next.snap_prefix)
+                        submit_generation(&state, &next.prompt_ids, next.max_gen, next.snap_prefix, sampling)
                     });
             if let Ok(next_rx) = resubmit {
                 tracing::warn!(
@@ -991,6 +997,7 @@ struct StreamJob {
     max_tokens: Option<u32>,
     stops: Vec<String>,
     model: String,
+    sampling: Sampling,
 }
 
 fn stream_messages(
@@ -1102,7 +1109,7 @@ fn stream_messages(
                     prepare_generation(&state, Prompt::Text(next_prompt.clone()), job.max_tokens)
                         .and_then(|mut next| {
                             next.snap_prefix = history_boundary(&state, &next_prompt);
-                            submit_generation(&state, &next.prompt_ids, next.max_gen, next.snap_prefix)
+                            submit_generation(&state, &next.prompt_ids, next.max_gen, next.snap_prefix, job.sampling)
                         });
                 match resubmit {
                     Ok(next_rx) => {
