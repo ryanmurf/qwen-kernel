@@ -267,3 +267,37 @@ Measured through the real split (in-cluster head, WiFi to midnight):
 - Determinism x2 exact; /v1/messages round trip clean (`end_turn`).
 - Steady decode ~30 tok/s single-stream (256-token run, prefill excluded);
   ~33 tok/s e2e on short runs.
+
+### Sampling (task #44, 2026-07-11)
+
+Greedy-only serving let the 80B lock into deterministic agentic tool loops
+(the eval's "1/7 persistent engine-stall": the same 43-Bash-call trajectory
+byte-identical on retry). Sampling now exists WITHOUT touching the engine's
+fused greedy path:
+
+- **Wire (qkp3, magic `0x716b7033`)**: the frame header grows a 5th word
+  `topk`. On an op1 frame to a LAST stage, the reply appends `topk`
+  (u32 id, f32 logit) pairs for the final position, descending. Greedy
+  requests send `topk=0` and are byte-identical to qkp2 behavior. Old/new
+  builds refuse each other at hello — rebuild the midnight worker when
+  bumping the head image.
+- **Sampler lives on the HEAD** (server/src/split.rs): softmax at `temp`
+  over the candidates, nucleus `top_p`, SplitMix64 per-request stream. The
+  sampled id feeds the next `stage_run`, so EOS/limit and snapshot
+  semantics are unchanged. The worker stays sampler-free —
+  `qk_stage_topk` (additive C ABI) just reads the final logit row.
+- **Policy** (`resolve_sampling`): explicit `temperature` always wins
+  (0 = greedy — how the token gates stay exact); absent temperature falls
+  back to `QK_TEMP_DEFAULT` (unset = 0 = the historic behavior);
+  `QK_TEMP_CAP` clamps explicit requests. split-80b deploys
+  `QK_TEMP_DEFAULT=0.7`, `QK_TEMP_CAP=0.8`, `top_p` default 0.95. Every
+  sampled request logs `[sample] slot= temp= top_p= seed=`; pin `seed` on
+  /completion to reproduce a run.
+- **Single-box path** stays greedy-only (the argmax→embed chain is fused
+  in the decode CBs); a sampled request there warns and serves greedy.
+
+Gate note: after midnight's chunked-DN rebuild the two known near-tie
+positions (ids1@35, ids2@41) flipped to the OTHER llama-top-2 candidate
+(gaps 0.031 / 0.081 — re-certified vs llama CPU n_probs 2026-07-11) and
+the expect files were re-baselined. Greedy gate: 4/4 exact at 40-43 tok/s
+e2e (the chunked-DN work also bought ~25% on short-run e2e).
