@@ -7,6 +7,9 @@
 // y[M] = W[M,K] · x[K], W in raw ggml IQ4_XS super-blocks (136 B per 256).
 // 4.25 bpw: 8 sub-blocks of 32 with 6-bit scales and a shared nonlinear
 // 16-value codebook (kvalues_iq4nl). One 32-element sub-block per work unit.
+// gl_WorkGroupID.z batches independent positions/slots (x stride K, y stride
+// M) — same contract as gemv_q8_0; batch prefill and multi-slot decode rely
+// on it.
 
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint TPR = 256u;
@@ -33,6 +36,8 @@ void main() {
     uint lane = tid % TPR;
     uint wg   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     uint row  = wg * (256u / TPR) + tid / TPR;
+    uint rq   = gl_WorkGroupID.z;
+    uint xo2  = rq * pc.K;
 
     float acc = 0.0;
     if (row < pc.M) {
@@ -55,8 +60,8 @@ void main() {
             float s1 = 0.0, s2 = 0.0;
             for (uint j = 0u; j < 16u; ++j) {
                 uint q = uint(wb[base + b].qs[qoff + j]);
-                s1 += float(kvalues_iq4nl[q & 0xFu]) * x[xoff + j];
-                s2 += float(kvalues_iq4nl[q >> 4u]) * x[xoff + 16u + j];
+                s1 += float(kvalues_iq4nl[q & 0xFu]) * x[xo2 + xoff + j];
+                s2 += float(kvalues_iq4nl[q >> 4u]) * x[xo2 + xoff + 16u + j];
             }
             acc += dl * (s1 + s2);
         }
@@ -68,5 +73,5 @@ void main() {
         if (lane < s) partial[tid] += partial[tid + s];
         barrier();
     }
-    if (lane == 0u && row < pc.M) y[row] = partial[tid];
+    if (lane == 0u && row < pc.M) y[rq * pc.M + row] = partial[tid];
 }

@@ -11,7 +11,9 @@ layout(std430, binding = 1) readonly  buffer BufGB { float gb[]; };    // [Tn][g
 layout(std430, binding = 2) writeonly buffer BufO  { float o[]; };     // [Tn][hV][dS]
 layout(std430, binding = 3)          buffer BufS  { vec4 s4[]; };      // slot state [hV][dS][dS/4]
 
-layout(push_constant) uniform PC { uint dState; uint hK; uint hV; uint Tn; } pc;
+// kDiv semantics as in dn_step.comp: 0 -> kh = h % hK (qwen35moe tiling),
+// else kh = h / kDiv (qwen3next consecutive pairs).
+layout(push_constant) uniform PC { uint dState; uint hK; uint hV; uint Tn; uint kDiv; } pc;
 
 shared vec4 qs4[64];
 shared vec4 ks4[64];
@@ -22,7 +24,7 @@ void main() {
     uint dS = pc.dState;
     uint nv = dS / 4u;
 
-    uint kh = h % pc.hK;
+    uint kh = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
     float qScale = inversesqrt(float(dS));
 
     // Seed each thread's state row from the slot buffer (0 for a fresh slot), so the
