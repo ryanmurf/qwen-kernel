@@ -29,12 +29,9 @@ const TOOL_CLOSE: &str = "</tool_call>";
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
-/// The generation scaffold `render_prompt` appends after the conversation (see
-/// its final `push_str`). It must stay byte-identical to that suffix.
-const GEN_CUE: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-
 /// Token offset of the conversation-history boundary — the prompt with the
-/// trailing [`GEN_CUE`] scaffold stripped. Snapshotting the KV there (rather
+/// trailing generation cue (`state.chat_template.gen_cue()`, the exact scaffold
+/// `render_prompt` appends) stripped. Snapshotting the KV there (rather
 /// than after the whole prompt) makes turn N's cache entry a genuine prefix of
 /// turn N+1, which appends the reply + next turn *after the same history*, so
 /// N+1 restores it and prefills only its delta. Returns 0 (disabled) when the
@@ -42,7 +39,7 @@ const GEN_CUE: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 /// which is always safe: matchPrefix verifies tokens before reusing, so an
 /// off/zero boundary only forgoes reuse, never corrupts output.
 fn history_boundary(state: &AppState, prompt: &str) -> u32 {
-    match prompt.strip_suffix(GEN_CUE) {
+    match prompt.strip_suffix(state.chat_template.gen_cue()) {
         Some(history) => state
             .tokenizer
             .tokenize(history, true)
@@ -203,7 +200,7 @@ fn infer_tool_name(input: &Value, tools: &[ToolSpec]) -> Option<String> {
 /// upstream Qwen chat template: tools advertised in the system turn inside
 /// `<tools>` tags, assistant tool calls as `<tool_call>` JSON, and tool
 /// results wrapped in `<tool_response>` inside a user turn.
-fn render_prompt(req: &MessagesReq) -> Result<String> {
+fn render_prompt(req: &MessagesReq, gen_cue: &str) -> Result<String> {
     let system = match &req.system {
         None => None,
         Some(SystemField::Text(text)) => Some(text.clone()),
@@ -289,7 +286,7 @@ fn render_prompt(req: &MessagesReq) -> Result<String> {
         }
     }
 
-    out.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    out.push_str(gen_cue);
     if prefill {
         let last = req.messages.last().expect("prefill checked non-empty");
         out.push_str(render_assistant_content(&last.content)?.trim_end());
@@ -369,7 +366,7 @@ fn fit_to_context(state: &AppState, req: &mut MessagesReq) -> Result<String> {
     let target = (n_ctx as f32 * 0.72) as u32;
     let mut trimming = false;
     loop {
-        let prompt = render_prompt(req)?;
+        let prompt = render_prompt(req, state.chat_template.gen_cue())?;
         let len = state.tokenizer.tokenize(&prompt, true)?.len() as u32;
         let limit = if trimming { target } else { hard };
         if len <= limit {
@@ -661,13 +658,13 @@ const MAX_TOOL_RETRIES: usize = 2;
 /// `<tool_response>` and reopen the assistant turn — the same shape as a real
 /// tool round-trip — so the agentic loop continues instead of the turn ending
 /// with the raw `<tool_call>` text.
-fn continuation_prompt(prompt: &str, generated: &str, error: &str) -> String {
+fn continuation_prompt(prompt: &str, generated: &str, error: &str, gen_cue: &str) -> String {
     format!(
         "{prompt}{generated}<|im_end|>\n<|im_start|>user\n<tool_response>\n\
          ERROR: your tool call was malformed and was NOT executed: {error}. \
          Re-emit the corrected tool call as a single JSON object with both fields, exactly:\n\
          <tool_call>\n{{\"name\": \"<function-name>\", \"arguments\": {{<args-json-object>}}}}\n</tool_call>\n\
-         </tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+         </tool_response><|im_end|>\n{gen_cue}"
     )
 }
 
@@ -771,7 +768,12 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
             && completed.finish == FinishKind::Eos
             && attempts < MAX_TOOL_RETRIES
         {
-            let next_prompt = continuation_prompt(&prompt_text, &completed.content, &error);
+            let next_prompt = continuation_prompt(
+                &prompt_text,
+                &completed.content,
+                &error,
+                state.chat_template.gen_cue(),
+            );
             let resubmit =
                 prepare_generation(&state, Prompt::Text(next_prompt.clone()), req.max_tokens)
                     .and_then(|mut next| {
@@ -1090,7 +1092,12 @@ fn stream_messages(
                 && attempts < MAX_TOOL_RETRIES
             {
                 let error = malformed[0].1.clone();
-                let next_prompt = continuation_prompt(&prompt_text, &raw_text, &error);
+                let next_prompt = continuation_prompt(
+                    &prompt_text,
+                    &raw_text,
+                    &error,
+                    state.chat_template.gen_cue(),
+                );
                 let resubmit =
                     prepare_generation(&state, Prompt::Text(next_prompt.clone()), job.max_tokens)
                         .and_then(|mut next| {
@@ -1158,7 +1165,7 @@ pub async fn count_tokens(
 fn handle_count_tokens(state: AppState, headers: HeaderMap, body: Bytes) -> Result<Response> {
     require_json(&headers)?;
     let req: MessagesReq = parse_json(&body)?;
-    let prompt = render_prompt(&req)?;
+    let prompt = render_prompt(&req, state.chat_template.gen_cue())?;
     let tokens = state.tokenizer.tokenize(&prompt, true)?;
     Ok(Json(json!({ "input_tokens": tokens.len() })).into_response())
 }
@@ -1166,6 +1173,7 @@ fn handle_count_tokens(state: AppState, headers: HeaderMap, body: Bytes) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template::{CUE_PLAIN, CUE_THINK};
 
     fn req_from_json(body: Value) -> MessagesReq {
         serde_json::from_value(body).expect("request parses")
@@ -1193,7 +1201,7 @@ mod tests {
                 ]}
             ]
         }));
-        let prompt = render_prompt(&req).expect("renders");
+        let prompt = render_prompt(&req, CUE_THINK).expect("renders");
         assert!(prompt.starts_with("<|im_start|>system\nBe brief.\n\n# Tools"));
         assert!(prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""));
         assert!(prompt.contains("\n</tools>\n\nFor each function call"));
@@ -1218,7 +1226,7 @@ mod tests {
                 { "role": "assistant", "content": "{\"color\":" }
             ]
         }));
-        let prompt = render_prompt(&req).expect("renders");
+        let prompt = render_prompt(&req, CUE_THINK).expect("renders");
         assert!(prompt.starts_with("<|im_start|>system\nYou are terse.<|im_end|>\n"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n{\"color\":"));
     }
@@ -1238,7 +1246,7 @@ mod tests {
                 { "role": "user", "content": "continue" }
             ]
         }));
-        let prompt = render_prompt(&req).expect("renders");
+        let prompt = render_prompt(&req, CUE_THINK).expect("renders");
         assert!(prompt.contains(
             "<|im_start|>system\n<system-reminder>stay on task</system-reminder><|im_end|>\n\
              <|im_start|>user\ncontinue<|im_end|>\n"
@@ -1253,12 +1261,12 @@ mod tests {
                 { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "" } }
             ]}]
         }));
-        assert!(render_prompt(&image).is_err());
+        assert!(render_prompt(&image, CUE_THINK).is_err());
         let role = req_from_json(json!({
             "max_tokens": 16,
             "messages": [{ "role": "tool", "content": "x" }]
         }));
-        assert!(render_prompt(&role).is_err());
+        assert!(render_prompt(&role, CUE_THINK).is_err());
     }
 
     fn collect(events: Vec<ParsedEvent>) -> Vec<(String, String)> {
@@ -1360,7 +1368,7 @@ mod tests {
                 ]}
             ]
         }));
-        let prompt = render_prompt(&req).expect("renders");
+        let prompt = render_prompt(&req, CUE_THINK).expect("renders");
         assert!(prompt.contains(
             "<|im_start|>assistant\n<tool_call>\n\
              {\"name\": \"Write\", \"arguments\": {\"file_path\": \"/tmp/x\", \"content\": \"hi\"}}\n\
@@ -1414,10 +1422,27 @@ mod tests {
             "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
             "<tool_call>\n{\"arguments\": {}}\n</tool_call>",
             "the JSON object is missing the required \"name\" field",
+            CUE_THINK,
         );
         assert!(prompt.contains("<tool_call>\n{\"arguments\": {}}\n</tool_call><|im_end|>\n"));
         assert!(prompt.contains("<tool_response>\nERROR: your tool call was malformed"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn plain_cue_renders_without_think_scaffold() {
+        // Qwen3-Next-Instruct shape: generation cue opens the assistant turn
+        // with no think block, for both fresh turns and tool-retry
+        // continuations.
+        let req = req_from_json(json!({
+            "messages": [{ "role": "user", "content": "hi" }]
+        }));
+        let prompt = render_prompt(&req, CUE_PLAIN).expect("renders");
+        assert!(prompt.ends_with("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"));
+        assert!(!prompt.contains("<think>"));
+        let cont = continuation_prompt(&prompt, "<tool_call>bad</tool_call>", "err", CUE_PLAIN);
+        assert!(cont.ends_with("</tool_response><|im_end|>\n<|im_start|>assistant\n"));
+        assert!(!cont.contains("<think>"));
     }
 
     #[test]
