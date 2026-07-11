@@ -1467,7 +1467,7 @@ static bool caseBlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) {
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
     struct { uint32_t ch; } pcConv{chQkv};
     struct { uint32_t d; float e; } pcQk{dS, eps};
-    struct { uint32_t d, hk, hv; } pcStep{dS, hK, hV};
+    struct { uint32_t d, hk, hv, kdiv; } pcStep{dS, hK, hV, 0};  // 35B harness: modulo tiling
     struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
     struct { uint32_t n; } pcAdd{nEmbd};
     struct { uint32_t a, b, cc, d; } pcv{moe.nEmbd, moe.nFf, moe.nExp, moe.nUsed};
@@ -1483,7 +1483,7 @@ static bool caseBlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) {
         barrier();
         dispatchB(pQk, sQk, 2 * hK, &pcQk, 8);
         barrier();
-        dispatchB(pStep, sStep, hV, &pcStep, 12);
+        dispatchB(pStep, sStep, hV, &pcStep, 16);
         barrier();
         dispatchB(pGate, sGate, hV, &pcGate, 12);
         barrier();
@@ -2450,7 +2450,7 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
         pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
     struct { uint32_t ch, d, qkch; float e; } pcConvN{chQkv, dS, 2 * hK * dS, eps};
-    struct { uint32_t d, hk, hv; } pcStep{dS, hK, hV};
+    struct { uint32_t d, hk, hv, kdiv; } pcStep{dS, hK, hV, 0};  // 35B harness: modulo tiling
     struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
     struct { uint32_t n; } pcAdd{nEmbd};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, 512, 256, 8};
@@ -2470,7 +2470,7 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
                 barrier();
                 dispatchB(pConvN, L.sConv, chQkv / dS, &pcConvN, 16);
                 barrier();
-                dispatchB(pStep, L.sStep, hV, &pcStep, 12);
+                dispatchB(pStep, L.sStep, hV, &pcStep, 16);
                 barrier();
                 dispatchB(pGate, L.sGate, hV, &pcGate, 12);
                 barrier();
@@ -2720,6 +2720,10 @@ struct qk_engine {
     // Qwen3-Next-80B (48/512/10); read from GGUF KVs / tensor shapes in open().
     // The tensor DIMS above are identical across both models by construction.
     uint32_t nLayer = 40, nExp = 256, nUsed = 8, ffE = 512;
+    // DeltaNet GQA broadcast: 0 -> v-head h reads k-head h % hK (qwen35moe
+    // ggml_repeat tiling); else h / dnKDiv (qwen3next consecutive pairs,
+    // dnKDiv = hV/hK). Feeds the dn_step kernels' kDiv push constant.
+    uint32_t dnKDiv = 0;
     bool guIq4 = false;   // routed gate/up experts are IQ4_XS (80B) vs IQ3_XXS (35B)
     bool embQ8 = false;   // token_embd is Q8_0 (80B repack) vs Q6_K (35B)
     float eps = 1e-6f;
@@ -3060,6 +3064,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     if (nLayer < 1 || nLayer > 256) return fail("qk_open: bad block_count");
     nUsed = (uint32_t)g.kvInt(arch + ".expert_used_count", nUsed);
     if (nUsed < 1 || nUsed > 16) return fail("qk_open: expert_used_count > 16 unsupported");
+    // qwen3next pairs v-heads consecutively with k-heads (k-head g serves
+    // v-heads 2g, 2g+1); qwen35moe tiles (h % hK). Verified against llama.cpp
+    // per-op dumps — the two archs genuinely differ here.
+    if (arch == "qwen3next") dnKDiv = hV / hK;
     eosTok = (uint32_t)g.kvInt("tokenizer.ggml.eos_token_id", eosTok);
     bosTok = (uint32_t)g.kvInt("tokenizer.ggml.bos_token_id", bosTok);
     lEnd = nLayer;  // full model by default (the member init used the pre-open default)
@@ -3548,7 +3556,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         pcWo{nEmbd, dIn}, pcHead{vocab, nEmbd};
     struct { uint32_t n, h; } pcAb{nEmbd, hV};
     struct { uint32_t ch, d, qkch; float e; } pcConvN{chQkv, dS, 2 * hK * dS, eps};
-    struct { uint32_t d, hk, hv; } pcStep{dS, hK, hV};
+    struct { uint32_t d, hk, hv, kdiv; } pcStep{dS, hK, hV, dnKDiv};
     struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
     struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; }
@@ -3579,7 +3587,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             barrier();
             disp(pConvN, L.sConv, chQkv / dS, &pcConvN, 16);
             barrier();
-            disp(pStep, L.sStep, hV, &pcStep, 12);
+            disp(pStep, L.sStep, hV, &pcStep, 16);
             barrier();
             disp(pGate, L.sGate, hV, &pcGate, 12);
             barrier();
@@ -3957,7 +3965,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     struct { uint32_t n, hv, Tn; } pcAbB{nEmbd, hV, n};
     struct { uint32_t channels, dState, qkCh; float e; uint32_t Tn; }
         pcConvB{chQkv, dS, 2 * hK * dS, eps, n};
-    struct { uint32_t dState, hK_, hV_, Tn; } pcStepB{dS, hK, hV, n};
+    struct { uint32_t dState, hK_, hV_, Tn, kDiv; } pcStepB{dS, hK, hV, n, dnKDiv};
     struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
     struct { uint32_t tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t base, Tn, qbase; }
@@ -3988,27 +3996,74 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         barrier();
         disp(pEmb, sbEmb, 1, &pcE, 12);
         barrier();
+        // QK_DUMP_X=<file>: read back the embedded residual rows (port-bisect
+        // tooling; compare against a reference dequant of token_embd rows).
+        if (const char* xf = getenv("QK_DUMP_X")) {
+            VkMemoryBarrier tb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            tb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            tb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb, 0, nullptr, 0,
+                                 nullptr);
+            VkBufferCopy cx{0, (VkDeviceSize)hidOutOff, (VkDeviceSize)n * nEmbd * 4};
+            vkCmdCopyBuffer(c.cb, bbXin.buf, stage.buf, 1, &cx);
+            flushCB();
+            if (FILE* f = fopen(xf, "wb")) {
+                fwrite((uint8_t*)stageMap + hidOutOff, 4, (size_t)n * nEmbd, f);
+                fclose(f);
+            }
+        }
     }
     disp(pRms, blayers[lFirst].sRms, 1, &pcRms, 8);
     barrier();
+    // QK_DUMP_TAPS=<dir>: per-op readbacks for the FIRST layer of this stage
+    // (port-bisect tooling; diff against llama.cpp eval-callback dumps).
+    const char* tapsDir = getenv("QK_DUMP_TAPS");
+    auto tap = [&](uint32_t il, const char* name, VkBuffer buf, size_t bytes) {
+        if (!tapsDir || il != lFirst) return;
+        VkMemoryBarrier tb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        tb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        tb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb, 0, nullptr, 0, nullptr);
+        const size_t off = 64u << 20;
+        VkBufferCopy cx{0, (VkDeviceSize)off, (VkDeviceSize)bytes};
+        vkCmdCopyBuffer(c.cb, buf, stage.buf, 1, &cx);
+        flushCB();
+        char pth[512];
+        snprintf(pth, sizeof pth, "%s/%s.bin", tapsDir, name);
+        if (FILE* f = fopen(pth, "wb")) {
+            fwrite((uint8_t*)stageMap + off, 1, bytes, f);
+            fclose(f);
+        }
+    };
     for (uint32_t il = lFirst; il < lEnd; il++) {
         Layer& L = layers[il];
         BLayer& BL = blayers[il];
         zdim = n;
         if (L.rec) {
+            tap(il, "xn", bbXn.buf, (size_t)n * nEmbd * 4);
             proj(BL.sP1, chQkv, nEmbd, false, L.iq4P1);
             proj(BL.sP2, dIn, nEmbd, false, L.iq4P2);
             disp(pAbB, BL.sAb, 2 * hV, &pcAbB, 12);
             barrier();
+            tap(il, "qkv", bbBig.buf, (size_t)n * chQkv * 4);
+            tap(il, "z", bbMid.buf, (size_t)n * dIn * 4);
+            tap(il, "gb", bbGb.buf, (size_t)n * 2 * hV * 4);
             disp(pConvB, BL.sConv, chQkv / dS, &pcConvB, 20);
             barrier();
+            tap(il, "conv", bbConvOut.buf, (size_t)n * chQkv * 4);
             zdim = 1;
-            disp(pStepB, BL.sStep, hV, &pcStepB, 16);
+            disp(pStepB, BL.sStep, hV, &pcStepB, 20);
             zdim = n;
             barrier();
+            tap(il, "step", bbO.buf, (size_t)n * hV * dS * 4);
             disp(pGateB, BL.sGate, hV, &pcGateB, 16);
             barrier();
+            tap(il, "gate", bbAtt.buf, (size_t)n * dIn * 4);
             proj(BL.sWo, nEmbd, dIn, true, L.iq4Wo);
+            barrier();
+            tap(il, "wo", bbAttnOut.buf, (size_t)n * nEmbd * 4);
         } else {
             proj(BL.sP1, chQkv, nEmbd, false, L.iq4P1);
             proj(BL.sP2, hKV * dh, nEmbd, false, L.iq4P2);
@@ -4982,6 +5037,18 @@ int main(int argc, char** argv) {
                 hin = hout;
             }
             if (net) {
+                // QK_PIPE_DUMP=<dir>: raw dump of every hidden frame shipped to
+                // the remote stage (port-bisect tooling; compare vs llama.cpp
+                // eval-callback l_out-<lastLocalLayer> dumps).
+                if (const char* df = getenv("QK_PIPE_DUMP")) {
+                    static int fi = 0;
+                    char pth[512];
+                    snprintf(pth, sizeof pth, "%s/frame%d_n%u_base%u.bin", df, fi++, n, base);
+                    if (FILE* dfp = fopen(pth, "wb")) {
+                        fwrite(hin, 4, (size_t)n * nEmbd, dfp);
+                        fclose(dfp);
+                    }
+                }
                 auto ta = std::chrono::steady_clock::now();
                 PipeHdr hd{1, 0, n, base};
                 if (!(writeAll(fd, &hd, sizeof hd) && writeAll(fd, hin, (size_t)n * nEmbd * 4) &&
@@ -4996,7 +5063,15 @@ int main(int argc, char** argv) {
         };
         std::vector<uint32_t> ids(np);
         auto t0 = std::chrono::steady_clock::now();
-        if (!runChain(prompt.data(), np, 0, ids.data())) return 1;
+        // QK_PIPE_SERIAL=1: feed the prompt one token per frame (n=1, the
+        // decode-shaped kernels) instead of one batched frame — port-bisect
+        // tool to separate batch-only kernel bugs from per-token ones.
+        if (getenv("QK_PIPE_SERIAL")) {
+            for (uint32_t i = 0; i < np; i++)
+                if (!runChain(&prompt[i], 1, i, ids.data() + i)) return 1;
+        } else if (!runChain(prompt.data(), np, 0, ids.data())) {
+            return 1;
+        }
         double prefillMs = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - t0).count();
         std::fill(stMs.begin(), stMs.end(), 0.0);  // report decode-only per-stage times
