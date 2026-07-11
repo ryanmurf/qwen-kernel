@@ -17,7 +17,7 @@ using namespace metal;
 // GQA: v-head h uses q/k head (h % hK). qkv layout: q [0, hK*dS), k
 // [hK*dS, 2*hK*dS), v [2*hK*dS, ...) — RAW projection values (pre-conv).
 
-struct StepPC { uint dState; uint hK; uint hV; float eps; };
+struct StepPC { uint dState; uint hK; uint hV; float eps; uint kDiv; };
 
 kernel void dn_step(device const float* qkv    [[buffer(0)]],
                     device float*       convSt [[buffer(1)]],
@@ -40,7 +40,9 @@ kernel void dn_step(device const float* qkv    [[buffer(0)]],
     const uint nv = dS / 4u;
     const float eps = pc.eps;
 
-    const uint kh    = h % pc.hK;
+    // kDiv == 0: v-head h uses q/k head h % hK (qwen35moe modulo tiling).
+    // kDiv != 0: consecutive pairing h / kDiv (qwen3next: kDiv = hV/hK = 2).
+    const uint kh    = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
     const uint chQkv = (2u * pc.hK + pc.hV) * dS;
     const uint qo    = rq * chQkv;
 
