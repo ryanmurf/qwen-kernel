@@ -99,10 +99,12 @@ uint32_t qk_n_embd(const qk_engine *e)      { (void)e; return QK_NEMBD; }
  * fed token alone), so save/load only validate bounds — enough to test the
  * driver's snapshot choreography. 3 entries, like the engine's default. */
 uint32_t qk_state_n(const qk_engine *e) { (void)e; return 3; }
-int qk_state_save(qk_engine *e, uint32_t slot, uint32_t idx) {
+int qk_state_save(qk_engine *e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
+    (void)n_tok;
     return (!e || slot >= e->cfg.n_slots || idx >= 3) ? -1 : 0;
 }
-int qk_state_load(qk_engine *e, uint32_t slot, uint32_t idx) {
+int qk_state_load(qk_engine *e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
+    (void)n_tok;
     return (!e || slot >= e->cfg.n_slots || idx >= 3) ? -1 : 0;
 }
 

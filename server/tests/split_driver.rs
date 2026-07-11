@@ -70,10 +70,13 @@ fn serve_conn(engine: &mut Engine, stream: &mut TcpStream, frames: &FrameLog) {
         frames.lock().unwrap().push((op, slot, n, base, topk));
         match op {
             3 | 4 => {
+                // Word 5 (reused topk field) carries the snapshot's live
+                // token count; the stub's state is tiny so it just forwards.
+                let n_tok = word(4);
                 let rc = if op == 3 {
-                    engine.state_save(slot, n)
+                    engine.state_save(slot, n, n_tok)
                 } else {
-                    engine.state_load(slot, n)
+                    engine.state_load(slot, n, n_tok)
                 };
                 let status = u32::from(rc.is_err());
                 if stream.write_all(&status.to_le_bytes()).is_err() {

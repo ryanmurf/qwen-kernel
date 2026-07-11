@@ -61,7 +61,7 @@ spec:
         - --slots
         - "2"
         - --ctx
-        - "65536"
+        - "49152"
         - --chunk
         - "8"
         - --split-next
@@ -70,11 +70,11 @@ spec:
         - name: QK_LAYERS
           value: "0:12"
         # Snapshot ENTRY COUNT for split cross-turn reuse (qk_state_n). Each
-        # entry is a host snapshot of this stage's state (~0.8 GiB at ctx
-        # 65536: 3 attn layers + DN share). The midnight worker runs the
-        # engine default (3); the counts must stay equal on both sides.
+        # entry is a host snapshot bounded to its LIVE token count (worst case ~0.6 GiB at ctx
+        # 49152: 3 attn layers + DN share; typical agent turns are far less).
+        # The midnight worker is launched with the SAME count (QK_PCACHE=4).
         - name: QK_PCACHE
-          value: "3"
+          value: "4"
         - name: QK_PCACHE_LOG
           value: "1"
         - name: QK_STATS_FILE

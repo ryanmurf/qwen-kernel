@@ -36,7 +36,7 @@ type QkStageRun = unsafe extern "C" fn(
     *mut u32,   // ids_out (last stage) or NULL
 ) -> c_int;
 
-type QkStateOp = unsafe extern "C" fn(*mut QkEngineOpaque, u32, u32) -> c_int;
+type QkStateOp = unsafe extern "C" fn(*mut QkEngineOpaque, u32, u32, u32) -> c_int;
 
 /// Pipeline-split ABI (engine ≥ 240c63e). Resolved as a group; `None` on
 /// older engine libraries, which still serve unsplit.
@@ -330,17 +330,19 @@ impl Engine {
             .map_or(0, |s| unsafe { (s.n)(self.raw) })
     }
 
-    pub fn state_save(&mut self, slot: u32, idx: u32) -> Result<()> {
+    /// `n_tok` bounds the attention-KV copy to the snapshot's live length
+    /// (0 = full stripes); pass the same value on save and load.
+    pub fn state_save(&mut self, slot: u32, idx: u32, n_tok: u32) -> Result<()> {
         let s = self.syms.state.as_ref().context("no snapshot ABI")?;
-        if unsafe { (s.save)(self.raw, slot, idx) } < 0 {
+        if unsafe { (s.save)(self.raw, slot, idx, n_tok) } < 0 {
             bail!("qk_state_save({slot}, {idx}) failed");
         }
         Ok(())
     }
 
-    pub fn state_load(&mut self, slot: u32, idx: u32) -> Result<()> {
+    pub fn state_load(&mut self, slot: u32, idx: u32, n_tok: u32) -> Result<()> {
         let s = self.syms.state.as_ref().context("no snapshot ABI")?;
-        if unsafe { (s.load)(self.raw, slot, idx) } < 0 {
+        if unsafe { (s.load)(self.raw, slot, idx, n_tok) } < 0 {
             bail!("qk_state_load({slot}, {idx}) failed");
         }
         Ok(())

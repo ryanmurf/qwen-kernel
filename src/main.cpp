@@ -2895,7 +2895,7 @@ struct qk_engine {
     void snapshotSlot(uint32_t slot);           // save slot state -> LRU cache entry
     int matchPrefix(const uint32_t* prompt, uint32_t n);  // longest cached prefix, or -1
     void restoreInto(uint32_t slot, int cacheIdx);        // cache entry -> slot state
-    void copyStripes(uint32_t slot, VkBuffer snapBuf, bool save);  // stripes <-> snapshot
+    void copyStripes(uint32_t slot, VkBuffer snapBuf, bool save, uint32_t nTok = 0);  // stripes <-> snapshot (nTok bounds KV rows)
     ~qk_engine();
 };
 
@@ -2948,13 +2948,38 @@ void qk_engine::resetSlot(uint32_t slot) {
 
 // Copy every layer's per-slot state stripe between the slot and a snapshot
 // buffer (save=true: slot -> snapshot; save=false: snapshot -> slot).
-void qk_engine::copyStripes(uint32_t slot, VkBuffer snapBuf, bool save) {
+void qk_engine::copyStripes(uint32_t slot, VkBuffer snapBuf, bool save, uint32_t nTok) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
         if (!L.st1) continue;  // layer not owned by this pipeline stage
+        // Attention KV stripes are [hKV][tmax][dh]: with a live token count,
+        // copy only each kv-head's first nTok rows — snapshots then touch
+        // (and keep resident) pages proportional to the conversation, not to
+        // capacity. Offsets stay capacity-strided so save/restore layouts
+        // match regardless of nTok; positions >= nTok are never read.
+        // Recurrent (DeltaNet/conv) stripes are position-independent state
+        // and always copy whole.
+        if (!L.rec && nTok && nTok < nCtx) {
+            VkDeviceSize headBytes = L.ps1 / hKV;
+            VkDeviceSize liveBytes = (VkDeviceSize)nTok * dh * 4;
+            VkBufferCopy cp1[8], cp2[8];
+            for (uint32_t h = 0; h < hKV; h++) {
+                VkDeviceSize off = (VkDeviceSize)h * headBytes;
+                if (save) {
+                    cp1[h] = {(VkDeviceSize)slot * L.ps1 + off, snapOff1[il] + off, liveBytes};
+                    cp2[h] = {(VkDeviceSize)slot * L.ps2 + off, snapOff2[il] + off, liveBytes};
+                } else {
+                    cp1[h] = {snapOff1[il] + off, (VkDeviceSize)slot * L.ps1 + off, liveBytes};
+                    cp2[h] = {snapOff2[il] + off, (VkDeviceSize)slot * L.ps2 + off, liveBytes};
+                }
+            }
+            vkCmdCopyBuffer(c.cb, save ? L.st1 : snapBuf, save ? snapBuf : L.st1, hKV, cp1);
+            vkCmdCopyBuffer(c.cb, save ? L.st2 : snapBuf, save ? snapBuf : L.st2, hKV, cp2);
+            continue;
+        }
         VkBufferCopy a, b;
         if (save) {
             a = {(VkDeviceSize)slot * L.ps1, snapOff1[il], L.ps1};
@@ -4315,16 +4340,16 @@ __attribute__((visibility("default")))
 uint32_t qk_state_n(const qk_engine* e) { return (uint32_t)e->pcache.size(); }
 
 __attribute__((visibility("default")))
-int qk_state_save(qk_engine* e, uint32_t slot, uint32_t idx) {
+int qk_state_save(qk_engine* e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
     if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
-    e->copyStripes(slot, e->pcache[idx].snap.buf, /*save=*/true);
+    e->copyStripes(slot, e->pcache[idx].snap.buf, /*save=*/true, n_tok);
     return 0;
 }
 
 __attribute__((visibility("default")))
-int qk_state_load(qk_engine* e, uint32_t slot, uint32_t idx) {
+int qk_state_load(qk_engine* e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
     if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
-    e->copyStripes(slot, e->pcache[idx].snap.buf, /*save=*/false);
+    e->copyStripes(slot, e->pcache[idx].snap.buf, /*save=*/false, n_tok);
     return 0;
 }
 
@@ -4950,9 +4975,10 @@ int main(int argc, char** argv) {
                 PipeHdr h;
                 while (readAll(fd, &h, sizeof h) && h.op != 2) {
                     if (h.op == 3 || h.op == 4) {
-                        // state save/load: idx rides in the n field; 4-byte status reply
-                        uint32_t rc = (uint32_t)(h.op == 3 ? qk_state_save(e, h.slot, h.n)
-                                                           : qk_state_load(e, h.slot, h.n));
+                        // state save/load: idx rides in the n field, live token
+                        // count in the topk word (0 = full stripe); 4-byte status
+                        uint32_t rc = (uint32_t)(h.op == 3 ? qk_state_save(e, h.slot, h.n, h.topk)
+                                                           : qk_state_load(e, h.slot, h.n, h.topk));
                         if (!writeAll(fd, &rc, 4)) break;
                         continue;
                     }
