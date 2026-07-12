@@ -201,6 +201,29 @@ fast::exp2 + log2e-folded scale, per-KV-block causal skip-mask,
 simdgroup_barrier(mem_none) scheduling, nsg sweep) and prod promotion
 (rebuild build/ + worker relaunch + tron gates).
 
+**Thermal-robust confirmation (same-day, warm/soaked state):** the 1468 figure
+was cool-state. Re-measured llama.cpp pp512 in the CURRENT soaked state (in-tree
+llama-bench -r5) = 1419.8 +/- 9.5 tok/s -- llama ALSO droops under sustained
+soak (its 1452 was cool; PORT.md M0's "thermally flat" held only across 2 runs,
+not a long soak). Same warm state, back-to-back: qk-MMA 356.6-357.5 ms =
+1432-1436 tok/s vs llama 1419.8 (360.6 ms). So qk wins **1.010x warm** and
+1.011x cool -- the prefill lead is THERMALLY ROBUST, ~1% both states, not a
+cool-state artifact. (Earlier scare of "qk 357 < llama 1452" was apples/oranges:
+qk-warm vs llama-cool.)
+
+**codex gpt-5.6-sol squeeze pass (perf-neutral, kept):** handed the kernel to a
+Codex agent for a squeeze. Its managed shell had no Metal device (GPU-denied),
+so it flew blind and applied only provably-safe transforms: softmax to log2
+space with fast::exp2 (log2e folded into qs), and per-KV-block causal skip
+(fully-causal blocks bypass the per-element mask). Verified here: scalar-proj
+prefillcmp 36/36 @ rel 7.9e-7 (tighter), prefilldecode HANDOFF EXACT, base>0
+serve-test EXACT. Interleaved A/B (shader hot-swap via QK_SHADER_DIR) vs the
+pre-squeeze kernel: identical within 0.5 ms -- a WASH. The 13 ms attn is
+MMA/bandwidth-bound, not exp/mask-bound, so those levers don't move it; the
+real remaining lever is tile/nsg geometry + register-vs-tgmem O, which needs
+on-GPU measurement (codex couldn't). Kept the change anyway (correct + the
+idiomatic exp2 path).
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
