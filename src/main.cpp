@@ -8,7 +8,9 @@
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
 //   qk list [filter]          list tensors in the GGUF
 //
-// Env: QK_DEVICE=<n> device index; QK_SHADER_DIR; QK_GGUF=<path>.
+// Env: QK_DEVICE=<n> device index; QK_DEVICE_PCI=<bdf> (e.g. 1a:00.0, wins
+//      over QK_DEVICE — enumeration order flips across boots, BDF doesn't);
+//      QK_SHADER_DIR; QK_GGUF=<path>.
 
 #include <vulkan/vulkan.h>
 
@@ -129,6 +131,27 @@ static void destroyBuf(VkCtx& c, Buf& b) {
     b = Buf{};
 }
 
+// BDF ("0000:1a:00.0") of a physical device via VK_EXT_pci_bus_info; ""
+// when the driver doesn't expose it (lavapipe).
+static std::string pciBdf(VkPhysicalDevice d) {
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(d, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> ext(n);
+    vkEnumerateDeviceExtensionProperties(d, nullptr, &n, ext.data());
+    bool has = false;
+    for (const auto& e : ext)
+        if (!strcmp(e.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME)) { has = true; break; }
+    if (!has) return {};
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &pci;
+    vkGetPhysicalDeviceProperties2(d, &p2);
+    char buf[32];
+    snprintf(buf, sizeof buf, "%04x:%02x:%02x.%x",
+             pci.pciDomain, pci.pciBus, pci.pciDevice, pci.pciFunction);
+    return buf;
+}
+
 static void initVk(VkCtx& c, const char* argv0) {
     c.argv0 = argv0;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -146,19 +169,45 @@ static void initVk(VkCtx& c, const char* argv0) {
     }
     std::vector<VkPhysicalDevice> devs(ndev);
     VK_CHECK(vkEnumeratePhysicalDevices(c.inst, &ndev, devs.data()));
+    const char* wantPci = getenv("QK_DEVICE_PCI"); // BDF suffix, "1a:00.0" ok
     int pick = -1;
+    std::string pickBdf;
     for (uint32_t i = 0; i < ndev; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(devs[i], &p);
-        if (pick < 0 && p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+        VkPhysicalDeviceMemoryProperties m;
+        vkGetPhysicalDeviceMemoryProperties(devs[i], &m);
+        VkDeviceSize vram = 0;
+        for (uint32_t h = 0; h < m.memoryHeapCount; h++)
+            if (m.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                vram = std::max(vram, m.memoryHeaps[h].size);
+        std::string bdf = pciBdf(devs[i]);
+        bool discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        fprintf(stderr, "vk device %u: %s [%s] vram=%zu MiB%s\n", i, p.deviceName,
+                bdf.empty() ? "?" : bdf.c_str(), (size_t)(vram >> 20),
+                discrete ? "" : " (not discrete)");
+        if (wantPci && !bdf.empty() && bdf.size() >= strlen(wantPci) &&
+            bdf.compare(bdf.size() - strlen(wantPci), strlen(wantPci), wantPci) == 0)
             pick = (int)i;
+        if (!wantPci && pick < 0 && discrete) pick = (int)i;
     }
-    if (const char* e = getenv("QK_DEVICE")) pick = atoi(e);
+    if (wantPci && pick < 0) {
+        fprintf(stderr, "QK_DEVICE_PCI=%s matched no device\n", wantPci);
+        exit(1);
+    }
+    if (!wantPci)
+        if (const char* e = getenv("QK_DEVICE")) pick = atoi(e);
     if (pick < 0) pick = 0;
+    if (pick >= (int)ndev) {
+        fprintf(stderr, "QK_DEVICE=%d out of range (%u devices)\n", pick, ndev);
+        exit(1);
+    }
     c.phys = devs[pick];
     vkGetPhysicalDeviceProperties(c.phys, &c.props);
     vkGetPhysicalDeviceMemoryProperties(c.phys, &c.mp);
-    printf("device: %s\n", c.props.deviceName);
+    pickBdf = pciBdf(c.phys);
+    printf("device: %s [%s]\n", c.props.deviceName,
+           pickBdf.empty() ? "?" : pickBdf.c_str());
 
     // 8/16-bit storage + int8/fp16 arithmetic for raw ggml block access
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
