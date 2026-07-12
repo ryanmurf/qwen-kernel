@@ -2101,7 +2101,7 @@ struct qk_engine {
 
     id<MTLComputePipelineState> pGemvA, pGemvO, pAb, pStep, pPrep, pAttn, pMoeS,
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pAm1, pAm2, pEmb,
-        pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
+        pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemmB4, pMoeGu4, pMoeGuG4i, pMoeGuG5i;
     // chunked delta rule (prefill DN): parallel kq/solve + chunk-serial step
@@ -2464,6 +2464,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pEmb   = getPipe(c, embQ8 ? "embed_q8_0" : "embed_q6k", embQ8 ? "embed_q8_0" : "embed_q6k", 0);
     pPrepB = getPipe(c, "fa_batch", "fa_prep_batch", 0);
     pAttnB = getPipe(c, "fa_batch", "fa_attn_batch", 0);
+    pAttnBM = getPipe(c, "fa_batch", "fa_attn_batch_mma", 0);
     pAbB   = getPipe(c, "dn_batch", "dn_ab_batch", nsg);
     pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
     pStepB = getPipe(c, "dn_batch", "dn_step_batch", 0);
@@ -2911,6 +2912,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     const bool skAttn = skip && strstr(skip, "attn");
     const bool skGu   = skip && strstr(skip, "gu");
     const bool skDown = skip && strstr(skip, "down");
+    static const bool faMma = getenv("QK_FA_MMA") != nullptr;  // MMA prefill attn
     if (wantLogits) logits.resize(vocab);
     if (base == 0) resetSlot(slot);
     // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
@@ -3025,8 +3027,12 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 dspz(pPrepB, {bbBig, bbKin, bbVin, L.qn, L.kn, bbMid, WB{L.st1, so1},
                               WB{L.st2, so2}, bRope}, &pcFaB, 40, hQ + 2 * hKV, 256, n);
                 bar();
-                dspz(pAttnB, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
-                     &pcFaB, 40, hQ, 256, n);
+                if (faMma)
+                    dspz(pAttnBM, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
+                         &pcFaB, 40, hQ, 256, (n + 15) / 16);   // QTM=16 queries/tile
+                else
+                    dspz(pAttnB, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
+                         &pcFaB, 40, hQ, 256, n);
                 bar();
                 }
                 proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);

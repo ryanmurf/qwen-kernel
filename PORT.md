@@ -166,6 +166,41 @@ consistent first-person dialogue (was context-drifty before the fix).
   80B section is closed. :18200 is prod-standing now (same as :18100);
   runbook docs/split-serving.md (tron 414bee7). Task #43 closed.
 
+## 2026-07-12 -- pp512 BEATS llama.cpp: flash-attention MMA (1468 vs 1452)
+
+The last un-flipped scorecard axis. Prefill was 0.96x llama (1399 vs 1452);
+everything else already wins (decode 1.42x, aggregate 1.31x, RSS 318 MB vs
+17 GB). Stage isolation at N=512 (v5 record config, thermal-stable full=366.0
++/-0.3 ms): gu 124 / down 79 / dn 78 / proj 70 / attn 31 ms. gu/down/proj are
+mature (llama-parity packed kernels); attn was the one stage far above its flop
+model (~7x) -- fa_attn_batch was NAIVE (scalar per-thread dh=256 dot, one
+threadgroup per (head,query), full K/V re-read per query, no MMA).
+
+**fa_attn_batch_mma** (shaders/metal/fa_batch.metal): tiled online
+flash-attention. Grid (hQ, 1, ceil(Tn/16)); QTM=16 queries/tile, KBM=64-key
+blocks, 8 simdgroups. S=Q K^T and O=P V via simdgroup_float8x8 MMA (K^T via
+transpose-load, same pattern as dn_chunk_kq); O accumulator + online-softmax
+state in threadgroup memory (dh=256 too fat for a register-resident O -- this
+matches llama.cpp's own dk256 kernel choice); causal mask, GQA 16:2, sigmoid
+output gate fused in the epilogue. Key-tiles fully past the causal bound are
+skipped (P=0). Same buffers/signature as the scalar kernel; opt-in via
+QK_FA_MMA=1 (engine dispatch picks pAttnBM with the tiled grid).
+
+Numbers (N=512, QK_MOE_GROUPED=5, QK_MLOCK, lap-thermal, interleaved A/B):
+attn 30.2 -> 13.2 ms (-56%); pp512 365.9/366.1 -> 348.5/348.9 ms =
+1399 -> 1468/1469 tok/s. llama.cpp 1452 (llama-bench -r5, same box/GGUF):
+qk 1468 = 1.011x -- prefill flipped to a WIN, the +17 ms clearing the ~7 ms
+run-to-run noise band. Gates (all green): scalar-proj prefillcmp 36/36 @ rel
+1e-6 (f32-exact vs serial -- the MMA attn adds only fp-order noise);
+default-hp prefillcmp 35/36 (sole miss = documented N=48 seed=42 near-tie,
+dice at the f16 floor -- scalar batched flips the same die); prefilldecode
+HANDOFF EXACT; base>0 multi-chunk (ids4 1040 tok, 3 chunks via serve-test)
+MMA == scalar batched EXACT. Still opt-in pending a squeeze pass (13 ms leaves
+headroom vs the ~86% ALU-util ceiling; llama.cpp levers not yet applied:
+fast::exp2 + log2e-folded scale, per-KV-block causal skip-mask,
+simdgroup_barrier(mem_none) scheduling, nsg sweep) and prod promotion
+(rebuild build/ + worker relaunch + tron gates).
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
