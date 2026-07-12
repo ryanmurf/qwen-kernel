@@ -157,3 +157,138 @@ kernel void fa_attn_batch(device const float* qhat  [[buffer(0)]],
         att[qho + h * dh + t] = o * (1.0f / (1.0f + exp(-g)));
     }
 }
+
+// -------- MMA flash attention (batched prefill) --------------------------
+// Replaces fa_attn_batch's scalar per-thread dots with simdgroup 8x8 MMA and
+// query tiling. One threadgroup = one head x a tile of QTM=16 queries; NSGM=8
+// simdgroups (256 threads). Online softmax streamed over KBM=64-key blocks.
+//   S = Q K^T   (MMA, K^T via transpose-load)  -> masked/scaled -> P
+//   O += P V    (MMA)                           with online rescale of O
+// O accumulator + softmax state live in threadgroup memory (dh=256 is too fat
+// for a register-resident accumulator); tiles are packed dense row-major so
+// simdgroup_load strides are contiguous. Same buffers/signature as
+// fa_attn_batch (qhat, kc, vc, qfull, att); grid (hQ, 1, ceil(Tn/QTM)).
+constant uint QTM = 16u;   // queries per tile (2 MMA row tiles)
+constant uint KBM = 64u;   // key block (8 MMA col tiles)
+constant uint NSGM = 8u;   // simdgroups per threadgroup (256 threads)
+
+kernel void fa_attn_batch_mma(device const float* qhat  [[buffer(0)]],
+                              device const float* kc    [[buffer(1)]],
+                              device const float* vc    [[buffer(2)]],
+                              device const float* qfull [[buffer(3)]],
+                              device float*       att   [[buffer(4)]],
+                              constant FaBPC&     pc    [[buffer(5)]],
+                              uint3 tid3  [[thread_position_in_threadgroup]],
+                              uint  sgid  [[simdgroup_index_in_threadgroup]],
+                              uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    const uint h   = tgpig.x;              // query head
+    const uint qt  = tgpig.z;              // query tile
+    const uint dh  = pc.dh;                // 256
+    const uint hQ  = pc.hQ;
+    const uint tmax = pc.tmax;
+    const uint kv  = h / (hQ / pc.hKV);    // GQA: KV head
+    const uint tid = tid3.x;               // 0..255
+    const uint nDT = dh / 8u;              // dim tiles (32)
+    const uint qstart = qt * QTM;
+    if (qstart >= pc.Tn) return;
+    const float qs = rsqrt(float(dh));
+
+    threadgroup float Otg[QTM * 256];      // [QTM][dh] accumulator
+    threadgroup float Stg[QTM * KBM];      // [QTM][KBM] scores then probs
+    threadgroup float mrow[QTM], lrow[QTM], corrTg[QTM];
+
+    for (uint i = tid; i < QTM * dh; i += 256u) Otg[i] = 0.0f;
+    if (tid < QTM) { mrow[tid] = -3.4e38f; lrow[tid] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // causal key bound: last query in tile is min(qstart+QTM,Tn)-1
+    const uint lastq = min(qstart + QTM, pc.Tn) - 1u;
+    const uint nk = pc.base + lastq + 1u;  // attend keys 0..base+lastq
+
+    for (uint p0 = 0u; p0 < nk; p0 += KBM) {
+        // ---- Phase A: raw S = Q K^T into Stg (per 8x8 tile) ----
+        for (uint tix = sgid; tix < (QTM / 8u) * (KBM / 8u); tix += NSGM) {
+            const uint rt = tix / (KBM / 8u);      // 0..1
+            const uint ct = tix % (KBM / 8u);      // 0..7
+            if (p0 + ct * 8u >= nk) continue;      // whole key-tile masked
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint dt = 0u; dt < nDT; ++dt) {
+                simdgroup_float8x8 qf, kf;
+                simdgroup_load(qf, qhat + (ulong)(qstart + rt * 8u) * hQ * dh +
+                                        (ulong)h * dh + dt * 8u, hQ * dh);
+                simdgroup_load(kf, kc + (ulong)(kv * tmax + p0 + ct * 8u) * dh +
+                                      dt * 8u, dh, ulong2(0, 0), true);   // K^T
+                simdgroup_multiply_accumulate(acc, qf, kf, acc);
+            }
+            simdgroup_store(acc, Stg + (rt * 8u) * KBM + ct * 8u, KBM);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Phase B1: per-row mask/scale/softmax update, exp -> P ----
+        if (tid < QTM) {
+            const uint r = tid;
+            const uint qidx = qstart + r;
+            if (qidx < pc.Tn) {
+                const uint qpos = pc.base + qidx;
+                const uint kcount = min(KBM, nk - p0);
+                float bmax = -3.4e38f;
+                for (uint k = 0u; k < kcount; ++k) {
+                    const uint kpos = p0 + k;
+                    const float s = (kpos <= qpos) ? Stg[r * KBM + k] * qs : -3.4e38f;
+                    Stg[r * KBM + k] = s;
+                    bmax = max(bmax, s);
+                }
+                const float oldm = mrow[r];
+                const float newm = max(oldm, bmax);
+                const float corr = exp(oldm - newm);
+                float rsum = 0.0f;
+                for (uint k = 0u; k < kcount; ++k) {
+                    const float p = exp(Stg[r * KBM + k] - newm);
+                    Stg[r * KBM + k] = p;
+                    rsum += p;
+                }
+                for (uint k = kcount; k < KBM; ++k) Stg[r * KBM + k] = 0.0f;
+                mrow[r] = newm;
+                lrow[r] = lrow[r] * corr + rsum;
+                corrTg[r] = corr;
+            } else {
+                for (uint k = 0u; k < KBM; ++k) Stg[r * KBM + k] = 0.0f;
+                corrTg[r] = 1.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Phase B2: rescale O by corr (online softmax) ----
+        for (uint i = tid; i < QTM * dh; i += 256u) Otg[i] *= corrTg[i / dh];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Phase C: O += P V (per 8x8 O-tile) ----
+        for (uint tix = sgid; tix < (QTM / 8u) * nDT; tix += NSGM) {
+            const uint rt  = tix / nDT;            // 0..1
+            const uint dct = tix % nDT;            // 0..31
+            simdgroup_float8x8 acc;
+            simdgroup_load(acc, Otg + (rt * 8u) * dh + dct * 8u, dh);
+            for (uint kt = 0u; kt < KBM / 8u; ++kt) {
+                if (p0 + kt * 8u >= nk) continue;  // P=0 there, skip V read
+                simdgroup_float8x8 pf, vf;
+                simdgroup_load(pf, Stg + (rt * 8u) * KBM + kt * 8u, KBM);
+                simdgroup_load(vf, vc + (ulong)(kv * tmax + p0 + kt * 8u) * dh +
+                                      dct * 8u, dh);
+                simdgroup_multiply_accumulate(acc, pf, vf, acc);
+            }
+            simdgroup_store(acc, Otg + (rt * 8u) * dh + dct * 8u, dh);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- output: att = (O / l) * sigmoid(gate) ----
+    for (uint i = tid; i < QTM * dh; i += 256u) {
+        const uint r = i / dh, t = i % dh;
+        const uint qidx = qstart + r;
+        if (qidx >= pc.Tn) continue;
+        const float o = Otg[i] / lrow[r];
+        const float g = qfull[(ulong)qidx * hQ * 2u * dh + (ulong)h * 2u * dh + dh + t];
+        att[(ulong)qidx * hQ * dh + (ulong)h * dh + t] = o * (1.0f / (1.0f + exp(-g)));
+    }
+}
