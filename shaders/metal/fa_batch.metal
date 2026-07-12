@@ -192,7 +192,9 @@ kernel void fa_attn_batch_mma(device const float* qhat  [[buffer(0)]],
     const uint nDT = dh / 8u;              // dim tiles (32)
     const uint qstart = qt * QTM;
     if (qstart >= pc.Tn) return;
-    const float qs = rsqrt(float(dh));
+    // Keep the online-softmax state in log2 space so both exponentials can use
+    // the native fast exp2 path.
+    const float qs = rsqrt(float(dh)) * 1.4426950408889634f;
 
     threadgroup float Otg[QTM * 256];      // [QTM][dh] accumulator
     threadgroup float Stg[QTM * KBM];      // [QTM][KBM] scores then probs
@@ -207,6 +209,10 @@ kernel void fa_attn_batch_mma(device const float* qhat  [[buffer(0)]],
     const uint nk = pc.base + lastq + 1u;  // attend keys 0..base+lastq
 
     for (uint p0 = 0u; p0 < nk; p0 += KBM) {
+        // Every key in blocks ending at/before the first query is causal for
+        // all rows. Keep the per-element comparison only for diagonal blocks.
+        const bool fullyUnmasked = p0 + KBM <= pc.base + qstart + 1u;
+
         // ---- Phase A: raw S = Q K^T into Stg (per 8x8 tile) ----
         for (uint tix = sgid; tix < (QTM / 8u) * (KBM / 8u); tix += NSGM) {
             const uint rt = tix / (KBM / 8u);      // 0..1
@@ -233,18 +239,26 @@ kernel void fa_attn_batch_mma(device const float* qhat  [[buffer(0)]],
                 const uint qpos = pc.base + qidx;
                 const uint kcount = min(KBM, nk - p0);
                 float bmax = -3.4e38f;
-                for (uint k = 0u; k < kcount; ++k) {
-                    const uint kpos = p0 + k;
-                    const float s = (kpos <= qpos) ? Stg[r * KBM + k] * qs : -3.4e38f;
-                    Stg[r * KBM + k] = s;
-                    bmax = max(bmax, s);
+                if (fullyUnmasked) {
+                    for (uint k = 0u; k < KBM; ++k) {
+                        const float s = Stg[r * KBM + k] * qs;
+                        Stg[r * KBM + k] = s;
+                        bmax = max(bmax, s);
+                    }
+                } else {
+                    for (uint k = 0u; k < kcount; ++k) {
+                        const float s = p0 + k <= qpos
+                                          ? Stg[r * KBM + k] * qs : -3.4e38f;
+                        Stg[r * KBM + k] = s;
+                        bmax = max(bmax, s);
+                    }
                 }
                 const float oldm = mrow[r];
                 const float newm = max(oldm, bmax);
-                const float corr = exp(oldm - newm);
+                const float corr = fast::exp2(oldm - newm);
                 float rsum = 0.0f;
                 for (uint k = 0u; k < kcount; ++k) {
-                    const float p = exp(Stg[r * KBM + k] - newm);
+                    const float p = fast::exp2(Stg[r * KBM + k] - newm);
                     Stg[r * KBM + k] = p;
                     rsum += p;
                 }
