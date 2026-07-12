@@ -72,9 +72,12 @@ spec:
         # Snapshot ENTRY COUNT for split cross-turn reuse (qk_state_n). Each
         # entry is a host snapshot bounded to its LIVE token count (worst case ~0.6 GiB at ctx
         # 49152: 3 attn layers + DN share; typical agent turns are far less).
-        # The midnight worker is launched with the SAME count (QK_PCACHE=4).
+        # The midnight worker is launched with the SAME count (QK_PCACHE=6).
+        # 4 -> 6 (2026-07-12): burn2 showed 2 concurrent sessions x per-turn
+        # saves + side-requests LRU-thrash 4 entries into full-history cold
+        # re-prefills (~45-60s/turn); 6 covers the observed working set.
         - name: QK_PCACHE
-          value: "4"
+          value: "6"
         - name: QK_PCACHE_LOG
           value: "1"
         - name: QK_STATS_FILE
