@@ -10,6 +10,7 @@
 //   qk normroutecmp [experts] [slots] [iters]  split normalized router
 //   qk fasrvcmp [slots] [max-pos] [min-pos] [iters]  decode-attention schedules
 //   qk fadecode [slots] [pos] [steps] [tmax] [min-pos]  steady deep decode
+//   qk cachecmp [tmax=512]    packed/full prefix-state snapshot comparison
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
 //   qk list [filter]          list tensors in the GGUF
 //   qk slotcmp <ids> <nGen> [nSlots] [tmax]  slot compaction/churn exactness
@@ -43,6 +44,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <new>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -2599,6 +2602,7 @@ struct qk_engine {
     bool shareFork = false;
     bool prefillMulti = true;
     bool slotCompact = true;
+    bool pcacheCompact = true;
     bool slotsNeedCompact = false;
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
     // Pipeline split (QK_LAYERS=a:b): this engine owns layers [lFirst, lEnd).
@@ -2754,7 +2758,12 @@ struct qk_engine {
 
     struct CacheEntry {
         std::vector<uint32_t> tokens;
-        std::vector<uint8_t> snap;   // host copy of all st1/st2 stripes (UMA memcpy)
+        // Packed host snapshot: recurrent stripes in full, then only the live
+        // K/V prefix for each attention kv-head. Allocated on first save and
+        // resized on overwrite, so empty cache entries cost no payload memory.
+        std::unique_ptr<uint8_t[]> snap;
+        size_t snapBytes = 0;
+        uint32_t snapTok = 0;
         uint64_t lru = 0;
         bool valid = false;
     };
@@ -2784,6 +2793,8 @@ struct qk_engine {
     int matchPrefix(const uint32_t* prompt, uint32_t n);
     void restoreInto(uint32_t slot, int cacheIdx);
     void copyStripes(uint32_t stripe, uint8_t* snap, bool save, uint32_t nTok = 0);
+    size_t packedSnapSize(uint32_t nTok) const;
+    bool copyPackedStripes(uint32_t stripe, CacheEntry& entry, bool save, uint32_t nTok);
     uint32_t physicalSlot(uint32_t slot) const;
     uint32_t acquirePhysicalSlot(uint32_t slot);
     void moveSlotState(uint32_t fromStripe, uint32_t toStripe, uint32_t nTok);
@@ -2839,6 +2850,82 @@ void qk_engine::copyStripes(uint32_t stripe, uint8_t* snap, bool save, uint32_t 
             memcpy(s2, snap + snapOff2[il], L.ps2);
         }
     }
+}
+
+size_t qk_engine::packedSnapSize(uint32_t nTok) const {
+    const uint32_t liveTok = nTok ? std::min(nTok, nCtx) : nCtx;
+    size_t bytes = 0;
+    for (const Layer& L : layers) {
+        if (!L.st1) continue;
+        if (L.rec) bytes += L.ps1 + L.ps2;
+        else bytes += (size_t)2 * hKV * liveTok * dh * sizeof(float);
+    }
+    return bytes;
+}
+
+bool qk_engine::copyPackedStripes(uint32_t stripe, CacheEntry& entry,
+                                  bool save, uint32_t nTok) {
+    const uint32_t liveTok = nTok ? std::min(nTok, nCtx) : nCtx;
+    if (!pcacheCompact) {
+        if (save) {
+            if (!entry.snap || entry.snapBytes != snapSize) {
+                std::unique_ptr<uint8_t[]> fresh(new (std::nothrow) uint8_t[snapSize]);
+                if (!fresh) return false;
+                entry.snap = std::move(fresh);
+                entry.snapBytes = snapSize;
+            }
+            entry.snapTok = liveTok;
+        } else if (!entry.snap || entry.snapBytes != snapSize || liveTok > entry.snapTok) {
+            return false;
+        }
+        copyStripes(stripe, entry.snap.get(), save, nTok);
+        return true;
+    }
+    if (save) {
+        const size_t bytes = packedSnapSize(liveTok);
+        if (!entry.snap || entry.snapBytes != bytes) {
+            std::unique_ptr<uint8_t[]> fresh(new (std::nothrow) uint8_t[bytes]);
+            if (!fresh) return false;
+            entry.snap = std::move(fresh);
+            entry.snapBytes = bytes;
+        }
+        entry.snapTok = liveTok;
+    } else if (!entry.snap || liveTok > entry.snapTok ||
+               entry.snapBytes != packedSnapSize(entry.snapTok)) {
+        return false;
+    }
+
+    uint8_t* p = entry.snap.get();
+    const size_t storedLiveBytes = (size_t)entry.snapTok * dh * sizeof(float);
+    const size_t copyLiveBytes = (size_t)liveTok * dh * sizeof(float);
+    for (Layer& L : layers) {
+        if (!L.st1) continue;
+        uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)stripe * L.ps1;
+        uint8_t* s2 = (uint8_t*)L.st2.contents + (size_t)stripe * L.ps2;
+        if (L.rec) {
+            if (save) {
+                memcpy(p, s1, L.ps1); p += L.ps1;
+                memcpy(p, s2, L.ps2); p += L.ps2;
+            } else {
+                memcpy(s1, p, L.ps1); p += L.ps1;
+                memcpy(s2, p, L.ps2); p += L.ps2;
+            }
+            continue;
+        }
+        const size_t headStride = L.ps1 / hKV;
+        for (uint8_t* state : {s1, s2}) {
+            for (uint32_t h = 0; h < hKV; ++h) {
+                if (save) memcpy(p, state + (size_t)h * headStride, storedLiveBytes);
+                else memcpy(state + (size_t)h * headStride, p, copyLiveBytes);
+                p += storedLiveBytes;
+            }
+        }
+    }
+    if ((size_t)(p - entry.snap.get()) != entry.snapBytes) {
+        fprintf(stderr, "packed prefix snapshot size invariant failed\n");
+        abort();
+    }
+    return true;
 }
 
 uint32_t qk_engine::physicalSlot(uint32_t slot) const {
@@ -2967,12 +3054,20 @@ void qk_engine::snapshotSlot(uint32_t slot) {
         if (pcache[i].lru < pcache[idx].lru) idx = (int)i;
     }
     CacheEntry& e = pcache[idx];
+    if (!copyPackedStripes(physicalSlot(slot), e, /*save=*/true,
+                           pcacheCompact ? sl.pos : 0)) {
+        fprintf(stderr, "prefix cache snapshot allocation/copy failed (%u tokens)\n", sl.pos);
+        return;
+    }
     size_t pp = std::min((size_t)sl.pos, sl.prompt.size());
     e.tokens.assign(sl.prompt.begin(), sl.prompt.begin() + pp);
     e.tokens.insert(e.tokens.end(), sl.genTokens.begin(), sl.genTokens.begin() + fedGen);
     e.lru = ++lruClock;
     e.valid = true;
-    copyStripes(physicalSlot(slot), e.snap.data(), /*save=*/true);
+    if (getenv("QK_MEM_STATS"))
+        fprintf(stderr, "[pcache] save entry=%d tokens=%u payload=%.1f MiB (%s)\n",
+                idx, (uint32_t)e.tokens.size(), e.snapBytes / 1048576.0,
+                pcacheCompact ? "packed" : "full");
 }
 
 int qk_engine::matchPrefix(const uint32_t* prompt, uint32_t n) {
@@ -2993,7 +3088,16 @@ int qk_engine::matchPrefix(const uint32_t* prompt, uint32_t n) {
 
 void qk_engine::restoreInto(uint32_t slot, int cacheIdx) {
     pcache[cacheIdx].lru = ++lruClock;
-    copyStripes(physicalSlot(slot), pcache[cacheIdx].snap.data(), /*save=*/false);
+    CacheEntry& e = pcache[cacheIdx];
+    if (pcacheCompact && e.tokens.size() != e.snapTok) {
+        fprintf(stderr, "prefix cache token/state length mismatch for entry %d\n", cacheIdx);
+        abort();
+    }
+    if (!copyPackedStripes(physicalSlot(slot), e, /*save=*/false,
+                           (uint32_t)e.tokens.size())) {
+        fprintf(stderr, "prefix cache restore invariant failed for entry %d\n", cacheIdx);
+        abort();
+    }
 }
 
 bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t errLen) {
@@ -3002,6 +3106,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     shareFork = getenv("QK_FORK") != nullptr;
     prefillMulti = !getenv("QK_PREFILL_MULTI") || atoi(getenv("QK_PREFILL_MULTI")) != 0;
     slotCompact = !getenv("QK_SLOT_COMPACT") || atoi(getenv("QK_SLOT_COMPACT")) != 0;
+    pcacheCompact = !getenv("QK_PCACHE_COMPACT") ||
+                    atoi(getenv("QK_PCACHE_COMPACT")) != 0;
     specOn = getenv("QK_SPEC") != nullptr;
     specScratch = specOn || getenv("QK_SPEC_SCRATCH") != nullptr;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
@@ -3761,7 +3867,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (v >= 1 && v <= 256) PCACHE_N = (uint32_t)v;
     }
     pcache.resize(PCACHE_N);
-    for (auto& e : pcache) e.snap.resize(snapSize);
+    if (getenv("QK_MEM_STATS"))
+        fprintf(stderr, "qk_open: prefix snapshots %s/lazy (full capacity %.2f GiB x %u entries)\n",
+                pcacheCompact ? "packed" : "full", snapSize / 1073741824.0, PCACHE_N);
 
     if (const char* v = getenv("QK_SPEC_L")) {
         long x = atol(v);
@@ -4977,14 +5085,12 @@ uint32_t qk_state_n(const qk_engine* e) { return (uint32_t)e->pcache.size(); }
 
 int qk_state_save(qk_engine* e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
     if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
-    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/true, n_tok);
-    return 0;
+    return e->copyPackedStripes(slot, e->pcache[idx], /*save=*/true, n_tok) ? 0 : -2;
 }
 
 int qk_state_load(qk_engine* e, uint32_t slot, uint32_t idx, uint32_t n_tok) {
     if (!e || slot >= e->nSlots || idx >= e->pcache.size()) return -1;
-    e->copyStripes(slot, e->pcache[idx].snap.data(), /*save=*/false, n_tok);
-    return 0;
+    return e->copyPackedStripes(slot, e->pcache[idx], /*save=*/false, n_tok) ? 0 : -2;
 }
 
 int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float* hidden_in,
@@ -7342,6 +7448,141 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (mode == "cachecmp") {
+            const uint32_t tmax = argc > 2 ? (uint32_t)atoi(argv[2]) : 512u;
+            if (tmax < 400u || tmax > 65536u) {
+                fprintf(stderr, "usage: qk cachecmp [tmax=512, >=400]\n");
+                return 1;
+            }
+            const char* oldPc = getenv("QK_PCACHE");
+            const bool hadPc = oldPc != nullptr;
+            const std::string oldPcValue = oldPc ? oldPc : "";
+            setenv("QK_PCACHE", "6", 1);
+            qk_config cfg{2, tmax, 1};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (hadPc) setenv("QK_PCACHE", oldPcValue.c_str(), 1);
+            else unsetenv("QK_PCACHE");
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+
+            static constexpr uint32_t seed[] = {
+                12162u, 5028u, 264u, 854u, 11u, 303u, 264u,
+                11012u, 13721u, 85624u, 1881u, 1330u, 22767u, 11u};
+            auto makePrompt = [&](uint32_t tag, uint32_t n) {
+                std::vector<uint32_t> p(n);
+                for (uint32_t i = 0; i < n; ++i)
+                    p[i] = (seed[i % std::size(seed)] + tag * 7919u + i * 17u) % e->vocab;
+                return p;
+            };
+            std::vector<float> unused;
+            auto seedState = [&](uint32_t stripe, const std::vector<uint32_t>& p) {
+                e->resetStripe(stripe);
+                std::vector<float> hidden;
+                if (!e->firstStage()) {
+                    hidden.resize((size_t)p.size() * qk_engine::nEmbd);
+                    for (size_t i = 0; i < hidden.size(); ++i)
+                        hidden[i] = (float)((int)((i * 17u + p[i / qk_engine::nEmbd]) % 257u) -
+                                            128) * (1.0f / 128.0f);
+                }
+                for (uint32_t off = 0; off < p.size();) {
+                    const uint32_t n = std::min(e->maxB, (uint32_t)p.size() - off);
+                    e->prefillBatchLast(e->firstStage() ? p.data() + off : nullptr,
+                                        n, stripe, unused, /*wantLogits=*/false, off,
+                                        /*argmaxOut=*/nullptr,
+                                        e->firstStage() ? nullptr
+                                            : hidden.data() + (size_t)off * qk_engine::nEmbd);
+                    off += n;
+                }
+            };
+
+            std::vector<uint8_t> ref(e->snapSize), got(e->snapSize);
+            uint64_t diffBytes = 0;
+            auto compareEntry = [&](uint32_t idx, uint32_t stateTok,
+                                    uint32_t saveTok, uint32_t loadTok,
+                                    uint32_t tag) {
+                const std::vector<uint32_t> p = makePrompt(tag, stateTok);
+                seedState(0, p);
+                std::fill(ref.begin(), ref.end(), 0);
+                e->copyStripes(0, ref.data(), /*save=*/true, loadTok);
+                auto ts = std::chrono::steady_clock::now();
+                if (qk_state_save(e, 0, idx, saveTok)) return false;
+                const double saveMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - ts).count();
+                const size_t expected = e->pcacheCompact ? e->packedSnapSize(saveTok) : e->snapSize;
+                if (e->pcache[idx].snapBytes != expected) return false;
+                e->resetStripe(1);
+                auto tl = std::chrono::steady_clock::now();
+                if (qk_state_load(e, 1, idx, loadTok)) return false;
+                const double loadMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tl).count();
+                std::fill(got.begin(), got.end(), 0);
+                e->copyStripes(1, got.data(), /*save=*/true, loadTok);
+                uint64_t nd = 0;
+                if (memcmp(ref.data(), got.data(), ref.size()) != 0)
+                    for (size_t i = 0; i < ref.size(); ++i) nd += ref[i] != got[i];
+                diffBytes += nd;
+                printf("  idx=%u state=%u save=%u load=%u payload=%.1f MiB "
+                       "copy=%.1f/%.1f ms diff=%llu\n",
+                       idx, stateTok, saveTok, loadTok,
+                       e->pcache[idx].snapBytes / 1048576.0, saveMs, loadMs,
+                       (unsigned long long)nd);
+                return nd == 0;
+            };
+
+            bool ok = true;
+            // Reuse one entry in both growth directions; this catches stale
+            // head-stride assumptions when a long snapshot is overwritten by
+            // a short one and vice versa.
+            for (uint32_t n : {384u, 8u, 255u, 17u, 127u, 64u})
+                ok &= compareEntry(0, n, n, n, 10u + n);
+            // A smaller-prefix restore from a longer packed entry must skip
+            // each stored head's unused suffix while restoring full DN state.
+            ok &= compareEntry(1, 384u, 384u, 65u, 777u);
+            ok &= qk_state_load(e, 1, 1, 385u) == -2;
+            // n_tok=0 retains the public ABI's full-stripe behavior.
+            ok &= compareEntry(0, 384u, 0u, 0u, 888u);
+            ok &= compareEntry(0, 8u, 8u, 8u, 999u);  // full -> short shrink
+
+            // Populate all six automatic entries, touch entry 0, then insert
+            // a seventh distinct prefix. The least-recently-used entry 1 must
+            // be replaced while entry 0 and entries 2..5 survive unchanged.
+            std::array<uint32_t, 7> sig{};
+            for (uint32_t j = 0; j < 6; ++j) {
+                std::vector<uint32_t> p = makePrompt(200u + j, 9u + j);
+                sig[j] = p[0];
+                seedState(0, p);
+                qk_engine::Slot& sl = e->slots[0];
+                sl.prompt = p; sl.genTokens.clear(); sl.pos = (uint32_t)p.size();
+                e->snapshotSlot(0);
+            }
+            e->restoreInto(0, 0);  // entry 0 becomes newest
+            {
+                std::vector<uint32_t> p = makePrompt(206u, 15u);
+                sig[6] = p[0];
+                seedState(0, p);
+                qk_engine::Slot& sl = e->slots[0];
+                sl.prompt = p; sl.genTokens.clear(); sl.pos = (uint32_t)p.size();
+                e->snapshotSlot(0);
+            }
+            ok &= e->pcache.size() == 6 && e->pcache[0].valid && e->pcache[1].valid;
+            ok &= !e->pcache[0].tokens.empty() && e->pcache[0].tokens[0] == sig[0];
+            ok &= !e->pcache[1].tokens.empty() && e->pcache[1].tokens[0] == sig[6];
+            for (uint32_t j = 2; j < 6; ++j)
+                ok &= e->pcache[j].valid && !e->pcache[j].tokens.empty() &&
+                      e->pcache[j].tokens[0] == sig[j];
+            std::vector<uint32_t> probe = e->pcache[0].tokens;
+            probe.push_back(42u);
+            ok &= e->matchPrefix(probe.data(), (uint32_t)probe.size()) == 0;
+            size_t payload = 0;
+            for (const auto& ce : e->pcache) payload += ce.snapBytes;
+            printf("cachecmp: %s layout, diff=%llu, six-entry payload %.1f MiB, LRU=%s -> %s\n",
+                   e->pcacheCompact ? "packed" : "full",
+                   (unsigned long long)diffBytes, payload / 1048576.0,
+                   ok ? "PASS" : "FAIL", ok ? "PASS" : "FAIL");
+            qk_close(e);
+            return ok ? 0 : 1;
+        }
+
         if (mode == "cachetest") {
             if (argc < 4) { fprintf(stderr, "usage: qk cachetest <ids-file> <nGen> [tmax]\n"); return 1; }
             std::vector<uint32_t> prompt;
@@ -7356,11 +7597,11 @@ int main(int argc, char** argv) {
             uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 4096;
             auto run = [&](qk_engine* e, const std::vector<uint32_t>& ids, uint32_t gN, double& ms) {
                 std::vector<uint32_t> out;
+                auto t0 = std::chrono::steady_clock::now();
                 qk_slot_start(e, 0, ids.data(), (uint32_t)ids.size(), gN, 0);
                 uint32_t ch = qk_chunk(e);
                 std::vector<uint32_t> ot((size_t)ch), oc(1);
                 uint32_t fin = 0;
-                auto t0 = std::chrono::steady_clock::now();
                 while (qk_step_chunk(e, ot.data(), oc.data(), &fin) > 0)
                     for (uint32_t i = 0; i < oc[0]; i++) out.push_back(ot[i]);
                 ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
