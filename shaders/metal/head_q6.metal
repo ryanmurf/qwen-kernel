@@ -43,6 +43,34 @@ static inline void q6_stage32(device const block_q6_K* mat, uint rowBlocks,
     }
 }
 
+static inline void q6_stage16_half(device const block_q6_K* mat, uint rowBlocks,
+                                   uint row, uint g32, uint half16,
+                                   threadgroup half* dst) {
+    device const block_q6_K& blk = mat[(ulong)row * rowBlocks + (g32 >> 3u)];
+    const float d = float(blk.d);
+    const uint gg = (g32 & 7u) * 2u + half16;
+    const uint hh = gg >> 3u;
+    const uint r  = (gg & 7u) >> 1u;
+    const uint is = gg & 1u;
+    const float sc = float(int(blk.scales[hh * 8u + r * 2u + is]));
+    const uint qlBase = hh * 64u + (r & 1u) * 32u + is * 16u;
+    const uint qhBase = hh * 32u + is * 16u;
+    const uint shift = r * 2u;
+    const bool hi = r >= 2u;
+    device const packed_uchar4* qlp =
+        (device const packed_uchar4*)&blk.ql[qlBase];
+    device const packed_uchar4* qhp =
+        (device const packed_uchar4*)&blk.qh[qhBase];
+    threadgroup half4* o4 = (threadgroup half4*)dst;
+    for (uint i = 0u; i < 4u; ++i) {
+        const uchar4 qlv = uchar4(qlp[i]);
+        const uchar4 qhv = uchar4(qhp[i]);
+        const uint4 lo = hi ? (uint4(qlv) >> 4u) : (uint4(qlv) & 0xFu);
+        const int4 q = int4(lo | (((uint4(qhv) >> shift) & 3u) << 4u)) - 32;
+        o4[i] = half4((d * sc) * float4(q));
+    }
+}
+
 constant uint HBM = 32u;
 constant uint HBN = 8u;
 constant uint HBK = 64u;
@@ -284,6 +312,141 @@ kernel void head_q6_gemm_b8_top1_f32_m64(device const block_q6_K* w [[buffer(0)]
         }
     }
 }
+
+// Explicit reduced-precision verifier tier.  Q6 values and activations are
+// rounded to half in threadgroup memory, while MMA accumulates in f32.  A
+// 64-row tile keeps all eight row simdgroups occupied; TN={8,16,32} reuses
+// each staged weight panel across progressively wider verifier batches.
+template <uint TN>
+static inline void head_q6_top1_f16_body(device const block_q6_K* w,
+                                         device const float* x,
+                                         device float* vals,
+                                         device uint* idxs,
+                                         device float* lastLogits,
+                                         constant HeadTopPC& pc,
+                                         threadgroup half* Wsh,
+                                         threadgroup half* Xsh,
+                                         threadgroup float* outb,
+                                         threadgroup float* sgVals,
+                                         threadgroup uint* sgIdxs,
+                                         uint3 tid3, uint3 tgpig,
+                                         uint sgid, uint slid) {
+    const uint tid = tid3.x;
+    const uint row0 = tgpig.x * 64u;
+    const uint tok0 = tgpig.z * TN;
+    const uint rowBlocks = pc.K >> 8u;
+    simdgroup_float8x8 acc[TN / 8u];
+    for (uint nc = 0u; nc < TN / 8u; ++nc)
+        acc[nc] = simdgroup_float8x8(0.0f);
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += HBK) {
+        if (tid < 256u) {
+            const uint rr = tid >> 2u, g = (tid >> 1u) & 1u;
+            const uint half16 = tid & 1u, row = row0 + rr;
+            threadgroup half* dst = Wsh + rr * HSK + g * 32u + half16 * 16u;
+            if (row < pc.M)
+                q6_stage16_half(w, rowBlocks, row, (k0 >> 5u) + g, half16, dst);
+            else
+                for (uint i = 0u; i < 16u; ++i) dst[i] = 0.0h;
+        }
+        for (uint p = tid * 4u; p < TN * HBK; p += 256u * 4u) {
+            const uint tq = p >> 6u, kk = p & 63u, tok = tok0 + tq;
+            threadgroup half4* dst =
+                (threadgroup half4*)(Xsh + tq * HSK + kk);
+            *dst = tok < pc.N
+                ? half4(*(device const packed_float4*)(x + (ulong)tok * pc.K + k0 + kk))
+                : half4(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kf = 0u; kf < HBK / 8u; ++kf) {
+            simdgroup_half8x8 af;
+            simdgroup_load(af, Wsh + (sgid * 8u) * HSK + kf * 8u, HSK);
+            for (uint nc = 0u; nc < TN / 8u; ++nc) {
+                simdgroup_half8x8 bf;
+                simdgroup_load(bf, Xsh + (nc * 8u) * HSK + kf * 8u,
+                               HSK, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc[nc], af, bf, acc[nc]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float* buf = outb + sgid * 72u;
+    const uint fi = slid >> 2u, fj = (slid & 3u) * 2u;
+    for (uint nc = 0u; nc < TN / 8u; ++nc) {
+        simdgroup_store(acc[nc], buf, 9u);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (pc.materialize) {
+            for (uint jj = 0u; jj < 2u; ++jj) {
+                const uint row = row0 + sgid * 8u + fi;
+                const uint tok = tok0 + nc * 8u + fj + jj;
+                if (row < pc.M && tok + 1u == pc.N)
+                    lastLogits[row] = buf[fi * 9u + fj + jj];
+            }
+        }
+        if (slid < 8u) {
+            float best = -3.4e38f;
+            uint besti = 0xFFFFFFFFu;
+            for (uint r = 0u; r < 8u; ++r) {
+                const uint id = row0 + sgid * 8u + r;
+                if (id >= pc.M) continue;
+                const float v = buf[r * 9u + slid];
+                if (v > best || (v == best && id < besti)) {
+                    best = v; besti = id;
+                }
+            }
+            const uint q = nc * 8u + slid;
+            sgVals[sgid * TN + q] = best;
+            sgIdxs[sgid * TN + q] = besti;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < TN) {
+        const uint tok = tok0 + tid;
+        if (tok < pc.N) {
+            float best = -3.4e38f;
+            uint besti = 0xFFFFFFFFu;
+            for (uint s = 0u; s < 8u; ++s) {
+                const float v = sgVals[s * TN + tid];
+                const uint id = sgIdxs[s * TN + tid];
+                if (v > best || (v == best && id < besti)) {
+                    best = v; besti = id;
+                }
+            }
+            const ulong o = (ulong)tok * pc.tiles + tgpig.x;
+            vals[o] = best;
+            idxs[o] = besti;
+        }
+    }
+}
+
+#define HEAD_Q6_F16_KERNEL(NAME, TN)                                              \
+kernel void NAME(device const block_q6_K* w [[buffer(0)]],                       \
+                 device const float* x [[buffer(1)]],                            \
+                 device float* vals [[buffer(2)]],                               \
+                 device uint* idxs [[buffer(3)]],                                \
+                 device float* lastLogits [[buffer(4)]],                         \
+                 constant HeadTopPC& pc [[buffer(5)]],                           \
+                 uint3 tid3 [[thread_position_in_threadgroup]],                  \
+                 uint3 tgpig [[threadgroup_position_in_grid]],                   \
+                 uint sgid [[simdgroup_index_in_threadgroup]],                   \
+                 uint slid [[thread_index_in_simdgroup]]) {                      \
+    threadgroup half Wsh[64u * HSK];                                             \
+    threadgroup half Xsh[TN * HSK];                                              \
+    threadgroup float outb[8u * 72u];                                            \
+    threadgroup float sgVals[8u * TN];                                           \
+    threadgroup uint sgIdxs[8u * TN];                                            \
+    head_q6_top1_f16_body<TN>(w, x, vals, idxs, lastLogits, pc,                  \
+                              Wsh, Xsh, outb, sgVals, sgIdxs,                    \
+                              tid3, tgpig, sgid, slid);                          \
+}
+
+HEAD_Q6_F16_KERNEL(head_q6_gemm_b8_top1_f16, 8u)
+HEAD_Q6_F16_KERNEL(head_q6_gemm_b16_top1_f16, 16u)
+HEAD_Q6_F16_KERNEL(head_q6_gemm_b32_top1_f16, 32u)
+#undef HEAD_Q6_F16_KERNEL
 
 struct HeadReducePC { uint tiles; uint N; };
 kernel void head_top1_reduce_batch(device const float* vals [[buffer(0)]],

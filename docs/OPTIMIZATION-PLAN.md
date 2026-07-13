@@ -265,6 +265,26 @@ and G8 once speculation exists.
 lower bandwidth. Any accumulation-order change can flip close logits. Sampling
 requires values, not just ids.
 
+#### 8d. Optional half-input/f32-accumulate verifier head — medium EV
+
+**Expected value:** Another 2-5% oracle-verifier improvement after the exact
+head work, with larger isolated wins as K grows. No one-token decode benefit.
+
+**Approach:** Behind an explicit precision flag, round staged Q6 dequantized
+weights and hidden activations to half while retaining f32 MMA accumulators.
+Use a 64-row tile and B={8,16,32} column widths so one weight load serves the
+whole verifier panel; repeat B32 rather than growing private accumulators past
+the occupancy cliff. Fuse the same stable candidate reduction as the f32 path.
+
+**Correctness gate:** Precision-class self-consistency: every-position batched
+argmax against serial on the full prefill sweep and several natural prompts,
+coherent top-k/materialized final logits, oracle and forced-rollback streams,
+handoff/cache/multi-slot gates, and quantified logit drift.
+
+**Risk:** Medium-high. Half input rounding can flip a close winner on an unseen
+prompt even with f32 accumulation. It must remain opt-in and must not alter the
+default exact f32 path.
+
 ### 9. Prefill flash-attention geometry and GQA reuse sweep — medium-high EV
 
 **Expected value:** Attention is now about 13 ms of pp512; a 20-40% kernel win
@@ -629,3 +649,4 @@ correctness gates, and commit id.
 | 8a. Exact f32 batched Q6_K head | validated | The 32-row x 8-token f32-MMA tile matched shipping-head argmax on distinct real-weight RHS at N={4,5,8,9,16,32}, chose id 0 for deliberate all-logit ties, and stayed within 4.3e-6 max absolute logit error. The full scalar prefill sweep is 36/36 exact with 7.9e-7 worst relative error. G0-G8, cache restore, staggered two-slot serving, eight-slot determinism, and handoff are green. | Head+argmax at N=4/8/16/32 fell from 2.739/5.519/11.030/22.025 ms to 2.426/2.669/5.128/10.025 ms: 1.13/2.07/2.15/2.20x. Oracle verifier A/B at K=4/8/16/32 improved from 5.80/4.97/4.75/4.43 to 5.63/4.68/4.43/4.15 ms/token (about 3-6%). N=2 is slower and remains on GEMV. BK=32 was 1.5% slower; BK=128 was 43% slower; f32 BN=16/32 only tied repeated BN=8 and were removed. | Default the tiled head only for per-position argmax batches N>=4; `QK_HEAD_GEMM=0` restores shipping GEMV and `QK_HEAD_GEMM_N` exposes the crossover. Full-logit single-row callers remain exact GEMV. This commit. |
 | 8b. Single-row fused head top-1 | hard wall | Exact shipping-order spans {16,64,256} returned the same winner as materialized logits, including stable lower-id ties. The prototype was removed after decode A/B. | Span 16 was the isolated winner at about 0.84 ms, but real one-slot decode was flat: 200-token control/candidate 92.2/92.0 tok/s and 100-token control/candidate 85.5/85.6 tok/s. The head reads 398 MiB while logits are only 0.95 MiB, so suppressed stores and argmax cannot move the graph. | Reject B=1 fusion. Preserve full logits for sampling/debug and pursue batched per-tile candidate reduction only as a memory lever. |
 | 8c. Batched fused head candidates + compact logits scratch | validated | The M32/M64 kernels preserve the exact f32 tile arithmetic per logit, return every real-weight row winner at N={4,8}, choose id 0 for all-zero ties, and materialize the final logit row bit-for-bit against the full tiled head. The strengthened scalar prefill gate now directly exercises fused argmax and is 36/36 exact at 2.9e-6 worst relative final-logit error. `stagecmp` proves final top-32 ordering/top-1 coherence; G0-G8, cache restore, staggered serving, eight-slot determinism, and handoff are green. | M64 fused candidate+reduce at N=8/16/32 measured 2.604/5.046/9.830 ms versus 2.672/5.134/10.021 ms for full tiled logits+argmax (about 1-3%); M32 remains the neutral/slightly faster N=4 geometry. M96 was exact but slower at N=8 (2.692 ms) and was removed. Default maxB=128 last-stage head scratch falls from about 121.25 MiB to 6.6 MiB; maxB=512 falls from about 485 MiB to 18 MiB, saving about 467 MiB. pp512 was 331.11 ms compact versus 331.94 ms rollback, so no regression. | Default per-tile candidates for N>=4, M32 below N=8 and M64 otherwise; retain only the final full-logit row when sampling/top-k needs it. `QK_HEAD_GEMM=0` restores shipping full logits. This commit. |
+| 8d. Optional half-input/f32-accumulate verifier head | validated precision tier | Real-weight `headcmp` at N={4,5,7,8,9,16,17,32,33,64,128} retained every f32 winner and stable id-0 ties; random final-row drift stayed below 5.0e-4 absolute. The strengthened scalar prefill sweep is 36/36 argmax-consistent with 6.9e-4 worst relative final-logit drift. Oracle verification is exact on ids1/2/3/4, every K=8 rollback corruption mode is exact, top-32 agrees with the materialized final row, and all adapted G0-G8/cache/staggered-slot/handoff gates are green. | Fused N=4/8/16/32 head time fell from exact-f32 2.438/2.604/5.046/9.830 ms to 1.846/1.858/2.528/3.980 ms (1.3-2.5x). Bracketed ids3 oracle K=4/8/16/32 improved from 5.61/4.54/4.18/4.00 to 5.40/4.44/4.02/3.83 ms/token (about 2-4%). Using all 256 threads for half-row Q6 staging improved N=8 another 2.7%. A 128-row/16-simdgroup tile was exact but 6-8% slower; native B64/B128 accumulator widths hit a severe register cliff, so both were removed in favor of repeated B32. | Ship only behind `QK_HEAD_F16=1`; N<4 and the default path remain exact f32. The tier explicitly trades unseen near-tie risk for verifier speed and is not default-on. This commit. |
