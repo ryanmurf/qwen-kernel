@@ -694,12 +694,12 @@ kernel void fa_attn_srv_split_q8_gqa8(device const float* qhat    [[buffer(0)]],
     }
 }
 
-// Half-KV split decode with the same GQA reuse as the Q8-row tier.  Each
+// Plain/half-KV split decode with the same GQA reuse as the Q8-row tier.  Each
 // threadgroup owns HG adjacent query heads that map to one KV head, loads each
-// half K/V element once, and retains one independent softmax/partial stream per
+// K/V element once, and retains one independent softmax/partial stream per
 // query head for the unchanged reducer.
-template <uint HG>
-static inline void fa_attn_srv_split_f16_gqa_body(
+template <uint HG, bool HALF_KV>
+static inline void fa_attn_srv_split_gqa_body(
     device const float* qhat, device const uchar* kc, device const uchar* vc,
     device float* partial, device const uint* slotPos, constant FaSplitPC& pc,
     threadgroup float* q, threadgroup float* sc, threadgroup float* red,
@@ -722,11 +722,14 @@ static inline void fa_attn_srv_split_f16_gqa_body(
     const float qs = rsqrt(float(dh));
     if (t < ts) {
         const ulong kb = (row0 + t) * dh;
-        device const half* kh = (device const half*)kc;
         float score[HG];
         for (uint hr = 0u; hr < HG; ++hr) score[hr] = 0.0f;
         for (uint j = 0u; j < dh; j += 4u) {
-            const float4 x = float4(*((device const half4*)(kh + kb + j)));
+            float4 x;
+            if (HALF_KV)
+                x = float4(*((device const half4*)((device const half*)kc + kb + j)));
+            else
+                x = *((device const float4*)((device const float*)kc + kb + j));
             for (uint k = 0u; k < 4u; ++k)
                 for (uint hr = 0u; hr < HG; ++hr)
                     score[hr] += q[hr * dh + j + k] * x[k];
@@ -761,11 +764,12 @@ static inline void fa_attn_srv_split_f16_gqa_body(
     if (t < dh) {
         float acc[HG];
         for (uint hr = 0u; hr < HG; ++hr) acc[hr] = 0.0f;
-        device const half* vp = (device const half*)vc + row0 * dh + t;
+        ulong vi = row0 * dh + t;
         for (uint j = 0u; j < ts; ++j) {
-            const float vv = float(*vp);
+            const float vv = HALF_KV ? float(((device const half*)vc)[vi])
+                                     : ((device const float*)vc)[vi];
             for (uint hr = 0u; hr < HG; ++hr) acc[hr] += sc[hr * dh + j] * vv;
-            vp += dh;
+            vi += dh;
         }
         const uint pb = ((rq * pc.hQ + h0) * pc.maxChunks + c) * ps;
         for (uint hr = 0u; hr < HG; ++hr) partial[pb + hr * hs + t] = acc[hr];
@@ -779,7 +783,7 @@ static inline void fa_attn_srv_split_f16_gqa_body(
     }
 }
 
-#define FA_F16_GQA_KERNEL(NAME, HG)                                             \
+#define FA_GQA_KERNEL(NAME, HG, HALF_KV)                                        \
 kernel void NAME(device const float* qhat    [[buffer(0)]],                     \
                  device const uchar* kc      [[buffer(1)]],                     \
                  device const uchar* vc      [[buffer(2)]],                     \
@@ -791,14 +795,17 @@ kernel void NAME(device const float* qhat    [[buffer(0)]],                     
 {                                                                               \
     threadgroup float q[(HG) * 256u], sc[(HG) * 256u];                          \
     threadgroup float red[256u], ml[(HG)], ll[(HG)];                            \
-    fa_attn_srv_split_f16_gqa_body<(HG)>(                                      \
+    fa_attn_srv_split_gqa_body<(HG), (HALF_KV)>(                               \
         qhat, kc, vc, partial, slotPos, pc, q, sc, red, ml, ll, tid3, tgpig);   \
 }
 
-FA_F16_GQA_KERNEL(fa_attn_srv_split_f16_gqa2, 2u)
-FA_F16_GQA_KERNEL(fa_attn_srv_split_f16_gqa4, 4u)
-FA_F16_GQA_KERNEL(fa_attn_srv_split_f16_gqa8, 8u)
-#undef FA_F16_GQA_KERNEL
+FA_GQA_KERNEL(fa_attn_srv_split_f16_gqa2, 2u, true)
+FA_GQA_KERNEL(fa_attn_srv_split_f16_gqa4, 4u, true)
+FA_GQA_KERNEL(fa_attn_srv_split_f16_gqa8, 8u, true)
+FA_GQA_KERNEL(fa_attn_srv_split_f32_gqa2, 2u, false)
+FA_GQA_KERNEL(fa_attn_srv_split_f32_gqa4, 4u, false)
+FA_GQA_KERNEL(fa_attn_srv_split_f32_gqa8, 8u, false)
+#undef FA_GQA_KERNEL
 
 // Bit-exact compact grid for highly skewed batches. Unlike the rectangular
 // split grid, every work item names a live (slot, 256-key chunk) pair.
