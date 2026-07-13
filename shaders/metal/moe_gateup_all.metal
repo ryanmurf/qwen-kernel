@@ -171,3 +171,55 @@ kernel void moe_gateup_all_iq4(device const block_iq4_xs*  gwE [[buffer(0)]],
     if (slid == 0u)
         h[ho + s * pc.n_ff + r] = (g / (1.0f + exp(-g))) * u;   // silu(g) * u
 }
+
+// Decode specialization for the 35B model's K=2048, n_ff=512 IQ3 shape.
+// Each lane owns exactly two 32-element groups, so the compiler can
+// eliminate divisions/loop control while preserving the original order.
+kernel void moe_gateup_all_k2048_ff512(
+                           device const block_iq3_xxs* gwE [[buffer(0)]],
+                           device const block_iq3_xxs* uwE [[buffer(1)]],
+                           device const block_q8_0* gwS [[buffer(2)]],
+                           device const block_q8_0* uwS [[buffer(3)]],
+                           device const float* x [[buffer(4)]],
+                           device const SelT* sel [[buffer(5)]],
+                           device float* h [[buffer(6)]],
+                           constant MoePC& pc [[buffer(7)]],
+                           uint3 tgpig [[threadgroup_position_in_grid]],
+                           uint sgid [[simdgroup_index_in_threadgroup]],
+                           uint slid [[thread_index_in_simdgroup]]) {
+    const uint out = tgpig.x * NSG + sgid;
+    const uint s = out >> 9u;
+    const uint r = out & 511u;
+    const uint rq = tgpig.z;
+    if (s > pc.n_used) return;
+    const uint xo = rq * 2048u;
+    const uint ho = rq * (pc.n_used + 1u) * 512u;
+
+    float accG = 0.0f, accU = 0.0f;
+    if (s < pc.n_used) {
+        const uint eid = min(sel[rq].ids[s], pc.n_expert - 1u);
+        const ulong base = ((ulong)eid * 512u + r) * 8u;
+#pragma unroll
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            const uint u = slid + pass * 32u;
+            const uint b = u >> 3u;
+            const uint ib32 = u & 7u;
+            device const float4* xp =
+                (device const float4*)(x + xo + b * 256u + ib32 * 32u);
+            accG += iq3_group32_dot(gwE[base + b], ib32, xp);
+            accU += iq3_group32_dot(uwE[base + b], ib32, xp);
+        }
+    } else {
+        const ulong base = (ulong)r * 64u;
+#pragma unroll
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            const uint b = slid + pass * 32u;
+            device const float4* xp = (device const float4*)(x + xo + b * 32u);
+            accG += q8_block_dot(gwS[base + b], xp);
+            accU += q8_block_dot(uwS[base + b], xp);
+        }
+    }
+    const float g = simd_sum(accG);
+    const float u = simd_sum(accU);
+    if (slid == 0u) h[ho + s * 512u + r] = (g / (1.0f + exp(-g))) * u;
+}

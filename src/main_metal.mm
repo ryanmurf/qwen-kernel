@@ -795,8 +795,13 @@ static bool caseMoe(MtlCtx& c, uint32_t layer, uint32_t iters) {
     const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
     id<MTLComputePipelineState> pLogits = getPipe(c, "moe_logits", "moe_logits", nsg);
     id<MTLComputePipelineState> pSelect = getPipe(c, "moe_select", "moe_select", 0);
-    id<MTLComputePipelineState> pGu     = getPipe(c, "moe_gateup_all",
-        guIq4 ? "moe_gateup_all_iq4" : "moe_gateup_all", nsg);
+    bool guFixed = guIq3 && nEmbd == 2048u && nFf == 512u;
+    if (const char* v = getenv("QK_MOE_GU_FIXED"))
+        guFixed = atoi(v) != 0 && guIq3 && nEmbd == 2048u && nFf == 512u;
+    const char* guKernel = guFixed
+        ? "moe_gateup_all_k2048_ff512"
+        : (guIq4 ? "moe_gateup_all_iq4" : "moe_gateup_all");
+    id<MTLComputePipelineState> pGu = getPipe(c, "moe_gateup_all", guKernel, nsg);
     id<MTLComputePipelineState> pDn     = downQ6 ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
                                                  : getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
 
@@ -924,6 +929,110 @@ static bool caseMoe(MtlCtx& c, uint32_t layer, uint32_t iters) {
         printf("     40 layers -> %.2f ms/token MoE-FFN share\n", ns * 40 / 1e6);
     }
     return pass;
+}
+
+// Direct real-weight comparison of the decode gate+up kernel and its
+// K=2048/n_ff=512 specialization, independent of router/down stages.
+static bool caseMoeGuCmp(MtlCtx& c, uint32_t layer, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    char name[128];
+    auto T = [&](const char* suffix) -> const GgufTensor* {
+        snprintf(name, sizeof name, "blk.%u.%s", layer, suffix);
+        return g.find(name);
+    };
+    const GgufTensor* tGE = T("ffn_gate_exps.weight");
+    const GgufTensor* tUE = T("ffn_up_exps.weight");
+    const GgufTensor* tGS = T("ffn_gate_shexp.weight");
+    const GgufTensor* tUS = T("ffn_up_shexp.weight");
+    if (!tGE || !tUE || !tGS || !tUS) {
+        fprintf(stderr, "moegucmp missing gate/up tensors for layer %u\n", layer);
+        return false;
+    }
+    const bool iq3 = tGE->type == GGML_IQ3_XXS && tUE->type == GGML_IQ3_XXS;
+    const uint32_t K = (uint32_t)tGE->ne[0];
+    const uint32_t ff = (uint32_t)tGE->ne[1];
+    const uint32_t nExp = (uint32_t)tGE->ne[2];
+    const uint32_t nUsed = (uint32_t)g.kvInt(
+        g.kvStr("general.architecture", "") + ".expert_used_count", 8);
+    if (!iq3 || tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0 ||
+        K != 2048u || ff != 512u || nUsed > 16u) {
+        fprintf(stderr, "moegucmp requires IQ3_XXS K=2048, n_ff=512 target shapes\n");
+        return false;
+    }
+    printf("\n== moegucmp blk.%u IQ3_XXS K=%u ff=%u experts=%u top-%u ==\n",
+           layer, K, ff, nExp, nUsed);
+
+    std::vector<float> x = randomX(K);
+    struct SelH { uint32_t ids[16]; float w[16]; float wShared; float pad[7]; } sel{};
+    for (uint32_t s = 0; s < nUsed; ++s) {
+        sel.ids[s] = (17u + 29u * s) % nExp;
+        sel.w[s] = 1.0f / nUsed;
+    }
+    sel.wShared = 0.5f;
+    const size_t rbE = ggmlRowBytes(tGE->type, K);
+    const size_t rbS = ggmlRowBytes(GGML_Q8_0, K);
+    const size_t wEBytes = (size_t)nExp * ff * rbE;
+    const size_t wSBytes = (size_t)ff * rbS;
+    const size_t hCount = (size_t)(nUsed + 1u) * ff;
+    id<MTLBuffer> bGE = createBuf(c, wEBytes, tGE->data, true);
+    id<MTLBuffer> bUE = createBuf(c, wEBytes, tUE->data, true);
+    id<MTLBuffer> bGS = createBuf(c, wSBytes, tGS->data, true);
+    id<MTLBuffer> bUS = createBuf(c, wSBytes, tUS->data, true);
+    id<MTLBuffer> bX = createBuf(c, (size_t)K * 4u, x.data(), true);
+    id<MTLBuffer> bSel = createBuf(c, sizeof(sel), &sel, true);
+    id<MTLBuffer> bSafe = createBuf(c, hCount * 4u, nullptr, true);
+    id<MTLBuffer> bFixed = createBuf(c, hCount * 4u, nullptr, true);
+    const uint32_t nsg = 4u;
+    id<MTLComputePipelineState> pSafe =
+        getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    id<MTLComputePipelineState> pFixed =
+        getPipe(c, "moe_gateup_all", "moe_gateup_all_k2048_ff512", nsg);
+    struct { uint32_t k, ff, ne, nu; } pc{K, ff, nExp, nUsed};
+    const uint32_t wgs = (uint32_t)((hCount + nsg - 1u) / nsg);
+
+    auto encode = [&](id<MTLComputeCommandEncoder> enc,
+                      id<MTLComputePipelineState> pso, id<MTLBuffer> h) {
+        [enc setComputePipelineState:pso];
+        id<MTLBuffer> bufs[] = {bGE, bUE, bGS, bUS, bX, bSel, h};
+        for (uint32_t i = 0; i < 7u; ++i) [enc setBuffer:bufs[i] offset:0 atIndex:i];
+        [enc setBytes:&pc length:sizeof(pc) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
+    };
+    auto once = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> h) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            encode(enc, pso, h);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+    };
+    once(pSafe, bSafe);
+    once(pFixed, bFixed);
+    const uint32_t* a = (const uint32_t*)bSafe.contents;
+    const uint32_t* b = (const uint32_t*)bFixed.contents;
+    size_t mismatches = 0;
+    for (size_t i = 0; i < hCount; ++i) mismatches += a[i] != b[i];
+    printf("fixed-vs-safe: %zu/%zu bit mismatches -> %s\n",
+           mismatches, hCount, mismatches ? "FAIL" : "EXACT");
+
+    auto run = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> h) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < iters; ++i) encode(enc, pso, h);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / iters;
+        }
+    };
+    if (iters) {
+        run(pSafe, bSafe); run(pFixed, bFixed);
+        const double s0 = run(pSafe, bSafe), f0 = run(pFixed, bFixed);
+        const double f1 = run(pFixed, bFixed), s1 = run(pSafe, bSafe);
+        printf("gpu us/iter: safe %.1f / %.1f | fixed %.1f / %.1f\n", s0, s1, f0, f1);
+    }
+    return mismatches == 0;
 }
 
 
@@ -1390,7 +1499,12 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     id<MTLComputePipelineState> pMoeL  = getPipe(c, "moe_logits", "moe_logits", nsg);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
-    id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    bool moeGuFixed = !moe.guIq4 && moe.nFf == 512u;
+    if (const char* v = getenv("QK_MOE_GU_FIXED"))
+        moeGuFixed = atoi(v) != 0 && !moe.guIq4 && moe.nFf == 512u;
+    id<MTLComputePipelineState> pMoeGu = getPipe(
+        c, "moe_gateup_all",
+        moeGuFixed ? "moe_gateup_all_k2048_ff512" : "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pMoeDn = moe.downQ6
         ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
         : getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
@@ -1725,7 +1839,12 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
-    id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    bool moeGuFixed = !moe.guIq4 && moe.nFf == 512u;
+    if (const char* v = getenv("QK_MOE_GU_FIXED"))
+        moeGuFixed = atoi(v) != 0 && !moe.guIq4 && moe.nFf == 512u;
+    id<MTLComputePipelineState> pMoeGu = getPipe(
+        c, "moe_gateup_all",
+        moeGuFixed ? "moe_gateup_all_k2048_ff512" : "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pMoeDn = moe.downQ6
         ? getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg)
         : getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
@@ -2026,7 +2145,12 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", 0);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
-    id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    bool moeGuFixed = ffE == 512u;
+    if (const char* v = getenv("QK_MOE_GU_FIXED"))
+        moeGuFixed = atoi(v) != 0 && ffE == 512u;
+    id<MTLComputePipelineState> pMoeGu = getPipe(
+        c, "moe_gateup_all",
+        moeGuFixed ? "moe_gateup_all_k2048_ff512" : "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pMoeD4 = getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
     id<MTLComputePipelineState> pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
     bool headFixedK = true;
@@ -2808,7 +2932,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAttnReduce = getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
     pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
-    pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
+    bool moeGuFixed = !guIq4 && ffE == 512u;
+    if (const char* v = getenv("QK_MOE_GU_FIXED"))
+        moeGuFixed = atoi(v) != 0 && !guIq4 && ffE == 512u;
+    pMoeGu = getPipe(c, "moe_gateup_all",
+                     moeGuFixed ? "moe_gateup_all_k2048_ff512" : "moe_gateup_all", nsg);
     pMoeD4 = getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
     pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
     pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
@@ -6281,6 +6409,8 @@ int main(int argc, char** argv) {
             ok = caseMoe(c, argU(2, 0), argU(3, 200));
         } else if (mode == "moegcmp") {
             ok = caseMoeGrp(c, argU(2, 0), argU(3, 128), argU(4, 50));
+        } else if (mode == "moegucmp") {
+            ok = caseMoeGuCmp(c, argU(2, 0), argU(3, 100));
         } else if (mode == "block") {
             ok = caseBlock(c, argU(2, 0), argU(3, 3), argU(4, 200));
         } else if (mode == "ablock") {
