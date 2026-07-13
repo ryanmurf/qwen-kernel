@@ -2668,11 +2668,13 @@ struct qk_engine {
         pMoeLA, pMoeLS, pAddNSg, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBAligned;
-    // Adaptive decode attention coarsens producer scheduling while retaining
-    // one byte-identical 256-key partial per chunk and the shipping reducer.
+    // Adaptive decode attention either coarsens f32 producer scheduling or
+    // shares compact-cache reads across GQA heads. Both retain one original
+    // 256-key partial per query head/chunk and the shipping reducer.
     id<MTLComputePipelineState> pAttnCompact, pAttnMulti,
-        pAttnQ8G2, pAttnQ8G4, pAttnQ8G8;
-    bool faDecodeSplit = true, faDecodeWork = true;
+        pAttnQ8G2, pAttnQ8G4, pAttnQ8G8,
+        pAttnF16G2, pAttnF16G4, pAttnF16G8;
+    bool faDecodeSplit = true, faDecodeWork = true, faF16Gqa = true;
     int faFanOverride = -1;
     int moeNormSplitMode = -1;  // -1 auto, 0 fused recompute, 1 split/reuse
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
@@ -3391,9 +3393,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         pAttnQ8G2 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa2", kvBytes);
         pAttnQ8G4 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa4", kvBytes);
         pAttnQ8G8 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes);
+    } else if (kvF16) {
+        pAttnF16G2 = getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa2", kvBytes);
+        pAttnF16G4 = getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa4", kvBytes);
+        pAttnF16G8 = getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa8", kvBytes);
     }
     if (const char* v = getenv("QK_FA_SPLIT")) faDecodeSplit = atoi(v) != 0;
     if (const char* v = getenv("QK_FA_WORK")) faDecodeWork = atoi(v) != 0;
+    if (const char* v = getenv("QK_FA_F16_GQA")) faF16Gqa = atoi(v) != 0;
     if (const char* v = getenv("QK_FA_FAN")) {
         const int x = atoi(v);
         if (x == 1 || x == 4 || x == 8 || x == 16 || x == 32 || x == 64)
@@ -4048,15 +4055,21 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
     // require the first materially winning fan unless explicitly overridden.
     if (faFan < 8u) faFan = 1u;
     if (faFanOverride > 0) faFan = (uint32_t)faFanOverride;
-    if (kvQ8) faFan = 1u;
-    uint32_t q8HeadGroup = 1u;
+    if (kvQ8 || (kvF16 && faF16Gqa)) faFan = 1u;
+    uint32_t decodeHeadGroup = 1u;
     if (kvQ8) {
         const uint32_t qPerKv = hQ / hKV;
-        if (liveChunks >= 64u && qPerKv % 8u == 0u) q8HeadGroup = 8u;
+        if (liveChunks >= 64u && qPerKv % 8u == 0u) decodeHeadGroup = 8u;
         else if ((liveChunks >= 16u || (zdim >= 4u && liveChunks >= 8u)) &&
                  qPerKv % 4u == 0u)
-            q8HeadGroup = 4u;
-        else if (liveChunks >= 8u && qPerKv % 2u == 0u) q8HeadGroup = 2u;
+            decodeHeadGroup = 4u;
+        else if (liveChunks >= 8u && qPerKv % 2u == 0u) decodeHeadGroup = 2u;
+    } else if (kvF16 && faF16Gqa) {
+        const uint32_t qPerKv = hQ / hKV;
+        if (balanced && liveChunks >= 128u && qPerKv % 8u == 0u)
+            decodeHeadGroup = 8u;
+        else if (liveChunks >= 32u && qPerKv % 4u == 0u) decodeHeadGroup = 4u;
+        else if (qPerKv % 2u == 0u) decodeHeadGroup = 2u;
     }
     const bool faUseWork = !kvQ8 && faDecodeSplit && faDecodeWork && (faFan > 1u ||
         (uint64_t)liveChunks * 4u < (uint64_t)zdim * splitChunks);
@@ -4085,10 +4098,10 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
         static uint64_t lastSig = UINT64_MAX;
         const uint64_t sig = (uint64_t)zdim << 56u | (uint64_t)splitChunks << 40u |
             (uint64_t)liveChunks << 16u | (uint64_t)faFan << 8u |
-            (uint64_t)q8HeadGroup << 4u | faUseWork;
+            (uint64_t)decodeHeadGroup << 4u | faUseWork;
         if (sig != lastSig) {
             fprintf(stderr, "[fa] slots=%u chunks=%u..%u live=%u fan=%u hg=%u work=%u/%u\n",
-                    zdim, minChunks, splitChunks, liveChunks, faFan, q8HeadGroup,
+                    zdim, minChunks, splitChunks, liveChunks, faFan, decodeHeadGroup,
                     faUseWork ? faWorkN : 0u, zdim * splitChunks);
             lastSig = sig;
         }
@@ -4151,15 +4164,18 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
             dsp(pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.st1, L.st2, bRope, bSlotPos},
                 &pcFa, 32, hQ + 2 * hKV, 256);
             bar();
-            const bool useFaSplit = faDecodeSplit && (kvQ8 ||
+            const bool useFaSplit = faDecodeSplit && (kvQ8 || (kvF16 && faF16Gqa) ||
                 !(zdim == 1u && splitChunks == 1u && faFanOverride < 0));
             if (useFaSplit && !faUseWork) {
                 id<MTLComputePipelineState> splitPipe = pAttnSplit;
-                if (q8HeadGroup == 2u) splitPipe = pAttnQ8G2;
-                else if (q8HeadGroup == 4u) splitPipe = pAttnQ8G4;
-                else if (q8HeadGroup == 8u) splitPipe = pAttnQ8G8;
+                if (kvQ8 && decodeHeadGroup == 2u) splitPipe = pAttnQ8G2;
+                else if (kvQ8 && decodeHeadGroup == 4u) splitPipe = pAttnQ8G4;
+                else if (kvQ8 && decodeHeadGroup == 8u) splitPipe = pAttnQ8G8;
+                else if (kvF16 && decodeHeadGroup == 2u) splitPipe = pAttnF16G2;
+                else if (kvF16 && decodeHeadGroup == 4u) splitPipe = pAttnF16G4;
+                else if (kvF16 && decodeHeadGroup == 8u) splitPipe = pAttnF16G8;
                 dspY(splitPipe, {bMid, L.st1, L.st2, bPartial, bSlotPos},
-                     &pcFaSplit, 36, hQ / q8HeadGroup, splitChunks, 256);
+                     &pcFaSplit, 36, hQ / decodeHeadGroup, splitChunks, 256);
                 bar();
                 dsp(pAttnReduce, {bPartial, bBig, bAtt, bSlotPos}, &pcFaSplit, 36, hQ, 256);
             } else if (useFaSplit) {
@@ -6319,6 +6335,18 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
     if (kvQ8)
         splitVars.push_back({"q8-gqa8",
             getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes),
+            nil, 0u, 8u});
+    if (kvF16)
+        splitVars.push_back({"f16-gqa2",
+            getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa2", kvBytes),
+            nil, 0u, 2u});
+    if (kvF16)
+        splitVars.push_back({"f16-gqa4",
+            getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa4", kvBytes),
+            nil, 0u, 4u});
+    if (kvF16)
+        splitVars.push_back({"f16-gqa8",
+            getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa8", kvBytes),
             nil, 0u, 8u});
     std::vector<uint32_t> compactWork;
     for (uint32_t s = 0; s < slots; ++s) {
