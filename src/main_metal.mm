@@ -9,6 +9,7 @@
 //   qk slotgemv [M] [K] [B] [TPR] [iters]  Q8_0 slot-batch comparison
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
 //   qk list [filter]          list tensors in the GGUF
+//   qk slotcmp <ids> <nGen> [nSlots] [tmax]  slot compaction/churn exactness
 //
 // Env: QK_DEVICE=<n> device index; QK_SHADER_DIR (dir with *.metal);
 //      QK_GGUF=<path>.
@@ -2430,6 +2431,8 @@ struct qk_engine {
     id<MTLBuffer> gbuf;   // no-copy view of the whole GGUF mmap
     uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
     bool shareFork = false;
+    bool slotCompact = true;
+    bool slotsNeedCompact = false;
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
     // Pipeline split (QK_LAYERS=a:b): this engine owns layers [lFirst, lEnd).
     uint32_t lFirst = 0, lEnd = 40;
@@ -2540,6 +2543,10 @@ struct qk_engine {
 
     struct Slot {
         bool active = false;
+        // Public slot ids are stable client identities. Unsplit serving packs
+        // live model state into physical stripes [0,nActive), avoiding decode
+        // work for holes left by staggered completion/cancellation.
+        uint32_t phys = UINT32_MAX;
         std::vector<uint32_t> prompt;
         std::vector<uint32_t> genTokens;
         uint32_t cursor = 0, pos = 0, gen = 0, maxGen = 0, last = 0;
@@ -2594,35 +2601,39 @@ struct qk_engine {
     int stageTopK(uint32_t k, uint32_t* idsOut, float* valsOut);
     uint32_t serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32_t slot,
                                  std::vector<float>& logits);
-    void resetSlot(uint32_t slot);
+    void resetStripe(uint32_t stripe);
     void snapshotSlot(uint32_t slot);
     int matchPrefix(const uint32_t* prompt, uint32_t n);
     void restoreInto(uint32_t slot, int cacheIdx);
-    void copyStripes(uint32_t slot, uint8_t* snap, bool save, uint32_t nTok = 0);
+    void copyStripes(uint32_t stripe, uint8_t* snap, bool save, uint32_t nTok = 0);
+    uint32_t physicalSlot(uint32_t slot) const;
+    uint32_t acquirePhysicalSlot(uint32_t slot);
+    void moveSlotState(uint32_t fromStripe, uint32_t toStripe, uint32_t nTok);
+    void compactActiveSlots();
     // The recurrent scratch stripe is index nSlots. Verification advances
     // DeltaNet/conv there while attention KV writes remain on the live slot.
     void copyDnStripes(uint32_t fromStripe, uint32_t toStripe);
     void verifyRound(const uint32_t* toks, uint32_t n, uint32_t slot, uint32_t base,
                      uint32_t* outIds);
-    void promoteScratch(uint32_t slot) { copyDnStripes(nSlots, slot); }
+    void promoteScratch(uint32_t slot) { copyDnStripes(nSlots, physicalSlot(slot)); }
     void encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
                     bool equivalentSlots = false);
 };
 
-void qk_engine::resetSlot(uint32_t slot) {
+void qk_engine::resetStripe(uint32_t stripe) {
     for (auto& L : layers) {   // GPU is idle at every call site (engine is synchronous)
         if (!L.st1) continue;  // layer outside this stage's [lFirst, lEnd)
-        memset((uint8_t*)L.st1.contents + (size_t)slot * L.ps1, 0, L.ps1);
-        memset((uint8_t*)L.st2.contents + (size_t)slot * L.ps2, 0, L.ps2);
+        memset((uint8_t*)L.st1.contents + (size_t)stripe * L.ps1, 0, L.ps1);
+        memset((uint8_t*)L.st2.contents + (size_t)stripe * L.ps2, 0, L.ps2);
     }
 }
 
-void qk_engine::copyStripes(uint32_t slot, uint8_t* snap, bool save, uint32_t nTok) {
+void qk_engine::copyStripes(uint32_t stripe, uint8_t* snap, bool save, uint32_t nTok) {
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
         if (!L.st1) continue;
-        uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)slot * L.ps1;
-        uint8_t* s2 = (uint8_t*)L.st2.contents + (size_t)slot * L.ps2;
+        uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)stripe * L.ps1;
+        uint8_t* s2 = (uint8_t*)L.st2.contents + (size_t)stripe * L.ps2;
         // Attention KV stripes are [hKV][tmax][dh]: with a live token count,
         // copy only each kv-heads first nTok rows so snapshot cost and
         // resident pages track the conversation, not capacity. Recurrent
@@ -2652,6 +2663,97 @@ void qk_engine::copyStripes(uint32_t slot, uint8_t* snap, bool save, uint32_t nT
     }
 }
 
+uint32_t qk_engine::physicalSlot(uint32_t slot) const {
+    if (splitStage() || !slotCompact) return slot;
+    if (slot >= nSlots || slots[slot].phys >= nSlots) {
+        fprintf(stderr, "physicalSlot: logical slot %u has no live stripe\n", slot);
+        abort();
+    }
+    return slots[slot].phys;
+}
+
+void qk_engine::moveSlotState(uint32_t fromStripe, uint32_t toStripe, uint32_t nTok) {
+    if (fromStripe == toStripe) return;
+    // Compaction always moves toward a lower, vacant stripe while the GPU is
+    // idle. Recurrent state is fixed-size; attention only needs the live KV
+    // prefix, not the potentially enormous configured context capacity.
+    for (Layer& L : layers) {
+        if (!L.st1) continue;
+        uint8_t* from1 = (uint8_t*)L.st1.contents + (size_t)fromStripe * L.ps1;
+        uint8_t* from2 = (uint8_t*)L.st2.contents + (size_t)fromStripe * L.ps2;
+        uint8_t* to1 = (uint8_t*)L.st1.contents + (size_t)toStripe * L.ps1;
+        uint8_t* to2 = (uint8_t*)L.st2.contents + (size_t)toStripe * L.ps2;
+        if (L.rec) {
+            memcpy(to1, from1, L.ps1);
+            memcpy(to2, from2, L.ps2);
+        } else if (nTok) {
+            const size_t headBytes = L.ps1 / hKV;
+            const size_t liveBytes = std::min((size_t)nTok, (size_t)nCtx) * dh * 4;
+            for (uint32_t h = 0; h < hKV; ++h) {
+                const size_t off = (size_t)h * headBytes;
+                memcpy(to1 + off, from1 + off, liveBytes);
+                memcpy(to2 + off, from2 + off, liveBytes);
+            }
+        }
+    }
+}
+
+void qk_engine::compactActiveSlots() {
+    if (splitStage() || !slotCompact || !slotsNeedCompact) return;
+    std::array<int32_t, 16> owner;
+    owner.fill(-1);
+    uint32_t nLive = 0;
+    for (uint32_t s = 0; s < nSlots; ++s) {
+        const Slot& sl = slots[s];
+        if (!sl.active || sl.finPending) continue;
+        if (sl.phys >= nSlots || owner[sl.phys] >= 0) {
+            fprintf(stderr, "compactActiveSlots: invalid/duplicate stripe for slot %u\n", s);
+            abort();
+        }
+        owner[sl.phys] = (int32_t)s;
+        ++nLive;
+    }
+    // Fill each hole below nLive with one high stripe. This changes physical
+    // row order (which is fully mapped) but copies at most one state per hole,
+    // instead of shifting every later client and its potentially large KV.
+    for (uint32_t target = 0; target < nLive; ++target) {
+        if (owner[target] >= 0) continue;
+        uint32_t source = nSlots;
+        while (source > nLive) {
+            --source;
+            if (owner[source] >= 0) break;
+        }
+        if (source < nLive || owner[source] < 0) {
+            fprintf(stderr, "compactActiveSlots: no source for hole %u/%u\n", target, nLive);
+            abort();
+        }
+        Slot& sl = slots[(uint32_t)owner[source]];
+        // During serial prompt ingestion `cursor` advances while `pos` stays
+        // at the last batched boundary, so cursor is the live KV length. Once
+        // generation begins, pos is the authoritative fed-token count.
+        const uint32_t liveTok = std::max(
+            sl.pos, std::min(sl.cursor, (uint32_t)sl.prompt.size()));
+        moveSlotState(source, target, liveTok);
+        sl.phys = target;
+        owner[target] = owner[source];
+        owner[source] = -1;
+    }
+    slotsNeedCompact = false;
+}
+
+uint32_t qk_engine::acquirePhysicalSlot(uint32_t slot) {
+    if (splitStage() || !slotCompact) {
+        slots[slot].phys = slot;
+        return slot;
+    }
+    compactActiveSlots();
+    uint32_t n = 0;
+    for (const Slot& sl : slots) if (sl.active && !sl.finPending) ++n;
+    if (n >= nSlots) abort();
+    slots[slot].phys = n;
+    return n;
+}
+
 void qk_engine::copyDnStripes(uint32_t fromStripe, uint32_t toStripe) {
     // Every caller is synchronous: the preceding command buffer has completed
     // and the next one has not been committed, so shared-memory copies are
@@ -2667,9 +2769,10 @@ void qk_engine::copyDnStripes(uint32_t fromStripe, uint32_t toStripe) {
 
 void qk_engine::verifyRound(const uint32_t* toks, uint32_t n, uint32_t slot, uint32_t base,
                             uint32_t* outIds) {
-    copyDnStripes(slot, nSlots);  // seed scratch from live state at `base`
+    const uint32_t stripe = physicalSlot(slot);
+    copyDnStripes(stripe, nSlots);  // seed scratch from live state at `base`
     std::vector<float> dummy;
-    prefillBatchLast(toks, n, slot, dummy, /*wantLogits=*/false, base, outIds,
+    prefillBatchLast(toks, n, stripe, dummy, /*wantLogits=*/false, base, outIds,
                      /*hiddenIn=*/nullptr, /*hiddenOut=*/nullptr, /*scratchState=*/true);
 }
 
@@ -2690,7 +2793,7 @@ void qk_engine::snapshotSlot(uint32_t slot) {
     e.tokens.insert(e.tokens.end(), sl.genTokens.begin(), sl.genTokens.begin() + fedGen);
     e.lru = ++lruClock;
     e.valid = true;
-    copyStripes(slot, e.snap.data(), /*save=*/true);
+    copyStripes(physicalSlot(slot), e.snap.data(), /*save=*/true);
 }
 
 int qk_engine::matchPrefix(const uint32_t* prompt, uint32_t n) {
@@ -2711,13 +2814,14 @@ int qk_engine::matchPrefix(const uint32_t* prompt, uint32_t n) {
 
 void qk_engine::restoreInto(uint32_t slot, int cacheIdx) {
     pcache[cacheIdx].lru = ++lruClock;
-    copyStripes(slot, pcache[cacheIdx].snap.data(), /*save=*/false);
+    copyStripes(physicalSlot(slot), pcache[cacheIdx].snap.data(), /*save=*/false);
 }
 
 bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t errLen) {
     auto fail = [&](const char* m) { if (err && errLen) snprintf(err, errLen, "%s", m); return false; };
     nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
     shareFork = getenv("QK_FORK") != nullptr;
+    slotCompact = !getenv("QK_SLOT_COMPACT") || atoi(getenv("QK_SLOT_COMPACT")) != 0;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
     initMtl(c, "libqk");
@@ -3320,6 +3424,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     specToks.resize(maxB);
     specAm.resize(maxB);
     slots.resize(nSlots);
+    for (uint32_t s = 0; s < nSlots; ++s) slots[s].phys = s;
     return true;
 }
 
@@ -3605,6 +3710,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
                             (double)sl.specFed / sl.specRounds);
             sl.resetSpec();
             sl.active = false;
+            slotsNeedCompact = true;
             *outFin |= 1u << s;
         }
     };
@@ -3625,6 +3731,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         }
         finish(s);
     }
+    compactActiveSlots();
 
     // V1 speculates only when exactly one unfinished slot is active. A verify
     // round blocks for about one serial chunk and would otherwise be unfair to
@@ -3664,7 +3771,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
                     promoteScratch((uint32_t)only);
                 } else {
                     std::vector<float> dummy;
-                    prefillBatchLast(specToks.data(), accepted, (uint32_t)only, dummy,
+                    prefillBatchLast(specToks.data(), accepted, physicalSlot((uint32_t)only), dummy,
                                      /*wantLogits=*/false, sl.pos);
                 }
                 sl.pos += accepted;
@@ -3681,6 +3788,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
                 if (eosHit || sl.gen >= sl.maxGen || sl.pos >= nCtx) {
                     snapshotSlot((uint32_t)only);
                     sl.finPending = true;
+                    slotsNeedCompact = true;
                     finish((uint32_t)only);
                     break;
                 }
@@ -3691,24 +3799,30 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     // Serial fallback for slots with no high-confidence draft and for all
     // multi-slot steps. It is also responsible for prompt ingestion.
     for (uint32_t step = 0; step < chunkN; step++) {
+        // A slot may have completed in the preceding iteration. Move only its
+        // surviving neighbors now, after every bTok row from that dispatch has
+        // been consumed.
+        compactActiveSlots();
         int nAct = 0;
         uint32_t maxZ = 0;
         bool need = false;
+        for (uint32_t p = 0; p < nSlots; ++p) {
+            slotIn[p] = 0;
+            slotPos[p] = 0;
+        }
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
-            if (!sl.active || sl.finPending) {
-                slotIn[s] = 0;
-                slotPos[s] = 0;
-                continue;
-            }
-            nAct++; maxZ = s + 1;
+            if (!sl.active || sl.finPending) continue;
+            const uint32_t p = physicalSlot(s);
+            nAct++;
+            maxZ = std::max(maxZ, p + 1);
             if (sl.cursor < sl.prompt.size()) {
-                slotIn[s] = sl.prompt[sl.cursor];
-                slotPos[s] = sl.cursor;
+                slotIn[p] = sl.prompt[sl.cursor];
+                slotPos[p] = sl.cursor;
                 need = true;
             } else {
-                slotIn[s] = sl.last;
-                slotPos[s] = sl.pos;
+                slotIn[p] = sl.last;
+                slotPos[p] = sl.pos;
                 if (outCnt[s] < chunkN) need = true;
             }
         }
@@ -3716,12 +3830,15 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 
         bool equivalentSlots = moeSlotGrouped && maxZ >= 2 && nAct == (int)maxZ;
         if (equivalentSlots) {
-            const Slot& r = slots[0];
-            for (uint32_t s = 1; s < maxZ; ++s) {
+            const Slot* r = nullptr;
+            for (uint32_t s = 0; s < nSlots; ++s)
+                if (slots[s].active && !slots[s].finPending) { r = &slots[s]; break; }
+            for (uint32_t s = 0; s < nSlots; ++s) {
                 const Slot& q = slots[s];
-                if (!q.active || q.equivId != r.equivId || q.cursor != r.cursor ||
-                    q.pos != r.pos || q.genTokens.size() != r.genTokens.size() ||
-                    q.last != r.last) {
+                if (!q.active || q.finPending || &q == r) continue;
+                if (q.equivId != r->equivId || q.cursor != r->cursor ||
+                    q.pos != r->pos || q.genTokens.size() != r->genTokens.size() ||
+                    q.last != r->last) {
                     equivalentSlots = false;
                     break;
                 }
@@ -3753,7 +3870,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
             if (!sl.active || sl.finPending) continue;
-            uint32_t sampled = tok[s];
+            uint32_t sampled = tok[physicalSlot(s)];
             bool prefilling = sl.cursor < sl.prompt.size();
             if (prefilling && sl.cursor + 1 < sl.prompt.size()) {
                 sl.cursor++;
@@ -3765,6 +3882,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
                 if (!prefilling) sl.pos++;
                 snapshotSlot(s);
                 sl.finPending = true;
+                slotsNeedCompact = true;
                 finish(s);
                 continue;
             }
@@ -3776,6 +3894,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
             if (sl.pos >= nCtx || sl.gen >= sl.maxGen) {
                 snapshotSlot(s);
                 sl.finPending = true;
+                slotsNeedCompact = true;
                 finish(s);
             }
         }
@@ -3810,7 +3929,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     // win vs llama). QK_FA_MMA=0 forces the old scalar kernel (rollback/debug).
     static const bool faMma = !getenv("QK_FA_MMA") || atoi(getenv("QK_FA_MMA")) != 0;
     if (wantLogits) logits.resize(vocab);
-    if (base == 0) resetSlot(slot);
+    if (base == 0) resetStripe(slot);
     // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
     for (uint32_t il = lFirst; il < lEnd; il++) {
         if (!layers[il].rec) continue;
@@ -4160,7 +4279,7 @@ uint32_t qk_engine::serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32
             return 0;
         }
     }
-    resetSlot(slot);
+    resetStripe(slot);
     uint32_t* slotIn = (uint32_t*)bSlotIn.contents;
     uint32_t* slotPos = (uint32_t*)bSlotPos.contents;
     for (uint32_t s = 0; s < nSlots; s++) { slotIn[s] = 0; slotPos[s] = 0; }
@@ -4244,13 +4363,14 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
     for (uint32_t i = 0; i < n_prompt; i++) if (prompt[i] >= e->vocab) return -4;
     qk_engine::Slot& s = e->slots[slot];
+    const uint32_t stripe = e->acquirePhysicalSlot(slot);
     int cidx = e->matchPrefix(prompt, n_prompt);
     uint32_t start;
     if (cidx >= 0) {
         e->restoreInto(slot, cidx);
         start = (uint32_t)e->pcache[cidx].tokens.size();
     } else {
-        e->resetSlot(slot);
+        e->resetStripe(stripe);
         start = 0;
     }
     uint32_t target = n_prompt >= 1 ? n_prompt - 1 : 0;
@@ -4259,7 +4379,8 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
         while (limit > done && limit - done >= 16) {
             uint32_t chunk = std::min(e->maxB, limit - done);
             std::vector<float> unused;
-            e->prefillBatchLast(prompt + done, chunk, slot, unused, /*wantLogits=*/false, /*base=*/done);
+            e->prefillBatchLast(prompt + done, chunk, stripe, unused,
+                                /*wantLogits=*/false, /*base=*/done);
             done += chunk;
         }
     };
@@ -4300,9 +4421,11 @@ __attribute__((visibility("default")))
 void qk_slot_cancel(qk_engine* e, uint32_t slot) {
     if (e && slot < e->nSlots) {
         e->slots[slot].active = false;
+        e->slotsNeedCompact = true;
         e->slots[slot].prompt.clear();
         e->slots[slot].equivId = 0;
         e->slots[slot].resetSpec();
+        e->compactActiveSlots();
     }
 }
 
@@ -5764,6 +5887,115 @@ int main(int argc, char** argv) {
                    gen[0].size(), gen[1].size(), ms, steps);
             printf("GEN0:"); for (uint32_t t : gen[0]) printf(" %u", t); printf("\n");
             printf("GEN1:"); for (uint32_t t : gen[1]) printf(" %u", t); printf("\n");
+            qk_close(e);
+            return 0;
+        }
+
+        if (mode == "slotcmp") {
+            if (argc < 4) {
+                fprintf(stderr, "usage: qk slotcmp <ids-file> <nGen> [nSlots] [tmax]\n");
+                return 1;
+            }
+            std::vector<uint32_t> prompt;
+            {
+                FILE* f = fopen(argv[2], "r");
+                if (!f) { perror(argv[2]); return 1; }
+                int v;
+                while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+                fclose(f);
+            }
+            const uint32_t nGen = (uint32_t)atoi(argv[3]);
+            const uint32_t ns = argc > 4 ? (uint32_t)atoi(argv[4]) : 8;
+            const uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 512;
+            if (nGen < 8 || ns < 2 || ns > 16 || prompt.empty() ||
+                prompt.size() + nGen > tmax) {
+                fprintf(stderr, "slotcmp: require nGen>=8, 2<=nSlots<=16, prompt+nGen<=tmax\n");
+                return 1;
+            }
+            qk_config cfg{ns, tmax, 1};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            std::vector<std::vector<uint32_t>> prompts(ns, prompt);
+            for (uint32_t s = 1; s < ns; ++s)
+                prompts[s][0] = (prompts[s][0] + 7919u * s) % e->vocab;
+            std::vector<uint32_t> outTok(ns), outCnt(ns);
+            uint32_t fin = 0;
+            auto stepInto = [&](std::vector<std::vector<uint32_t>>& gen) {
+                int active = qk_step_chunk(e, outTok.data(), outCnt.data(), &fin);
+                if (active < 0) return active;
+                for (uint32_t s = 0; s < ns; ++s)
+                    for (uint32_t i = 0; i < outCnt[s]; ++i) gen[s].push_back(outTok[s]);
+                return active;
+            };
+
+            // Establish one golden trajectory per heterogeneous prompt while
+            // every public index is independently mapped to physical stripe 0.
+            std::vector<std::vector<uint32_t>> golden(ns);
+            for (uint32_t target = 0; target < ns; ++target) {
+                std::vector<std::vector<uint32_t>> gen(ns);
+                if (qk_slot_start(e, target, prompts[target].data(),
+                                  (uint32_t)prompts[target].size(),
+                                  nGen, 0)) {
+                    fprintf(stderr, "slotcmp: start %u failed\n", target);
+                    qk_close(e); return 1;
+                }
+                while (stepInto(gen) > 0) {}
+                golden[target] = std::move(gen[target]);
+            }
+
+            // Exercise a hole at every physical index, then one simultaneous
+            // irregular mask. A survivor step forces state moves; restarting
+            // removed clients makes subsequent dispatches heterogeneous in
+            // position while logical output ownership stays stable.
+            for (uint32_t churn = 0; churn <= ns; ++churn) {
+                std::vector<std::vector<uint32_t>> gen(ns);
+                for (uint32_t s = 0; s < ns; ++s) {
+                    if (qk_slot_start(e, s, prompts[s].data(),
+                                      (uint32_t)prompts[s].size(), nGen, 0)) {
+                        fprintf(stderr, "slotcmp: churn %u start %u failed\n", churn, s);
+                        qk_close(e); return 1;
+                    }
+                }
+                for (uint32_t i = 0; i < 3; ++i)
+                    if (stepInto(gen) <= 0) {
+                        fprintf(stderr, "slotcmp: early finish in churn %u\n", churn);
+                        qk_close(e); return 1;
+                    }
+                std::vector<uint32_t> removed;
+                for (uint32_t s = 0; s < ns; ++s) {
+                    const bool remove = churn < ns ? s == churn
+                        : ((s % 3) == 1 || (s + 1 == ns && s != 0));
+                    if (!remove) continue;
+                    qk_slot_cancel(e, s);
+                    gen[s].clear();
+                    removed.push_back(s);
+                }
+                if (stepInto(gen) <= 0) {
+                    fprintf(stderr, "slotcmp: no survivors in churn %u\n", churn);
+                    qk_close(e); return 1;
+                }
+                for (uint32_t s : removed) {
+                    if (qk_slot_start(e, s, prompts[s].data(),
+                                      (uint32_t)prompts[s].size(), nGen, 0)) {
+                        fprintf(stderr, "slotcmp: churn %u restart %u failed\n", churn, s);
+                        qk_close(e); return 1;
+                    }
+                }
+                while (stepInto(gen) > 0) {}
+                for (uint32_t s = 0; s < ns; ++s) {
+                    if (gen[s] == golden[s]) continue;
+                    size_t at = 0;
+                    while (at < gen[s].size() && at < golden[s].size() &&
+                           gen[s][at] == golden[s][at]) ++at;
+                    fprintf(stderr, "slotcmp: churn %u slot %u differs at %zu "
+                                    "(got %zu, want %zu)\n",
+                            churn, s, at, gen[s].size(), golden[s].size());
+                    qk_close(e); return 1;
+                }
+            }
+            printf("slotcmp: PASS %u/%u lone slots + every hole + mask churn, "
+                   "%zu tokens exact\n", ns, ns, golden[0].size());
             qk_close(e);
             return 0;
         }
