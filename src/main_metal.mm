@@ -11,6 +11,7 @@
 //   qk normroutecmp [experts] [slots] [iters]  split normalized router
 //   qk fasrvcmp [slots] [max-pos] [min-pos] [iters]  decode-attention schedules
 //   qk fadecode [slots] [pos] [steps] [tmax] [min-pos]  steady deep decode
+//   qk counters                 list hardware counter support
 //   qk cachecmp [tmax=512]    packed/full prefix-state snapshot comparison
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
 //   qk list [filter]          list tensors in the GGUF
@@ -87,6 +88,158 @@ static void initMtl(MtlCtx& c, const char* argv0) {
            c.dev.name.UTF8String, (int)c.dev.hasUnifiedMemory,
            (double)c.dev.recommendedMaxWorkingSetSize / (1ull << 30));
 }
+
+static id<MTLCounterSet> timestampCounterSet(id<MTLDevice> dev) {
+    for (id<MTLCounterSet> set in dev.counterSets)
+        if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) return set;
+    return nil;
+}
+
+static void printCounterInfo(const MtlCtx& c) {
+    printf("counter sampling: stage=%d dispatch=%d draw=%d blit=%d\n",
+           (int)[c.dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary],
+           (int)[c.dev supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary],
+           (int)[c.dev supportsCounterSampling:MTLCounterSamplingPointAtDrawBoundary],
+           (int)[c.dev supportsCounterSampling:MTLCounterSamplingPointAtBlitBoundary]);
+    for (id<MTLCounterSet> set in c.dev.counterSets) {
+        printf("  %s:", set.name.UTF8String);
+        for (id<MTLCounter> counter in set.counters)
+            printf(" %s", counter.name.UTF8String);
+        printf("\n");
+    }
+}
+
+// M4 exposes only timestamp samples at compute-encoder boundaries.  This
+// opt-in helper therefore splits one command buffer into labeled passes.  It
+// deliberately allocates no Metal objects and never splits the encoder unless
+// QK_COUNTERS=1: normal inference retains its original GPU command stream.
+struct StageCounterTrace {
+    id<MTLDevice> dev = nil;
+    id<MTLCounterSampleBuffer> samples = nil;
+    id<MTLFence> pendingFence = nil;
+    std::vector<id<MTLFence>> fences;
+    NSUInteger next = 0;
+    std::vector<const char*> labels;
+
+    explicit StageCounterTrace(MtlCtx& c, NSUInteger sampleCount = 2048) {
+        const char* e = getenv("QK_COUNTERS");
+        if (!e || atoi(e) == 0) return;
+        dev = c.dev;
+        if (![c.dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            fprintf(stderr, "[counter] stage-boundary sampling is unsupported\n");
+            return;
+        }
+        id<MTLCounterSet> set = timestampCounterSet(c.dev);
+        if (!set) {
+            fprintf(stderr, "[counter] timestamp counter set is unavailable\n");
+            return;
+        }
+        MTLCounterSampleBufferDescriptor* desc = [MTLCounterSampleBufferDescriptor new];
+        desc.counterSet = set;
+        desc.label = @"qk stage timestamps";
+        desc.storageMode = MTLStorageModeShared;
+        desc.sampleCount = sampleCount;
+        NSError* err = nil;
+        samples = [c.dev newCounterSampleBufferWithDescriptor:desc error:&err];
+        if (!samples)
+            fprintf(stderr, "[counter] sample-buffer allocation failed: %s\n",
+                    err ? err.localizedDescription.UTF8String : "unknown error");
+    }
+
+    bool enabled() const { return samples != nil; }
+
+    id<MTLComputeCommandEncoder> begin(id<MTLCommandBuffer> cb) {
+        if (next + 2 > samples.sampleCount) {
+            fprintf(stderr, "[counter] sample capacity exhausted at %lu\n",
+                    (unsigned long)next);
+            exit(1);
+        }
+        MTLComputePassDescriptor* pass = [MTLComputePassDescriptor computePassDescriptor];
+        pass.dispatchType = MTLDispatchTypeConcurrent;
+        MTLComputePassSampleBufferAttachmentDescriptor* a =
+            [pass.sampleBufferAttachments objectAtIndexedSubscript:0];
+        a.sampleBuffer = samples;
+        a.startOfEncoderSampleIndex = next++;
+        a.endOfEncoderSampleIndex = next++;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:pass];
+        if (pendingFence) [enc waitForFence:pendingFence];
+        return enc;
+    }
+
+    void end(id<MTLComputeCommandEncoder> enc, const char* label) {
+        id<MTLFence> fence = [dev newFence];
+        [enc updateFence:fence];
+        [enc endEncoding];
+        fences.push_back(fence);
+        pendingFence = fence;
+        labels.push_back(label);
+    }
+
+    void discardEmpty(id<MTLComputeCommandEncoder> enc) {
+        // nextPass starts the following pass eagerly.  A no-logit call has no
+        // work after the final residual boundary; Metal may leave that empty
+        // pass's timestamps at zero, so exclude its reserved pair.
+        [enc endEncoding];
+        next -= 2;
+    }
+
+    void report(double cbSeconds) const {
+        if (!enabled() || labels.empty()) return;
+        NSData* data = [samples resolveCounterRange:NSMakeRange(0, next)];
+        if (!data || data.length < next * sizeof(MTLCounterResultTimestamp)) {
+            fprintf(stderr, "[counter] failed to resolve %lu timestamp samples\n",
+                    (unsigned long)next);
+            return;
+        }
+        const auto* ts = (const MTLCounterResultTimestamp*)data.bytes;
+        for (NSUInteger i = 0; i < next; ++i) {
+            if (ts[i].timestamp == MTLCounterErrorValue || ts[i].timestamp == 0 ||
+                (i && ts[i].timestamp < ts[i - 1].timestamp)) {
+                fprintf(stderr, "[counter] GPU reported an invalid/non-monotonic "
+                                "timestamp at %lu; trace skipped\n",
+                        (unsigned long)i);
+                return;
+            }
+        }
+        const char* raw = getenv("QK_COUNTER_RAW");
+        if (raw && atoi(raw) != 0) {
+            fprintf(stderr, "[counter-raw] bytes=%lu samples=%lu stride=%lu\n",
+                    (unsigned long)data.length, (unsigned long)next,
+                    (unsigned long)(data.length / next));
+            for (NSUInteger i = 0; i < std::min<NSUInteger>(next, 24); ++i)
+                fprintf(stderr, "[counter-raw] %3lu %20llu\n", (unsigned long)i,
+                        (unsigned long long)ts[i].timestamp);
+        }
+        const uint64_t span = ts[next - 1].timestamp - ts[0].timestamp;
+        uint64_t active = 0, gaps = 0;
+        std::map<std::string, uint64_t> totals;
+        std::map<std::string, uint32_t> counts;
+        uint64_t prevEnd = ts[0].timestamp;
+        for (size_t i = 0; i < labels.size(); ++i) {
+            const uint64_t start = std::max(ts[2 * i].timestamp, prevEnd);
+            const uint64_t end = ts[2 * i + 1].timestamp;
+            if (start > prevEnd) gaps += start - prevEnd;
+            const uint64_t dt = end > start ? end - start : 0;
+            active += dt;
+            totals[labels[i]] += dt;
+            counts[labels[i]]++;
+            prevEnd = std::max(prevEnd, end);
+        }
+        // Apple GPU timestamps are currently nanoseconds.  Calibrate the
+        // stage rows to the command-buffer timestamp anyway, so the report is
+        // meaningful if a future device uses a different tick period.
+        const double scaleMs = span ? cbSeconds * 1e3 / (double)span : 0.0;
+        fprintf(stderr,
+                "[counter] timestamp-only trace: %zu fenced passes (encoder splitting perturbs schedule)\n"
+                "[counter] span %.3f ms | command-buffer %.3f ms | active %.3f ms",
+                labels.size(), span * 1e-6, cbSeconds * 1e3, active * scaleMs);
+        fprintf(stderr, " | gaps %.3f ms\n", gaps * scaleMs);
+        for (const auto& [name, ticks] : totals)
+            fprintf(stderr, "[counter] %-14s %8.3f ms  %5.1f%%  (%u passes)\n",
+                    name.c_str(), ticks * scaleMs,
+                    span ? 100.0 * ticks / (double)span : 0.0, counts[name]);
+    }
+};
 
 // Mirrors loadSpv: QK_SHADER_DIR, then <exe-dir>/shaders/metal, then CWD.
 static std::string loadMetalSource(const char* argv0, const char* name) {
@@ -4825,8 +4978,15 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
 
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [c.queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc =
-            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        StageCounterTrace counter(c);
+        id<MTLComputeCommandEncoder> enc = counter.enabled()
+            ? counter.begin(cb)
+            : [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        auto nextPass = [&](const char* label) {
+            if (!counter.enabled()) return;
+            counter.end(enc, label);
+            enc = counter.begin(cb);
+        };
         auto dspz = [&](id<MTLComputePipelineState> pso,
                         std::initializer_list<WB> bufs,
                         const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr, uint32_t z) {
@@ -4907,6 +5067,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             dspz(pEmb, {bEmbdW, bbIds, bbXin, layers[lFirst].aNorm, bbXn}, &pcE, 16, 1, 256, n);
         }
         bar();
+        nextPass("input");
         // Preserve the per-sequence numerical regime when rows from several
         // prompts share the activation matrix. Crossing the grouped-MoE
         // threshold only in aggregate changes recurrent trajectories.
@@ -4919,6 +5080,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 dspz(pAbB, {bbXn, L.alW, L.beW, L.dt, L.av, bbGb}, &pcAbB, 12,
                      (2 * hV + nsg - 1) / nsg, thrN, n);
                 bar();
+                nextPass("rec-proj");
                 if (!skDn) {
                 for (uint32_t q = 0; q < nSeq; ++q) {
                     const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
@@ -4933,6 +5095,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                          &pcConvB, 20, chQkv / dS, dS, seqN);
                 }
                 bar();
+                nextPass("dn-conv");
                 if (dnChunk) {
                     const size_t kqStride = (size_t)nChDn * hK * 2 * 64 * 64 * 4;
                     const size_t uwStride = (size_t)nChDn * hV * 4 * 64 * dS * 4;
@@ -4946,6 +5109,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                              &pcDnC, 20, hK, dS, nChDn);
                     }
                     bar();
+                    nextPass("dn-kq");
                     for (uint32_t q = 0; q < nSeq; ++q) {
                         const size_t ro = (size_t)q * seqN;
                         dspz(pDnSolve,
@@ -4958,6 +5122,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                              &pcDnC, 20, hV, dS, nChDn);
                     }
                     bar();
+                    nextPass("dn-solve");
                     for (uint32_t q = 0; q < nSeq; ++q) {
                         const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
                         const size_t oo = (size_t)q * seqPad;
@@ -4984,6 +5149,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     }
                 }
                 bar();
+                nextPass("dn-step");
                 for (uint32_t q = 0; q < nSeq; ++q) {
                     const size_t ro = (size_t)q * seqN;
                     const size_t oo = (size_t)q * seqPad;
@@ -4994,6 +5160,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                          &pcGateB, 16, (hV + nsg - 1) / nsg, thrN, seqN);
                 }
                 bar();
+                nextPass("dn-gate");
                 }
                 proj(L.outW, L.outP, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
             } else {
@@ -5001,6 +5168,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 proj(L.wk, L.wkP, bbXn, bbKin, hKV * dh, nEmbd, false, L.iq4P2);
                 proj(L.wv, L.wvP, bbXn, bbVin, hKV * dh, nEmbd, false, L.iq4P3);
                 bar();
+                nextPass("attn-proj");
                 if (!skAttn) {
                 for (uint32_t q = 0; q < nSeq; ++q) {
                     const uint32_t stateSlot = stateSlotFor(q);
@@ -5016,6 +5184,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                          &pcFaB, 40, hQ + 2 * hKV, 256, seqN);
                 }
                 bar();
+                nextPass("attn-prep");
                 for (uint32_t q = 0; q < nSeq; ++q) {
                     const uint32_t stateSlot = stateSlotFor(q);
                     const size_t ro = (size_t)q * seqN;
@@ -5039,15 +5208,18 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                              &pcFaB, 40, hQ, 256, seqN);
                 }
                 bar();
+                nextPass("attention");
                 }
                 proj(L.wo, L.woP, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
             }
             bar();
+            nextPass(L.rec ? "out-proj" : "attn-out");
             if (useGrouped) {
                 // grouped regime: residual+norm via add_rmsnorm (same y/xn2 as
                 // the fused kernel), router logits as one f32 GEMM
                 dspz(pAddN, {bbXin, bbAttnOut, L.pn, bbY, bbXn2}, &pcRms, 8, 1, 256, n);
                 bar();
+                nextPass("residual");
                 struct { uint32_t M, K, N; } pcLg{nExp + 1, nEmbd, n};
                 dspz(pLogG, {L.mgi, L.mgis, bbXn2, bbML}, &pcLg, 12, (nExp + 1 + 31) / 32, 128,
                      (n + 31) / 32);
@@ -5056,9 +5228,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      &pcv5, 20, (nExp + 1 + nsg - 1) / nsg, thrN, n);
             }
             bar();
+            nextPass(useGrouped ? "router" : "router+resid");
             if (!skMoe) {
             dspz(pMoeS, {bbML, bbMSel}, &pcv, 16, 1, 32, n);
             bar();
+            nextPass("select");
             if (useGrouped) {
                 struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, ffE, nExp, nUsed, n};
                 const bool compactWork = (moeGrouped == 5 || moeGrouped == 6) &&
@@ -5071,6 +5245,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     dspz(pMoeGrp, {bbMSel, bbStart, bbATok, bbASlot},
                          &pcg, 20, 1, 256, 1);
                 bar();
+                nextPass("moe-group");
                 if (!skGu) {
                 if (compactWork)
                     dspz(pMoeGuG5Work,
@@ -5100,6 +5275,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                          thrN, 1);
                 }
                 bar();
+                nextPass("moe-gateup");
                 if (!skDown) {
                 if (compactWork)
                     dspz(L.downQ6 ? pMoeDGP6Work : pMoeDGP4Work,
@@ -5118,6 +5294,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                          {L.mde, L.mds, bbMH, bbStart, bbATok, bbASlot, bbMDy},
                          &pcv, 16, (nExp + 1) * (nEmbd / 32), 128, 1);
                 bar();
+                nextPass("moe-down");
                 dspz(pMoeDR, {bbMDy, bbMSel, bbMY}, &pcv, 16, (nEmbd + 255) / 256, 256, n);
                 }
             } else {
@@ -5126,15 +5303,18 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbMSel, bbMH}, &pcv, 16,
                      ((nUsed + 1) * ffE + nsg - 1) / nsg, thrN, n);
                 bar();
+                nextPass("moe-gateup");
                 if (!skDown)
                 dspz(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bbMH, bbMSel, bbMY},
                      &pcv, 16, (nEmbd + nsg - 1) / nsg, thrN, n);
             }
             bar();
+            nextPass(useGrouped ? "moe-reduce" : "moe-down");
             }
             WB nextNorm = il + 1 < lEnd ? layers[il + 1].aNorm : bONorm;
             dspz(pAddN, {bbY, bbMY, nextNorm, bbXin, bbXn}, &pcRms, 8, 1, 256, n);
             bar();
+            nextPass("residual");
         }
         if (wantLogits || argmaxOut) {
             // per-position ids (argmaxOut: stageRun wire contract) need the
@@ -5160,6 +5340,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      &pcHead, 20, headTiles, wide ? 256 : 128,
                      (nh + headCols - 1u) / headCols);
                 bar();
+                nextPass("head");
                 struct { uint32_t tiles, nn; } pcRed{headTiles, nh};
                 dspz(pHeadTopReduce, {bbHeadV, bbHeadI, bbTok}, &pcRed, 8, 1, 256, nh);
                 lastRunRows = 1;
@@ -5173,21 +5354,29 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      &pcHead, 8, (vocab + 3) / 4, 64, nh);
                 if (argmaxOut) {
                     bar();
+                    nextPass("head");
                     const uint32_t amWgs = (vocab + 4095) / 4096;
                     struct { uint32_t nn, span; } pcAm{vocab, 4096};
                     struct { uint32_t m, pos; } pcAm2{amWgs, 0};
                     dspz(pAm1, {bbLogits, bbAV, bbAI}, &pcAm, 8, amWgs, 256, n);
                     bar();
+                    nextPass("argmax-1");
                     dspz(pAm2, {bbAV, bbAI, bbTok, bRbScratch}, &pcAm2, 8, 1, 256, n);
                 }
             }
         }
-        [enc endEncoding];
+        if (counter.enabled()) {
+            if (wantLogits || argmaxOut) counter.end(enc, "head-tail");
+            else counter.discardEmpty(enc);
+        } else {
+            [enc endEncoding];
+        }
         auto tw0 = std::chrono::steady_clock::now();
         [cb commit];
         [cb waitUntilCompleted];
         lastCbGpu = cb.GPUEndTime - cb.GPUStartTime;
         lastCbWall = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
+        counter.report(lastCbGpu);
     }
     if (wantLogits)
         memcpy(logits.data(),
@@ -8613,6 +8802,11 @@ int main(int argc, char** argv) {
         auto argU = [&](int i, uint32_t dflt) {
             return argc > i ? (uint32_t)atoi(argv[i]) : dflt;
         };
+
+        if (mode == "counters") {
+            printCounterInfo(c);
+            return 0;
+        }
 
         bool ok = true;
         if (mode == "suite") {
