@@ -244,6 +244,163 @@ kernel void fa_attn_srv_split(device const float* qhat    [[buffer(0)]],
     }
 }
 
+// Bit-exact compact grid for highly skewed batches. Unlike the rectangular
+// split grid, every work item names a live (slot, 256-key chunk) pair.
+kernel void fa_attn_srv_split_compact(device const float* qhat    [[buffer(0)]],
+                                      device const float* kc      [[buffer(1)]],
+                                      device const float* vc      [[buffer(2)]],
+                                      device float*       partial [[buffer(3)]],
+                                      device const uint*  slotPos [[buffer(4)]],
+                                      device const uint*  work    [[buffer(5)]],
+                                      constant FaSplitPC& pc      [[buffer(6)]],
+                                      uint3 tid3  [[thread_position_in_threadgroup]],
+                                      uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    const uint item = work[tgpig.y];
+    const uint h  = tgpig.x;
+    const uint c  = item & 0xffffu;
+    const uint rq = item >> 16u;
+    const uint p0 = c * CK;
+    const uint n  = slotPos[rq] + 1u;
+
+    const uint t  = tid3.x;
+    const uint dh = pc.dh;
+    const uint ts = min(CK, n - p0);
+    const uint kv = h / (pc.hQ / pc.hKV);
+    const uint kvo = rq * pc.hKV * pc.tmax * dh;
+    const uint qho = rq * pc.hQ * dh;
+
+    threadgroup float q[256];
+    threadgroup float sc[256];
+    threadgroup float red[256];
+
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float qs = rsqrt(float(dh));
+    if (t < ts) {
+        float score = 0.0f;
+        device const float* kb = kc + kvo + (kv * pc.tmax + (p0 + t)) * dh;
+        for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+        sc[t] = score * qs;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    red[t] = (t < ts) ? sc[t] : -3.4e38f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float mLocal = red[0];
+    if (t < ts) sc[t] = exp(sc[t] - mLocal);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    red[t] = (t < ts) ? sc[t] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint partialStride = dh + 2u;
+    const uint partialBase = ((rq * pc.hQ + h) * pc.maxChunks + c) * partialStride;
+    if (t < dh) {
+        float accLocal = 0.0f;
+        for (uint j = 0u; j < ts; ++j) {
+            accLocal += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+        }
+        partial[partialBase + t] = accLocal;
+    }
+    if (t == 0u) {
+        partial[partialBase + dh] = mLocal;
+        partial[partialBase + dh + 1u] = red[0];
+    }
+}
+
+// Bit-exact producer coarsening. One TG processes a balanced run of original
+// 256-key chunks, but emits one independent partial per chunk. The shipping
+// reducer therefore sees byte-identical inputs in the same order; only q
+// loading and producer scheduling are amortized.
+kernel void fa_attn_srv_split_multi(device const float* qhat    [[buffer(0)]],
+                                    device const float* kc      [[buffer(1)]],
+                                    device const float* vc      [[buffer(2)]],
+                                    device float*       partial [[buffer(3)]],
+                                    device const uint*  slotPos [[buffer(4)]],
+                                    device const uint2* work    [[buffer(5)]],
+                                    constant FaSplitPC& pc      [[buffer(6)]],
+                                    uint3 tid3  [[thread_position_in_threadgroup]],
+                                    uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    const uint2 item = work[tgpig.y];
+    const uint h  = tgpig.x;
+    const uint rq = item.x >> 16u;
+    const uint first = item.y >> 16u;
+    const uint count = item.y & 0xffffu;
+    const uint n  = slotPos[rq] + 1u;
+
+    const uint t  = tid3.x;
+    const uint dh = pc.dh;
+    const uint kv = h / (pc.hQ / pc.hKV);
+    const uint kvo = rq * pc.hKV * pc.tmax * dh;
+    const uint qho = rq * pc.hQ * dh;
+
+    threadgroup float q[256];
+    threadgroup float sc[256];
+    threadgroup float red[256];
+
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float qs = rsqrt(float(dh));
+    const uint partialStride = dh + 2u;
+    for (uint u = 0u; u < count; ++u) {
+        const uint c = first + u;
+        const uint p0 = c * CK;
+        const uint ts = min(CK, n - p0);
+        if (t < ts) {
+            float score = 0.0f;
+            device const float* kb = kc + kvo + (kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+            sc[t] = score * qs;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        red[t] = (t < ts) ? sc[t] : -3.4e38f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] = max(red[t], red[t + s]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float mLocal = red[0];
+        if (t < ts) sc[t] = exp(sc[t] - mLocal);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        red[t] = (t < ts) ? sc[t] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] += red[t + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const uint partialBase =
+            ((rq * pc.hQ + h) * pc.maxChunks + c) * partialStride;
+        if (t < dh) {
+            float accLocal = 0.0f;
+            for (uint j = 0u; j < ts; ++j)
+                accLocal += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+            partial[partialBase + t] = accLocal;
+        }
+        if (t == 0u) {
+            partial[partialBase + dh] = mLocal;
+            partial[partialBase + dh + 1u] = red[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void fa_attn_srv_reduce(device const float* partial [[buffer(0)]],
                                device const float* qfull   [[buffer(1)]],
                                device float*       att     [[buffer(2)]],
