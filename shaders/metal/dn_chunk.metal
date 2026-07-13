@@ -128,12 +128,27 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
     threadgroup float Ltg[64];
     threadgroup float Btg[64];
 
-    if (j == 0u) {  // inclusive log-decay cumsum + beta stash
+    // One simdgroup parallelizes 64 decay/beta loads. Every lane executes the
+    // same left-to-right shuffle/add chain, retaining the scalar accumulation
+    // order without a second threadgroup barrier.
+    if (j < 32u) {
+        const uint t1 = j + 32u;
+        const float g0 = j < Cc ? gb[(ulong)(t0 + j) * 2u * pc.hV + h] : 0.0f;
+        const float g1 = t1 < Cc ? gb[(ulong)(t0 + t1) * 2u * pc.hV + h] : 0.0f;
+        if (j < Cc)
+            Btg[j] = gb[(ulong)(t0 + j) * 2u * pc.hV + pc.hV + h];
+        if (t1 < Cc)
+            Btg[t1] = gb[(ulong)(t0 + t1) * 2u * pc.hV + pc.hV + h];
         float acc = 0.0f;
-        for (uint t = 0u; t < Cc; ++t) {
-            acc += gb[(ulong)(t0 + t) * 2u * pc.hV + h];
-            Ltg[t] = acc;
-            Btg[t] = gb[(ulong)(t0 + t) * 2u * pc.hV + pc.hV + h];
+#pragma unroll
+        for (uint t = 0u; t < 32u; ++t) {
+            acc += simd_shuffle(g0, t);
+            if (j == 0u && t < Cc) Ltg[t] = acc;
+        }
+#pragma unroll
+        for (uint t = 0u; t < 32u; ++t) {
+            acc += simd_shuffle(g1, t);
+            if (j == 0u && t + 32u < Cc) Ltg[t + 32u] = acc;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
