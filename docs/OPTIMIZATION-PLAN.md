@@ -611,4 +611,5 @@ correctness gates, and commit id.
 | Rank / lever | Status | Correctness | Performance result | Decision / commit |
 |---|---|---|---|---|
 | Plan and source audit | complete | Read all 1109 lines of `PORT.md`; audited Metal/Vulkan spec paths and all Metal kernel families | No benchmark; planning only | Initial plan commit |
-
+| Clean campaign baseline | complete | G0-G7 green: prefillcmp 36/36 at 7.9e-7; dncmp all PASS; block/ablock PASS; decode exact; eight slots identical; handoff exact | Cool probe 546.8 GB/s; decode 8.54 ms/tok; B=8 195.2 tok/s; pp512 346.26 ms = 1479 tok/s | Control for subsequent A/B work |
+| 1a. Metal oracle verifier | validated | Default hp path K={2,4,8,16,32} reproduced all 95 checked positions; every legacy G0-G7 gate re-run green. Scalar GEMM also exact at K={48,64,96}. Default hp K=64 had one near-tie mismatch, so exact default is capped at 32. | On one 96-token stream at 9.72 ms serial: K=2/4/8/16/32 verification was 7.82/5.85/4.93/4.55/4.36 ms/token = 1.24/1.66/1.97/2.13/2.23x oracle speedup. Scalar K=96 was 4.23 ms/token = 2.30x. | Keep `verify` harness; proceed to scratch rollback, then prompt lookup. This commit. |
