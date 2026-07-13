@@ -2305,7 +2305,7 @@ struct qk_engine {
     id<MTLComputePipelineState> pGemvA, pGemvO, pGemvAB, pGemvOB,
         pAb, pStep, pPrep, pAttn,
         pAttnSplit, pAttnReduce, pMoeS,
-        pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pAm1, pAm2, pEmb,
+        pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadB, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemmB4, pMoeGu4, pMoeGuG4i, pMoeGuG5i;
@@ -2322,6 +2322,8 @@ struct qk_engine {
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
     uint32_t gemmThreads = 256;
     uint32_t gemmBM = 128, gemmBN = 64;
+    bool headGemm = true;
+    uint32_t headGemmN = 4;
     bool slotBatch = false;
     uint32_t slotTprA = 64, slotTprO = 128;
     uint32_t slotBatchN = 0;
@@ -2765,6 +2767,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
     pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     pHead  = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
+    pHeadB = getPipe(c, "head_q6", "head_q6_gemm_b8_f32", 0);
     pAm1   = getPipe(c, "argmax", "argmax1", 0);
     pAm2   = getPipe(c, "argmax", "argmax2", 0);
     pEmb   = getPipe(c, embQ8 ? "embed_q8_0" : "embed_q6k", embQ8 ? "embed_q8_0" : "embed_q6k", 0);
@@ -2775,6 +2778,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
     pStepB = getPipe(c, "dn_batch", "dn_step_batch", 0);
     pGateB = getPipe(c, "dn_batch", "dn_gate_batch", nsg);
+    if (const char* v = getenv("QK_HEAD_GEMM")) headGemm = atoi(v) != 0;
+    if (const char* v = getenv("QK_HEAD_GEMM_N")) {
+        const uint32_t x = (uint32_t)atoi(v);
+        if (x >= 1u && x <= 64u) headGemmN = x;
+    }
     if (const char* v = getenv("QK_DN_CHUNK")) dnChunk = atoi(v) != 0;
     if (const char* v = getenv("QK_DN_STEP_RES")) {
         const uint32_t x = (uint32_t)atoi(v);
@@ -3812,9 +3820,19 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             // — the z=n head is ~417 MB of Q6_K weight reads PER ROW.
             const uint32_t nh = argmaxOut ? n : 1;
             lastRunRows = nh;
-            struct { uint32_t m, k; } pcHead{vocab, nEmbd};
-            dspz(pHead, {bHeadW, nh == 1 ? WB{bbXn, (NSUInteger)(n - 1) * nEmbd * 4} : WB{bbXn},
-                         bbLogits}, &pcHead, 8, (vocab + 3) / 4, 64, nh);
+            const bool tiledHead = argmaxOut && headGemm && nh >= headGemmN;
+            if (tiledHead) {
+                struct { uint32_t m, k, nn, span; } pcHead{vocab, nEmbd, nh, 0};
+                dspz(pHeadB, {bHeadW, bbXn, bbLogits}, &pcHead, 16,
+                     (vocab + 31) / 32, 128, (nh + 7) / 8);
+            } else {
+                struct { uint32_t m, k; } pcHead{vocab, nEmbd};
+                dspz(pHead,
+                     {bHeadW, nh == 1 ? WB{bbXn, (NSUInteger)(n - 1) * nEmbd * 4}
+                                      : WB{bbXn},
+                      bbLogits},
+                     &pcHead, 8, (vocab + 3) / 4, 64, nh);
+            }
             if (argmaxOut) {
                 bar();
                 const uint32_t amWgs = (vocab + 4095) / 4096;
@@ -4139,6 +4157,192 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
         double wBytes = (double)nb * 34;
         printf("gpu: %8.1f µs/iter | %7.1f GFLOP/s | W %6.1f GB/s-equiv\n",
                ns / 1e3, flops / ns, wBytes / ns);
+    }
+    return pass;
+}
+
+// Real Q6_K output-head comparison.  The shipping GEMV is the exact-logit
+// reference and the tiled path targets verifier batches.
+static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    const GgufTensor* t = g.find("output.weight");
+    if (!t || t->type != GGML_Q6_K || t->ne[2] != 1) {
+        fprintf(stderr, "headcmp requires a 2D Q6_K output.weight\n");
+        return false;
+    }
+    const uint32_t K = (uint32_t)t->ne[0];
+    const uint32_t M = (uint32_t)t->ne[1];
+    if (!N || K % 256u) {
+        fprintf(stderr, "headcmp requires N > 0 and K divisible by 256\n");
+        return false;
+    }
+    const size_t rowBytes = ggmlRowBytes(t->type, K);
+    const size_t wBytes = (size_t)M * rowBytes;
+    printf("\n== headcmp  Q6_K W[%u,%u], X[%u,%u] (W %.1f MiB) ==\n",
+           M, K, N, K, (double)wBytes / (1 << 20));
+
+    std::mt19937 rng(0x48454144u);
+    std::normal_distribution<float> nd(0.f, 0.35f);
+    std::vector<float> x((size_t)N * K);
+    for (float& v : x) v = nd(rng);
+
+    id<MTLComputePipelineState> pBase = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
+    id<MTLComputePipelineState> pGemm =
+        getPipe(c, "head_q6", "head_q6_gemm_b8_f32", 0);
+    id<MTLComputePipelineState> pAm1 = getPipe(c, "argmax", "argmax1", 0);
+    id<MTLComputePipelineState> pAm2 = getPipe(c, "argmax", "argmax2", 0);
+
+    id<MTLBuffer> bW = createBuf(c, wBytes, t->data);
+    id<MTLBuffer> bX = createBuf(c, x.size() * sizeof(float), x.data());
+    id<MTLBuffer> bRef = createBuf(c, (size_t)N * M * sizeof(float));
+    id<MTLBuffer> bGemm = createBuf(c, (size_t)N * M * sizeof(float));
+    id<MTLBuffer> bAV = createBuf(c, (size_t)N * 64 * sizeof(float));
+    id<MTLBuffer> bAI = createBuf(c, (size_t)N * 64 * sizeof(uint32_t));
+    id<MTLBuffer> bTok = createBuf(c, (size_t)N * sizeof(uint32_t));
+    id<MTLBuffer> bRb = createBuf(c, sizeof(uint32_t));
+
+    struct HeadPC { uint32_t M, K, N, span; } pc{M, K, N, 0};
+    struct Am1PC { uint32_t n, span; } pcAm1{M, 4096u};
+    const uint32_t amWgs = (M + pcAm1.span - 1u) / pcAm1.span;
+    struct Am2PC { uint32_t m, pos; } pcAm2{amWgs, 0u};
+    const uint32_t mk[2] = {M, K};
+
+    auto barrier = [](id<MTLComputeCommandEncoder> enc) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    };
+    auto encBase = [&](id<MTLComputeCommandEncoder> enc, bool argmax) {
+        [enc setComputePipelineState:pBase];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:bRef offset:0 atIndex:2];
+        [enc setBytes:mk length:sizeof(mk) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((M + 3u) / 4u, 1, N)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        if (!argmax) return;
+        barrier(enc);
+        [enc setComputePipelineState:pAm1];
+        [enc setBuffer:bRef offset:0 atIndex:0];
+        [enc setBuffer:bAV offset:0 atIndex:1];
+        [enc setBuffer:bAI offset:0 atIndex:2];
+        [enc setBytes:&pcAm1 length:sizeof(pcAm1) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(amWgs, 1, N)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier(enc);
+        [enc setComputePipelineState:pAm2];
+        [enc setBuffer:bAV offset:0 atIndex:0];
+        [enc setBuffer:bAI offset:0 atIndex:1];
+        [enc setBuffer:bTok offset:0 atIndex:2];
+        [enc setBuffer:bRb offset:0 atIndex:3];
+        [enc setBytes:&pcAm2 length:sizeof(pcAm2) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, N)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto encGemm = [&](id<MTLComputeCommandEncoder> enc, bool argmax) {
+        [enc setComputePipelineState:pGemm];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:bGemm offset:0 atIndex:2];
+        [enc setBytes:&pc length:sizeof(pc) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((M + 31u) / 32u, 1, (N + 7u) / 8u)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (!argmax) return;
+        barrier(enc);
+        [enc setComputePipelineState:pAm1];
+        [enc setBuffer:bGemm offset:0 atIndex:0];
+        [enc setBuffer:bAV offset:0 atIndex:1];
+        [enc setBuffer:bAI offset:0 atIndex:2];
+        [enc setBytes:&pcAm1 length:sizeof(pcAm1) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(amWgs, 1, N)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier(enc);
+        [enc setComputePipelineState:pAm2];
+        [enc setBuffer:bAV offset:0 atIndex:0];
+        [enc setBuffer:bAI offset:0 atIndex:1];
+        [enc setBuffer:bTok offset:0 atIndex:2];
+        [enc setBuffer:bRb offset:0 atIndex:3];
+        [enc setBytes:&pcAm2 length:sizeof(pcAm2) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, N)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto submit = [&](auto&& encode, uint32_t reps) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < reps; ++i) {
+                encode(enc);
+                if (i + 1u < reps) barrier(enc);
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                fprintf(stderr, "headcmp Metal failure: %s\n",
+                        cb.error.localizedDescription.UTF8String);
+                return -1.0;
+            }
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / reps;
+        }
+    };
+
+    if (submit([&](auto enc) { encBase(enc, true); }, 1) < 0 ||
+        submit([&](auto enc) { encGemm(enc, true); }, 1) < 0) return false;
+    const float* yr = (const float*)bRef.contents;
+    const float* yg = (const float*)bGemm.contents;
+    const uint32_t* gt = (const uint32_t*)bTok.contents;
+    std::vector<uint32_t> refTok(N);
+    double rms2 = 0.0, maxAbs = 0.0, maxRel = 0.0;
+    for (size_t i = 0; i < (size_t)N * M; ++i) rms2 += (double)yr[i] * yr[i];
+    const double rms = std::sqrt(rms2 / ((size_t)N * M));
+    const double floor = std::max(1e-6, rms * 1e-4);
+    uint32_t tokenBad = 0;
+    for (uint32_t n = 0; n < N; ++n) {
+        uint32_t ri = 0, gi = 0;
+        for (uint32_t m = 1; m < M; ++m) {
+            if (yr[(size_t)n * M + m] > yr[(size_t)n * M + ri]) ri = m;
+            if (yg[(size_t)n * M + m] > yg[(size_t)n * M + gi]) gi = m;
+        }
+        refTok[n] = ri;
+        const bool ok = ri == gi && ri == gt[n];
+        tokenBad += !ok;
+        printf("  row %u: ref=%u gemm=%u gpu-argmax=%u  %s\n",
+               n, ri, gi, gt[n], ok ? "EXACT" : "MISMATCH");
+    }
+    for (size_t i = 0; i < (size_t)N * M; ++i) {
+        const double ae = std::fabs((double)yg[i] - yr[i]);
+        maxAbs = std::max(maxAbs, ae);
+        maxRel = std::max(maxRel, ae / std::max(floor, (double)std::fabs(yr[i])));
+    }
+    printf("  tiled logits: rms=%.6g max_abs=%.6g max_rel(floor %.3g)=%.6g\n",
+           rms, maxAbs, floor, maxRel);
+
+    // Deliberate all-logit tie: both reductions must choose vocabulary id 0.
+    memset(bX.contents, 0, x.size() * sizeof(float));
+    if (submit([&](auto enc) { encBase(enc, true); }, 1) < 0) return false;
+    std::vector<uint32_t> tieRef(N);
+    memcpy(tieRef.data(), bTok.contents, (size_t)N * sizeof(uint32_t));
+    if (submit([&](auto enc) { encGemm(enc, true); }, 1) < 0) return false;
+    const uint32_t* tieGot = (const uint32_t*)bTok.contents;
+    uint32_t tieBad = 0;
+    for (uint32_t n = 0; n < N; ++n) tieBad += tieRef[n] != 0u || tieGot[n] != 0u;
+    memcpy(bX.contents, x.data(), x.size() * sizeof(float));
+    printf("  all-zero tie: %u/%u chose lower id 0\n", N - tieBad, N);
+
+    const bool logitsClose = maxAbs <= std::max(1e-5, rms * 1e-4);
+    const bool pass = tokenBad == 0 && tieBad == 0 && logitsClose;
+    printf("correctness: tiled argmax %u/%u exact, logits %s -> %s\n",
+           N - tokenBad, N, logitsClose ? "CLOSE" : "DRIFT", pass ? "PASS" : "FAIL");
+    if (pass && iters) {
+        auto bench = [&](const char* name, auto&& encode) {
+            submit(encode, 1);
+            const double us = submit(encode, iters);
+            printf("  %-27s %8.2f us  (%7.1f tok/s aggregate)\n",
+                   name, us, 1e6 * N / us);
+        };
+        bench("shipping GEMV", [&](auto enc) { encBase(enc, false); });
+        bench("shipping GEMV + argmax", [&](auto enc) { encBase(enc, true); });
+        bench("32x8 f32 GEMM", [&](auto enc) { encGemm(enc, false); });
+        bench("32x8 f32 GEMM + argmax", [&](auto enc) { encGemm(enc, true); });
     }
     return pass;
 }
@@ -5367,6 +5571,8 @@ int main(int argc, char** argv) {
             ok = caseABlock(c, argU(2, 3), argU(3, 3), argU(4, 200));
         } else if (mode == "bgemm") {
             ok = caseBGemm(c, argU(2, 8192), argU(3, 2048), argU(4, 128), argU(5, 50));
+        } else if (mode == "headcmp") {
+            ok = caseHeadCmp(c, argU(2, 8), argU(3, 20));
         } else if (mode == "dncmp") {
             ok = caseDnChunk(c, argU(2, 512), argU(3, 30));
         } else if (mode == "token") {
