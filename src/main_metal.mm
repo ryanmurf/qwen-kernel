@@ -3362,9 +3362,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     prefillGemvBatch = gemvFast && gemvTprA == 16u && gemvTprO == 128u;
     if (const char* v = getenv("QK_PREFILL_GEMV_BATCH"))
         prefillGemvBatch = prefillGemvBatch && atoi(v) != 0;
-    if (!guIq4 && prefillGemvBatch) {
+    if (prefillGemvBatch) {
         // Exact small-prefill path: reuse each decoded Q8 block across four
         // token rows while retaining the shipping GEMV's TPR/reduction order.
+        // The 80B is predominantly IQ4 but retains a Q8 attention-V projection,
+        // so its mixed-format path needs these pipelines too.
         pPrefillGemvA4 = getPipe(c, "gemv_q8_0_batch", "gemv_q8_0_b4_k2048", gemvTprA);
         pPrefillGemvO4 = getPipe(c, "gemv_q8_0_batch", "gemv_q8_0_b4_k4096", gemvTprO);
     }
