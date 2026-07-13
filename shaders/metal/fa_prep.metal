@@ -39,10 +39,36 @@ kernel void fa_prep(device const float* qfull  [[buffer(0)]],
     const uint kvo = rq * pc.hKV * pc.tmax * dh;
     const uint qho = rq * pc.hQ * dh;
 
+    threadgroup float sv[256];
+    threadgroup float red[8];
+    threadgroup float scale;
+
     if (w >= pc.hQ + pc.hKV) {           // v: plain copy into cache
         const uint h = w - pc.hQ - pc.hKV;
-        if (t < dh) kv_store(vc, kvo + (h * pc.tmax + pc.pos) * dh + t,
-                             vin[kio + h * dh + t]);
+        const ulong io = kvo + (ulong)(h * pc.tmax + pc.pos) * dh + t;
+        const float outV = t < dh ? vin[kio + h * dh + t] : 0.0f;
+        if (KV_BYTES == 1u) {
+            const float mx = simd_max(abs(outV));
+            if (slid == 0u) red[sgid] = mx;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (t == 0u) {
+                float amax = red[0];
+                for (uint i = 1u; i < 8u; ++i) amax = max(amax, red[i]);
+                scale = amax > 0.0f ? amax / 127.0f : 0.0f;
+                *((device float*)(vc + (io >> 8u) * KV_Q8_ROW)) = scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t < dh) {
+            if (KV_BYTES == 1u) {
+                const int qv = scale > 0.0f
+                    ? clamp(int(rint(outV / scale)), -127, 127) : 0;
+                const ulong rb = (io >> 8u) * KV_Q8_ROW;
+                *((device char*)(vc + rb + KV_Q8_DATA + (io & 255u))) = char(qv);
+            } else {
+                kv_store(vc, io, outV);
+            }
+        }
         return;
     }
 
@@ -51,9 +77,6 @@ kernel void fa_prep(device const float* qfull  [[buffer(0)]],
     float v = 0.0f;
     if (t < dh) v = isQ ? qfull[qfo + h * 2u * dh + t] : kin[kio + h * dh + t];
 
-    threadgroup float sv[256];
-    threadgroup float red[8];
-    threadgroup float scale;
     const float sg = simd_sum(v * v);
     if (slid == 0u) red[sgid] = sg;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -68,8 +91,8 @@ kernel void fa_prep(device const float* qfull  [[buffer(0)]],
 
     // rope on pairs (j, j+nRot/2), j < nRot/2
     const uint half_ = pc.nRot / 2u;
+    float outV = 0.0f;
     if (t < dh) {
-        float outV;
         if (t < pc.nRot) {
             const uint j = t < half_ ? t : t - half_;
             const uint ci = 2u * (pc.pos * half_ + j);
@@ -80,6 +103,29 @@ kernel void fa_prep(device const float* qfull  [[buffer(0)]],
             outV = sv[t];
         }
         if (isQ) qhat[qho + h * dh + t] = outV;
-        else     kv_store(kc, kvo + (h * pc.tmax + pc.pos) * dh + t, outV);
+    }
+    if (!isQ && KV_BYTES == 1u) {
+        const float mx = simd_max(abs(outV));
+        if (slid == 0u) red[sgid] = mx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t == 0u) {
+            float amax = red[0];
+            for (uint i = 1u; i < 8u; ++i) amax = max(amax, red[i]);
+            scale = amax > 0.0f ? amax / 127.0f : 0.0f;
+            const ulong row = kvo + (ulong)(h * pc.tmax + pc.pos) * dh;
+            *((device float*)(kc + (row >> 8u) * KV_Q8_ROW)) = scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!isQ && t < dh) {
+        const ulong io = kvo + (ulong)(h * pc.tmax + pc.pos) * dh + t;
+        if (KV_BYTES == 1u) {
+            const int qv = scale > 0.0f
+                ? clamp(int(rint(outV / scale)), -127, 127) : 0;
+            const ulong rb = (io >> 8u) * KV_Q8_ROW;
+            *((device char*)(kc + rb + KV_Q8_DATA + (io & 255u))) = char(qv);
+        } else {
+            kv_store(kc, io, outV);
+        }
     }
 }

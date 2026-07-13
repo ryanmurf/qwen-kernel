@@ -16,7 +16,7 @@
 //   qk slotcmp <ids> <nGen> [nSlots] [tmax]  slot compaction/churn exactness
 //
 // Env: QK_DEVICE=<n> device index; QK_SHADER_DIR (dir with *.metal);
-//      QK_GGUF=<path>; QK_KV_F16=1 opts into half KV storage/f32 compute.
+//      QK_GGUF=<path>; QK_KV_F16=1 or QK_KV_Q8=1 selects a lossy KV tier.
 //
 // MSL is compiled at runtime from shaders/metal/*.metal (no offline metal
 // toolchain needed — mirrors the Vulkan loadSpv flow, QK_SHADER_DIR wins).
@@ -1967,11 +1967,15 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     const uint32_t nRot  = 64;
     const uint32_t qfN   = hQ * 2 * dh, kvN = hKV * dh, atN = hQ * dh;
     const uint32_t tmax  = 128;
-    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
-    const uint32_t kvBytes = kvF16 ? 2u : 4u;
+    const bool kvQ8 = getenv("QK_KV_Q8") && atoi(getenv("QK_KV_Q8")) != 0;
+    const bool kvF16 = !kvQ8 && getenv("QK_KV_F16") &&
+                       atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvQ8 ? 1u : kvF16 ? 2u : 4u;
+    const uint32_t kvRowBytes = kvQ8 ? 272u : dh * kvBytes;
     const float eps = 1e-6f;
     printf("\n== ablock blk.%u (full attn)  n_embd=%u heads=%ux%u kv=%u rot=%u %s ==\n",
-           layer, nEmbd, hQ, dh, hKV, nRot, kvF16 ? "KV=f16" : "KV=f32");
+           layer, nEmbd, hQ, dh, hKV, nRot,
+           kvQ8 ? "KV=q8-row" : kvF16 ? "KV=f16" : "KV=f32");
 
     const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbQ8a = ggmlRowBytes(GGML_Q8_0, atN);
@@ -2021,8 +2025,8 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     id<MTLBuffer> bKin = createBuf(c, kvN * 4, nullptr, true);
     id<MTLBuffer> bVin = createBuf(c, kvN * 4, nullptr, true);
     id<MTLBuffer> bQhat = createBuf(c, atN * 4, nullptr, true);
-    id<MTLBuffer> bKC = createBuf(c, (size_t)hKV * tmax * dh * kvBytes, nullptr, true);
-    id<MTLBuffer> bVC = createBuf(c, (size_t)hKV * tmax * dh * kvBytes, nullptr, true);
+    id<MTLBuffer> bKC = createBuf(c, (size_t)hKV * tmax * kvRowBytes, nullptr, true);
+    id<MTLBuffer> bVC = createBuf(c, (size_t)hKV * tmax * kvRowBytes, nullptr, true);
     id<MTLBuffer> bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
     id<MTLBuffer> bAtt = createBuf(c, atN * 4, nullptr, true);
     id<MTLBuffer> bAttnOut = createBuf(c, nEmbd * 4, nullptr, true);
@@ -2129,6 +2133,16 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
             v[j + nRot / 2] = x0 * sn + x1 * cs;
         }
     };
+    auto q8RowRef = [&](float* v) {
+        float amax = 0.0f;
+        for (uint32_t j = 0; j < dh; ++j) amax = std::max(amax, std::fabs(v[j]));
+        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        for (uint32_t j = 0; j < dh; ++j) {
+            const int q = d > 0.0f
+                ? std::clamp((int)std::lrint(v[j] / d), -127, 127) : 0;
+            v[j] = d * (float)q;
+        }
+    };
 
     std::mt19937 xr(123);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -2150,7 +2164,11 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
             rmsRef(&kin[(size_t)h * dh], knW, kd, dh);
             ropeRef(kd, t);
             float* vd = &vcCpu[((size_t)h * tmax + t) * dh];
-            if (kvF16) {
+            if (kvQ8) {
+                memcpy(vd, &vin[(size_t)h * dh], dh * 4);
+                q8RowRef(kd);
+                q8RowRef(vd);
+            } else if (kvF16) {
                 for (uint32_t j = 0; j < dh; ++j) {
                     kd[j] = qk_f16_to_f32(qk_f32_to_f16(kd[j]));
                     vd[j] = qk_f16_to_f32(qk_f32_to_f16(vin[(size_t)h * dh + j]));
@@ -2273,8 +2291,11 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     }
     const uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
     const uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64;
-    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
-    const uint32_t kvBytes = kvF16 ? 2u : 4u;
+    const bool kvQ8 = getenv("QK_KV_Q8") && atoi(getenv("QK_KV_Q8")) != 0;
+    const bool kvF16 = !kvQ8 && getenv("QK_KV_F16") &&
+                       atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvQ8 ? 1u : kvF16 ? 2u : 4u;
+    const uint32_t kvRowBytes = kvQ8 ? 272u : dh * kvBytes;
     const std::string arch = g.kvStr("general.architecture", "");
     const uint32_t dnKDivH = (arch == "qwen3next") ? hV / hK : 0;
     const uint32_t nLayer = (uint32_t)g.kvInt(arch + ".block_count", 40);
@@ -2289,7 +2310,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
     const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);
     printf("token mode: %zu prompt ids, gen %u, vocab %u, tmax %u, %s KV\n",
-           promptIds.size(), nGen, vocab, tmax, kvF16 ? "f16" : "f32");
+           promptIds.size(), nGen, vocab, tmax,
+           kvQ8 ? "q8-row" : kvF16 ? "f16" : "f32");
 
     const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
@@ -2425,8 +2447,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
             L.qn = W(T("attn_q_norm.weight"), dh * 4);
             L.kn = W(T("attn_k_norm.weight"), dh * 4);
             L.wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
-            L.kc = W(nullptr, (size_t)hKV * tmax * dh * kvBytes);
-            L.vc = W(nullptr, (size_t)hKV * tmax * dh * kvBytes);
+            L.kc = W(nullptr, (size_t)hKV * tmax * kvRowBytes);
+            L.vc = W(nullptr, (size_t)hKV * tmax * kvRowBytes);
         }
         L.mgi = W(moe.gi, (size_t)moe.nExp * nEmbd * 4);
         L.mgis = W(moe.gis, nEmbd * 4);
@@ -2616,7 +2638,9 @@ struct qk_engine {
     bool slotCompact = true;
     bool pcacheCompact = true;
     bool kvF16 = false;          // explicit lossy capacity tier; f32 compute
+    bool kvQ8 = false;           // aligned row-Q8 storage; f32 dequant/compute
     uint32_t kvBytes = 4;
+    uint32_t kvRowBytes = dh * 4;
     bool slotsNeedCompact = false;
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
     // Pipeline split (QK_LAYERS=a:b): this engine owns layers [lFirst, lEnd).
@@ -2646,7 +2670,8 @@ struct qk_engine {
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBAligned;
     // Adaptive decode attention coarsens producer scheduling while retaining
     // one byte-identical 256-key partial per chunk and the shipping reducer.
-    id<MTLComputePipelineState> pAttnCompact, pAttnMulti;
+    id<MTLComputePipelineState> pAttnCompact, pAttnMulti,
+        pAttnQ8G2, pAttnQ8G4, pAttnQ8G8;
     bool faDecodeSplit = true, faDecodeWork = true;
     int faFanOverride = -1;
     int moeNormSplitMode = -1;  // -1 auto, 0 fused recompute, 1 split/reuse
@@ -2843,7 +2868,7 @@ void qk_engine::copyStripes(uint32_t stripe, uint8_t* snap, bool save, uint32_t 
         // (DeltaNet/conv) stripes always copy whole.
         if (!L.rec && nTok && nTok < nCtx) {
             size_t headBytes = L.ps1 / hKV;
-            size_t liveBytes = (size_t)nTok * dh * kvBytes;
+            size_t liveBytes = (size_t)nTok * kvRowBytes;
             for (uint32_t h = 0; h < hKV; h++) {
                 size_t off = (size_t)h * headBytes;
                 if (save) {
@@ -2872,7 +2897,7 @@ size_t qk_engine::packedSnapSize(uint32_t nTok) const {
     for (const Layer& L : layers) {
         if (!L.st1) continue;
         if (L.rec) bytes += L.ps1 + L.ps2;
-        else bytes += (size_t)2 * hKV * liveTok * dh * kvBytes;
+        else bytes += (size_t)2 * hKV * liveTok * kvRowBytes;
     }
     return bytes;
 }
@@ -2910,8 +2935,8 @@ bool qk_engine::copyPackedStripes(uint32_t stripe, CacheEntry& entry,
     }
 
     uint8_t* p = entry.snap.get();
-    const size_t storedLiveBytes = (size_t)entry.snapTok * dh * kvBytes;
-    const size_t copyLiveBytes = (size_t)liveTok * dh * kvBytes;
+    const size_t storedLiveBytes = (size_t)entry.snapTok * kvRowBytes;
+    const size_t copyLiveBytes = (size_t)liveTok * kvRowBytes;
     for (Layer& L : layers) {
         if (!L.st1) continue;
         uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)stripe * L.ps1;
@@ -2968,7 +2993,7 @@ void qk_engine::moveSlotState(uint32_t fromStripe, uint32_t toStripe, uint32_t n
         } else if (nTok) {
             const size_t headBytes = L.ps1 / hKV;
             const size_t liveBytes =
-                std::min((size_t)nTok, (size_t)nCtx) * dh * kvBytes;
+                std::min((size_t)nTok, (size_t)nCtx) * kvRowBytes;
             for (uint32_t h = 0; h < hKV; ++h) {
                 const size_t off = (size_t)h * headBytes;
                 memcpy(to1 + off, from1 + off, liveBytes);
@@ -3123,8 +3148,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     slotCompact = !getenv("QK_SLOT_COMPACT") || atoi(getenv("QK_SLOT_COMPACT")) != 0;
     pcacheCompact = !getenv("QK_PCACHE_COMPACT") ||
                     atoi(getenv("QK_PCACHE_COMPACT")) != 0;
-    kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
-    kvBytes = kvF16 ? 2u : 4u;
+    kvQ8 = getenv("QK_KV_Q8") && atoi(getenv("QK_KV_Q8")) != 0;
+    kvF16 = !kvQ8 && getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
+    kvBytes = kvQ8 ? 1u : kvF16 ? 2u : 4u;
+    kvRowBytes = kvQ8 ? 272u : dh * kvBytes;
     specOn = getenv("QK_SPEC") != nullptr;
     specScratch = specOn || getenv("QK_SPEC_SCRATCH") != nullptr;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
@@ -3355,10 +3382,16 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
     pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", kvBytes);
     pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
-    pAttnSplit  = getPipe(c, "fa_srv", "fa_attn_srv_split", kvBytes); // flash-decoding
+    pAttnSplit  = getPipe(c, "fa_srv",
+        kvQ8 ? "fa_attn_srv_split_q8" : "fa_attn_srv_split", kvBytes);
     pAttnReduce = getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
     pAttnCompact = getPipe(c, "fa_srv", "fa_attn_srv_split_compact", kvBytes);
     pAttnMulti = getPipe(c, "fa_srv", "fa_attn_srv_split_multi", kvBytes);
+    if (kvQ8) {
+        pAttnQ8G2 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa2", kvBytes);
+        pAttnQ8G4 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa4", kvBytes);
+        pAttnQ8G8 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes);
+    }
     if (const char* v = getenv("QK_FA_SPLIT")) faDecodeSplit = atoi(v) != 0;
     if (const char* v = getenv("QK_FA_WORK")) faDecodeWork = atoi(v) != 0;
     if (const char* v = getenv("QK_FA_FAN")) {
@@ -3413,7 +3446,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     // retains the geometry but restores scalar softmax summation; `q16`
     // restores the original Q16/K64/S8 kernel for full rollback.
     const char* faGeom = getenv("QK_FA_GEOM");
-    if (kvF16) {
+    if (kvQ8) {
+        faQTM = 8; faThreads = 512; faHeadGroup = 2;
+        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_q8", kvBytes);
+    } else if (kvF16) {
         // MSL cannot directly load half storage into a float matrix. The f16
         // twin expands one K/V fragment per simdgroup into float TG scratch,
         // retaining the default GQA reuse and f32 MMA accumulation.
@@ -3843,14 +3879,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             L.qn = W(T("attn_q_norm.weight"), dh * 4);
             L.kn = W(T("attn_k_norm.weight"), dh * 4);
             L.wo = Wd("attn_output.weight", L.iq4Wo);
-            L.ps1 = (size_t)hKV * tmax * dh * kvBytes;
-            L.ps2 = (size_t)hKV * tmax * dh * kvBytes;
+            L.ps1 = (size_t)hKV * tmax * kvRowBytes;
+            L.ps2 = (size_t)hKV * tmax * kvRowBytes;
         }
         // +slack: fa_attn_batch_mma reads full 8-key MMA tiles, so at near-full
         // context (nk ~ tmax) the last slot's K/V load over-reads a few rows
         // past the buffer. One KBM(64)-key block of zeroed slack keeps it
         // in-bounds and finite (over-read rows are P=0, so contribute nothing).
-        const size_t stSlack = L.rec ? 0 : (size_t)64 * dh * kvBytes;
+        const size_t stSlack = L.rec ? 0 : (size_t)64 * kvRowBytes;
         // Spec-enabled recurrent layers reserve one shared verification
         // scratch stripe at index nSlots. Normal engines and attention (whose
         // positional KV is rollback-free) need only the live slot stripes.
@@ -4012,7 +4048,17 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
     // require the first materially winning fan unless explicitly overridden.
     if (faFan < 8u) faFan = 1u;
     if (faFanOverride > 0) faFan = (uint32_t)faFanOverride;
-    const bool faUseWork = faDecodeSplit && faDecodeWork && (faFan > 1u ||
+    if (kvQ8) faFan = 1u;
+    uint32_t q8HeadGroup = 1u;
+    if (kvQ8) {
+        const uint32_t qPerKv = hQ / hKV;
+        if (liveChunks >= 64u && qPerKv % 8u == 0u) q8HeadGroup = 8u;
+        else if ((liveChunks >= 16u || (zdim >= 4u && liveChunks >= 8u)) &&
+                 qPerKv % 4u == 0u)
+            q8HeadGroup = 4u;
+        else if (liveChunks >= 8u && qPerKv % 2u == 0u) q8HeadGroup = 2u;
+    }
+    const bool faUseWork = !kvQ8 && faDecodeSplit && faDecodeWork && (faFan > 1u ||
         (uint64_t)liveChunks * 4u < (uint64_t)zdim * splitChunks);
     uint32_t faWorkN = 0;
     if (faUseWork) {
@@ -4038,10 +4084,11 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
     if (getenv("QK_FA_LOG")) {
         static uint64_t lastSig = UINT64_MAX;
         const uint64_t sig = (uint64_t)zdim << 56u | (uint64_t)splitChunks << 40u |
-            (uint64_t)liveChunks << 16u | (uint64_t)faFan << 8u | faUseWork;
+            (uint64_t)liveChunks << 16u | (uint64_t)faFan << 8u |
+            (uint64_t)q8HeadGroup << 4u | faUseWork;
         if (sig != lastSig) {
-            fprintf(stderr, "[fa] slots=%u chunks=%u..%u live=%u fan=%u work=%u/%u\n",
-                    zdim, minChunks, splitChunks, liveChunks, faFan,
+            fprintf(stderr, "[fa] slots=%u chunks=%u..%u live=%u fan=%u hg=%u work=%u/%u\n",
+                    zdim, minChunks, splitChunks, liveChunks, faFan, q8HeadGroup,
                     faUseWork ? faWorkN : 0u, zdim * splitChunks);
             lastSig = sig;
         }
@@ -4104,11 +4151,15 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
             dsp(pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.st1, L.st2, bRope, bSlotPos},
                 &pcFa, 32, hQ + 2 * hKV, 256);
             bar();
-            const bool useFaSplit = faDecodeSplit &&
-                !(zdim == 1u && splitChunks == 1u && faFanOverride < 0);
+            const bool useFaSplit = faDecodeSplit && (kvQ8 ||
+                !(zdim == 1u && splitChunks == 1u && faFanOverride < 0));
             if (useFaSplit && !faUseWork) {
-                dspY(pAttnSplit, {bMid, L.st1, L.st2, bPartial, bSlotPos},
-                     &pcFaSplit, 36, hQ, splitChunks, 256);
+                id<MTLComputePipelineState> splitPipe = pAttnSplit;
+                if (q8HeadGroup == 2u) splitPipe = pAttnQ8G2;
+                else if (q8HeadGroup == 4u) splitPipe = pAttnQ8G4;
+                else if (q8HeadGroup == 8u) splitPipe = pAttnQ8G8;
+                dspY(splitPipe, {bMid, L.st1, L.st2, bPartial, bSlotPos},
+                     &pcFaSplit, 36, hQ / q8HeadGroup, splitChunks, 256);
                 bar();
                 dsp(pAttnReduce, {bPartial, bBig, bAtt, bSlotPos}, &pcFaSplit, 36, hQ, 256);
             } else if (useFaSplit) {
@@ -5940,8 +5991,10 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
 // twins retained after the full geometry sweep.
 static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     constexpr uint32_t dh = 256, hQ = 16, hKV = 2;
-    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
-    const uint32_t kvBytes = kvF16 ? 2u : 4u;
+    const bool kvQ8 = getenv("QK_KV_Q8") && atoi(getenv("QK_KV_Q8")) != 0;
+    const bool kvF16 = !kvQ8 && getenv("QK_KV_F16") &&
+                       atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvQ8 ? 1u : kvF16 ? 2u : 4u;
     if (!N || N > 1024 || base + N > 8192) {
         fprintf(stderr, "facmp requires 1 <= N <= 1024 and base+N <= 8192\n");
         return false;
@@ -5960,20 +6013,47 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     for (float& v : vc) v = vd(rng);
 
     std::vector<uint16_t> kc16, vc16;
+    std::vector<uint8_t> kc8, vc8;
     if (kvF16) {
         kc16.resize(kc.size()); vc16.resize(vc.size());
         for (size_t i = 0; i < kc.size(); ++i) kc16[i] = qk_f32_to_f16(kc[i]);
         for (size_t i = 0; i < vc.size(); ++i) vc16[i] = qk_f32_to_f16(vc[i]);
     }
+    auto quantQ8Rows = [&](const std::vector<float>& src, std::vector<uint8_t>& dst) {
+        constexpr size_t rowBytes = 272u;
+        const size_t rows = src.size() / dh;
+        dst.assign(rows * rowBytes, 0u);
+        for (size_t r = 0; r < rows; ++r) {
+            float amax = 0.0f;
+            for (uint32_t j = 0; j < dh; ++j)
+                amax = std::max(amax, std::fabs(src[r * dh + j]));
+            const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+            memcpy(dst.data() + r * rowBytes, &d, sizeof d);
+            int8_t* q = (int8_t*)(dst.data() + r * rowBytes + 16u);
+            for (uint32_t j = 0; j < dh; ++j)
+                q[j] = d > 0.0f ? (int8_t)std::clamp(
+                    (int)std::lrint(src[r * dh + j] / d), -127, 127) : 0;
+        }
+    };
+    if (kvQ8) { quantQ8Rows(kc, kc8); quantQ8Rows(vc, vc8); }
 
     id<MTLBuffer> bQ = createBuf(c, qhat.size() * sizeof(float), qhat.data());
-    id<MTLBuffer> bK = createBuf(c, kc.size() * kvBytes,
-                                  kvF16 ? (const void*)kc16.data() : (const void*)kc.data());
-    id<MTLBuffer> bV = createBuf(c, vc.size() * kvBytes,
-                                  kvF16 ? (const void*)vc16.data() : (const void*)vc.data());
+    const size_t kBytes = kvQ8 ? kc8.size() : kc.size() * kvBytes;
+    const size_t vBytes = kvQ8 ? vc8.size() : vc.size() * kvBytes;
+    const void* kData = kvQ8 ? (const void*)kc8.data()
+        : kvF16 ? (const void*)kc16.data() : (const void*)kc.data();
+    const void* vData = kvQ8 ? (const void*)vc8.data()
+        : kvF16 ? (const void*)vc16.data() : (const void*)vc.data();
+    id<MTLBuffer> bK = createBuf(c, kBytes, kData);
+    id<MTLBuffer> bV = createBuf(c, vBytes, vData);
+    id<MTLBuffer> bKF32 = kvQ8
+        ? createBuf(c, kc.size() * sizeof(float), kc.data()) : bK;
+    id<MTLBuffer> bVF32 = kvQ8
+        ? createBuf(c, vc.size() * sizeof(float), vc.data()) : bV;
     id<MTLBuffer> bQf = createBuf(c, qfull.size() * sizeof(float), qfull.data());
     const size_t outN = (size_t)N * hQ * dh;
     id<MTLBuffer> bRef = createBuf(c, outN * sizeof(float));
+    id<MTLBuffer> bF32Ref = kvQ8 ? createBuf(c, outN * sizeof(float)) : nil;
     id<MTLBuffer> bOut = createBuf(c, outN * sizeof(float));
     struct FaPC {
         uint32_t tmax, dh_, nRot, hQ_, hKV_;
@@ -5986,7 +6066,10 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
         id<MTLComputePipelineState> p;
     };
     std::vector<Variant> vars;
-    if (kvF16) {
+    if (kvQ8) {
+        vars.push_back({"gqa2_q8_k64_s16_q8", 8, 64, 16, 2,
+            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_q8", kvBytes)});
+    } else if (kvF16) {
         vars.push_back({"gqa2_q8_k64_s16_f16", 8, 64, 16, 2,
             getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_f16", kvBytes)});
     } else {
@@ -5995,10 +6078,12 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
         vars.push_back({"gqa2_q8_k64_s16_simd", 8, 64, 16, 2,
             getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", kvBytes)});
     }
-    id<MTLComputePipelineState> pRef = kvF16
+    id<MTLComputePipelineState> pRef = (kvF16 || kvQ8)
         ? getPipe(c, "fa_batch", "fa_attn_batch", kvBytes)
         : getPipe(c, "fa_batch", "fa_attn_batch_mma", kvBytes);
-    const uint32_t refQt = kvF16 ? 1u : 16u;
+    id<MTLComputePipelineState> pF32Ref = kvQ8
+        ? getPipe(c, "fa_batch", "fa_attn_batch", 4u) : pRef;
+    const uint32_t refQt = (kvF16 || kvQ8) ? 1u : 16u;
 
     auto encode = [&](id<MTLComputeCommandEncoder> enc,
                       id<MTLComputePipelineState> p, id<MTLBuffer> out,
@@ -6035,6 +6120,23 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
         }
     };
 
+    if (kvQ8) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pF32Ref];
+            [enc setBuffer:bQ offset:0 atIndex:0];
+            [enc setBuffer:bKF32 offset:0 atIndex:1];
+            [enc setBuffer:bVF32 offset:0 atIndex:2];
+            [enc setBuffer:bQf offset:0 atIndex:3];
+            [enc setBuffer:bF32Ref offset:0 atIndex:4];
+            [enc setBytes:&pc length:sizeof(pc) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(hQ, 1, N)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return false;
+        }
+    }
     if (submit(pRef, bRef, refQt, 8u, 1u, 1u) < 0) return false;
     const float* ref = (const float*)bRef.contents;
     double rms2 = 0.0;
@@ -6042,12 +6144,24 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     const double rms = std::sqrt(rms2 / outN);
     const double floor = std::max(1e-6, rms * 1e-4);
     printf("\n== facmp N=%u base=%u  Q[%u,%u,%u] KV[%u,%u,%u] %s ==\n",
-           N, base, N, hQ, dh, hKV, tmax, dh, kvF16 ? "f16" : "f32");
+           N, base, N, hQ, dh, hKV, tmax, dh,
+           kvQ8 ? "q8-row" : kvF16 ? "f16" : "f32");
+    if (kvQ8) {
+        const float* f32ref = (const float*)bF32Ref.contents;
+        double qMaxAbs = 0.0, qD2 = 0.0, qR2 = 0.0;
+        for (size_t i = 0; i < outN; ++i) {
+            const double d = (double)ref[i] - f32ref[i];
+            qMaxAbs = std::max(qMaxAbs, std::fabs(d));
+            qD2 += d * d; qR2 += (double)f32ref[i] * f32ref[i];
+        }
+        printf("  q8-vs-f32: max_abs %.6g | rel_rms %.6g\n",
+               qMaxAbs, std::sqrt(qD2 / qR2));
+    }
     printf("  %-24s %10s %11s %11s %8s\n",
            "geometry", "gpu_us", "max_abs", "max_rel", "result");
     const double refUs = iters ? submit(pRef, bRef, refQt, 8u, 1u, iters) : 0.0;
     printf("  %-24s %10.2f %11s %11s %8s\n",
-           kvF16 ? "scalar_f16 (ref)" : "q16_k64_s8 (ref)",
+           kvQ8 ? "scalar_q8 (ref)" : kvF16 ? "scalar_f16 (ref)" : "q16_k64_s8 (ref)",
            refUs, "-", "-", "REF");
     bool pass = true;
     for (const Variant& v : vars) {
@@ -6079,8 +6193,10 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
 static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
                          uint32_t minPos, uint32_t iters) {
     constexpr uint32_t dh = 256, hQ = 16, hKV = 2, CK = 256;
-    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
-    const uint32_t kvBytes = kvF16 ? 2u : 4u;
+    const bool kvQ8 = getenv("QK_KV_Q8") && atoi(getenv("QK_KV_Q8")) != 0;
+    const bool kvF16 = !kvQ8 && getenv("QK_KV_F16") &&
+                       atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvQ8 ? 1u : kvF16 ? 2u : 4u;
     if (!slots || slots > 16 || minPos > maxPos || maxPos >= 49152) {
         fprintf(stderr,
                 "fasrvcmp requires 1<=slots<=16 and 0<=min-pos<=max-pos<49152\n");
@@ -6111,21 +6227,51 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
     for (float& v : vc) v = vd(rng);
 
     std::vector<uint16_t> kc16, vc16;
+    std::vector<uint8_t> kc8, vc8;
     if (kvF16) {
         kc16.resize(kc.size()); vc16.resize(vc.size());
         for (size_t i = 0; i < kc.size(); ++i) kc16[i] = qk_f32_to_f16(kc[i]);
         for (size_t i = 0; i < vc.size(); ++i) vc16[i] = qk_f32_to_f16(vc[i]);
     }
+    auto quantQ8Rows = [&](const std::vector<float>& src, std::vector<uint8_t>& dst) {
+        constexpr size_t rowBytes = 272u;
+        const size_t rows = src.size() / dh;
+        dst.assign(rows * rowBytes, 0u);
+        for (size_t r = 0; r < rows; ++r) {
+            float amax = 0.0f;
+            for (uint32_t j = 0; j < dh; ++j)
+                amax = std::max(amax, std::fabs(src[r * dh + j]));
+            const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+            memcpy(dst.data() + r * rowBytes, &d, sizeof d);
+            int8_t* q = (int8_t*)(dst.data() + r * rowBytes + 16u);
+            for (uint32_t j = 0; j < dh; ++j)
+                q[j] = d > 0.0f ? (int8_t)std::clamp(
+                    (int)std::lrint(src[r * dh + j] / d), -127, 127) : 0;
+        }
+    };
+    if (kvQ8) {
+        quantQ8Rows(kc, kc8);
+        quantQ8Rows(vc, vc8);
+    }
 
     id<MTLBuffer> bQ = createBuf(c, qhat.size() * sizeof(float), qhat.data());
-    id<MTLBuffer> bK = createBuf(c, kc.size() * kvBytes,
-                                  kvF16 ? (const void*)kc16.data() : (const void*)kc.data());
-    id<MTLBuffer> bV = createBuf(c, vc.size() * kvBytes,
-                                  kvF16 ? (const void*)vc16.data() : (const void*)vc.data());
+    const size_t kBytes = kvQ8 ? kc8.size() : kc.size() * kvBytes;
+    const size_t vBytes = kvQ8 ? vc8.size() : vc.size() * kvBytes;
+    const void* kData = kvQ8 ? (const void*)kc8.data()
+        : kvF16 ? (const void*)kc16.data() : (const void*)kc.data();
+    const void* vData = kvQ8 ? (const void*)vc8.data()
+        : kvF16 ? (const void*)vc16.data() : (const void*)vc.data();
+    id<MTLBuffer> bK = createBuf(c, kBytes, kData);
+    id<MTLBuffer> bV = createBuf(c, vBytes, vData);
+    id<MTLBuffer> bKF32 = kvQ8
+        ? createBuf(c, kc.size() * sizeof(float), kc.data()) : bK;
+    id<MTLBuffer> bVF32 = kvQ8
+        ? createBuf(c, vc.size() * sizeof(float), vc.data()) : bV;
     id<MTLBuffer> bQf = createBuf(c, qfull.size() * sizeof(float), qfull.data());
     id<MTLBuffer> bPos = createBuf(c, pos.size() * sizeof(uint32_t), pos.data());
     const size_t outN = (size_t)slots * hQ * dh;
     id<MTLBuffer> bRef = createBuf(c, outN * sizeof(float));
+    id<MTLBuffer> bF32Ref = kvQ8 ? createBuf(c, outN * sizeof(float)) : nil;
     id<MTLBuffer> bOut = createBuf(c, outN * sizeof(float));
     id<MTLBuffer> bPartial = createBuf(
         c, (size_t)slots * hQ * maxChunks * (dh + 2u) * sizeof(float));
@@ -6142,8 +6288,11 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
 
     id<MTLComputePipelineState> pScalar =
         getPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
+    id<MTLComputePipelineState> pScalarF32 = kvQ8
+        ? getPipe(c, "fa_srv", "fa_attn_srv", 4u) : pScalar;
     id<MTLComputePipelineState> pSplit =
-        getPipe(c, "fa_srv", "fa_attn_srv_split", kvBytes);
+        getPipe(c, "fa_srv", kvQ8 ? "fa_attn_srv_split_q8" : "fa_attn_srv_split",
+                kvBytes);
     id<MTLComputePipelineState> pReduce =
         getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
     id<MTLComputePipelineState> pCompact =
@@ -6155,9 +6304,22 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
         id<MTLComputePipelineState> split;
         id<MTLBuffer> work;
         uint32_t workN;
+        uint32_t headGroup;
     };
     std::vector<SplitVariant> splitVars{
-        {"split256", pSplit, nil, 0u}};
+        {"split256", pSplit, nil, 0u, 1u}};
+    if (kvQ8)
+        splitVars.push_back({"q8-gqa2",
+            getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa2", kvBytes),
+            nil, 0u, 2u});
+    if (kvQ8)
+        splitVars.push_back({"q8-gqa4",
+            getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa4", kvBytes),
+            nil, 0u, 4u});
+    if (kvQ8)
+        splitVars.push_back({"q8-gqa8",
+            getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes),
+            nil, 0u, 8u});
     std::vector<uint32_t> compactWork;
     for (uint32_t s = 0; s < slots; ++s) {
         const uint32_t chunks = (pos[s] + 1u + CK - 1u) / CK;
@@ -6166,7 +6328,7 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
     }
     splitVars.push_back({"compact", pCompact,
         createBuf(c, compactWork.size() * sizeof(uint32_t), compactWork.data()),
-        (uint32_t)compactWork.size()});
+        (uint32_t)compactWork.size(), 1u});
     for (uint32_t fan : {1u, 4u, 8u, 16u, 32u, 64u}) {
         std::vector<uint32_t> balancedWork;
         uint32_t nBalanced = 0;
@@ -6186,7 +6348,7 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
         snprintf(name, sizeof(name), "multi%u", fan);
         id<MTLBuffer> bBalancedWork = createBuf(
             c, balancedWork.size() * sizeof(uint32_t), balancedWork.data());
-        splitVars.push_back({name, pMulti, bBalancedWork, nBalanced});
+        splitVars.push_back({name, pMulti, bBalancedWork, nBalanced, 1u});
     }
 
     auto bind = [](id<MTLComputeCommandEncoder> enc,
@@ -6203,16 +6365,21 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
         [enc dispatchThreadgroups:MTLSizeMake(hQ, 1, slots)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     };
+    auto scalarF32 = [&](id<MTLComputeCommandEncoder> enc, id<MTLBuffer> out) {
+        bind(enc, pScalarF32, {bQ, bKF32, bVF32, bQf, out, bPos}, &pc, sizeof(pc));
+        [enc dispatchThreadgroups:MTLSizeMake(hQ, 1, slots)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
     auto split = [&](id<MTLComputeCommandEncoder> enc, id<MTLBuffer> out,
                      const SplitVariant& v) {
         if (v.work) {
             bind(enc, v.split, {bQ, bK, bV, bPartial, bPos, v.work},
                  &spc, sizeof(spc));
-            [enc dispatchThreadgroups:MTLSizeMake(hQ, v.workN, 1)
+            [enc dispatchThreadgroups:MTLSizeMake(hQ / v.headGroup, v.workN, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
             bind(enc, v.split, {bQ, bK, bV, bPartial, bPos}, &spc, sizeof(spc));
-            [enc dispatchThreadgroups:MTLSizeMake(hQ, maxChunks, slots)
+            [enc dispatchThreadgroups:MTLSizeMake(hQ / v.headGroup, maxChunks, slots)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -6243,6 +6410,8 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
         }
     };
 
+    if (kvQ8 && submit([&](auto enc) { scalarF32(enc, bF32Ref); }, 1) < 0)
+        return false;
     if (submit([&](auto enc) { scalar(enc, bRef); }, 1) < 0) return false;
     const float* ref = (const float*)bRef.contents;
     double rms2 = 0.0;
@@ -6260,8 +6429,20 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
     memcpy(splitRef.data(), bOut.contents, outN * sizeof(float));
     printf("\n== fasrvcmp slots=%u pos=%u..%u tmax=%u %s KV "
            "chunks=%llu/%llu live ==\n",
-           slots, minPos, maxPos, tmax, kvF16 ? "f16" : "f32",
+           slots, minPos, maxPos, tmax, kvQ8 ? "q8-row" : kvF16 ? "f16" : "f32",
            (unsigned long long)liveChunks, (unsigned long long)launchedChunks);
+    if (kvQ8) {
+        const float* f32ref = (const float*)bF32Ref.contents;
+        double qMaxAbs = 0.0, qRelRmsNum = 0.0, qRelRmsDen = 0.0;
+        for (size_t i = 0; i < outN; ++i) {
+            const double d = (double)ref[i] - f32ref[i];
+            qMaxAbs = std::max(qMaxAbs, std::fabs(d));
+            qRelRmsNum += d * d;
+            qRelRmsDen += (double)f32ref[i] * f32ref[i];
+        }
+        printf("  q8-vs-f32: max_abs %.6g | rel_rms %.6g | storage %.4f B/value\n",
+               qMaxAbs, std::sqrt(qRelRmsNum / qRelRmsDen), 272.0 / 256.0);
+    }
     printf("  %-13s %10s %9s %10s %10s %11s %11s %8s\n",
            "schedule", "gpu_us", "speedup", "diff", "split_diff",
            "max_abs", "max_rel", "result");
@@ -7285,7 +7466,10 @@ int main(int argc, char** argv) {
                 const size_t nElem = bytes / elemBytes;
                 for (size_t i = 0; i < nElem; ++i) {
                     float av, bv;
-                    if (elemBytes == 2u) {
+                    if (elemBytes == 1u) {
+                        av = (float)ap[i]; bv = (float)bp[i];
+                        nd += ap[i] != bp[i];
+                    } else if (elemBytes == 2u) {
                         const uint16_t ah = ((const uint16_t*)ap)[i];
                         const uint16_t bh = ((const uint16_t*)bp)[i];
                         av = qk_f16_to_f32(ah); bv = qk_f16_to_f32(bh);
