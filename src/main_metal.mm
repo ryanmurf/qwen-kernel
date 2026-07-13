@@ -2689,10 +2689,15 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             L.ps1 = (size_t)hKV * tmax * dh * 4;
             L.ps2 = (size_t)hKV * tmax * dh * 4;
         }
-        L.st1 = createBuf(c, (size_t)nB * L.ps1, nullptr, true);
-        L.st2 = createBuf(c, (size_t)nB * L.ps2, nullptr, true);
-        memset(L.st1.contents, 0, (size_t)nB * L.ps1);
-        memset(L.st2.contents, 0, (size_t)nB * L.ps2);
+        // +slack: fa_attn_batch_mma reads full 8-key MMA tiles, so at near-full
+        // context (nk ~ tmax) the last slot's K/V load over-reads a few rows
+        // past the buffer. One KBM(64)-key block of zeroed slack keeps it
+        // in-bounds and finite (over-read rows are P=0, so contribute nothing).
+        const size_t stSlack = (size_t)64 * dh * 4;
+        L.st1 = createBuf(c, (size_t)nB * L.ps1 + stSlack, nullptr, true);
+        L.st2 = createBuf(c, (size_t)nB * L.ps2 + stSlack, nullptr, true);
+        memset(L.st1.contents, 0, (size_t)nB * L.ps1 + stSlack);
+        memset(L.st2.contents, 0, (size_t)nB * L.ps2 + stSlack);
         L.mgi = W(moe.gi, (size_t)moe.nExp * nEmbd * 4);
         L.mgis = W(moe.gis, nEmbd * 4);
         L.mge = W(moe.ge, (size_t)moe.nExp * moe.nFf * moe.rbGE);
@@ -2912,7 +2917,9 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     const bool skAttn = skip && strstr(skip, "attn");
     const bool skGu   = skip && strstr(skip, "gu");
     const bool skDown = skip && strstr(skip, "down");
-    static const bool faMma = getenv("QK_FA_MMA") != nullptr;  // MMA prefill attn
+    // MMA prefill attention is the default (beats scalar ~2x on attn, pp512
+    // win vs llama). QK_FA_MMA=0 forces the old scalar kernel (rollback/debug).
+    static const bool faMma = !getenv("QK_FA_MMA") || atoi(getenv("QK_FA_MMA")) != 0;
     if (wantLogits) logits.resize(vocab);
     if (base == 0) resetSlot(slot);
     // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
