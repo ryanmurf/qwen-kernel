@@ -1,7 +1,11 @@
 // Compile-time KV-cache storage width shared by every attention kernel.
-// The host specializes function constant 0 to 4 (exact f32 default) or 2
-// (opt-in f16 storage with f32 attention accumulation).
-constant uint KV_BYTES [[function_constant(0)]];
+// Current hosts inject QK_KV_BYTES=4 (exact f32 default), 2 (f16), or 1
+// (row-Q8) before compilation. An older host supplies no define and therefore
+// gets exact f32 without needing to understand a new function constant.
+#ifndef QK_KV_BYTES
+#define QK_KV_BYTES 4u
+#endif
+constant uint KV_BYTES = QK_KV_BYTES;
 
 // Q8 cache tier (KV_BYTES=1): one 272-byte record per logical 256-float row.
 // A shared f32 scale sits at byte 0 and signed values start at byte 16.  The

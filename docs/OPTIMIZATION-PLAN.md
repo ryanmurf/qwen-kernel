@@ -655,6 +655,35 @@ perturbed. Normal execution retains one concurrent encoder. The checked-in
 the binary/model/git/env/worker state, counter capabilities, bandwidth probes,
 and the requested workload profile.
 
+### 27. Runtime shader/host ABI isolation — high production-safety EV
+
+**Expected value:** No steady-state speed change, but prevents a restarted
+worker from JIT-compiling an incompatible moving working-tree shader set. A
+failed restart is a complete availability loss and therefore dominates a
+sub-percent kernel lever.
+
+**Approach:** Make engine instances prefer the shader snapshot adjacent to the
+running executable, retaining `QK_SHADER_DIR` precedence and the working-tree
+fallback for library consumers. Compile current 1/2/4-byte KV variants from
+separately keyed source-level defines, while an absent define selects exact f32;
+pre-KV-tier hosts can then safely compile a newer attention snapshot during a
+rolling upgrade without knowing a new function constant.
+
+**Correctness gate:** G0-G7 from `build-perf`, f16/Q8 attention specialization
+smoke, and the unchanged mandated production command reaching `:18200` with
+`QK_PCACHE=6` against the older on-disk host.
+
+**Risk:** Medium deployment risk: lookup precedence and source-defined KV-width
+variants affect every attention library. Require both current-host
+specialization gates and an actual old-host restart before committing.
+
+**Progress:** Complete. The first guarded-function-constant prototype still
+produced a specialization-required function in the older host and was rejected.
+Source-defined KV variants preserve constant folding in current hosts, while
+the default f32 source compiled in the July 12 production binary. The complete
+current-host matrix and an actual old-host restart are green; results are in row
+27 below.
+
 ## Conditional/external hard-wall investigations
 
 These are real optimization families but cannot be completed without assets or
@@ -751,3 +780,4 @@ correctness gates, and commit id.
 | 25c. Unsplit-35B prefill chunk capacity | validated | Default 1,024-row admission reproduces all 64 tokens in `tests/ref4.txt` after the 1,040-token prompt. Short B1/200 remains exact; the final G0-G7 matrix is re-run with the corrected 192-row grouped crossover. Split engines and IQ4/80B remain at 128. Flattened capacity is clamped to `nCtx*nSlots`, so a single short-context engine does not allocate unreachable rows. | Single-stream 1,040-token admission sweep: maxB 128/192/256/384/512/768/1024 = 2258/1884/1760/1510/1481/1379/1329 ms. A reverse repeat was 1,356 vs 2,258 ms: 1.67-1.70x throughput at 1024. Aliased scratch rises 26.2 -> 195.4 MiB versus maxB128 (+169 MiB); at ctx512 it clamps to 512 rows. | Default unsplit Q8/35B engines to maxB=1024 regardless of slot count. Retain 128 for split or IQ4/80B paths and `QK_MAXB` for explicit control. The 169-MiB capacity cost is well below the 15-GiB model and buys a dominant long-prompt win. This commit. |
 | 25d. DeltaNet chunk geometry | hard wall: C32 changes recurrent trajectory; C128 exceeds TG memory | A true C32 specialization passed the complete `dncmp` boundary matrix for both k-head mappings and remained bit-exact between resident and streamed C32 steps. It nevertheless failed the decisive N=128 handoff for seed 99 after four matching decode tokens, because twice as many state transformations change the f32 recurrent trajectory. The prototype and function-constant plumbing were removed. | C32 reduced the Tn512 isolated chain from 652-674 to 519 us (about 21%): KQ 82.5 -> 33.6 us, solve 250 -> 181 us, step 302 -> 284 us. A max-allocation probe was 539 us; right-sized C32 threadgroup arrays exposed the remaining occupancy gain. C128's K tile alone is 128x128x4 = 64 KiB, double M4's 32-KiB limit; its compact strict-lower M plus L/beta arrays also exceed 32 KiB before RHS registers. | Keep C64. C32's speed cannot compensate for a failed token-exact gate, and reproducing C64 semantics would require restoring the cross-half triangular interactions rather than selecting a smaller chunk. Reject C128 without a multi-dispatch algorithm, which would add barriers while doubling triangular work. This documentation-only hard-wall commit. |
 | 26. Stage timestamps and reproducible perf ledger | validated instrumentation; richer counters unavailable | Instrumentation-off passes the corrected full G0-G7 matrix: scalar prefill 42/42 at 2.8e-6, dncmp/block/ablock PASS, mandated decode exact, B8/200 deterministic, and N128 handoff exact. An enabled trace retains exact handoff. After the independent mixed-format initialization correction, the final 80B cross-format audit also passes B8/200 determinism and N={16,128} handoff. The measured 322.460-ms trace span equals the command-buffer timestamp to displayed precision; 319.606 ms is assigned to passes and 2.854 ms to fenced gaps. | Clean 505.3 -> 501.6 GB/s probes bracket: B1 8.42 ms/token (118.8 tok/s), B8 223.2 tok/s, ctx8k B1 9.594 ms/step, exact-class-v4 pp512 607.99 ms, and packed-v5 record pp512 323.16 ms (1,584 tok/s). The packed pp512 trace assigns 114.574 ms (35.5%) to gate/up, 60.837 (18.9%) down, 62.451 (19.4%) recurrent projections, 20.941 (6.5%) recurrent output projections, 15.028 (4.7%) attention projections, and 4.705 (1.5%) attention core. A saved pre-instrumentation binary bracketed 323.10/324.00 ms versus 322.99/323.09 ms after the change. | Keep opt-in `QK_COUNTERS=1`, optional `QK_COUNTER_RAW=1`, and `qk counters`; never infer unexposed occupancy/bytes from timestamps. Use `scripts/perf_ledger.sh probe|quick|full|trace` for future A/B records. Disabled instrumentation is GPU-command-identical and neutral in the measured host bracket. This commit. |
+| 27. Runtime shader/host ABI isolation | validated production-safety fix | The final source-defined 1/2/4-byte KV variants pass `fasrvcmp` for f32, f16, and row-Q8. Final G0-G7 is green: scalar prefill 42/42 at 2.8e-6, dncmp/block/ablock PASS, exact mandated decode, B8/200 identical, and N128 handoff exact. The 80B B8/40 stream is deterministic and its N128 handoff is exact. Most decisively, the untouched July 12 `build/qk` compiled the current default-f32 attention source and reached `:18200` under the exact mandated command with `QK_PCACHE=6`. | No intended hot-path change. Final 35B decode was 8.50 ms/token and B8 was 222.2 tok/s versus the adjacent Rank-26 ledger's 8.42 and 223.2, thermally/noise consistent; attention reference errors are unchanged. The failed guarded-function-constant prototypes were removed. | Prefer `<executable>/shaders/metal` for new engine instances and retain `QK_SHADER_DIR` plus working-directory fallback. Build KV-width libraries under separate `:kv1/:kv2/:kv4` cache keys using a source define; no define means exact f32 for old hosts. This commit. |
