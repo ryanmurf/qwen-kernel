@@ -2307,7 +2307,7 @@ struct qk_engine {
         pAttnSplit, pAttnReduce, pMoeS,
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
-        pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB;
+        pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBAligned;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemmB4, pMoeGu4, pMoeGuG4i, pMoeGuG5i;
     // chunked delta rule (prefill DN): parallel kq/solve + chunk-serial step
@@ -2323,6 +2323,7 @@ struct qk_engine {
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
     uint32_t gemmThreads = 256;
     uint32_t gemmBM = 128, gemmBN = 64;
+    bool gemmAligned = true;
     uint32_t faQTM = 8, faThreads = 256, faHeadGroup = 2;
     bool headGemm = true;
     uint32_t headGemmN = 4;
@@ -2830,6 +2831,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (gv && !strcmp(gv, "h2")) fn = "gemm_q8_0_h2";
         if (gv && !strcmp(gv, "hp")) fn = "gemm_q8_0_hp";
         pGemmB = getPipe(c, "gemm_q8_0", fn, 0);
+        if (const char* v = getenv("QK_GEMM_ALIGNED")) gemmAligned = atoi(v) != 0;
+        if (gemmAligned && !strcmp(fn, "gemm_q8_0_hp"))
+            pGemmBAligned = getPipe(c, "gemm_q8_0", "gemm_q8_0_hp_aligned", 0);
         gemmThreads = !strcmp(fn, "gemm_q8_0_sg") ? 128 : 256;  // sg is 4-simd; scalar+h are 256
         if (!strcmp(fn, "gemm_q8_0_h2")) { gemmBM = 64; gemmBN = 128; }
         if (!strcmp(fn, "gemm_q8_0_hp")) { gemmBM = 64; gemmBN = 32; gemmThreads = 128; }
@@ -3679,7 +3683,9 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 if (iq4)
                     dspz(pGemmB4, {W, X, Y}, &pcG, 12, (M + 63) / 64, 128, (n + 31) / 32);
                 else
-                    dspz(pGemmB, {W, X, Y}, &pcG, 12, (M + gemmBM - 1) / gemmBM, gemmThreads,
+                    dspz(pGemmBAligned && M % 64u == 0u && n % 32u == 0u
+                             ? pGemmBAligned : pGemmB,
+                         {W, X, Y}, &pcG, 12, (M + gemmBM - 1) / gemmBM, gemmThreads,
                          (n + gemmBN - 1) / gemmBN);
             } else {
                 pcP = {M, K};
@@ -4155,8 +4161,10 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
     if (gv && !strcmp(gv, "h32")) fn = "gemm_q8_0_h32";
     if (gv && !strcmp(gv, "h2")) fn = "gemm_q8_0_h2";
     if (gv && !strcmp(gv, "hp")) fn = "gemm_q8_0_hp";
+    if (gv && !strcmp(gv, "hpa")) fn = "gemm_q8_0_hp_aligned";
     bool scalar = !strcmp(fn, "gemm_q8_0");
-    const bool hp = !strcmp(fn, "gemm_q8_0_hp");
+    const bool aligned = !strcmp(fn, "gemm_q8_0_hp_aligned");
+    const bool hp = !strcmp(fn, "gemm_q8_0_hp") || !strcmp(fn, "gemm_q8_0_hp_aligned");
     const uint32_t tBM = !strcmp(fn, "gemm_q8_0_h2") ? 64 : hp ? 64 : 128;
     const uint32_t tBN = !strcmp(fn, "gemm_q8_0_h2") ? 128 : hp ? 32 : 64;
     id<MTLComputePipelineState> pso = getPipe(c, "gemm_q8_0", fn, 0);
@@ -4179,6 +4187,29 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         enc1(enc);
         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    }
+    if (aligned) {
+        id<MTLBuffer> bSafe = createBuf(c, yref.size() * 4);
+        id<MTLComputePipelineState> pSafe =
+            getPipe(c, "gemm_q8_0", "gemm_q8_0_hp", 0);
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pSafe];
+            [enc setBuffer:bW offset:0 atIndex:0];
+            [enc setBuffer:bX offset:0 atIndex:1];
+            [enc setBuffer:bSafe offset:0 atIndex:2];
+            [enc setBytes:&pc length:12 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((M + 63u) / 64u, 1, (N + 31u) / 32u)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+        const uint32_t* ya = (const uint32_t*)bY.contents;
+        const uint32_t* ys = (const uint32_t*)bSafe.contents;
+        size_t mismatches = 0;
+        for (size_t i = 0; i < yref.size(); ++i) mismatches += ya[i] != ys[i];
+        printf("aligned-vs-safe: %zu/%zu bit mismatches -> %s\n",
+               mismatches, yref.size(), mismatches ? "FAIL" : "EXACT");
     }
     const float* yg = (const float*)bY.contents;
     double rms = 0;
