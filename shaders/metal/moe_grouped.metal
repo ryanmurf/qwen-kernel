@@ -62,6 +62,77 @@ kernel void moe_group(device const SelT* sel   [[buffer(0)]],
     }
 }
 
+// Prefill companion for packed v5: in addition to the stable expert-sorted
+// assignment arrays, emit only the non-empty (expert, 32-assignment tile)
+// pairs. Consumers launch a fixed, host-computable upper bound and return on
+// sentinels. For routed counts c[e], sum ceil(c[e]/32) is bounded by
+// n_expert + ceil(n*n_used/32); the shared expert adds ceil(n/32).
+kernel void moe_group_work(device const SelT* sel   [[buffer(0)]],
+                           device uint*       start [[buffer(1)]],
+                           device uint*       aTok  [[buffer(2)]],
+                           device uint*       aSlot [[buffer(3)]],
+                           device uint*       work  [[buffer(4)]],
+                           constant GroupPC&  pc    [[buffer(5)]],
+                           uint3 tid3 [[thread_position_in_threadgroup]])
+{
+    const uint n = pc.n;
+    const uint tid = tid3.x;
+    threadgroup atomic_uint cnt[513];
+    threadgroup atomic_uint cur[513];
+    const uint ne1 = pc.n_expert + 1u;
+    for (uint e = tid; e < ne1; e += 256u) {
+        atomic_store_explicit(&cnt[e], 0u, memory_order_relaxed);
+        atomic_store_explicit(&cur[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n * pc.n_used; i += 256u) {
+        const uint e = min(sel[i / pc.n_used].ids[i % pc.n_used], pc.n_expert - 1u);
+        atomic_fetch_add_explicit(&cnt[e], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint acc = 0u, nw = 0u;
+        for (uint e = 0u; e < pc.n_expert; ++e) {
+            start[e] = acc;
+            const uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+            for (uint t0 = 0u; t0 < c; t0 += 32u) {
+                work[2u * nw] = e;
+                work[2u * nw + 1u] = t0;
+                ++nw;
+            }
+            acc += c;
+        }
+        start[pc.n_expert] = acc;
+        for (uint t0 = 0u; t0 < n; t0 += 32u) {
+            work[2u * nw] = pc.n_expert;
+            work[2u * nw + 1u] = t0;
+            ++nw;
+        }
+        acc += n;
+        start[pc.n_expert + 1u] = acc;
+        const uint cap = pc.n_expert + (n * pc.n_used + 31u) / 32u +
+                         (n + 31u) / 32u;
+        while (nw < cap) {
+            work[2u * nw] = pc.n_expert + 1u;
+            work[2u * nw + 1u] = 0u;
+            ++nw;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n * pc.n_used; i += 256u) {
+        const uint tok = i / pc.n_used, s = i % pc.n_used;
+        const uint e = min(sel[tok].ids[s], pc.n_expert - 1u);
+        const uint pos = start[e] +
+            atomic_fetch_add_explicit(&cur[e], 1u, memory_order_relaxed);
+        aTok[pos] = tok;
+        aSlot[pos] = s;
+    }
+    for (uint i = tid; i < n; i += 256u) {
+        aTok[start[pc.n_expert] + i] = i;
+        aSlot[start[pc.n_expert] + i] = pc.n_used;
+    }
+}
+
 // Decode companion: also emits a sorted compact live-expert list. The list is
 // padded with sentinel n_expert+1 through its fixed n*n_used+1 capacity, so
 // compact consumers can use a host-known upper-bound grid without an indirect
@@ -667,7 +738,9 @@ kernel void moe_gu_grouped3(device const block_iq3_xxs* gwE   [[buffer(0)]],
 // 32 rows/matrix x 32 tokens, K-chunk 64; f16 staging, f32 accumulators
 // (llama-identical numeric class); 14.6 KB threadgroup. Token tiles ride
 // grid z (early-return past c) so hot experts fan out instead of looping.
-template <bool LIVE>
+// MAP=0: dense expert grid + z token tile; MAP=1: compact live-expert map;
+// MAP=2: compact (expert,t0) work-pair map with no grid-z overlaunch.
+template <uint MAP>
 static inline void moe_gu_grouped5_body(device const block_iq3_xxs* gwE,
                                         device const block_iq3_xxs* uwE,
                                         device const block_q8_0* gwS,
@@ -677,7 +750,7 @@ static inline void moe_gu_grouped5_body(device const block_iq3_xxs* gwE,
                                         device const uint* aTok,
                                         device const uint* aSlot,
                                         device float* h,
-                                        device const uint* live,
+                                        device const uint* map,
                                         constant MoePC& pc,
                                         threadgroup half* WgSh,
                                         threadgroup half* WuSh,
@@ -689,7 +762,8 @@ static inline void moe_gu_grouped5_body(device const block_iq3_xxs* gwE,
     const uint tid = tid3.x;                 // 0..127, 4 simdgroups
     const uint nrt = pc.n_ff / G4M;          // 32-row tiles per expert
     const uint ei = tgpig.x / nrt;
-    const uint e  = LIVE ? live[ei] : ei;     // 0..255 routed, 256 shared
+    const uint e  = MAP == 2u ? map[2u * ei] :
+                    MAP == 1u ? map[ei] : ei; // 0..255 routed, 256 shared
     const uint rt = tgpig.x % nrt;
     if (e > pc.n_expert) return;              // fixed-grid compact sentinel
     const uint s0 = start[e], c = start[e + 1u] - s0;
@@ -706,7 +780,7 @@ static inline void moe_gu_grouped5_body(device const block_iq3_xxs* gwE,
     threadgroup half* wsh = (smat ? WuSh : WgSh)
                           + ((srow >> 3) * 8u) * 64u + (srow & 7u) * 8u;
 
-    const uint t0 = tgpig.z * G4N;               // token tile (grid z)
+    const uint t0 = MAP == 2u ? map[2u * ei + 1u] : tgpig.z * G4N;
     if (t0 >= c) return;
     {
         simdgroup_float8x8 accG[4], accU[4];
@@ -832,7 +906,7 @@ kernel void moe_gu_grouped5(device const block_iq3_xxs* gwE   [[buffer(0)]],
     threadgroup half WuSh[G4M * 64u];
     threadgroup half Xsh[64u * G4N];
     threadgroup float outb[4u * 144u];
-    moe_gu_grouped5_body<false>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot, h,
+    moe_gu_grouped5_body<0>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot, h,
                                  start, pc, WgSh, WuSh, Xsh, outb,
                                  tid3, tgpig, sgid, slid);
 }
@@ -857,8 +931,33 @@ kernel void moe_gu_grouped5_live(device const block_iq3_xxs* gwE [[buffer(0)]],
     threadgroup half WuSh[G4M * 64u];
     threadgroup half Xsh[64u * G4N];
     threadgroup float outb[4u * 144u];
-    moe_gu_grouped5_body<true>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot, h,
+    moe_gu_grouped5_body<1>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot, h,
                                 live, pc, WgSh, WuSh, Xsh, outb,
+                                tid3, tgpig, sgid, slid);
+}
+
+kernel void moe_gu_grouped5_work(device const block_iq3_xxs* gwE [[buffer(0)]],
+                                 device const block_iq3_xxs* uwE [[buffer(1)]],
+                                 device const block_q8_0* gwS [[buffer(2)]],
+                                 device const block_q8_0* uwS [[buffer(3)]],
+                                 device const float* x [[buffer(4)]],
+                                 device const uint* start [[buffer(5)]],
+                                 device const uint* aTok [[buffer(6)]],
+                                 device const uint* aSlot [[buffer(7)]],
+                                 device float* h [[buffer(8)]],
+                                 device const uint* work [[buffer(9)]],
+                                 constant MoePC& pc [[buffer(10)]],
+                                 uint3 tid3 [[thread_position_in_threadgroup]],
+                                 uint3 tgpig [[threadgroup_position_in_grid]],
+                                 uint sgid [[simdgroup_index_in_threadgroup]],
+                                 uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup half WgSh[G4M * 64u];
+    threadgroup half WuSh[G4M * 64u];
+    threadgroup half Xsh[64u * G4N];
+    threadgroup float outb[4u * 144u];
+    moe_gu_grouped5_body<2>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot, h,
+                                work, pc, WgSh, WuSh, Xsh, outb,
                                 tid3, tgpig, sgid, slid);
 }
 
