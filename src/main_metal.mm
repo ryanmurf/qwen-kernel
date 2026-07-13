@@ -7,6 +7,7 @@
 //   qk                        synthetic suite: f16, q8_0, q6_k, iq4_xs, iq3_xxs
 //   qk f16|q8_0|q6_k|iq4_xs|iq3_xxs [M] [K] [iters]
 //   qk slotgemv [M] [K] [B] [TPR] [iters]  Q8_0 slot-batch comparison
+//   qk normroutecmp [experts] [slots] [iters]  split normalized router
 //   qk fasrvcmp [slots] [max-pos] [min-pos] [iters]  decode-attention schedules
 //   qk fadecode [slots] [pos] [steps] [tmax] [min-pos]  steady deep decode
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
@@ -324,6 +325,118 @@ static std::vector<float> randomX(uint32_t K, uint32_t seed = 43) {
     std::vector<float> x(K);
     for (auto& v : x) v = nd(rng);
     return x;
+}
+
+// Compare the shipping residual+norm+router fusion against an exact two-stage
+// form that computes the RMS once and feeds the scale to every router row.
+static bool caseNormRouteCmp(MtlCtx& c, uint32_t nExp, uint32_t slots,
+                             uint32_t iters) {
+    constexpr uint32_t n = 2048u, nFf = 512u, nsg = 4u;
+    if ((nExp != 256u && nExp != 512u) || !slots || slots > 16u) {
+        fprintf(stderr, "normroutecmp requires experts={256,512}, slots=1..16\n");
+        return false;
+    }
+    std::mt19937 rng(0x4e525445u + nExp + 17u * slots);
+    std::normal_distribution<float> nd(0.0f, 0.2f);
+    std::vector<float> gi((size_t)nExp * n), gis(n), a((size_t)slots * n),
+        b((size_t)slots * n), pn(n);
+    for (float& v : gi) v = nd(rng);
+    for (float& v : gis) v = nd(rng);
+    for (float& v : a) v = nd(rng);
+    for (float& v : b) v = nd(rng);
+    for (float& v : pn) v = 1.0f + 0.1f * nd(rng);
+    id<MTLBuffer> bGi = createBuf(c, gi.size() * 4u, gi.data(), true);
+    id<MTLBuffer> bGis = createBuf(c, gis.size() * 4u, gis.data(), true);
+    id<MTLBuffer> bA = createBuf(c, a.size() * 4u, a.data(), true);
+    id<MTLBuffer> bB = createBuf(c, b.size() * 4u, b.data(), true);
+    id<MTLBuffer> bPn = createBuf(c, pn.size() * 4u, pn.data(), true);
+    const size_t vecBytes = (size_t)slots * n * 4u;
+    const size_t logBytes = (size_t)slots * (nExp + 1u) * 4u;
+    id<MTLBuffer> bYA = createBuf(c, vecBytes, nullptr, true);
+    id<MTLBuffer> bYB = createBuf(c, vecBytes, nullptr, true);
+    id<MTLBuffer> bXA = createBuf(c, vecBytes, nullptr, true);
+    id<MTLBuffer> bXB = createBuf(c, vecBytes, nullptr, true);
+    id<MTLBuffer> bLA = createBuf(c, logBytes, nullptr, true);
+    id<MTLBuffer> bLB = createBuf(c, logBytes, nullptr, true);
+    id<MTLBuffer> bScale = createBuf(c, (size_t)slots * 4u, nullptr, true);
+    id<MTLComputePipelineState> pFuse =
+        getPipe(c, "moe_logits", "moe_logits_addn", nsg);
+    id<MTLComputePipelineState> pNorm =
+        getPipe(c, "add_rmsnorm", "add_rmsnorm_sg", 0);
+    id<MTLComputePipelineState> pLog =
+        getPipe(c, "moe_logits", "moe_logits_scaled", nsg);
+    struct { uint32_t ne, nf, nx, nu; float eps; }
+        pc5{n, nFf, nExp, nExp == 512u ? 10u : 8u, 1e-6f};
+    struct { uint32_t ne, nf, nx, nu; } pc4{pc5.ne, pc5.nf, pc5.nx, pc5.nu};
+    struct { uint32_t n; float eps; } pcR{n, 1e-6f};
+    auto bind = [](id<MTLComputeCommandEncoder> enc,
+                   id<MTLComputePipelineState> p,
+                   std::initializer_list<id<MTLBuffer>> bufs,
+                   const void* pc, size_t pcBytes) {
+        [enc setComputePipelineState:p];
+        uint32_t i = 0;
+        for (id<MTLBuffer> x : bufs) [enc setBuffer:x offset:0 atIndex:i++];
+        [enc setBytes:pc length:pcBytes atIndex:i];
+    };
+    auto encodeFuse = [&](id<MTLComputeCommandEncoder> enc) {
+        bind(enc, pFuse, {bGi, bGis, bA, bB, bPn, bLA, bYA, bXA},
+             &pc5, sizeof(pc5));
+        [enc dispatchThreadgroups:MTLSizeMake((nExp + 1u + nsg - 1u) / nsg, 1, slots)
+            threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
+    };
+    auto encodeSplit = [&](id<MTLComputeCommandEncoder> enc) {
+        bind(enc, pNorm, {bA, bB, bPn, bYB, bXB, bScale}, &pcR, sizeof(pcR));
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, slots)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        bind(enc, pLog, {bGi, bGis, bYB, bPn, bScale, bLB}, &pc4, sizeof(pc4));
+        [enc dispatchThreadgroups:MTLSizeMake((nExp + 1u + nsg - 1u) / nsg, 1, slots)
+            threadsPerThreadgroup:MTLSizeMake(nsg * 32u, 1, 1)];
+    };
+    auto submit = [&](bool split, uint32_t reps) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc =
+                [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            for (uint32_t i = 0; i < reps; ++i) {
+                if (split) encodeSplit(enc); else encodeFuse(enc);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                fprintf(stderr, "normroutecmp Metal failure: %s\n",
+                        cb.error.localizedDescription.UTF8String);
+                return -1.0;
+            }
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / reps;
+        }
+    };
+    if (submit(false, 1) < 0 || submit(true, 1) < 0) return false;
+    auto bitdiff = [](id<MTLBuffer> x, id<MTLBuffer> y, size_t bytes) {
+        const uint32_t* xp = (const uint32_t*)x.contents;
+        const uint32_t* yp = (const uint32_t*)y.contents;
+        uint64_t d = 0;
+        for (size_t i = 0; i < bytes / 4u; ++i) d += xp[i] != yp[i];
+        return d;
+    };
+    const uint64_t dy = bitdiff(bYA, bYB, vecBytes);
+    const uint64_t dx = bitdiff(bXA, bXB, vecBytes);
+    const uint64_t dl = bitdiff(bLA, bLB, logBytes);
+    const bool pass = !dy && !dx && !dl;
+    printf("\n== normroutecmp experts=%u slots=%u ==\n", nExp, slots);
+    printf("  bitdiff y/xn/logits = %llu/%llu/%llu -> %s\n",
+           (unsigned long long)dy, (unsigned long long)dx,
+           (unsigned long long)dl, pass ? "PASS" : "FAIL");
+    if (iters) {
+        submit(false, 20); submit(true, 20);
+        const double f0 = submit(false, iters), s0 = submit(true, iters);
+        const double s1 = submit(true, iters), f1 = submit(false, iters);
+        printf("  fused %.3f/%.3f us | split %.3f/%.3f us | %.3fx\n",
+               f0, f1, s0, s1, (f0 + f1) / (s0 + s1));
+    }
+    return pass;
 }
 
 static bool caseF16(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
@@ -2510,7 +2623,7 @@ struct qk_engine {
     id<MTLComputePipelineState> pGemvA, pGemvO, pGemvAB, pGemvOB,
         pAb, pStep, pStepPrep, pStepState, pStepStateSimd, pPrep, pAttn,
         pAttnSplit, pAttnReduce, pMoeS,
-        pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
+        pMoeLA, pMoeLS, pAddNSg, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBAligned;
     // Adaptive decode attention coarsens producer scheduling while retaining
@@ -2518,6 +2631,7 @@ struct qk_engine {
     id<MTLComputePipelineState> pAttnCompact, pAttnMulti;
     bool faDecodeSplit = true, faDecodeWork = true;
     int faFanOverride = -1;
+    int moeNormSplitMode = -1;  // -1 auto, 0 fused recompute, 1 split/reuse
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemv4O, pGemmB4, pGemmB4Aligned,
         pMoeGu4, pMoeGuG4i, pMoeGuG5i;
@@ -2566,7 +2680,7 @@ struct qk_engine {
 
     id<MTLBuffer> bXin, bXn, bBig, bMid, bKin, bVin, bGb, bAtt, bAttnOut, bY, bXn2,
         bML, bMH, bMSel, bMY, bLogits, bRope, bAV, bAI,
-        bTok, bRbScratch, bSlotIn, bSlotPos, bPartial, bFaWork;
+        bTok, bRbScratch, bSlotIn, bSlotPos, bPartial, bFaWork, bMoeScale;
     WB bONorm{nil}, bHeadW{nil}, bEmbdW{nil};
 
     uint32_t maxB = 0;
@@ -3129,6 +3243,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
     pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
+    if (const char* v = getenv("QK_MOE_NORM_SPLIT"))
+        moeNormSplitMode = atoi(v) != 0;
+    pMoeLS = nil;
+    pAddNSg = nil;
+    if (nSlots >= 8u || moeNormSplitMode == 1) {
+        pMoeLS = getPipe(c, "moe_logits", "moe_logits_scaled", nsg);
+        pAddNSg = getPipe(c, "add_rmsnorm", "add_rmsnorm_sg", 0);
+    }
     bool moeGuFixed = !guIq4 && ffE == 512u;
     if (const char* v = getenv("QK_MOE_GU_FIXED"))
         moeGuFixed = atoi(v) != 0 && !guIq4 && ffE == 512u;
@@ -3281,6 +3403,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
     bY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
     bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    bMoeScale = pMoeLS
+        ? createBuf(c, (size_t)nB * sizeof(float), nullptr, true) : nil;
     bML = createBuf(c, (size_t)nB * (nExp + 1) * 4, nullptr, true);
     bMH = createBuf(c, (size_t)nB * (nUsed + 1) * ffE * 4, nullptr, true);
     bMSel = createBuf(c, (size_t)nB * 160, nullptr, true);   // sizeof(SelT)
@@ -3739,8 +3863,18 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
                              slotB ? zdim / slotBatchN : 0);
         }
         bar();
-        dsp(pMoeLA, {L.mgi, L.mgis, bXin, bAttnOut, L.pn, bML, bY, bXn2}, &pcv5, 20,
-            (nExp + 1 + nsg - 1) / nsg, thrN);
+        const bool splitMoeNorm = moeNormSplitMode == 1 ||
+            (moeNormSplitMode < 0 && zdim >= 8u);
+        if (splitMoeNorm) {
+            dsp(pAddNSg, {bXin, bAttnOut, L.pn, bY, bXn2, bMoeScale},
+                &pcRms, 8, 1, 32);
+            bar();
+            dsp(pMoeLS, {L.mgi, L.mgis, bY, L.pn, bMoeScale, bML},
+                &pcv, 16, (nExp + 1 + nsg - 1) / nsg, thrN);
+        } else {
+            dsp(pMoeLA, {L.mgi, L.mgis, bXin, bAttnOut, L.pn, bML, bY, bXn2},
+                &pcv5, 20, (nExp + 1 + nsg - 1) / nsg, thrN);
+        }
         bar();
         dsp(pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
         bar();
@@ -7653,6 +7787,8 @@ int main(int argc, char** argv) {
         } else if (mode == "slotgemv") {
             ok = caseQ80Batch(c, argU(2, 8192), argU(3, 2048), argU(4, 8),
                               argU(5, 64), argU(6, 100));
+        } else if (mode == "normroutecmp") {
+            ok = caseNormRouteCmp(c, argU(2, 256), argU(3, 1), argU(4, 500));
         } else if (mode == "q6_k") {
             ok = caseQ6K(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
         } else if (mode == "iq4_xs") {
