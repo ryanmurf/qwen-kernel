@@ -2029,7 +2029,11 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     id<MTLComputePipelineState> pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
     id<MTLComputePipelineState> pMoeD4 = getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
     id<MTLComputePipelineState> pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
-    id<MTLComputePipelineState> pHead  = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
+    bool headFixedK = true;
+    if (const char* v = getenv("QK_HEAD_FIXED_K")) headFixedK = atoi(v) != 0;
+    id<MTLComputePipelineState> pHead = headFixedK
+        ? getPipe(c, "gemv_q6_k_fixed", "gemv_q6_k_k2048", 2)
+        : getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
     id<MTLComputePipelineState> pAm1   = getPipe(c, "argmax", "argmax1", 0);
     id<MTLComputePipelineState> pAm2   = getPipe(c, "argmax", "argmax2", 0);
     id<MTLComputePipelineState> pEmb   = getPipe(c, "embed_q6k", "embed_q6k", 0);
@@ -2349,6 +2353,7 @@ struct qk_engine {
     bool headGemm = true;
     uint32_t headGemmN = 4;
     bool headF16 = false;  // opt-in half operands/f32 accumulation for batched head
+    bool headFixedK = true;
     bool slotBatch = false;
     uint32_t slotTprA = 64, slotTprO = 128;
     uint32_t gemvTprA = 16, gemvTprO = 128;
@@ -2813,7 +2818,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (x >= 1u && x <= 64u) headGemmN = x;
     }
     if (const char* v = getenv("QK_HEAD_F16")) headF16 = atoi(v) != 0;
-    pHead  = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
+    if (const char* v = getenv("QK_HEAD_FIXED_K")) headFixedK = atoi(v) != 0;
+    pHead = headFixedK
+        ? getPipe(c, "gemv_q6_k_fixed", "gemv_q6_k_k2048", 2)
+        : getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
     pHeadTop = getPipe(c, "head_q6", "head_q6_gemm_b8_top1_f32", 0);
     pHeadTop64 = getPipe(c, "head_q6", "head_q6_gemm_b8_top1_f32_m64", 0);
     if (headF16) {
@@ -4478,6 +4486,96 @@ static bool caseIQ4GemvCmp(MtlCtx& c, const std::string& tensorName,
         const double s0 = run(pSafe, bSafe), f0 = run(pFixed, bFixed);
         const double f1 = run(pFixed, bFixed), s1 = run(pSafe, bSafe);
         printf("gpu us/iter: safe %.2f / %.2f | fixed %.2f / %.2f\n", s0, s1, f0, f1);
+    }
+    return close;
+}
+
+// Real Q6_K output-head comparison for fixed K=2048 and NSG sweeps.
+static bool caseQ6GemvCmp(MtlCtx& c, uint32_t nsg, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    const GgufTensor* t = g.find("output.weight");
+    if (!t || t->type != GGML_Q6_K || t->ne[2] != 1) {
+        fprintf(stderr, "q6gemvcmp requires a 2D Q6_K output.weight\n");
+        return false;
+    }
+    const uint32_t K = (uint32_t)t->ne[0];
+    const uint32_t M = (uint32_t)t->ne[1];
+    if (K != 2048u || (nsg != 1u && nsg != 2u && nsg != 4u && nsg != 8u) ||
+        M % (2u * nsg) != 0u) {
+        fprintf(stderr, "q6gemvcmp requires K=2048, NSG={1,2,4,8}, and full row tiles\n");
+        return false;
+    }
+    const size_t wBytes = (size_t)M * ggmlRowBytes(t->type, K);
+    printf("\n== q6gemvcmp output.weight W[%u,%u], NSG=%u (W %.1f MiB) ==\n",
+           M, K, nsg, (double)wBytes / (1 << 20));
+
+    std::mt19937 rng(0x51364756u);
+    std::normal_distribution<float> nd(0.f, 0.35f);
+    std::vector<float> x(K);
+    for (float& v : x) v = nd(rng);
+
+    id<MTLBuffer> bW = createBuf(c, wBytes, t->data);
+    id<MTLBuffer> bX = createBuf(c, (size_t)K * 4u, x.data());
+    id<MTLBuffer> bSafe = createBuf(c, (size_t)M * 4u);
+    id<MTLBuffer> bFixed = createBuf(c, (size_t)M * 4u);
+    id<MTLComputePipelineState> pSafe = getPipe(c, "gemv_q6_k", "gemv_q6_k", nsg);
+    id<MTLComputePipelineState> pFixed =
+        getPipe(c, "gemv_q6_k_fixed", "gemv_q6_k_k2048", nsg);
+    const uint32_t mk[2] = {M, K};
+    const uint32_t wgs = M / (2u * nsg);
+
+    auto encode = [&](id<MTLComputeCommandEncoder> enc,
+                      id<MTLComputePipelineState> pso, id<MTLBuffer> y) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:y offset:0 atIndex:2];
+        [enc setBytes:mk length:sizeof(mk) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+    };
+    auto once = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> y) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            encode(enc, pso, y);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+    };
+    once(pSafe, bSafe);
+    once(pFixed, bFixed);
+    const uint32_t* ys = (const uint32_t*)bSafe.contents;
+    const uint32_t* yf = (const uint32_t*)bFixed.contents;
+    const float* fs = (const float*)ys;
+    const float* ff = (const float*)yf;
+    size_t mismatches = 0;
+    double rms = 0.0, maxAbs = 0.0;
+    for (uint32_t i = 0; i < M; ++i) rms += (double)fs[i] * fs[i];
+    rms = std::sqrt(rms / M);
+    for (uint32_t i = 0; i < M; ++i) {
+        mismatches += ys[i] != yf[i];
+        maxAbs = std::max(maxAbs, std::fabs((double)fs[i] - ff[i]));
+    }
+    const double scaled = maxAbs / std::max(1e-7, rms);
+    const bool close = scaled <= 2e-6;
+    printf("fixed-vs-safe: %zu/%u bit mismatches, max_abs %.3g, max_abs/rms %.3g -> %s\n",
+           mismatches, M, maxAbs, scaled, mismatches ? (close ? "CLOSE" : "FAIL") : "EXACT");
+
+    auto run = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> y) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < iters; ++i) encode(enc, pso, y);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / iters;
+        }
+    };
+    if (iters) {
+        run(pSafe, bSafe); run(pFixed, bFixed);
+        const double s0 = run(pSafe, bSafe), f0 = run(pFixed, bFixed);
+        const double f1 = run(pFixed, bFixed), s1 = run(pSafe, bSafe);
+        printf("gpu us/iter: safe %.1f / %.1f | fixed %.1f / %.1f\n", s0, s1, f0, f1);
     }
     return close;
 }
@@ -6207,6 +6305,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             ok = caseIQ4GemvCmp(c, argv[2], argU(3, 500));
+        } else if (mode == "q6gemvcmp") {
+            ok = caseQ6GemvCmp(c, argU(2, 2), argU(3, 10));
         } else if (mode == "headcmp") {
             ok = caseHeadCmp(c, argU(2, 8), argU(3, 20));
         } else if (mode == "facmp") {
