@@ -2099,7 +2099,8 @@ struct qk_engine {
     float eps = 1e-6f;
     uint32_t nsg = 4;
 
-    id<MTLComputePipelineState> pGemvA, pGemvO, pAb, pStep, pPrep, pAttn, pMoeS,
+    id<MTLComputePipelineState> pGemvA, pGemvO, pAb, pStep, pPrep, pAttn,
+        pAttnSplit, pAttnReduce, pMoeS,
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
@@ -2135,7 +2136,7 @@ struct qk_engine {
 
     id<MTLBuffer> bXin, bXn, bBig, bMid, bKin, bVin, bGb, bAtt, bAttnOut, bY, bXn2,
         bML, bMH, bMSel, bMY, bLogits, bRope, bAV, bAI,
-        bTok, bRbScratch, bSlotIn, bSlotPos;
+        bTok, bRbScratch, bSlotIn, bSlotPos, bPartial;
     WB bONorm{nil}, bHeadW{nil}, bEmbdW{nil};
 
     uint32_t maxB = 0;
@@ -2452,6 +2453,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pStep  = getPipe(c, "dn_step", "dn_step", 0);
     pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", 0);
     pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", 0);
+    pAttnSplit  = getPipe(c, "fa_srv", "fa_attn_srv_split", 0);   // flash-decoding
+    pAttnReduce = getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
     pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
     pMoeGu = getPipe(c, "moe_gateup_all", "moe_gateup_all", nsg);
@@ -2551,6 +2554,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bRbScratch = createBuf(c, 64, nullptr, true);
     bSlotIn = createBuf(c, (size_t)nB * 4, nullptr, true);
     bSlotPos = createBuf(c, (size_t)nB * 4, nullptr, true);
+    // split-K decode-attention partials: [slot][head][chunk](acc[dh], m, l)
+    { const uint32_t maxChunks = (nCtx + 255u) / 256u;
+      bPartial = createBuf(c, (size_t)nB * hQ * maxChunks * (dh + 2) * 4, nullptr, true); }
     memset(bSlotIn.contents, 0, (size_t)nB * 4);
     memset(bSlotPos.contents, 0, (size_t)nB * 4);
     {
@@ -2743,6 +2749,19 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
             threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
     };
     auto bar = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    // split-K (flash-decoding) decode attention. QK_FA_SPLIT=1 enables it;
+    // dspY adds the chunk (y) grid axis the plain dsp lacks.
+    static const bool faSplit = getenv("QK_FA_SPLIT") != nullptr;
+    auto dspY = [&](id<MTLComputePipelineState> pso, std::initializer_list<WB> bufs,
+                    const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t ydim,
+                    uint32_t thr) {
+        [enc setComputePipelineState:pso];
+        uint32_t i = 0;
+        for (const WB& b : bufs) [enc setBuffer:b.b offset:b.o atIndex:i++];
+        [enc setBytes:pc length:pcSize atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, ydim, zdim)
+            threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
+    };
     const uint32_t thrN = nsg * 32;
 
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
@@ -2754,6 +2773,14 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
     struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, ffE, nExp, nUsed, eps};
     struct { uint32_t pos, tmax, dh_, nRot_, hQ_, hKV_; float e, fb; }
         pcFa{0, nCtx, dh, nRot, hQ, hKV, eps, kFreqBase};
+    // split-K: dispatch only the chunks the deepest slot actually needs
+    // (over-length chunk-TGs early-return); partial stride is the full ceil(ctx/256).
+    uint32_t maxPos = 0;
+    { const uint32_t* sp = (const uint32_t*)bSlotPos.contents;
+      for (uint32_t s = 0; s < zdim; ++s) maxPos = std::max(maxPos, sp[s]); }
+    const uint32_t splitChunks = (maxPos + 1u + 255u) / 256u;
+    struct { uint32_t pos, tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t maxChunks; }
+        pcFaSplit{0, nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, (nCtx + 255u) / 256u};
     const uint32_t amWgs = (vocab + 4095) / 4096;
     struct { uint32_t n, span; } pcAm{vocab, 4096};
     struct { uint32_t m, pos; } pcAm2{amWgs, 0};
@@ -2787,7 +2814,14 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
             dsp(pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.st1, L.st2, bRope, bSlotPos},
                 &pcFa, 32, hQ + 2 * hKV, 256);
             bar();
-            dsp(pAttn, {bMid, L.st1, L.st2, bBig, bAtt, bSlotPos}, &pcFa, 32, hQ, 256);
+            if (faSplit) {
+                dspY(pAttnSplit, {bMid, L.st1, L.st2, bPartial, bSlotPos},
+                     &pcFaSplit, 36, hQ, splitChunks, 256);
+                bar();
+                dsp(pAttnReduce, {bPartial, bBig, bAtt, bSlotPos}, &pcFaSplit, 36, hQ, 256);
+            } else {
+                dsp(pAttn, {bMid, L.st1, L.st2, bBig, bAtt, bSlotPos}, &pcFa, 32, hQ, 256);
+            }
             bar();
             if (L.iq4Wo) dsp(pGemv4, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
             else         dsp(pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
