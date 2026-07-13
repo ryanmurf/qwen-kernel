@@ -1246,7 +1246,7 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
         dsp(enc, pGemvA, {bZW, bXn, bZ}, &pcZ, 8, dIn / 4, 256);
         dsp(enc, pAb, {bXn, bAlW, bBeW, bDt, bAv, bGb}, &pcAb, 8, (2 * hV + nsg - 1) / nsg, thrN);
         bar(enc);
-        dsp(enc, pStep, {bQkv, bConvSt, bKer, bGb, bS, bZ, bSN, bAtt}, &pcStep, 20, hV, dS);
+        dsp(enc, pStep, {bQkv, bConvSt, bKer, bGb, bS, bZ, bSN, bAtt}, &pcStep, 20, hK, dS);
         bar(enc);
         dsp(enc, pGemvO, {bOutW, bAtt, bAttnOut}, &pcOut, 8, nEmbd / 2, 256);
         bar(enc);
@@ -1955,7 +1955,7 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
                     (2 * hV + nsg - 1) / nsg, thrN);
                 bar(enc);
                 dsp(enc, pStep, {bBig, L.convSt, L.ker, bGb, L.S, bMid, L.sn, bAtt},
-                    &pcStep, 20, hV, dS);
+                    &pcStep, 20, hK, dS);
                 bar(enc);
                 dsp(enc, pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
             } else {
@@ -2799,7 +2799,7 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
                 (2 * hV + nsg - 1) / nsg, thrN);
             bar();
             dsp(pStep, {bBig, L.st1, L.ker, bGb, L.st2, bMid, L.sn, bAtt},
-                &pcStep, 20, hV, dS);
+                &pcStep, 20, hK, dS);
             bar();
             if (L.iq4Wo) dsp(pGemv4, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
             else         dsp(pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
