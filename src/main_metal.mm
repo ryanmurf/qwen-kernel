@@ -6,7 +6,8 @@
 // Usage:
 //   qk                        synthetic suite: f16, q8_0, q6_k, iq4_xs, iq3_xxs
 //   qk f16|q8_0|q6_k|iq4_xs|iq3_xxs [M] [K] [iters]
-//   qk slotgemv [M] [K] [B] [TPR] [iters]  Q8_0 slot-batch comparison
+//   qk slotgemv [M] [K] [B] [TPR] [iters]  Q8_0 batch comparison
+//       QK_SLOT_FIXED=1 selects the fixed-K shipping/four-row pair (B=4)
 //   qk normroutecmp [experts] [slots] [iters]  split normalized router
 //   qk fasrvcmp [slots] [max-pos] [min-pos] [iters]  decode-attention schedules
 //   qk fadecode [slots] [pos] [steps] [tmax] [min-pos]  steady deep decode
@@ -500,8 +501,8 @@ static bool caseQ80(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
 static bool caseQ80Batch(MtlCtx& c, uint32_t M, uint32_t K, uint32_t B,
                          uint32_t tpr, uint32_t iters) {
     if (K % 32 || (B != 2 && B != 4 && B != 8) ||
-        (tpr != 32 && tpr != 64 && tpr != 128)) {
-        fprintf(stderr, "slotgemv requires K%%32=0, B={2,4,8}, TPR={32,64,128}\n");
+        (tpr != 16 && tpr != 32 && tpr != 64 && tpr != 128)) {
+        fprintf(stderr, "slotgemv requires K%%32=0, B={2,4,8}, TPR={16,32,64,128}\n");
         return false;
     }
     const size_t nb = (size_t)M * K / 32;
@@ -524,9 +525,15 @@ static bool caseQ80Batch(MtlCtx& c, uint32_t M, uint32_t K, uint32_t B,
     id<MTLBuffer> bX = createBuf(c, xBytes, x.data());
     id<MTLBuffer> bRef = createBuf(c, yBytes);
     id<MTLBuffer> bBat = createBuf(c, yBytes);
-    id<MTLComputePipelineState> pRef = getPipe(c, "gemv_q8_0", "gemv_q8_0", tpr);
+    const bool fixed = getenv("QK_SLOT_FIXED") && atoi(getenv("QK_SLOT_FIXED")) != 0 &&
+                       (K == 2048u || K == 4096u) && B == 4u;
+    id<MTLComputePipelineState> pRef = fixed
+        ? getPipe(c, "gemv_q8_0_fixed", K == 2048u ? "gemv_q8_0_k2048"
+                                                   : "gemv_q8_0_k4096", tpr)
+        : getPipe(c, "gemv_q8_0", "gemv_q8_0", tpr);
     char fn[32];
-    snprintf(fn, sizeof fn, "gemv_q8_0_b%u", B);
+    if (fixed) snprintf(fn, sizeof fn, "gemv_q8_0_b%u_k%u", B, K);
+    else snprintf(fn, sizeof fn, "gemv_q8_0_b%u", B);
     id<MTLComputePipelineState> pBat = getPipe(c, "gemv_q8_0_batch", fn, tpr);
     struct { uint32_t m, k; } pc{M, K};
     const uint32_t rowsPerTg = 256u / tpr;
@@ -2664,6 +2671,7 @@ struct qk_engine {
     uint32_t nsg = 4;
 
     id<MTLComputePipelineState> pGemvA, pGemvO, pGemvAB, pGemvOB,
+        pPrefillGemvA4, pPrefillGemvO4,
         pAb, pStep, pStepPrep, pStepState, pStepStateSimd, pPrep, pAttn,
         pAttnSplit, pAttnReduce, pMoeS,
         pMoeLA, pMoeLS, pAddNSg, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
@@ -2698,6 +2706,7 @@ struct qk_engine {
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
     uint32_t gemmThreads = 256;
     uint32_t gemmBM = 128, gemmBN = 64;
+    bool prefillGemvBatch = false;
     bool gemmAligned = true;
     uint32_t faQTM = 8, faThreads = 256, faHeadGroup = 2;
     bool headGemm = true;
@@ -3350,6 +3359,15 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pGemvO = gemvFast
         ? getPipe(c, "gemv_q8_0_fixed", "gemv_q8_0_k4096", gemvTprO)
         : getPipe(c, "gemv_q8_0", "gemv_q8_0", gemvTprO);
+    prefillGemvBatch = gemvFast && gemvTprA == 16u && gemvTprO == 128u;
+    if (const char* v = getenv("QK_PREFILL_GEMV_BATCH"))
+        prefillGemvBatch = prefillGemvBatch && atoi(v) != 0;
+    if (!guIq4 && prefillGemvBatch) {
+        // Exact small-prefill path: reuse each decoded Q8 block across four
+        // token rows while retaining the shipping GEMV's TPR/reduction order.
+        pPrefillGemvA4 = getPipe(c, "gemv_q8_0_batch", "gemv_q8_0_b4_k2048", gemvTprA);
+        pPrefillGemvO4 = getPipe(c, "gemv_q8_0_batch", "gemv_q8_0_b4_k4096", gemvTprO);
+    }
     // Q8_0 dense projections can decode each weight block once for a group of
     // slots. The 80B repack uses IQ4_XS dense weights and intentionally stays
     // on its existing path. QK_SLOT_BATCH=0 is the benchmark/rollback switch.
@@ -4837,7 +4855,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         struct { uint32_t k, idx, pr; float e; } pcE{nEmbd, 0, 1, eps};
         struct { uint32_t M, K, N; } pcG;
 
-        // projection: tiled GEMM for n>=48 (weight reads amortized), else z=n GEMV
+        // projection: tiled GEMM for n>=48; exact weight reuse below it.
         auto proj = [&](WB W, WB WP, id<MTLBuffer> X, id<MTLBuffer> Y,
                         uint32_t M, uint32_t K, bool isOut, bool iq4) {
             if (skProj) return;
@@ -4861,12 +4879,20 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 if (iq4)
                     dspz(isOut ? pGemv4O : pGemv4, {W, X, Y}, &pcP, 8,
                          (M + 3) / 4, 64, n);
-                else
-                    dspz(isOut ? pGemvO : pGemvA,
-                         {W, X, Y}, &pcP, 8,
-                         (M + 256u / (isOut ? gemvTprO : gemvTprA) - 1u) /
-                             (256u / (isOut ? gemvTprO : gemvTprA)),
-                         256, n);
+                else {
+                    const uint32_t tpr = isOut ? gemvTprO : gemvTprA;
+                    const uint32_t wgs = (M + 256u / tpr - 1u) / (256u / tpr);
+                    const uint32_t n4 = prefillGemvBatch ? n & ~3u : 0u;
+                    if (n4)
+                        dspz(isOut ? pPrefillGemvO4 : pPrefillGemvA4,
+                             {W, X, Y}, &pcP, 8, wgs, 256, n4 / 4u);
+                    if (n4 < n)
+                        dspz(isOut ? pGemvO : pGemvA,
+                             {W,
+                              WB{X, (NSUInteger)((size_t)n4 * K * sizeof(float))},
+                              WB{Y, (NSUInteger)((size_t)n4 * M * sizeof(float))}},
+                             &pcP, 8, wgs, 256, n - n4);
+                }
             }
         };
 

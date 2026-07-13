@@ -13,7 +13,7 @@ struct block_q8_0 {
 };
 static_assert(sizeof(block_q8_0) == 34, "q8_0 block size");
 
-template <ushort NQ>
+template <ushort NQ, uint KFIX = 0u>
 static inline void gemv_q8_batch_body(device const block_q8_0* wb,
                                       device const float* x,
                                       device float* y,
@@ -22,7 +22,7 @@ static inline void gemv_q8_batch_body(device const block_q8_0* wb,
                                       uint tid, uint tgx, uint tgz,
                                       uint sgid, uint slid) {
     const uint M = mk.x;
-    const uint K = mk.y;
+    const uint K = KFIX ? KFIX : mk.y;
     const uint lane = tid % TPR;
     const uint row = tgx * (256u / TPR) + tid / TPR;
     const uint rq0 = tgz * NQ;
@@ -32,6 +32,7 @@ static inline void gemv_q8_batch_body(device const block_q8_0* wb,
     if (row < M) {
         const uint kb = K / 32u;
         const ulong base = (ulong)row * kb;
+#pragma unroll
         for (uint b = lane; b < kb; b += TPR) {
             device const block_q8_0& blk = wb[base + b];
             device const packed_char4* qp =
@@ -116,3 +117,20 @@ kernel void gemv_q8_0_b8(device const block_q8_0* wb [[buffer(0)]],
     gemv_q8_batch_body<8>(wb, x, y, mk, partial, tid3.x, tgpig.x,
                           tgpig.z, sgid, slid);
 }
+
+#define QK_FIXED_BATCH(NAME, NQ, KFIX)                                      \
+kernel void NAME(device const block_q8_0* wb [[buffer(0)]],                 \
+                 device const float* x [[buffer(1)]],                       \
+                 device float* y [[buffer(2)]],                             \
+                 constant uint2& mk [[buffer(3)]],                          \
+                 uint3 tid3 [[thread_position_in_threadgroup]],             \
+                 uint3 tgpig [[threadgroup_position_in_grid]],              \
+                 uint sgid [[simdgroup_index_in_threadgroup]],              \
+                 uint slid [[thread_index_in_simdgroup]]) {                 \
+    threadgroup float partial[NQ * 8];                                      \
+    gemv_q8_batch_body<NQ, KFIX>(wb, x, y, mk, partial, tid3.x, tgpig.x,   \
+                                 tgpig.z, sgid, slid);                       \
+}
+
+QK_FIXED_BATCH(gemv_q8_0_b4_k2048, 4, 2048u)
+QK_FIXED_BATCH(gemv_q8_0_b4_k4096, 4, 4096u)
