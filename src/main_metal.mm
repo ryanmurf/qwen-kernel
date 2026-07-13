@@ -3676,14 +3676,15 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             }
     }
 
-    // Multi-slot 35B admission can coalesce prompt chunks into one
-    // weight-amortized prefill. Single-slot, split, and IQ4/80B engines retain
-    // the lean legacy default; QK_MAXB remains an explicit override.
-    uint32_t cap = !splitStage() && !guIq4 && nSlots >= 2 ? 1024u : 128u;
+    // Unsplit 35B admission amortizes dense/MoE weights through 1024-row
+    // chunks. Split and IQ4/80B engines retain the lean 128-row allocation;
+    // QK_MAXB remains an explicit (context-clamped) override.
+    uint32_t cap = !splitStage() && !guIq4 ? 1024u : 128u;
     if (const char* v = getenv("QK_MAXB")) {
         long x = atol(v);
         if (x >= 16 && x <= 1024) cap = (uint32_t)x;
     }
+    cap = (uint32_t)std::min<uint64_t>(cap, (uint64_t)nCtx * nSlots);
     maxB = cap;
     const uint32_t headLogitRows = headGemm
         ? std::min(cap, std::max(1u, headGemmN - 1u)) : cap;
