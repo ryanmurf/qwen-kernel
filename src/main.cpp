@@ -2823,6 +2823,9 @@ struct qk_engine {
     Buf bAttScratch;           // split-K partials: nSlots*hQ*attnSplitMax*(dh+2) floats
     uint32_t attnChunk = 32;   // KV positions per split WG (QK_ATTN_CHUNK, 8..1024)
     uint32_t attnSplitMax = 0; // ceil(nCtx/attnChunk) WGs dispatched per q-head
+    bool useSplitK = true;     // QK_NO_SPLITK=1 restores the legacy attention paths
+    Buf bbPos;                 // 1-entry position buffer: the batch n==1 split-K
+    uint32_t* bbPosMap = nullptr;  // case binds it where the srv shaders read slotPos
     VkDescriptorSet sHead, sAm1, sAm2, sEmb;
 
     uint32_t maxB = 0;
@@ -2831,6 +2834,7 @@ struct qk_engine {
     struct BLayer {
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sGate, sWo, sAddN,
             sPrep, sAttn, sMoeL, sMoeS, sMoeGU, sMoeGUs, sMoeDn, sMoeDns, sAdd3;
+        VkDescriptorSet sAttnS, sAttnR;  // split-K for the n==1 (decode) batch case
     };
     std::vector<BLayer> blayers;
     VkDescriptorSet sbEmb, sbHead;
@@ -2972,7 +2976,7 @@ qk_engine::~qk_engine() {
         destroyBuf(c, *b);
     for (Buf* b : {&bbXin, &bbXn, &bbBig, &bbMid, &bbKin, &bbVin, &bbGb, &bbConvOut, &bbO,
                    &bbAtt, &bbAttnOut, &bbY, &bbXn2, &bbML, &bbMH, &bbMSel, &bbMY, &bbMY2,
-                   &bbLogits, &bbIds, &bbCarry, &bvAV, &bvAI, &bvTok, &bvSamp})
+                   &bbLogits, &bbIds, &bbCarry, &bbPos, &bvAV, &bvAI, &bvTok, &bvSamp})
         destroyBuf(c, *b);
     if (profQ) vkDestroyQueryPool(c.dev, profQ, nullptr);
     if (dpool) vkDestroyDescriptorPool(c.dev, dpool, nullptr);
@@ -3383,6 +3387,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMY2 = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     if (lastStage()) bbLogits = createBuf(c, (size_t)cap * vocab * 4, storSrc, true);
     bbIds = createBuf(c, (size_t)cap * 4, stor, false);
+    bbPos = createBuf(c, 4, stor, false);
+    VK_CHECK(vkMapMemory(c.dev, bbPos.mem, 0, VK_WHOLE_SIZE, 0, (void**)&bbPosMap));
     // Per-layer conv carry (the 3 tokens before a chunk): one [chQkv*3] slice per layer,
     // so a seeded (base>0) chunk can seed each deltanet layer's carry from its own conv
     // window. Zero for from-empty chunks. storSrc so it can be a copy target.
@@ -3538,6 +3544,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             BL.sPrep = mkSet(pPrepB, {bbBig.buf, bbKin.buf, bbVin.buf, qn, kn, bbMid.buf, kc, vc,
                                       bRope.buf});
             BL.sAttn = mkSet(pAttnB, {bbMid.buf, kc, vc, bbBig.buf, bbAtt.buf});
+            BL.sAttnS = mkSet(pAttnS, {bbMid.buf, kc, vc, bAttScratch.buf, bbPos.buf});
+            BL.sAttnR = mkSet(pAttnR, {bAttScratch.buf, bbBig.buf, bbAtt.buf, bbPos.buf});
             BL.sWo = mkSet(pGemvO, {wo, bbAtt.buf, bbAttnOut.buf});
         }
         if (denseBad) return fail("qk_open: dense projection tensor missing or bad type");
@@ -3679,7 +3687,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
     struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; uint32_t nSplit, pad; }
         pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase, attnSplitMax, attnChunk};
-    bool useSplitK = getenv("QK_NO_SPLITK") == nullptr;  // split-K decode attention
+    useSplitK = getenv("QK_NO_SPLITK") == nullptr;  // split-K decode attention
     const uint32_t amWgs = (vocab + 4095) / 4096;
     struct { uint32_t n, span; } pcAm{vocab, 4096};
     struct { uint32_t m; } pcAm2{amWgs};
@@ -4049,6 +4057,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 rebind(BL.sPrep, 7, L.st2, L.ps2, slot);
                 rebind(BL.sAttn, 1, L.st1, L.ps1, slot);
                 rebind(BL.sAttn, 2, L.st2, L.ps2, slot);
+                rebind(BL.sAttnS, 1, L.st1, L.ps1, slot);
+                rebind(BL.sAttnS, 2, L.st2, L.ps2, slot);
             }
         }
     }
@@ -4253,7 +4263,23 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             // queries carry no cross-tile state so this is exact. The kernel is
             // query-BLOCKED (QB queries per workgroup share each K/V read), so
             // tile offsets stay QB-aligned and z counts blocks, not queries.
-            {
+            if (useSplitK && n == 1) {
+                // Decode-shaped call (the split head's per-token path): the
+                // query-blocked kernel degenerates to hQ WGs serially walking
+                // [0, base] — the same pathology split-K fixed on the serve
+                // path. Reuse those exact shaders: rq (WG z) is 0, and bbPos
+                // stands in for slotPos with the single query's position.
+                *bbPosMap = base;
+                struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb;
+                         uint32_t nSplit, chunk; }
+                    pcSk{0, nCtx, dh, nRot, hQ, hKV, eps, kFreqBase,
+                         attnSplitMax, attnChunk};
+                zdim = 1;
+                disp(pAttnS, BL.sAttnS, hQ * attnSplitMax, &pcSk, 40);
+                barrier();
+                disp(pAttnR, BL.sAttnR, hQ, &pcSk, 40);
+                zdim = n;
+            } else {
                 constexpr uint32_t kQB = 16;  // must match QB in fa_attn_batch.comp
                 uint32_t qt = (uint32_t)std::max<uint64_t>(1, attnBudget / (uint64_t)(base + n));
                 qt = std::min(qt, n);
