@@ -1,0 +1,51 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// add_rmsnorm.comp plus reset of the per-row route-completion counter used by
+// moe_route_select.comp.  The arithmetic path is deliberately identical.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly  buffer BufB { float b[]; };
+layout(std430, binding = 2) readonly  buffer BufW { float w[]; };
+layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+layout(std430, binding = 4) writeonly buffer BufN { float xn[]; };
+struct SelT {
+    uint ids[16];
+    float weight[16];
+    float wShared;
+    uint routeDone;
+    float pad[6];
+};
+layout(std430, binding = 5) buffer Sel { SelT sel[]; };
+
+layout(push_constant) uniform PC { uint n; float eps; } pc;
+
+shared float red[256];
+shared float scale;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+    uint ro = rq * pc.n;
+    if (t == 0u) sel[rq].routeDone = 0u;
+    float ss = 0.0;
+    for (uint i = t; i < pc.n; i += 256u) {
+        float v = a[ro + i] + b[ro + i];
+        y[ro + i] = v;
+        ss += v * v;
+    }
+    float sg = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = sg;
+    barrier();
+    if (t == 0u) {
+        float tot = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += red[i];
+        scale = 1.0 / sqrt(tot / float(pc.n) + pc.eps);
+    }
+    barrier();
+    for (uint i = t; i < pc.n; i += 256u)
+        xn[ro + i] = (a[ro + i] + b[ro + i]) * scale * w[i];
+}

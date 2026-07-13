@@ -1,0 +1,131 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_memory_scope_semantics : require
+
+// Exact router-logit GEMVs with the fast selector executed by the last router
+// workgroup.  add_rmsnorm_route.comp resets routeDone before this dispatch.
+// Device-scope release/acquire semantics make all logit rows visible to the
+// winning workgroup before it performs top-k selection.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufW { float gi[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) coherent buffer BufL { float logits[]; };
+layout(std430, binding = 3) readonly buffer BufGIS { float gis[]; };
+struct SelT {
+    uint ids[16];
+    float weight[16];
+    float wShared;
+    uint routeDone;
+    float pad[6];
+};
+layout(std430, binding = 4) coherent buffer Sel { SelT sel[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float partial[256];
+shared uint isLast;
+shared float red[512];
+shared float waveVal[8];
+shared uint waveId[8];
+shared float bestVal;
+shared uint bestId;
+
+float saneLogit(uint rq, uint id) {
+    float v = id < pc.n_expert ? logits[rq * pc.n_expert + id] : -3.4e38;
+    return (isnan(v) || isinf(v)) ? -3.4e38 : v;
+}
+
+void main() {
+    uint e = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+
+    // Keep moe_logits.comp's accumulation and subgroup/serial reduction order.
+    float acc = 0.0;
+    if (e < pc.n_expert) {
+        uint base = e * pc.n_embd;
+        for (uint k = t; k < pc.n_embd; k += 256u)
+            acc += gi[base + k] * x[rq * pc.n_embd + k];
+    }
+    float v = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = v;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) total += partial[i];
+        if (e < pc.n_expert) logits[rq * pc.n_expert + e] = total;
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+        uint prior = atomicAdd(sel[rq].routeDone, 1u, gl_ScopeDevice,
+                               gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+        isLast = uint(prior + 1u == pc.n_expert);
+    }
+    barrier();
+    if (isLast == 0u) return;
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire);
+
+    uint u = t + 256u;
+    float lo = saneLogit(rq, t);
+    float hi = saneLogit(rq, u);
+
+    // Shared-expert gate: preserve moe_select.comp's 512-lane addition tree.
+    float a = 0.0, b = 0.0;
+    for (uint k = t; k < pc.n_embd; k += 512u)
+        a += gis[k] * x[rq * pc.n_embd + k];
+    for (uint k = u; k < pc.n_embd; k += 512u)
+        b += gis[k] * x[rq * pc.n_embd + k];
+    red[t] = a;
+    red[u] = b;
+    barrier();
+    for (uint s = 256u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    if (t == 0u) sel[rq].wShared = 1.0 / (1.0 + exp(-red[0]));
+    barrier();
+
+    for (uint pick = 0u; pick < pc.n_used; ++pick) {
+        float candidate = lo;
+        uint id = t;
+        if (hi > candidate) { candidate = hi; id = u; }
+
+        float wv = subgroupMax(candidate);
+        uint wi = subgroupMin(candidate == wv ? id : 0xffffffffu);
+        if (gl_SubgroupInvocationID == 0u) {
+            waveVal[gl_SubgroupID] = wv;
+            waveId[gl_SubgroupID] = wi;
+        }
+        barrier();
+
+        if (gl_SubgroupID == 0u) {
+            float cv = gl_SubgroupInvocationID < gl_NumSubgroups
+                ? waveVal[gl_SubgroupInvocationID] : -3.4e38;
+            uint ci = gl_SubgroupInvocationID < gl_NumSubgroups
+                ? waveId[gl_SubgroupInvocationID] : 0xffffffffu;
+            float gv = subgroupMax(cv);
+            uint gi = subgroupMin(cv == gv ? ci : 0xffffffffu);
+            if (gl_SubgroupInvocationID == 0u) { bestVal = gv; bestId = gi; }
+        }
+        barrier();
+
+        if (t == 0u) {
+            sel[rq].ids[pick] = min(bestId, pc.n_expert - 1u);
+            sel[rq].weight[pick] = bestVal;
+        }
+        if (bestId == t) lo = -3.4e38;
+        if (bestId == u) hi = -3.4e38;
+        barrier();
+    }
+
+    if (t == 0u) {
+        float m = sel[rq].weight[0];
+        float sum = 0.0;
+        for (uint i = 0u; i < pc.n_used; ++i) {
+            sel[rq].weight[i] = exp(sel[rq].weight[i] - m);
+            sum += sel[rq].weight[i];
+        }
+        for (uint i = 0u; i < pc.n_used; ++i) sel[rq].weight[i] /= sum;
+    }
+}

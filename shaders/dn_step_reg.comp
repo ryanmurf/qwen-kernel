@@ -1,0 +1,63 @@
+#version 450
+
+// Register-cached decode twin of dn_step.comp. A thread owns one 128-float
+// state row; keeping its 32 vec4s across the two dependent dot/update passes
+// removes the second global read without changing operation order.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufC  { float conv[]; };
+layout(std430, binding = 1) readonly buffer BufGB { float gb[]; };
+layout(std430, binding = 2) buffer BufS           { vec4 s4[]; };
+layout(std430, binding = 3) writeonly buffer BufO { float o[]; };
+
+layout(push_constant) uniform PC { uint dState; uint hK; uint hV; uint kDiv; } pc;
+
+shared vec4 qs4[64];
+shared vec4 ks4[64];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+    uint dS = pc.dState;
+    uint nv = dS / 4u;
+
+    uint kh    = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
+    uint co    = rq * (2u * pc.hK + pc.hV) * dS;
+    uint qBase = co + kh * dS;
+    uint kBase = co + pc.hK * dS + kh * dS;
+    uint vBase = co + 2u * pc.hK * dS + h * dS;
+
+    float qScale = inversesqrt(float(dS));
+    if (j < nv) {
+        qs4[j] = vec4(conv[qBase + 4u*j], conv[qBase + 4u*j + 1u],
+                      conv[qBase + 4u*j + 2u], conv[qBase + 4u*j + 3u]) * qScale;
+        ks4[j] = vec4(conv[kBase + 4u*j], conv[kBase + 4u*j + 1u],
+                      conv[kBase + 4u*j + 2u], conv[kBase + 4u*j + 3u]);
+    }
+    barrier();
+    if (j >= dS) return;
+
+    float decay = exp(gb[rq * 2u * pc.hV + h]);
+    float beta  = gb[rq * 2u * pc.hV + pc.hV + h];
+    float vj    = conv[vBase + j];
+    uint row = rq * pc.hV * dS * nv + (h * dS + j) * nv;
+
+    vec4 state[32];
+    float sk = 0.0;
+    for (uint i = 0u; i < nv; ++i) {
+        state[i] = s4[row + i];
+        sk += dot(state[i], ks4[i]);
+    }
+    sk *= decay;
+    float dj = beta * (vj - sk);
+
+    float oj = 0.0;
+    for (uint i = 0u; i < nv; ++i) {
+        vec4 sn = state[i] * decay + ks4[i] * dj;
+        s4[row + i] = sn;
+        oj += dot(sn, qs4[i]);
+    }
+    o[rq * pc.hV * dS + h * dS + j] = oj;
+}

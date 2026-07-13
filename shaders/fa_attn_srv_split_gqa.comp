@@ -1,0 +1,120 @@
+#version 450
+
+// GQA-aware split-K decode.  A workgroup handles GROUP adjacent query heads
+// which share one KV head, so every K/V element is fetched once and reused.
+// Per-head arithmetic order matches fa_attn_srv_split.comp.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint GROUP = 4u;
+
+layout(std430, binding = 0) readonly  buffer BufQH { float qhat[]; };
+layout(std430, binding = 1) readonly  buffer BufKC { float kc[]; };
+layout(std430, binding = 2) readonly  buffer BufVC { float vc[]; };
+layout(std430, binding = 3) writeonly buffer BufS  { float part[]; };
+layout(std430, binding = 4) readonly  buffer BufPos { uint slotPos[]; };
+
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+    uint splitMax; uint chunk;
+} pc;
+
+shared float q[8u * 256u];
+shared float score[8u * 256u];
+shared float red[256];
+shared float headM[8];
+shared float headL[8];
+
+void main() {
+    uint s = gl_WorkGroupID.x;
+    uint h0 = gl_WorkGroupID.y * GROUP;
+    uint t = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+    uint rq = gl_WorkGroupID.z;
+    uint n = slotPos[rq] + 1u;
+    uint pStart = s * pc.chunk;
+    if (pStart >= n || h0 >= pc.hQ) return;
+    uint pEnd = min(n, pStart + pc.chunk);
+    uint nHead = min(GROUP, pc.hQ - h0);
+    uint qPerKv = pc.hQ / pc.hKV;
+    uint kv = h0 / qPerKv;
+    uint kvo = rq * pc.hKV * pc.tmax * dh;
+    uint qho = rq * pc.hQ * dh;
+
+    // GROUP is restricted by the host to divisors of qPerKv, so a group never
+    // crosses a KV-head boundary.
+    for (uint g = 0u; g < nHead; ++g) {
+        if (t < dh) q[g * 256u + t] = qhat[qho + (h0 + g) * dh + t];
+        if (t == 0u) { headM[g] = -3.4e38; headL[g] = 0.0; }
+    }
+    barrier();
+
+    float acc[8];
+    for (uint g = 0u; g < 8u; ++g) acc[g] = 0.0;
+    float qs = inversesqrt(float(dh));
+
+    for (uint p0 = pStart; p0 < pEnd; p0 += 256u) {
+        uint ts = min(256u, pEnd - p0);
+        if (t < ts) {
+            float sv[8];
+            for (uint g = 0u; g < 8u; ++g) sv[g] = 0.0;
+            uint base = kvo + (kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) {
+                float kval = kc[base + j];
+                for (uint g = 0u; g < nHead; ++g)
+                    sv[g] += q[g * 256u + j] * kval;
+            }
+            for (uint g = 0u; g < nHead; ++g)
+                score[g * 256u + t] = sv[g] * qs;
+        }
+        barrier();
+
+        // Preserve each head's original max/sum reduction trees and update
+        // sequence. Heads are independent, so processing them serially here
+        // does not alter any per-head operation.
+        for (uint g = 0u; g < nHead; ++g) {
+            red[t] = t < ts ? score[g * 256u + t] : -3.4e38;
+            barrier();
+            for (uint st = 128u; st > 0u; st >>= 1u) {
+                if (t < st) red[t] = max(red[t], red[t + st]);
+                barrier();
+            }
+
+            float oldm = headM[g];
+            float newm = max(oldm, red[0]);
+            float corr = exp(oldm - newm);
+            acc[g] *= corr;
+            if (t < ts) score[g * 256u + t] = exp(score[g * 256u + t] - newm);
+            if (t == 0u) { headL[g] *= corr; headM[g] = newm; }
+            barrier();
+
+            red[t] = t < ts ? score[g * 256u + t] : 0.0;
+            barrier();
+            for (uint st = 128u; st > 0u; st >>= 1u) {
+                if (t < st) red[t] += red[t + st];
+                barrier();
+            }
+            if (t == 0u) headL[g] += red[0];
+            barrier();
+        }
+
+        if (t < dh) {
+            for (uint j = 0u; j < ts; ++j) {
+                float vv = vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+                for (uint g = 0u; g < nHead; ++g)
+                    acc[g] += score[g * 256u + j] * vv;
+            }
+        }
+        barrier();
+    }
+
+    for (uint g = 0u; g < nHead; ++g) {
+        uint h = h0 + g;
+        uint po = ((rq * pc.hQ + h) * pc.splitMax + s) * (dh + 2u);
+        if (t < dh) part[po + t] = acc[g];
+        if (t == 0u) {
+            part[po + dh] = headM[g];
+            part[po + dh + 1u] = headL[g];
+        }
+    }
+}

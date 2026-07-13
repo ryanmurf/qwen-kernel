@@ -11,7 +11,7 @@
 // down_exps is IQ4_XS with rows of n_ff elements. One workgroup per output o;
 // threads cover (slot, 32-elem sub-block) tasks.
 
-layout(local_size_x = 256) in;
+layout(local_size_x_id = 0) in;
 
 #include "iq_tables.glsl"
 
@@ -44,7 +44,7 @@ void main() {
 
     float acc = 0.0;
     if (o < pc.n_embd) {
-        for (uint g = tid; g < nt; g += 256u) {
+        for (uint g = tid; g < nt; g += gl_WorkGroupSize.x) {
             uint s  = g / nu;
             uint u  = g % nu;
             uint b  = u >> 3u;

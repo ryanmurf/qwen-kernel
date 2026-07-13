@@ -8,8 +8,10 @@
 // in flash-decode style; fa_attn_srv_reduce combines the partials and
 // applies the output gate.
 //
-// Workgroup x is linear: h = x / nSplit, s = x % nSplit (disp() may fold
-// x into a gy dimension only past 65535, far above hQ*nSplit).
+// Workgroup x is the live split `s`; workgroup y is query head `h`. Keeping
+// split and head as separate dimensions lets the host dispatch only
+// ceil(live_context/chunk) splits while the scratch layout retains its fixed
+// splitMax stride.
 
 layout(local_size_x = 256) in;
 
@@ -32,9 +34,8 @@ shared float m;
 shared float l;
 
 void main() {
-    uint x  = gl_WorkGroupID.x;
-    uint h  = x / pc.splitMax;
-    uint s  = x % pc.splitMax;
+    uint s  = gl_WorkGroupID.x;
+    uint h  = gl_WorkGroupID.y;
     uint t  = gl_LocalInvocationID.x;
     uint dh = pc.dh;
     uint rq = gl_WorkGroupID.z;
