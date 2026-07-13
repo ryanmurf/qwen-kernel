@@ -4151,6 +4151,154 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (mode == "verify") {
+            // Spec-decode P0 harness: compare oracle-draft batched verification
+            // rounds with the serial greedy stream. This is the full-accept
+            // path only: prefillBatchLast persists the round's final recurrent
+            // state directly to the live slot. Partial acceptance needs the
+            // scratch-state rollback path exercised by the later speccmp gate.
+            if (argc < 4) {
+                fprintf(stderr, "usage: qk verify <ids-file> <nGen> [K,K,...] [tmax]\n");
+                return 1;
+            }
+            std::vector<uint32_t> prompt;
+            {
+                FILE* f = fopen(argv[2], "r");
+                if (!f) { perror(argv[2]); return 1; }
+                int v;
+                while (fscanf(f, "%d%*[, \n]", &v) == 1) prompt.push_back((uint32_t)v);
+                fclose(f);
+            }
+            uint32_t nGen = (uint32_t)atoi(argv[3]);
+            std::vector<uint32_t> Ks;
+            if (argc > 4) {
+                const char* p = argv[4];
+                while (*p) {
+                    char* end = nullptr;
+                    unsigned long k = strtoul(p, &end, 10);
+                    if (end == p || k > UINT32_MAX) {
+                        fprintf(stderr, "verify: bad K list '%s'\n", argv[4]);
+                        return 1;
+                    }
+                    Ks.push_back((uint32_t)k);
+                    p = end;
+                    if (*p == ',') p++;
+                    else if (*p) {
+                        fprintf(stderr, "verify: bad K list '%s'\n", argv[4]);
+                        return 1;
+                    }
+                }
+            } else {
+                // The default hp projection GEMM is exact through K=32 on the
+                // gate stream. At K=64 its f16 input fragments can flip a
+                // near-tie; QK_GEMM=scalar is the exact wider-K control.
+                Ks = {2, 4, 8, 16, 32};
+            }
+            uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 4096;
+            qk_config cfg{1, tmax, 8};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+
+            // Generate the serial reference stream and time only calls after
+            // the first generated output (prompt ingestion is excluded).
+            std::vector<uint32_t> serial = prompt;
+            double serialMsTok = 0;
+            {
+                qk_slot_start(e, 0, prompt.data(), (uint32_t)prompt.size(), nGen, 0);
+                uint32_t ch = qk_chunk(e), fin = 0;
+                std::vector<uint32_t> out(ch), cnt(1);
+                double decodeMs = 0;
+                uint32_t decodeTok = 0;
+                bool generated = false;
+                while (true) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    int active = qk_step_chunk(e, out.data(), cnt.data(), &fin);
+                    double ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - t0).count();
+                    if (active <= 0) break;
+                    for (uint32_t i = 0; i < cnt[0]; i++) serial.push_back(out[i]);
+                    if (generated) { decodeMs += ms; decodeTok += cnt[0]; }
+                    if (cnt[0]) generated = true;
+                    if (fin & 1u) break;
+                }
+                serialMsTok = decodeTok ? decodeMs / decodeTok : 0;
+            }
+
+            const uint32_t np = (uint32_t)prompt.size();
+            const uint32_t ns = (uint32_t)serial.size();
+            printf("verify: prompt %u, serial stream %u gen tokens, serial decode %.2f ms/tok\n",
+                   np, ns - np, serialMsTok);
+            if (ns < np + 4) {
+                fprintf(stderr, "verify: stream too short (early EOS?)\n");
+                qk_close(e);
+                return 1;
+            }
+
+            bool allOk = true;
+            printf("  %-4s %8s %10s %8s %10s   %s\n",
+                   "K", "rounds", "round_ms", "ms/tok", "vs_serial", "exact");
+            for (uint32_t K : Ks) {
+                if (K < 1 || K > e->maxB) {
+                    printf("  K=%u skipped (maxB=%u)\n", K, e->maxB);
+                    continue;
+                }
+
+                // Reconstruct the prompt state from empty for each K.
+                std::vector<float> dummy;
+                for (uint32_t off = 0; off < np;) {
+                    uint32_t n = std::min(e->maxB, np - off);
+                    e->prefillBatchLast(prompt.data() + off, n, 0, dummy,
+                                        /*wantLogits=*/false, off);
+                    off += n;
+                }
+
+                // Feed serial[pos] as the first pending token. Per-position
+                // argmax i must reproduce serial[pos+i+1]. Head and both
+                // argmax reductions are encoded in the target command buffer.
+                uint32_t pos = np, mismatches = 0, rounds = 0, committed = 0;
+                uint32_t firstAt = 0, firstGot = 0, firstWant = 0;
+                bool haveFirst = false;
+                double totalMs = 0;
+                std::vector<uint32_t> argmax(e->maxB);
+                while (pos + 1 < ns) {
+                    uint32_t n = std::min(K, ns - pos - 1);
+                    auto t0 = std::chrono::steady_clock::now();
+                    e->prefillBatchLast(&serial[pos], n, 0, dummy,
+                                        /*wantLogits=*/false, pos, argmax.data());
+                    totalMs += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0).count();
+                    rounds++;
+                    for (uint32_t i = 0; i < n; i++) {
+                        if (argmax[i] == serial[pos + i + 1]) continue;
+                        if (!haveFirst) {
+                            firstAt = pos + i;
+                            firstGot = argmax[i];
+                            firstWant = serial[pos + i + 1];
+                            haveFirst = true;
+                        }
+                        mismatches++;
+                    }
+                    committed += n;
+                    pos += n;
+                }
+                const double msTok = committed ? totalMs / committed : 0;
+                const bool ok = mismatches == 0;
+                allOk = allOk && ok;
+                printf("  %-4u %8u %10.1f %8.2f %9.2fx   %s\n",
+                       K, rounds, rounds ? totalMs / rounds : 0, msTok,
+                       msTok > 0 ? serialMsTok / msTok : 0,
+                       ok ? "EXACT" : "**MISMATCH**");
+                if (!ok)
+                    printf("      %u/%u positions diverged; first input-pos %u got %u want %u\n",
+                           mismatches, committed, firstAt, firstGot, firstWant);
+            }
+            printf("verify: %s\n",
+                   allOk ? "ORACLE SPEC ROUNDS TOKEN-EXACT" : "DIVERGENCE (see above)");
+            qk_close(e);
+            return allOk ? 0 : 1;
+        }
+
         if (mode == "prefillcmp") {
             uint32_t N = argc > 2 ? (uint32_t)atoi(argv[2]) : 32;
             uint32_t ctx = argc > 3 ? (uint32_t)atoi(argv[3]) : 2048;
