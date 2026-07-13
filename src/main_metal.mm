@@ -2306,7 +2306,7 @@ struct qk_engine {
         pAb, pStep, pPrep, pAttn,
         pAttnSplit, pAttnReduce, pMoeS,
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
-        pHeadTop64, pHeadTopReduce, pAm1, pAm2, pEmb,
+        pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemmB4, pMoeGu4, pMoeGuG4i, pMoeGuG5i;
@@ -2325,6 +2325,7 @@ struct qk_engine {
     uint32_t gemmBM = 128, gemmBN = 64;
     bool headGemm = true;
     uint32_t headGemmN = 4;
+    bool headF16 = false;  // opt-in half operands/f32 accumulation for batched head
     bool slotBatch = false;
     uint32_t slotTprA = 64, slotTprO = 128;
     uint32_t slotBatchN = 0;
@@ -2767,9 +2768,20 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeD4 = getPipe(c, "moe_down_all", "moe_down_all_iq4", nsg);
     pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
     pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
+    if (const char* v = getenv("QK_HEAD_GEMM")) headGemm = atoi(v) != 0;
+    if (const char* v = getenv("QK_HEAD_GEMM_N")) {
+        const uint32_t x = (uint32_t)atoi(v);
+        if (x >= 1u && x <= 64u) headGemmN = x;
+    }
+    if (const char* v = getenv("QK_HEAD_F16")) headF16 = atoi(v) != 0;
     pHead  = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
     pHeadTop = getPipe(c, "head_q6", "head_q6_gemm_b8_top1_f32", 0);
     pHeadTop64 = getPipe(c, "head_q6", "head_q6_gemm_b8_top1_f32_m64", 0);
+    if (headF16) {
+        pHeadF8 = getPipe(c, "head_q6", "head_q6_gemm_b8_top1_f16", 0);
+        pHeadF16 = getPipe(c, "head_q6", "head_q6_gemm_b16_top1_f16", 0);
+        pHeadF32 = getPipe(c, "head_q6", "head_q6_gemm_b32_top1_f16", 0);
+    }
     pHeadTopReduce = getPipe(c, "head_q6", "head_top1_reduce_batch", 0);
     pAm1   = getPipe(c, "argmax", "argmax1", 0);
     pAm2   = getPipe(c, "argmax", "argmax2", 0);
@@ -2781,11 +2793,6 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
     pStepB = getPipe(c, "dn_batch", "dn_step_batch", 0);
     pGateB = getPipe(c, "dn_batch", "dn_gate_batch", nsg);
-    if (const char* v = getenv("QK_HEAD_GEMM")) headGemm = atoi(v) != 0;
-    if (const char* v = getenv("QK_HEAD_GEMM_N")) {
-        const uint32_t x = (uint32_t)atoi(v);
-        if (x >= 1u && x <= 64u) headGemmN = x;
-    }
     if (const char* v = getenv("QK_DN_CHUNK")) dnChunk = atoi(v) != 0;
     if (const char* v = getenv("QK_DN_STEP_RES")) {
         const uint32_t x = (uint32_t)atoi(v);
@@ -3835,15 +3842,22 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             const uint32_t nh = argmaxOut ? n : 1;
             const bool tiledHead = argmaxOut && headGemm && nh >= headGemmN;
             if (tiledHead) {
-                const bool wide = nh >= 8u;
+                const bool f16 = headF16 && nh >= 4u;
+                const bool wide = f16 || nh >= 8u;
                 const uint32_t headRows = wide ? 64u : 32u;
+                const uint32_t headCols = f16 ? (nh <= 8u ? 8u : nh <= 16u ? 16u : 32u)
+                                              : 8u;
                 const uint32_t headTiles = (vocab + headRows - 1u) / headRows;
                 const uint32_t materialize = (!scratchState || wantLogits) ? 1u : 0u;
                 struct { uint32_t m, k, nn, tiles, materialize; }
                     pcHead{vocab, nEmbd, nh, headTiles, materialize};
-                dspz(wide ? pHeadTop64 : pHeadTop,
+                id<MTLComputePipelineState> hp = f16
+                    ? (headCols == 8u ? pHeadF8 : headCols == 16u ? pHeadF16 : pHeadF32)
+                    : (wide ? pHeadTop64 : pHeadTop);
+                dspz(hp,
                      {bHeadW, bbXn, bbHeadV, bbHeadI, bbLogits},
-                     &pcHead, 20, headTiles, wide ? 256 : 128, (nh + 7) / 8);
+                     &pcHead, 20, headTiles, wide ? 256 : 128,
+                     (nh + headCols - 1u) / headCols);
                 bar();
                 struct { uint32_t tiles, nn; } pcRed{headTiles, nh};
                 dspz(pHeadTopReduce, {bbHeadV, bbHeadI, bbTok}, &pcRed, 8, 1, 256, nh);
@@ -4214,9 +4228,15 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     id<MTLComputePipelineState> pBase = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
     id<MTLComputePipelineState> pGemm =
         getPipe(c, "head_q6", "head_q6_gemm_b8_f32", 0);
-    const uint32_t topM = getenv("QK_HEAD_TOP_M64") ? 64u : 32u;
-    const char* topFn = topM == 64u ? "head_q6_gemm_b8_top1_f32_m64"
-                                    : "head_q6_gemm_b8_top1_f32";
+    const bool topF16 = getenv("QK_HEAD_F16") && atoi(getenv("QK_HEAD_F16")) != 0;
+    const uint32_t topM = topF16 ? 64u : getenv("QK_HEAD_TOP_M64") ? 64u : 32u;
+    const uint32_t topN = topF16 ? (N <= 8u ? 8u : N <= 16u ? 16u : 32u) : 8u;
+    const char* topFn = topF16
+        ? (topN == 8u ? "head_q6_gemm_b8_top1_f16" :
+           topN == 16u ? "head_q6_gemm_b16_top1_f16" :
+                         "head_q6_gemm_b32_top1_f16")
+        : topM == 64u ? "head_q6_gemm_b8_top1_f32_m64"
+                      : "head_q6_gemm_b8_top1_f32";
     id<MTLComputePipelineState> pTop = getPipe(c, "head_q6", topFn, 0);
     id<MTLComputePipelineState> pTopReduce =
         getPipe(c, "head_q6", "head_top1_reduce_batch", 0);
@@ -4310,7 +4330,7 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
         [enc setBuffer:bTI offset:0 atIndex:3];
         [enc setBuffer:bLast offset:0 atIndex:4];
         [enc setBytes:&topPc length:sizeof(topPc) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(nTiles, 1, (N + 7u) / 8u)
+        [enc dispatchThreadgroups:MTLSizeMake(nTiles, 1, (N + topN - 1u) / topN)
             threadsPerThreadgroup:MTLSizeMake(topThreads, 1, 1)];
         barrier(enc);
         struct { uint32_t tiles, N; } redPc{nTiles, N};
@@ -4379,7 +4399,9 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     for (uint32_t m = 0; m < M; ++m)
         lastMax = std::max(lastMax,
             std::fabs((double)last[m] - yg[(size_t)(N - 1u) * M + m]));
-    printf("  fused materialized last row max_abs=%.6g\n", lastMax);
+    const bool lastClose = topF16 ? lastMax <= 1e-3 : lastMax == 0.0;
+    printf("  fused materialized last row max_abs=%.6g (%s precision)\n",
+           lastMax, topF16 ? "f16-input" : "exact-f32");
 
     // Deliberate all-logit tie: both reductions must choose vocabulary id 0.
     memset(bX.contents, 0, x.size() * sizeof(float));
@@ -4399,7 +4421,7 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     printf("  all-zero tie: %u/%u chose lower id 0\n", N - tieBad, N);
 
     const bool logitsClose = maxAbs <= std::max(1e-5, rms * 1e-4);
-    const bool pass = tokenBad == 0 && tieBad == 0 && logitsClose && lastMax == 0.0;
+    const bool pass = tokenBad == 0 && tieBad == 0 && logitsClose && lastClose;
     printf("correctness: tiled argmax %u/%u exact, logits %s -> %s\n",
            N - tokenBad, N, logitsClose ? "CLOSE" : "DRIFT", pass ? "PASS" : "FAIL");
     if (pass && iters) {
@@ -4414,7 +4436,8 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
         bench("32x8 f32 GEMM", [&](auto enc) { encGemm(enc, false); });
         bench("32x8 f32 GEMM + argmax", [&](auto enc) { encGemm(enc, true); });
         char topName[48];
-        snprintf(topName, sizeof(topName), "%ux8 fused candidates", topM);
+        snprintf(topName, sizeof(topName), "%ux%u %s candidates", topM, topN,
+                 topF16 ? "f16" : "f32");
         bench(topName, [&](auto enc) { encTop(enc); });
     }
     return pass;
