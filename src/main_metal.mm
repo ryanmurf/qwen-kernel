@@ -643,7 +643,16 @@ static bool caseGguf(MtlCtx& c, const std::string& tensorName, uint32_t iters) {
             units = K / 32;
             break;
         case GGML_Q6_K:    kern = "gemv_q6_k";    units = K / 16; fixedNr0v = 2; break;
-        case GGML_IQ4_XS:  kern = "gemv_iq4_xs";  units = K / 32; fixedNr0v = 2; tgMem = 128; break;
+        case GGML_IQ4_XS:
+            if (const char* v = getenv("QK_IQ4_FIXED_K");
+                v && atoi(v) != 0 && (K == 2048u || K == 4096u)) {
+                kern = K == 2048u ? "gemv_iq4_xs_k2048" : "gemv_iq4_xs_k4096";
+                shaderFile = "gemv_iq4_xs_fixed";
+            } else {
+                kern = "gemv_iq4_xs";
+            }
+            units = K / 32; fixedNr0v = 2; tgMem = 128;
+            break;
         case GGML_IQ3_XXS: kern = "gemv_iq3_xxs"; units = K / 32; fixedNr0v = 4; tgMem = 1152; break;
         case GGML_F16:     kern = "gemv_f16";     units = K / 8;  break;
         default:
@@ -2320,7 +2329,7 @@ struct qk_engine {
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBAligned;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
-    id<MTLComputePipelineState> pGemv4, pGemmB4, pGemmB4Aligned,
+    id<MTLComputePipelineState> pGemv4, pGemv4O, pGemmB4, pGemmB4Aligned,
         pMoeGu4, pMoeGuG4i, pMoeGuG5i;
     // chunked delta rule (prefill DN): parallel kq/solve + chunk-serial step
     id<MTLComputePipelineState> pDnKq, pDnSolve, pDnStepC;
@@ -2344,6 +2353,7 @@ struct qk_engine {
     uint32_t slotTprA = 64, slotTprO = 128;
     uint32_t gemvTprA = 16, gemvTprO = 128;
     bool gemvFast = true;
+    bool iq4FixedK = true;
     uint32_t slotBatchN = 0;
 
     struct Layer {
@@ -2877,7 +2887,13 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeGuG5Live = getPipe(c, "moe_grouped", "moe_gu_grouped5_live", 0);
     pMoeGuG5Work = getPipe(c, "moe_grouped", "moe_gu_grouped5_work", 0);
     if (guIq4) {
-        pGemv4    = getPipe(c, "gemv_iq4_xs", "gemv_iq4_xs", 2);   // NSG=2: 64 thr, 4 rows/tg
+        if (const char* v = getenv("QK_IQ4_FIXED_K")) iq4FixedK = atoi(v) != 0;
+        pGemv4 = iq4FixedK
+            ? getPipe(c, "gemv_iq4_xs_fixed", "gemv_iq4_xs_k2048", 2)
+            : getPipe(c, "gemv_iq4_xs", "gemv_iq4_xs", 2);
+        pGemv4O = iq4FixedK
+            ? getPipe(c, "gemv_iq4_xs_fixed", "gemv_iq4_xs_k4096", 2)
+            : pGemv4;
         pGemmB4   = getPipe(c, "gemm_iq4_xs", "gemm_iq4_xs_hp", 0);
         if (gemmAligned)
             pGemmB4Aligned = getPipe(c, "gemm_iq4_xs", "gemm_iq4_xs_hp_aligned", 0);
@@ -3248,7 +3264,7 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
             dsp(pStep, {bBig, L.st1, L.ker, bGb, L.st2, bMid, L.sn, bAtt},
                 &pcStep, 20, hK, dS);
             bar();
-            if (L.iq4Wo) dsp(pGemv4, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
+            if (L.iq4Wo) dsp(pGemv4O, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
             else         dsp(slotB ? pGemvOB : pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo,
                              8, bwgs(nEmbd, slotB ? slotTprO : gemvTprO), 256,
                              slotB ? zdim / slotBatchN : 0);
@@ -3278,7 +3294,7 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
                 dsp(pAttn, {bMid, L.st1, L.st2, bBig, bAtt, bSlotPos}, &pcFa, 32, hQ, 256);
             }
             bar();
-            if (L.iq4Wo) dsp(pGemv4, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
+            if (L.iq4Wo) dsp(pGemv4O, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
             else         dsp(slotB ? pGemvOB : pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo,
                              8, bwgs(nEmbd, slotB ? slotTprO : gemvTprO), 256,
                              slotB ? zdim / slotBatchN : 0);
@@ -3721,7 +3737,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             } else {
                 pcP = {M, K};
                 if (iq4)
-                    dspz(pGemv4, {W, X, Y}, &pcP, 8, (M + 3) / 4, 64, n);
+                    dspz(isOut ? pGemv4O : pGemv4, {W, X, Y}, &pcP, 8,
+                         (M + 3) / 4, 64, n);
                 else
                     dspz(isOut ? pGemvO : pGemvA,
                          {W, X, Y}, &pcP, 8,
@@ -4350,6 +4367,97 @@ static bool caseQ8GemvCmp(MtlCtx& c, const std::string& tensorName,
         mismatches += ys[i] != yf[i];
         const double d = std::fabs((double)fs[i] - ff[i]);
         maxAbs = std::max(maxAbs, d);
+    }
+    const double scaled = maxAbs / std::max(1e-7, rms);
+    const bool close = scaled <= 2e-6;
+    printf("fixed-vs-safe: %zu/%u bit mismatches, max_abs %.3g, max_abs/rms %.3g -> %s\n",
+           mismatches, M, maxAbs, scaled, mismatches ? (close ? "CLOSE" : "FAIL") : "EXACT");
+
+    auto run = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> y) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < iters; ++i) encode(enc, pso, y);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / iters;
+        }
+    };
+    if (iters) {
+        run(pSafe, bSafe); run(pFixed, bFixed);
+        const double s0 = run(pSafe, bSafe), f0 = run(pFixed, bFixed);
+        const double f1 = run(pFixed, bFixed), s1 = run(pSafe, bSafe);
+        printf("gpu us/iter: safe %.2f / %.2f | fixed %.2f / %.2f\n", s0, s1, f0, f1);
+    }
+    return close;
+}
+
+// Real-weight IQ4_XS GEMV comparison for the two fixed inner dimensions used
+// by every 80B dense projection.  Both paths use the shipping NSG=2 geometry.
+static bool caseIQ4GemvCmp(MtlCtx& c, const std::string& tensorName,
+                           uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    const GgufTensor* t = g.find(tensorName);
+    if (!t || t->type != GGML_IQ4_XS || t->ne[2] != 1) {
+        fprintf(stderr, "iq4gemvcmp requires a 2D IQ4_XS tensor\n");
+        return false;
+    }
+    const uint32_t K = (uint32_t)t->ne[0];
+    const uint32_t M = (uint32_t)t->ne[1];
+    if ((K != 2048u && K != 4096u) || M % 4u != 0u) {
+        fprintf(stderr, "iq4gemvcmp requires K={2048,4096} and M%%4=0\n");
+        return false;
+    }
+    const size_t wBytes = (size_t)M * ggmlRowBytes(t->type, K);
+    printf("\n== iq4gemvcmp %s W[%u,%u] (W %.1f MiB) ==\n",
+           tensorName.c_str(), M, K, (double)wBytes / (1 << 20));
+
+    std::mt19937 rng(0x49344756u);
+    std::normal_distribution<float> nd(0.f, 0.35f);
+    std::vector<float> x(K);
+    for (float& v : x) v = nd(rng);
+
+    id<MTLBuffer> bW = createBuf(c, wBytes, t->data);
+    id<MTLBuffer> bX = createBuf(c, (size_t)K * 4u, x.data());
+    id<MTLBuffer> bSafe = createBuf(c, (size_t)M * 4u);
+    id<MTLBuffer> bFixed = createBuf(c, (size_t)M * 4u);
+    id<MTLComputePipelineState> pSafe = getPipe(c, "gemv_iq4_xs", "gemv_iq4_xs", 2);
+    id<MTLComputePipelineState> pFixed = getPipe(
+        c, "gemv_iq4_xs_fixed",
+        K == 2048u ? "gemv_iq4_xs_k2048" : "gemv_iq4_xs_k4096", 2);
+    const uint32_t mk[2] = {M, K};
+
+    auto encode = [&](id<MTLComputeCommandEncoder> enc,
+                      id<MTLComputePipelineState> pso, id<MTLBuffer> y) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:y offset:0 atIndex:2];
+        [enc setBytes:mk length:sizeof(mk) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(M / 4u, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    };
+    auto once = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> y) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            encode(enc, pso, y);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+    };
+    once(pSafe, bSafe);
+    once(pFixed, bFixed);
+    const uint32_t* ys = (const uint32_t*)bSafe.contents;
+    const uint32_t* yf = (const uint32_t*)bFixed.contents;
+    const float* fs = (const float*)ys;
+    const float* ff = (const float*)yf;
+    size_t mismatches = 0;
+    double rms = 0.0, maxAbs = 0.0;
+    for (uint32_t i = 0; i < M; ++i) rms += (double)fs[i] * fs[i];
+    rms = std::sqrt(rms / M);
+    for (uint32_t i = 0; i < M; ++i) {
+        mismatches += ys[i] != yf[i];
+        maxAbs = std::max(maxAbs, std::fabs((double)fs[i] - ff[i]));
     }
     const double scaled = maxAbs / std::max(1e-7, rms);
     const bool close = scaled <= 2e-6;
@@ -6093,6 +6201,12 @@ int main(int argc, char** argv) {
                 return 1;
             }
             ok = caseQ8GemvCmp(c, argv[2], argU(3, 16), argU(4, 500));
+        } else if (mode == "iq4gemvcmp") {
+            if (argc < 3) {
+                fprintf(stderr, "usage: qk iq4gemvcmp <tensor> [iters]\n");
+                return 1;
+            }
+            ok = caseIQ4GemvCmp(c, argv[2], argU(3, 500));
         } else if (mode == "headcmp") {
             ok = caseHeadCmp(c, argU(2, 8), argU(3, 20));
         } else if (mode == "facmp") {
