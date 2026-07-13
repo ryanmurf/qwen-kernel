@@ -32,6 +32,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gguf.h"
@@ -459,6 +461,27 @@ static bool caseIQ3XXS(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
 static const char* ggufPath() {
     const char* p = getenv("QK_GGUF");
     return p ? p : kDefaultGguf;
+}
+
+// Mirror per-request cache/spec stats to stderr and an optional durable file.
+static void qkStatsLine(const char* fmt, ...) {
+    static FILE* f = [] {
+        const char* p = getenv("QK_STATS_FILE");
+        FILE* h = p ? fopen(p, "a") : nullptr;
+        if (p && !h) fprintf(stderr, "QK_STATS_FILE: cannot open %s\n", p);
+        return h;
+    }();
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+    if (f) {
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        fflush(f);
+    }
 }
 
 static bool caseGguf(MtlCtx& c, const std::string& tensorName, uint32_t iters) {
@@ -2162,8 +2185,30 @@ struct qk_engine {
         std::vector<uint32_t> prompt;
         std::vector<uint32_t> genTokens;
         uint32_t cursor = 0, pos = 0, gen = 0, maxGen = 0, last = 0;
+        // A verify round may emit more than the ABI chunk; overflow drains on
+        // later calls without GPU work. finPending delays slot release until
+        // that queue is empty.
+        std::vector<uint32_t> outQ;
+        size_t outQHead = 0;
+        bool finPending = false;
+        // Latest earlier occurrence of each specL-token gram in prompt+output.
+        std::unordered_map<uint64_t, uint32_t> ngram;
+        uint32_t ngramBuilt = 0;
+        uint32_t specRounds = 0, specFed = 0, specEmitted = 0, serialSteps = 0;
+        void resetSpec() {
+            outQ.clear();
+            outQHead = 0;
+            finPending = false;
+            ngram.clear();
+            ngramBuilt = 0;
+            specRounds = specFed = specEmitted = serialSteps = 0;
+        }
     };
     std::vector<Slot> slots;
+    bool specOn = false;
+    uint32_t specL = 6, specK = 8;
+    std::vector<uint32_t> specToks, specAm;
+    uint32_t specDraft(uint32_t slot);
 
     struct CacheEntry {
         std::vector<uint32_t> tokens;
@@ -2762,6 +2807,22 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pcache.resize(PCACHE_N);
     for (auto& e : pcache) e.snap.resize(snapSize);
 
+    specOn = getenv("QK_SPEC") != nullptr;
+    if (const char* v = getenv("QK_SPEC_L")) {
+        long x = atol(v);
+        if (x >= 2 && x <= 64) specL = (uint32_t)x;
+    }
+    if (const char* v = getenv("QK_SPEC_K")) {
+        long x = atol(v);
+        // The default hp projection path has a demonstrated K=64 near-tie;
+        // cap the exact serving policy at 32. Wider scalar experiments remain
+        // available through the standalone verify harness.
+        if (x >= 2 && (uint32_t)x <= std::min(maxB, 32u)) specK = (uint32_t)x;
+        else fprintf(stderr, "QK_SPEC_K=%ld ignored (exact range 2..%u)\n",
+                     x, std::min(maxB, 32u));
+    }
+    specToks.resize(maxB);
+    specAm.resize(maxB);
     slots.resize(nSlots);
     return true;
 }
@@ -2880,6 +2941,43 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
     dsp(pAm2, {bAV, bAI, bTok, bRbScratch}, &pcAm2, 8, 1, 256);
 }
 
+uint32_t qk_engine::specDraft(uint32_t slot) {
+    Slot& sl = slots[slot];
+    const uint32_t L = specL;
+    const size_t histN = sl.prompt.size() + sl.genTokens.size();
+    if (histN < (size_t)L + 1) return 0;
+    auto tokenAt = [&](size_t i) -> uint32_t {
+        return i < sl.prompt.size() ? sl.prompt[i] : sl.genTokens[i - sl.prompt.size()];
+    };
+    auto gramHash = [&](size_t end) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = end - L; i < end; i++) {
+            h ^= tokenAt(i);
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+
+    // Index only grams ending before the current suffix, so it cannot match
+    // itself. Hash collisions can waste a round but cannot alter output because
+    // acceptance compares the actual target argmax tokens.
+    if (sl.ngramBuilt < L) sl.ngramBuilt = L;
+    for (size_t end = sl.ngramBuilt; end < histN; end++)
+        sl.ngram[gramHash(end)] = (uint32_t)end;
+    sl.ngramBuilt = (uint32_t)histN;
+    auto it = sl.ngram.find(gramHash(histN));
+    if (it == sl.ngram.end()) return 0;
+
+    const uint32_t matchEnd = it->second;
+    const uint32_t maxN = std::min(std::min(specK, nCtx - sl.pos), sl.maxGen - sl.gen);
+    if (maxN < 2) return 0;
+    const uint32_t nDraft =
+        std::min<uint32_t>(maxN - 1, (uint32_t)(histN - matchEnd));
+    specToks[0] = tokenAt(histN - 1);  // sampled pending token, not yet fed
+    for (uint32_t i = 0; i < nDraft; i++) specToks[i + 1] = tokenAt(matchEnd + i);
+    return nDraft + 1;
+}
+
 int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     for (uint32_t s = 0; s < nSlots; s++) outCnt[s] = 0;
     *outFin = 0;
@@ -2890,23 +2988,126 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     uint32_t* slotIn = (uint32_t*)bSlotIn.contents;
     uint32_t* slotPos = (uint32_t*)bSlotPos.contents;
     const uint32_t* tok = (const uint32_t*)bTok.contents;
+    static const bool noEos = getenv("QK_NO_EOS") != nullptr;
 
+    auto finish = [&](uint32_t s) {
+        Slot& sl = slots[s];
+        if (sl.finPending && sl.outQHead >= sl.outQ.size()) {
+            if (specOn && sl.specRounds && getenv("QK_SPEC_LOG"))
+                qkStatsLine("[spec] slot=%u rounds=%u fed=%u emitted=%u serial=%u "
+                            "avg_accept=%.2f\n",
+                            s, sl.specRounds, sl.specFed, sl.specEmitted, sl.serialSteps,
+                            (double)sl.specFed / sl.specRounds);
+            sl.resetSpec();
+            sl.active = false;
+            *outFin |= 1u << s;
+        }
+    };
+    auto emit = [&](uint32_t s, uint32_t t) {
+        if (outCnt[s] < chunkN) outTok[s * chunkN + outCnt[s]++] = t;
+        else slots[s].outQ.push_back(t);
+    };
+
+    // Drain tokens already verified in a previous call. No GPU work is needed.
+    for (uint32_t s = 0; s < nSlots; s++) {
+        Slot& sl = slots[s];
+        if (!sl.active) continue;
+        while (sl.outQHead < sl.outQ.size() && outCnt[s] < chunkN)
+            outTok[s * chunkN + outCnt[s]++] = sl.outQ[sl.outQHead++];
+        if (sl.outQHead >= sl.outQ.size()) {
+            sl.outQ.clear();
+            sl.outQHead = 0;
+        }
+        finish(s);
+    }
+
+    // V1 speculates only when exactly one unfinished slot is active. A verify
+    // round blocks for about one serial chunk and would otherwise be unfair to
+    // concurrent slots; multi-slot batching is a separate optimization.
+    if (specOn) {
+        int only = -1, nActive = 0;
+        for (uint32_t s = 0; s < nSlots; s++) {
+            if (slots[s].active && !slots[s].finPending) {
+                nActive++;
+                only = (int)s;
+            }
+        }
+        if (nActive == 1) {
+            Slot& sl = slots[only];
+            while (sl.active && !sl.finPending && sl.cursor >= sl.prompt.size() &&
+                   outCnt[only] < chunkN) {
+                uint32_t n = specDraft((uint32_t)only);
+                if (n < 2) break;
+                verifyRound(specToks.data(), n, (uint32_t)only, sl.pos, specAm.data());
+
+                uint32_t accepted = 1;
+                while (accepted < n && specToks[accepted] == specAm[accepted - 1]) accepted++;
+
+                uint32_t emitN = accepted;
+                bool eosHit = false;
+                if (!noEos) {
+                    for (uint32_t i = 0; i < accepted; i++) {
+                        if (specAm[i] != eosTok) continue;
+                        eosHit = true;
+                        emitN = i;       // EOS itself is not returned to the caller
+                        accepted = i + 1;  // but the state through its predictor is committed
+                        break;
+                    }
+                }
+
+                if (accepted == n) {
+                    promoteScratch((uint32_t)only);
+                } else {
+                    std::vector<float> dummy;
+                    prefillBatchLast(specToks.data(), accepted, (uint32_t)only, dummy,
+                                     /*wantLogits=*/false, sl.pos);
+                }
+                sl.pos += accepted;
+                for (uint32_t i = 0; i < emitN; i++) {
+                    sl.genTokens.push_back(specAm[i]);
+                    sl.last = specAm[i];
+                    sl.gen++;
+                    emit((uint32_t)only, specAm[i]);
+                }
+                sl.specRounds++;
+                sl.specFed += accepted;
+                sl.specEmitted += emitN;
+
+                if (eosHit || sl.gen >= sl.maxGen || sl.pos >= nCtx) {
+                    snapshotSlot((uint32_t)only);
+                    sl.finPending = true;
+                    finish((uint32_t)only);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Serial fallback for slots with no high-confidence draft and for all
+    // multi-slot steps. It is also responsible for prompt ingestion.
     for (uint32_t step = 0; step < chunkN; step++) {
         int nAct = 0;
         uint32_t maxZ = 0;
+        bool need = false;
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
-            if (!sl.active) { slotIn[s] = 0; slotPos[s] = 0; continue; }
+            if (!sl.active || sl.finPending) {
+                slotIn[s] = 0;
+                slotPos[s] = 0;
+                continue;
+            }
             nAct++; maxZ = s + 1;
             if (sl.cursor < sl.prompt.size()) {
                 slotIn[s] = sl.prompt[sl.cursor];
                 slotPos[s] = sl.cursor;
+                need = true;
             } else {
                 slotIn[s] = sl.last;
                 slotPos[s] = sl.pos;
+                if (outCnt[s] < chunkN) need = true;
             }
         }
-        if (!nAct) break;
+        if (!nAct || !need) break;
 
         @autoreleasepool {
             auto he0 = std::chrono::steady_clock::now();
@@ -2932,7 +3133,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
-            if (!sl.active) continue;
+            if (!sl.active || sl.finPending) continue;
             uint32_t sampled = tok[s];
             bool prefilling = sl.cursor < sl.prompt.size();
             if (prefilling && sl.cursor + 1 < sl.prompt.size()) {
@@ -2940,21 +3141,23 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
                 continue;
             }
             if (prefilling) { sl.cursor = (uint32_t)sl.prompt.size(); sl.pos = (uint32_t)sl.prompt.size(); }
-            static const bool noEos = getenv("QK_NO_EOS") != nullptr;  // bench: force nGen
+            sl.serialSteps++;
             if (sampled == eosTok && !noEos) {
                 if (!prefilling) sl.pos++;
                 snapshotSlot(s);
-                sl.active = false; *outFin |= 1u << s;
+                sl.finPending = true;
+                finish(s);
                 continue;
             }
-            outTok[s * chunkN + outCnt[s]++] = sampled;
+            emit(s, sampled);
             sl.genTokens.push_back(sampled);
             sl.last = sampled;
             sl.gen++;
             if (!prefilling) sl.pos++;
             if (sl.pos >= nCtx || sl.gen >= sl.maxGen) {
                 snapshotSlot(s);
-                sl.active = false; *outFin |= 1u << s;
+                sl.finPending = true;
+                finish(s);
             }
         }
     }
@@ -3401,21 +3604,25 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
         batch_to(target);
     }
     if (getenv("QK_PCACHE_LOG")) {
-        fprintf(stderr, "[pcache] slot=%u prompt=%u reuse=%u prefill=%u hit=%d snap=%u\n",
-                slot, n_prompt, start, done - start, cidx >= 0 ? 1 : 0, snapPos);
-        fflush(stderr);
+        qkStatsLine("[pcache] slot=%u prompt=%u reuse=%u prefill=%u hit=%d snap=%u\n",
+                    slot, n_prompt, start, done - start, cidx >= 0 ? 1 : 0, snapPos);
     }
     s.cursor = done; s.pos = done;
     s.active = true; s.prompt.assign(prompt, prompt + n_prompt);
     s.genTokens.clear();
     s.gen = 0; s.maxGen = max_gen; s.last = 0;
+    s.resetSpec();
     if (e->shareFork && snapPos == 0 && done > start) e->snapshotSlot(slot);
     return 0;
 }
 
 __attribute__((visibility("default")))
 void qk_slot_cancel(qk_engine* e, uint32_t slot) {
-    if (e && slot < e->nSlots) { e->slots[slot].active = false; e->slots[slot].prompt.clear(); }
+    if (e && slot < e->nSlots) {
+        e->slots[slot].active = false;
+        e->slots[slot].prompt.clear();
+        e->slots[slot].resetSpec();
+    }
 }
 
 __attribute__((visibility("default")))

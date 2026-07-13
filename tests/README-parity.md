@@ -18,3 +18,15 @@ see PORT.md M4). Model: `Qwen3.6-35B-A3B-UD-Q3_K_M.gguf`.
 
 The engine matches all four byte-for-byte in the default config (and ids4
 additionally under QK_MAXB=512 with grouped MoE v3/v4 — PORT.md Phase B).
+
+`ids-spec-echo.txt` is a performance/correctness fixture for prompt-lookup
+speculative decoding, not a parity reference. It asks the model to repeat two
+copies of a fixed passage. With `QK_NO_EOS=1`, compare:
+
+```sh
+QK_NO_EOS=1 ./build-perf/qk serve-test tests/ids-spec-echo.txt 100 1 512
+QK_NO_EOS=1 QK_SPEC=1 QK_SPEC_LOG=1 ./build-perf/qk serve-test tests/ids-spec-echo.txt 100 1 512
+```
+
+The `GEN:` lines must match exactly. The 2026-07-12 Metal baseline accepted
+7.67 tokens/round at K=8 and improved the 100-token run by 1.37x.
