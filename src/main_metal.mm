@@ -2323,6 +2323,7 @@ struct qk_engine {
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
     uint32_t gemmThreads = 256;
     uint32_t gemmBM = 128, gemmBN = 64;
+    uint32_t faQTM = 8, faThreads = 256, faHeadGroup = 2;
     bool headGemm = true;
     uint32_t headGemmN = 4;
     bool headF16 = false;  // opt-in half operands/f32 accumulation for batched head
@@ -2788,7 +2789,20 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pEmb   = getPipe(c, embQ8 ? "embed_q8_0" : "embed_q6k", embQ8 ? "embed_q8_0" : "embed_q6k", 0);
     pPrepB = getPipe(c, "fa_batch", "fa_prep_batch", 0);
     pAttnB = getPipe(c, "fa_batch", "fa_attn_batch", 0);
-    pAttnBM = getPipe(c, "fa_batch", "fa_attn_batch_mma", 0);
+    // Two-Q-head Q8/K64/S16 geometry is the prefill-attention default. `exact`
+    // retains the geometry but restores scalar softmax summation; `q16`
+    // restores the original Q16/K64/S8 kernel for full rollback.
+    const char* faGeom = getenv("QK_FA_GEOM");
+    if (faGeom && !strcmp(faGeom, "q16")) {
+        faQTM = 16; faThreads = 256; faHeadGroup = 1;
+        pAttnBM = getPipe(c, "fa_batch", "fa_attn_batch_mma", 0);
+    } else if (faGeom && !strcmp(faGeom, "exact")) {
+        faQTM = 8; faThreads = 512; faHeadGroup = 2;
+        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", 0);
+    } else {
+        faQTM = 8; faThreads = 512; faHeadGroup = 2;
+        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", 0);
+    }
     pAbB   = getPipe(c, "dn_batch", "dn_ab_batch", nsg);
     pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
     pStepB = getPipe(c, "dn_batch", "dn_step_batch", 0);
@@ -3733,7 +3747,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 bar();
                 if (faMma)
                     dspz(pAttnBM, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
-                         &pcFaB, 40, hQ, 256, (n + 15) / 16);   // QTM=16 queries/tile
+                         &pcFaB, 40, hQ / faHeadGroup, faThreads,
+                         (n + faQTM - 1u) / faQTM);
                 else
                     dspz(pAttnB, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
                          &pcFaB, 40, hQ, 256, n);
@@ -4439,6 +4454,125 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
         snprintf(topName, sizeof(topName), "%ux%u %s candidates", topM, topN,
                  topF16 ? "f16" : "f32");
         bench(topName, [&](auto enc) { encTop(enc); });
+    }
+    return pass;
+}
+
+// Synthetic prefill flash-attention comparison. The shipping Q16/K64/S8
+// kernel is the independent reference for the paired exact and SIMD-softmax
+// twins retained after the full geometry sweep.
+static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
+    constexpr uint32_t dh = 256, hQ = 16, hKV = 2;
+    if (!N || N > 1024 || base + N > 8192) {
+        fprintf(stderr, "facmp requires 1 <= N <= 1024 and base+N <= 8192\n");
+        return false;
+    }
+    const uint32_t tmax = std::max(2048u, base + N + 64u);
+    std::mt19937 rng(0x4641544eu + N * 17u + base);
+    std::normal_distribution<float> qd(0.f, 0.20f), vd(0.f, 0.35f);
+    const uint32_t qcap = (N + 15u) / 16u * 16u;
+    std::vector<float> qhat((size_t)qcap * hQ * dh);
+    std::vector<float> qfull((size_t)qcap * hQ * 2u * dh);
+    std::vector<float> kc((size_t)hKV * tmax * dh);
+    std::vector<float> vc((size_t)hKV * tmax * dh);
+    for (float& v : qhat) v = qd(rng);
+    for (float& v : qfull) v = qd(rng);
+    for (float& v : kc) v = qd(rng);
+    for (float& v : vc) v = vd(rng);
+
+    id<MTLBuffer> bQ = createBuf(c, qhat.size() * sizeof(float), qhat.data());
+    id<MTLBuffer> bK = createBuf(c, kc.size() * sizeof(float), kc.data());
+    id<MTLBuffer> bV = createBuf(c, vc.size() * sizeof(float), vc.data());
+    id<MTLBuffer> bQf = createBuf(c, qfull.size() * sizeof(float), qfull.data());
+    const size_t outN = (size_t)N * hQ * dh;
+    id<MTLBuffer> bRef = createBuf(c, outN * sizeof(float));
+    id<MTLBuffer> bOut = createBuf(c, outN * sizeof(float));
+    struct FaPC {
+        uint32_t tmax, dh_, nRot, hQ_, hKV_;
+        float eps, freqBase;
+        uint32_t base_, Tn, qbase;
+    } pc{tmax, dh, 64u, hQ, hKV, 1e-6f, 1000000.f, base, N, 0u};
+
+    struct Variant {
+        const char* name; uint32_t qt, kb, ns, hg;
+        id<MTLComputePipelineState> p;
+    };
+    std::vector<Variant> vars{
+        {"gqa2_q8_k64_s16_exact", 8, 64, 16, 2,
+         getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", 0)},
+        {"gqa2_q8_k64_s16_simd", 8, 64, 16, 2,
+         getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", 0)},
+    };
+    id<MTLComputePipelineState> pRef =
+        getPipe(c, "fa_batch", "fa_attn_batch_mma", 0);
+
+    auto encode = [&](id<MTLComputeCommandEncoder> enc,
+                      id<MTLComputePipelineState> p, id<MTLBuffer> out,
+                      uint32_t qt, uint32_t ns, uint32_t hg) {
+        [enc setComputePipelineState:p];
+        [enc setBuffer:bQ offset:0 atIndex:0];
+        [enc setBuffer:bK offset:0 atIndex:1];
+        [enc setBuffer:bV offset:0 atIndex:2];
+        [enc setBuffer:bQf offset:0 atIndex:3];
+        [enc setBuffer:out offset:0 atIndex:4];
+        [enc setBytes:&pc length:sizeof(pc) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(hQ / hg, 1, (N + qt - 1u) / qt)
+            threadsPerThreadgroup:MTLSizeMake(ns * 32u, 1, 1)];
+    };
+    auto submit = [&](id<MTLComputePipelineState> p, id<MTLBuffer> out,
+                      uint32_t qt, uint32_t ns, uint32_t hg, uint32_t reps) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < reps; ++i) {
+                encode(enc, p, out, qt, ns, hg);
+                if (i + 1u < reps)
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                fprintf(stderr, "facmp Metal failure: %s\n",
+                        cb.error.localizedDescription.UTF8String);
+                return -1.0;
+            }
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / reps;
+        }
+    };
+
+    if (submit(pRef, bRef, 16u, 8u, 1u, 1u) < 0) return false;
+    const float* ref = (const float*)bRef.contents;
+    double rms2 = 0.0;
+    for (size_t i = 0; i < outN; ++i) rms2 += (double)ref[i] * ref[i];
+    const double rms = std::sqrt(rms2 / outN);
+    const double floor = std::max(1e-6, rms * 1e-4);
+    printf("\n== facmp N=%u base=%u  Q[%u,%u,%u] KV[%u,%u,%u] ==\n",
+           N, base, N, hQ, dh, hKV, tmax, dh);
+    printf("  %-24s %10s %11s %11s %8s\n",
+           "geometry", "gpu_us", "max_abs", "max_rel", "result");
+    const double refUs = iters ? submit(pRef, bRef, 16u, 8u, 1u, iters) : 0.0;
+    printf("  %-24s %10.2f %11s %11s %8s\n",
+           "q16_k64_s8 (ref)", refUs, "-", "-", "REF");
+    bool pass = true;
+    for (const Variant& v : vars) {
+        if (submit(v.p, bOut, v.qt, v.ns, v.hg, 1u) < 0) return false;
+        const float* got = (const float*)bOut.contents;
+        double maxAbs = 0.0, maxRel = 0.0;
+        size_t nDiff = 0;
+        for (size_t i = 0; i < outN; ++i) {
+            const double ae = std::fabs((double)got[i] - ref[i]);
+            maxAbs = std::max(maxAbs, ae);
+            maxRel = std::max(maxRel, ae / std::max(floor, (double)std::fabs(ref[i])));
+            nDiff += got[i] != ref[i];
+        }
+        const bool ok = maxAbs <= std::max(2e-5, rms * 2e-4);
+        pass &= ok;
+        const double us = iters ? submit(v.p, bOut, v.qt, v.ns, v.hg, iters) : 0.0;
+        char label[40];
+        snprintf(label, sizeof label, "%s%s", v.name, nDiff ? "" : " bit-exact");
+        printf("  %-24s %10.2f %11.4g %11.4g %8s\n",
+               label, us, maxAbs, maxRel, ok ? "PASS" : "FAIL");
     }
     return pass;
 }
@@ -5707,6 +5841,8 @@ int main(int argc, char** argv) {
             ok = caseBGemm(c, argU(2, 8192), argU(3, 2048), argU(4, 128), argU(5, 50));
         } else if (mode == "headcmp") {
             ok = caseHeadCmp(c, argU(2, 8), argU(3, 20));
+        } else if (mode == "facmp") {
+            ok = caseFaCmp(c, argU(2, 512), argU(3, 0), argU(4, 20));
         } else if (mode == "dncmp") {
             ok = caseDnChunk(c, argU(2, 512), argU(3, 30));
         } else if (mode == "token") {
