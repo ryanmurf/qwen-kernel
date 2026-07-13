@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "fa_kv.metal"
 
 // Full-attention pre-step for one token (port of shaders/fa_prep.comp):
 //   TG w in [0,hQ):        q head w: RMS(q)·q_norm, rope, -> qhat
@@ -20,8 +21,8 @@ kernel void fa_prep(device const float* qfull  [[buffer(0)]],
                     device const float* qn     [[buffer(3)]],
                     device const float* kn     [[buffer(4)]],
                     device float*       qhat   [[buffer(5)]],
-                    device float*       kc     [[buffer(6)]],
-                    device float*       vc     [[buffer(7)]],
+                    device uchar*       kc     [[buffer(6)]],
+                    device uchar*       vc     [[buffer(7)]],
                     device const float* ropeCS [[buffer(8)]],
                     constant FaPC&      pc     [[buffer(9)]],
                     uint3 tid3  [[thread_position_in_threadgroup]],
@@ -40,7 +41,8 @@ kernel void fa_prep(device const float* qfull  [[buffer(0)]],
 
     if (w >= pc.hQ + pc.hKV) {           // v: plain copy into cache
         const uint h = w - pc.hQ - pc.hKV;
-        if (t < dh) vc[kvo + (h * pc.tmax + pc.pos) * dh + t] = vin[kio + h * dh + t];
+        if (t < dh) kv_store(vc, kvo + (h * pc.tmax + pc.pos) * dh + t,
+                             vin[kio + h * dh + t]);
         return;
     }
 
@@ -78,6 +80,6 @@ kernel void fa_prep(device const float* qfull  [[buffer(0)]],
             outV = sv[t];
         }
         if (isQ) qhat[qho + h * dh + t] = outV;
-        else     kc[kvo + (h * pc.tmax + pc.pos) * dh + t] = outV;
+        else     kv_store(kc, kvo + (h * pc.tmax + pc.pos) * dh + t, outV);
     }
 }

@@ -16,7 +16,7 @@
 //   qk slotcmp <ids> <nGen> [nSlots] [tmax]  slot compaction/churn exactness
 //
 // Env: QK_DEVICE=<n> device index; QK_SHADER_DIR (dir with *.metal);
-//      QK_GGUF=<path>.
+//      QK_GGUF=<path>; QK_KV_F16=1 opts into half KV storage/f32 compute.
 //
 // MSL is compiled at runtime from shaders/metal/*.metal (no offline metal
 // toolchain needed — mirrors the Vulkan loadSpv flow, QK_SHADER_DIR wins).
@@ -1967,9 +1967,11 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     const uint32_t nRot  = 64;
     const uint32_t qfN   = hQ * 2 * dh, kvN = hKV * dh, atN = hQ * dh;
     const uint32_t tmax  = 128;
+    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvF16 ? 2u : 4u;
     const float eps = 1e-6f;
-    printf("\n== ablock blk.%u (full attn)  n_embd=%u heads=%ux%u kv=%u rot=%u ==\n",
-           layer, nEmbd, hQ, dh, hKV, nRot);
+    printf("\n== ablock blk.%u (full attn)  n_embd=%u heads=%ux%u kv=%u rot=%u %s ==\n",
+           layer, nEmbd, hQ, dh, hKV, nRot, kvF16 ? "KV=f16" : "KV=f32");
 
     const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbQ8a = ggmlRowBytes(GGML_Q8_0, atN);
@@ -1977,8 +1979,8 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
-    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", 0);
-    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", 0);
+    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", kvBytes);
+    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", kvBytes);
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
@@ -2019,8 +2021,8 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     id<MTLBuffer> bKin = createBuf(c, kvN * 4, nullptr, true);
     id<MTLBuffer> bVin = createBuf(c, kvN * 4, nullptr, true);
     id<MTLBuffer> bQhat = createBuf(c, atN * 4, nullptr, true);
-    id<MTLBuffer> bKC = createBuf(c, (size_t)hKV * tmax * dh * 4, nullptr, true);
-    id<MTLBuffer> bVC = createBuf(c, (size_t)hKV * tmax * dh * 4, nullptr, true);
+    id<MTLBuffer> bKC = createBuf(c, (size_t)hKV * tmax * dh * kvBytes, nullptr, true);
+    id<MTLBuffer> bVC = createBuf(c, (size_t)hKV * tmax * dh * kvBytes, nullptr, true);
     id<MTLBuffer> bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
     id<MTLBuffer> bAtt = createBuf(c, atN * 4, nullptr, true);
     id<MTLBuffer> bAttnOut = createBuf(c, nEmbd * 4, nullptr, true);
@@ -2147,7 +2149,15 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
             float* kd = &kcCpu[((size_t)h * tmax + t) * dh];
             rmsRef(&kin[(size_t)h * dh], knW, kd, dh);
             ropeRef(kd, t);
-            memcpy(&vcCpu[((size_t)h * tmax + t) * dh], &vin[(size_t)h * dh], dh * 4);
+            float* vd = &vcCpu[((size_t)h * tmax + t) * dh];
+            if (kvF16) {
+                for (uint32_t j = 0; j < dh; ++j) {
+                    kd[j] = qk_f16_to_f32(qk_f32_to_f16(kd[j]));
+                    vd[j] = qk_f16_to_f32(qk_f32_to_f16(vin[(size_t)h * dh + j]));
+                }
+            } else {
+                memcpy(vd, &vin[(size_t)h * dh], dh * 4);
+            }
         }
         for (uint32_t h = 0; h < hQ; h++) {
             uint32_t kv = h / (hQ / hKV);
@@ -2263,6 +2273,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     }
     const uint32_t nEmbd = 2048, chQkv = 8192, dIn = 4096, hV = 32, dS = 128, hK = 16;
     const uint32_t dh = 256, hQ = 16, hKV = 2, nRot = 64;
+    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvF16 ? 2u : 4u;
     const std::string arch = g.kvStr("general.architecture", "");
     const uint32_t dnKDivH = (arch == "qwen3next") ? hV / hK : 0;
     const uint32_t nLayer = (uint32_t)g.kvInt(arch + ".block_count", 40);
@@ -2276,8 +2288,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
     const size_t rbE = ggmlRowBytes(GGML_Q6_K, nEmbd);
-    printf("token mode: %zu prompt ids, gen %u, vocab %u, tmax %u\n",
-           promptIds.size(), nGen, vocab, tmax);
+    printf("token mode: %zu prompt ids, gen %u, vocab %u, tmax %u, %s KV\n",
+           promptIds.size(), nGen, vocab, tmax, kvF16 ? "f16" : "f32");
 
     const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
@@ -2303,8 +2315,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
         ? getPipe(c, "dn_step", dnStateFn, 0) : nil;
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
-    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", 0);
-    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", 0);
+    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", kvBytes);
+    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", kvBytes);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
     bool moeGuFixed = ffE == 512u;
@@ -2413,8 +2425,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
             L.qn = W(T("attn_q_norm.weight"), dh * 4);
             L.kn = W(T("attn_k_norm.weight"), dh * 4);
             L.wo = W(T("attn_output.weight"), (size_t)nEmbd * rbQ8i);
-            L.kc = W(nullptr, (size_t)hKV * tmax * dh * 4);
-            L.vc = W(nullptr, (size_t)hKV * tmax * dh * 4);
+            L.kc = W(nullptr, (size_t)hKV * tmax * dh * kvBytes);
+            L.vc = W(nullptr, (size_t)hKV * tmax * dh * kvBytes);
         }
         L.mgi = W(moe.gi, (size_t)moe.nExp * nEmbd * 4);
         L.mgis = W(moe.gis, nEmbd * 4);
@@ -2603,6 +2615,8 @@ struct qk_engine {
     bool prefillMulti = true;
     bool slotCompact = true;
     bool pcacheCompact = true;
+    bool kvF16 = false;          // explicit lossy capacity tier; f32 compute
+    uint32_t kvBytes = 4;
     bool slotsNeedCompact = false;
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
     // Pipeline split (QK_LAYERS=a:b): this engine owns layers [lFirst, lEnd).
@@ -2829,7 +2843,7 @@ void qk_engine::copyStripes(uint32_t stripe, uint8_t* snap, bool save, uint32_t 
         // (DeltaNet/conv) stripes always copy whole.
         if (!L.rec && nTok && nTok < nCtx) {
             size_t headBytes = L.ps1 / hKV;
-            size_t liveBytes = (size_t)nTok * dh * 4;
+            size_t liveBytes = (size_t)nTok * dh * kvBytes;
             for (uint32_t h = 0; h < hKV; h++) {
                 size_t off = (size_t)h * headBytes;
                 if (save) {
@@ -2858,7 +2872,7 @@ size_t qk_engine::packedSnapSize(uint32_t nTok) const {
     for (const Layer& L : layers) {
         if (!L.st1) continue;
         if (L.rec) bytes += L.ps1 + L.ps2;
-        else bytes += (size_t)2 * hKV * liveTok * dh * sizeof(float);
+        else bytes += (size_t)2 * hKV * liveTok * dh * kvBytes;
     }
     return bytes;
 }
@@ -2896,8 +2910,8 @@ bool qk_engine::copyPackedStripes(uint32_t stripe, CacheEntry& entry,
     }
 
     uint8_t* p = entry.snap.get();
-    const size_t storedLiveBytes = (size_t)entry.snapTok * dh * sizeof(float);
-    const size_t copyLiveBytes = (size_t)liveTok * dh * sizeof(float);
+    const size_t storedLiveBytes = (size_t)entry.snapTok * dh * kvBytes;
+    const size_t copyLiveBytes = (size_t)liveTok * dh * kvBytes;
     for (Layer& L : layers) {
         if (!L.st1) continue;
         uint8_t* s1 = (uint8_t*)L.st1.contents + (size_t)stripe * L.ps1;
@@ -2953,7 +2967,8 @@ void qk_engine::moveSlotState(uint32_t fromStripe, uint32_t toStripe, uint32_t n
             memcpy(to2, from2, L.ps2);
         } else if (nTok) {
             const size_t headBytes = L.ps1 / hKV;
-            const size_t liveBytes = std::min((size_t)nTok, (size_t)nCtx) * dh * 4;
+            const size_t liveBytes =
+                std::min((size_t)nTok, (size_t)nCtx) * dh * kvBytes;
             for (uint32_t h = 0; h < hKV; ++h) {
                 const size_t off = (size_t)h * headBytes;
                 memcpy(to1 + off, from1 + off, liveBytes);
@@ -3108,6 +3123,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     slotCompact = !getenv("QK_SLOT_COMPACT") || atoi(getenv("QK_SLOT_COMPACT")) != 0;
     pcacheCompact = !getenv("QK_PCACHE_COMPACT") ||
                     atoi(getenv("QK_PCACHE_COMPACT")) != 0;
+    kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
+    kvBytes = kvF16 ? 2u : 4u;
     specOn = getenv("QK_SPEC") != nullptr;
     specScratch = specOn || getenv("QK_SPEC_SCRATCH") != nullptr;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
@@ -3336,12 +3353,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (dnDecodeSplitMode < 0)
             pStepStateSimd = getPipe(c, "dn_step", "dn_step_state_rowsimd", 0);
     }
-    pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", 0);
-    pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", 0);
-    pAttnSplit  = getPipe(c, "fa_srv", "fa_attn_srv_split", 0);   // flash-decoding
+    pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", kvBytes);
+    pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
+    pAttnSplit  = getPipe(c, "fa_srv", "fa_attn_srv_split", kvBytes); // flash-decoding
     pAttnReduce = getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
-    pAttnCompact = getPipe(c, "fa_srv", "fa_attn_srv_split_compact", 0);
-    pAttnMulti = getPipe(c, "fa_srv", "fa_attn_srv_split_multi", 0);
+    pAttnCompact = getPipe(c, "fa_srv", "fa_attn_srv_split_compact", kvBytes);
+    pAttnMulti = getPipe(c, "fa_srv", "fa_attn_srv_split_multi", kvBytes);
     if (const char* v = getenv("QK_FA_SPLIT")) faDecodeSplit = atoi(v) != 0;
     if (const char* v = getenv("QK_FA_WORK")) faDecodeWork = atoi(v) != 0;
     if (const char* v = getenv("QK_FA_FAN")) {
@@ -3390,21 +3407,27 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAm1   = getPipe(c, "argmax", "argmax1", 0);
     pAm2   = getPipe(c, "argmax", "argmax2", 0);
     pEmb   = getPipe(c, embQ8 ? "embed_q8_0" : "embed_q6k", embQ8 ? "embed_q8_0" : "embed_q6k", 0);
-    pPrepB = getPipe(c, "fa_batch", "fa_prep_batch", 0);
-    pAttnB = getPipe(c, "fa_batch", "fa_attn_batch", 0);
+    pPrepB = getPipe(c, "fa_batch", "fa_prep_batch", kvBytes);
+    pAttnB = getPipe(c, "fa_batch", "fa_attn_batch", kvBytes);
     // Two-Q-head Q8/K64/S16 geometry is the prefill-attention default. `exact`
     // retains the geometry but restores scalar softmax summation; `q16`
     // restores the original Q16/K64/S8 kernel for full rollback.
     const char* faGeom = getenv("QK_FA_GEOM");
-    if (faGeom && !strcmp(faGeom, "q16")) {
+    if (kvF16) {
+        // MSL cannot directly load half storage into a float matrix. The f16
+        // twin expands one K/V fragment per simdgroup into float TG scratch,
+        // retaining the default GQA reuse and f32 MMA accumulation.
+        faQTM = 8; faThreads = 512; faHeadGroup = 2;
+        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_f16", kvBytes);
+    } else if (faGeom && !strcmp(faGeom, "q16")) {
         faQTM = 16; faThreads = 256; faHeadGroup = 1;
-        pAttnBM = getPipe(c, "fa_batch", "fa_attn_batch_mma", 0);
+        pAttnBM = getPipe(c, "fa_batch", "fa_attn_batch_mma", kvBytes);
     } else if (faGeom && !strcmp(faGeom, "exact")) {
         faQTM = 8; faThreads = 512; faHeadGroup = 2;
-        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", 0);
+        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", kvBytes);
     } else {
         faQTM = 8; faThreads = 512; faHeadGroup = 2;
-        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", 0);
+        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", kvBytes);
     }
     pAbB   = getPipe(c, "dn_batch", "dn_ab_batch", nsg);
     pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
@@ -3820,14 +3843,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             L.qn = W(T("attn_q_norm.weight"), dh * 4);
             L.kn = W(T("attn_k_norm.weight"), dh * 4);
             L.wo = Wd("attn_output.weight", L.iq4Wo);
-            L.ps1 = (size_t)hKV * tmax * dh * 4;
-            L.ps2 = (size_t)hKV * tmax * dh * 4;
+            L.ps1 = (size_t)hKV * tmax * dh * kvBytes;
+            L.ps2 = (size_t)hKV * tmax * dh * kvBytes;
         }
         // +slack: fa_attn_batch_mma reads full 8-key MMA tiles, so at near-full
         // context (nk ~ tmax) the last slot's K/V load over-reads a few rows
         // past the buffer. One KBM(64)-key block of zeroed slack keeps it
         // in-bounds and finite (over-read rows are P=0, so contribute nothing).
-        const size_t stSlack = L.rec ? 0 : (size_t)64 * dh * 4;
+        const size_t stSlack = L.rec ? 0 : (size_t)64 * dh * kvBytes;
         // Spec-enabled recurrent layers reserve one shared verification
         // scratch stripe at index nSlots. Normal engines and attention (whose
         // positional KV is rollback-free) need only the live slot stripes.
@@ -4596,7 +4619,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     const bool skDown = skip && strstr(skip, "down");
     // MMA prefill attention is the default (beats scalar ~2x on attn, pp512
     // win vs llama). QK_FA_MMA=0 forces the old scalar kernel (rollback/debug).
-    static const bool faMma = !getenv("QK_FA_MMA") || atoi(getenv("QK_FA_MMA")) != 0;
+    const bool faMma = !getenv("QK_FA_MMA") || atoi(getenv("QK_FA_MMA")) != 0;
     if (wantLogits) logits.resize(vocab);
     for (uint32_t q = 0; q < nSeq; ++q)
         if (baseFor(q) == 0) resetStripe(stateSlotFor(q));
@@ -5917,6 +5940,8 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
 // twins retained after the full geometry sweep.
 static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     constexpr uint32_t dh = 256, hQ = 16, hKV = 2;
+    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvF16 ? 2u : 4u;
     if (!N || N > 1024 || base + N > 8192) {
         fprintf(stderr, "facmp requires 1 <= N <= 1024 and base+N <= 8192\n");
         return false;
@@ -5934,9 +5959,18 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     for (float& v : kc) v = qd(rng);
     for (float& v : vc) v = vd(rng);
 
+    std::vector<uint16_t> kc16, vc16;
+    if (kvF16) {
+        kc16.resize(kc.size()); vc16.resize(vc.size());
+        for (size_t i = 0; i < kc.size(); ++i) kc16[i] = qk_f32_to_f16(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vc16[i] = qk_f32_to_f16(vc[i]);
+    }
+
     id<MTLBuffer> bQ = createBuf(c, qhat.size() * sizeof(float), qhat.data());
-    id<MTLBuffer> bK = createBuf(c, kc.size() * sizeof(float), kc.data());
-    id<MTLBuffer> bV = createBuf(c, vc.size() * sizeof(float), vc.data());
+    id<MTLBuffer> bK = createBuf(c, kc.size() * kvBytes,
+                                  kvF16 ? (const void*)kc16.data() : (const void*)kc.data());
+    id<MTLBuffer> bV = createBuf(c, vc.size() * kvBytes,
+                                  kvF16 ? (const void*)vc16.data() : (const void*)vc.data());
     id<MTLBuffer> bQf = createBuf(c, qfull.size() * sizeof(float), qfull.data());
     const size_t outN = (size_t)N * hQ * dh;
     id<MTLBuffer> bRef = createBuf(c, outN * sizeof(float));
@@ -5951,14 +5985,20 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
         const char* name; uint32_t qt, kb, ns, hg;
         id<MTLComputePipelineState> p;
     };
-    std::vector<Variant> vars{
-        {"gqa2_q8_k64_s16_exact", 8, 64, 16, 2,
-         getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", 0)},
-        {"gqa2_q8_k64_s16_simd", 8, 64, 16, 2,
-         getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", 0)},
-    };
-    id<MTLComputePipelineState> pRef =
-        getPipe(c, "fa_batch", "fa_attn_batch_mma", 0);
+    std::vector<Variant> vars;
+    if (kvF16) {
+        vars.push_back({"gqa2_q8_k64_s16_f16", 8, 64, 16, 2,
+            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_f16", kvBytes)});
+    } else {
+        vars.push_back({"gqa2_q8_k64_s16_exact", 8, 64, 16, 2,
+            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", kvBytes)});
+        vars.push_back({"gqa2_q8_k64_s16_simd", 8, 64, 16, 2,
+            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", kvBytes)});
+    }
+    id<MTLComputePipelineState> pRef = kvF16
+        ? getPipe(c, "fa_batch", "fa_attn_batch", kvBytes)
+        : getPipe(c, "fa_batch", "fa_attn_batch_mma", kvBytes);
+    const uint32_t refQt = kvF16 ? 1u : 16u;
 
     auto encode = [&](id<MTLComputeCommandEncoder> enc,
                       id<MTLComputePipelineState> p, id<MTLBuffer> out,
@@ -5995,19 +6035,20 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
         }
     };
 
-    if (submit(pRef, bRef, 16u, 8u, 1u, 1u) < 0) return false;
+    if (submit(pRef, bRef, refQt, 8u, 1u, 1u) < 0) return false;
     const float* ref = (const float*)bRef.contents;
     double rms2 = 0.0;
     for (size_t i = 0; i < outN; ++i) rms2 += (double)ref[i] * ref[i];
     const double rms = std::sqrt(rms2 / outN);
     const double floor = std::max(1e-6, rms * 1e-4);
-    printf("\n== facmp N=%u base=%u  Q[%u,%u,%u] KV[%u,%u,%u] ==\n",
-           N, base, N, hQ, dh, hKV, tmax, dh);
+    printf("\n== facmp N=%u base=%u  Q[%u,%u,%u] KV[%u,%u,%u] %s ==\n",
+           N, base, N, hQ, dh, hKV, tmax, dh, kvF16 ? "f16" : "f32");
     printf("  %-24s %10s %11s %11s %8s\n",
            "geometry", "gpu_us", "max_abs", "max_rel", "result");
-    const double refUs = iters ? submit(pRef, bRef, 16u, 8u, 1u, iters) : 0.0;
+    const double refUs = iters ? submit(pRef, bRef, refQt, 8u, 1u, iters) : 0.0;
     printf("  %-24s %10.2f %11s %11s %8s\n",
-           "q16_k64_s8 (ref)", refUs, "-", "-", "REF");
+           kvF16 ? "scalar_f16 (ref)" : "q16_k64_s8 (ref)",
+           refUs, "-", "-", "REF");
     bool pass = true;
     for (const Variant& v : vars) {
         if (submit(v.p, bOut, v.qt, v.ns, v.hg, 1u) < 0) return false;
@@ -6038,6 +6079,8 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
 static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
                          uint32_t minPos, uint32_t iters) {
     constexpr uint32_t dh = 256, hQ = 16, hKV = 2, CK = 256;
+    const bool kvF16 = getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
+    const uint32_t kvBytes = kvF16 ? 2u : 4u;
     if (!slots || slots > 16 || minPos > maxPos || maxPos >= 49152) {
         fprintf(stderr,
                 "fasrvcmp requires 1<=slots<=16 and 0<=min-pos<=max-pos<49152\n");
@@ -6067,9 +6110,18 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
     for (float& v : kc) v = qd(rng);
     for (float& v : vc) v = vd(rng);
 
+    std::vector<uint16_t> kc16, vc16;
+    if (kvF16) {
+        kc16.resize(kc.size()); vc16.resize(vc.size());
+        for (size_t i = 0; i < kc.size(); ++i) kc16[i] = qk_f32_to_f16(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vc16[i] = qk_f32_to_f16(vc[i]);
+    }
+
     id<MTLBuffer> bQ = createBuf(c, qhat.size() * sizeof(float), qhat.data());
-    id<MTLBuffer> bK = createBuf(c, kc.size() * sizeof(float), kc.data());
-    id<MTLBuffer> bV = createBuf(c, vc.size() * sizeof(float), vc.data());
+    id<MTLBuffer> bK = createBuf(c, kc.size() * kvBytes,
+                                  kvF16 ? (const void*)kc16.data() : (const void*)kc.data());
+    id<MTLBuffer> bV = createBuf(c, vc.size() * kvBytes,
+                                  kvF16 ? (const void*)vc16.data() : (const void*)vc.data());
     id<MTLBuffer> bQf = createBuf(c, qfull.size() * sizeof(float), qfull.data());
     id<MTLBuffer> bPos = createBuf(c, pos.size() * sizeof(uint32_t), pos.data());
     const size_t outN = (size_t)slots * hQ * dh;
@@ -6089,15 +6141,15 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
     } spc{0u, tmax, dh, 64u, hQ, hKV, 1e-6f, 1000000.f, maxChunks};
 
     id<MTLComputePipelineState> pScalar =
-        getPipe(c, "fa_srv", "fa_attn_srv", 0);
+        getPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
     id<MTLComputePipelineState> pSplit =
-        getPipe(c, "fa_srv", "fa_attn_srv_split", 0);
+        getPipe(c, "fa_srv", "fa_attn_srv_split", kvBytes);
     id<MTLComputePipelineState> pReduce =
         getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
     id<MTLComputePipelineState> pCompact =
-        getPipe(c, "fa_srv", "fa_attn_srv_split_compact", 0);
+        getPipe(c, "fa_srv", "fa_attn_srv_split_compact", kvBytes);
     id<MTLComputePipelineState> pMulti =
-        getPipe(c, "fa_srv", "fa_attn_srv_split_multi", 0);
+        getPipe(c, "fa_srv", "fa_attn_srv_split_multi", kvBytes);
     struct SplitVariant {
         std::string name;
         id<MTLComputePipelineState> split;
@@ -6206,9 +6258,10 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
         return false;
     std::vector<float> splitRef(outN);
     memcpy(splitRef.data(), bOut.contents, outN * sizeof(float));
-    printf("\n== fasrvcmp slots=%u pos=%u..%u tmax=%u chunks=%llu/%llu live ==\n",
-           slots, minPos, maxPos, tmax, (unsigned long long)liveChunks,
-           (unsigned long long)launchedChunks);
+    printf("\n== fasrvcmp slots=%u pos=%u..%u tmax=%u %s KV "
+           "chunks=%llu/%llu live ==\n",
+           slots, minPos, maxPos, tmax, kvF16 ? "f16" : "f32",
+           (unsigned long long)liveChunks, (unsigned long long)launchedChunks);
     printf("  %-13s %10s %9s %10s %10s %11s %11s %8s\n",
            "schedule", "gpu_us", "speedup", "diff", "split_diff",
            "max_abs", "max_rel", "result");
@@ -7224,39 +7277,49 @@ int main(int argc, char** argv) {
                                 slots.data(), bases.data());
             const double multiGpu = e->lastCbGpu;
             double maxAbs = 0.0, sumD2 = 0.0, sumR2 = 0.0;
-            uint64_t nFloat = 0, bitDiff = 0;
+            uint64_t nValue = 0, bitDiff = 0;
             std::vector<uint8_t> got(e->snapSize);
+            auto compareRegion = [&](const uint8_t* ap, const uint8_t* bp,
+                                     size_t bytes, uint32_t elemBytes,
+                                     uint64_t& nd, double& ma) {
+                const size_t nElem = bytes / elemBytes;
+                for (size_t i = 0; i < nElem; ++i) {
+                    float av, bv;
+                    if (elemBytes == 2u) {
+                        const uint16_t ah = ((const uint16_t*)ap)[i];
+                        const uint16_t bh = ((const uint16_t*)bp)[i];
+                        av = qk_f16_to_f32(ah); bv = qk_f16_to_f32(bh);
+                        nd += ah != bh;
+                    } else {
+                        const uint32_t ab = ((const uint32_t*)ap)[i];
+                        const uint32_t bb = ((const uint32_t*)bp)[i];
+                        memcpy(&av, &ab, sizeof av); memcpy(&bv, &bb, sizeof bv);
+                        nd += ab != bb;
+                    }
+                    const double d = (double)bv - av;
+                    ma = std::max(ma, std::abs(d));
+                    sumD2 += d * d;
+                    sumR2 += (double)av * av;
+                }
+                nValue += nElem;
+            };
             for (uint32_t q = 0; q < B; ++q) {
                 e->copyStripes(q, got.data(), /*save=*/true, bases[q] + N);
-                const float* a = (const float*)ref[q].data();
-                const float* b = (const float*)got.data();
-                for (size_t i = 0; i < e->snapSize / 4; ++i) {
-                    const double d = (double)b[i] - a[i];
-                    maxAbs = std::max(maxAbs, std::abs(d));
-                    sumD2 += d * d;
-                    sumR2 += (double)a[i] * a[i];
-                    bitDiff += a[i] != b[i];
+                for (uint32_t il = 0; il < e->nLayer; ++il) {
+                    const qk_engine::Layer& L = e->layers[il];
+                    uint64_t nd = 0;
+                    double ma = 0.0;
+                    const uint32_t eb = L.rec ? 4u : e->kvBytes;
+                    compareRegion(ref[q].data() + e->snapOff1[il],
+                                  got.data() + e->snapOff1[il], L.ps1, eb, nd, ma);
+                    compareRegion(ref[q].data() + e->snapOff2[il],
+                                  got.data() + e->snapOff2[il], L.ps2, eb, nd, ma);
+                    bitDiff += nd; maxAbs = std::max(maxAbs, ma);
+                    if (nd && getenv("QK_PMULTI_DETAIL"))
+                        printf("    detail slot=%u layer=%u %s diff=%llu max=%.3g\n",
+                               q, il, L.rec ? "dn" : "attn",
+                               (unsigned long long)nd, ma);
                 }
-                if (getenv("QK_PMULTI_DETAIL")) {
-                    for (uint32_t il = 0; il < e->nLayer; ++il) {
-                        uint64_t nd = 0;
-                        double ma = 0.0;
-                        for (size_t off : {e->snapOff1[il], e->snapOff2[il]}) {
-                            const size_t nf = (off == e->snapOff1[il]
-                                ? e->layers[il].ps1 : e->layers[il].ps2) / 4;
-                            const float* la = (const float*)(ref[q].data() + off);
-                            const float* lb = (const float*)(got.data() + off);
-                            for (size_t i = 0; i < nf; ++i) {
-                                nd += la[i] != lb[i];
-                                ma = std::max(ma, std::abs((double)lb[i] - la[i]));
-                            }
-                        }
-                        if (nd) printf("    detail slot=%u layer=%u %s diff=%llu max=%.3g\n",
-                                       q, il, e->layers[il].rec ? "dn" : "attn",
-                                       (unsigned long long)nd, ma);
-                    }
-                }
-                nFloat += e->snapSize / 4;
                 e->prefillBatchLast(&pending[q], 1, q, logits, /*wantLogits=*/true,
                                     bases[q] + N);
                 gotTok[q] = (uint32_t)std::distance(
@@ -7265,7 +7328,7 @@ int main(int argc, char** argv) {
             bool exactTok = refTok == gotTok;
             printf("prefillmulticmp: B=%u N=%u state bitdiff=%llu/%llu max_abs=%.3g "
                    "rel_rms=%.3g handoff=%s\n", B, N,
-                   (unsigned long long)bitDiff, (unsigned long long)nFloat, maxAbs,
+                   (unsigned long long)bitDiff, (unsigned long long)nValue, maxAbs,
                    sumR2 > 0 ? sqrt(sumD2 / sumR2) : 0.0,
                    exactTok ? "EXACT" : "MISMATCH");
             printf("  serial %.3f ms | coalesced %.3f ms | %.2fx\n",
