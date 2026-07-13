@@ -7,6 +7,8 @@
 //   qk                        synthetic suite: f16, q8_0, q6_k, iq4_xs, iq3_xxs
 //   qk f16|q8_0|q6_k|iq4_xs|iq3_xxs [M] [K] [iters]
 //   qk slotgemv [M] [K] [B] [TPR] [iters]  Q8_0 slot-batch comparison
+//   qk fasrvcmp [slots] [max-pos] [min-pos] [iters]  decode-attention schedules
+//   qk fadecode [slots] [pos] [steps] [tmax] [min-pos]  steady deep decode
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
 //   qk list [filter]          list tensors in the GGUF
 //   qk slotcmp <ids> <nGen> [nSlots] [tmax]  slot compaction/churn exactness
@@ -2511,6 +2513,11 @@ struct qk_engine {
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBAligned;
+    // Adaptive decode attention coarsens producer scheduling while retaining
+    // one byte-identical 256-key partial per chunk and the shipping reducer.
+    id<MTLComputePipelineState> pAttnCompact, pAttnMulti;
+    bool faDecodeSplit = true, faDecodeWork = true;
+    int faFanOverride = -1;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemv4O, pGemmB4, pGemmB4Aligned,
         pMoeGu4, pMoeGuG4i, pMoeGuG5i;
@@ -2559,7 +2566,7 @@ struct qk_engine {
 
     id<MTLBuffer> bXin, bXn, bBig, bMid, bKin, bVin, bGb, bAtt, bAttnOut, bY, bXn2,
         bML, bMH, bMSel, bMY, bLogits, bRope, bAV, bAI,
-        bTok, bRbScratch, bSlotIn, bSlotPos, bPartial;
+        bTok, bRbScratch, bSlotIn, bSlotPos, bPartial, bFaWork;
     WB bONorm{nil}, bHeadW{nil}, bEmbdW{nil};
 
     uint32_t maxB = 0;
@@ -3109,6 +3116,17 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", 0);
     pAttnSplit  = getPipe(c, "fa_srv", "fa_attn_srv_split", 0);   // flash-decoding
     pAttnReduce = getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
+    pAttnCompact = getPipe(c, "fa_srv", "fa_attn_srv_split_compact", 0);
+    pAttnMulti = getPipe(c, "fa_srv", "fa_attn_srv_split_multi", 0);
+    if (const char* v = getenv("QK_FA_SPLIT")) faDecodeSplit = atoi(v) != 0;
+    if (const char* v = getenv("QK_FA_WORK")) faDecodeWork = atoi(v) != 0;
+    if (const char* v = getenv("QK_FA_FAN")) {
+        const int x = atoi(v);
+        if (x == 1 || x == 4 || x == 8 || x == 16 || x == 32 || x == 64)
+            faFanOverride = x;
+        else if (x != 0)
+            fprintf(stderr, "QK_FA_FAN=%d ignored (expected 1,4,8,16,32,64)\n", x);
+    }
     pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
     bool moeGuFixed = !guIq4 && ffE == 512u;
@@ -3289,7 +3307,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bSlotPos = createBuf(c, (size_t)nB * 4, nullptr, true);
     // split-K decode-attention partials: [slot][head][chunk](acc[dh], m, l)
     { const uint32_t maxChunks = (nCtx + 255u) / 256u;
-      bPartial = createBuf(c, (size_t)nB * hQ * maxChunks * (dh + 2) * 4, nullptr, true); }
+      bPartial = createBuf(c, (size_t)nB * hQ * maxChunks * (dh + 2) * 4, nullptr, true);
+      bFaWork = createBuf(c, (size_t)nB * maxChunks * 2u * sizeof(uint32_t), nullptr, true); }
     memset(bSlotIn.contents, 0, (size_t)nB * 4);
     memset(bSlotPos.contents, 0, (size_t)nB * 4);
     {
@@ -3522,17 +3541,15 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
             threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
     };
     auto bar = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
-    // split-K (flash-decoding) decode attention. QK_FA_SPLIT=1 enables it;
-    // dspY adds the chunk (y) grid axis the plain dsp lacks.
-    static const bool faSplit = getenv("QK_FA_SPLIT") != nullptr;
+    // dspY adds the chunk/work-item (y) grid axis the plain dsp lacks.
     auto dspY = [&](id<MTLComputePipelineState> pso, std::initializer_list<WB> bufs,
                     const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t ydim,
-                    uint32_t thr) {
+                    uint32_t thr, uint32_t gridZ = 0) {
         [enc setComputePipelineState:pso];
         uint32_t i = 0;
         for (const WB& b : bufs) [enc setBuffer:b.b offset:b.o atIndex:i++];
         [enc setBytes:pc length:pcSize atIndex:i];
-        [enc dispatchThreadgroups:MTLSizeMake(wgs, ydim, zdim)
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, ydim, gridZ ? gridZ : zdim)
             threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
     };
     const uint32_t thrN = nsg * 32;
@@ -3551,12 +3568,95 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
     struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, ffE, nExp, nUsed, eps};
     struct { uint32_t pos, tmax, dh_, nRot_, hQ_, hKV_; float e, fb; }
         pcFa{0, nCtx, dh, nRot, hQ, hKV, eps, kFreqBase};
-    // split-K: dispatch only the chunks the deepest slot actually needs
-    // (over-length chunk-TGs early-return); partial stride is the full ceil(ctx/256).
-    uint32_t maxPos = 0;
+    // Adaptive split-K schedule. A 256-key producer maximizes parallelism for
+    // one/few live trajectories; balanced deep batches already expose ample
+    // head/slot parallelism and instead win by processing several chunks in each
+    // producer. Highly skewed batches use a compact (slot,group) work list.
+    uint32_t maxPos = 0, minChunks = UINT32_MAX, liveChunks = 0;
+    uint32_t slotChunks[16]{};
     { const uint32_t* sp = (const uint32_t*)bSlotPos.contents;
-      for (uint32_t s = 0; s < zdim; ++s) maxPos = std::max(maxPos, sp[s]); }
+      for (uint32_t s = 0; s < zdim; ++s) {
+          maxPos = std::max(maxPos, sp[s]);
+          slotChunks[s] = (sp[s] + 1u + 255u) / 256u;
+          minChunks = std::min(minChunks, slotChunks[s]);
+          liveChunks += slotChunks[s];
+      } }
     const uint32_t splitChunks = (maxPos + 1u + 255u) / 256u;
+    auto nearestFaFan = [](uint32_t chunkWork) {
+        const uint32_t target = std::max(1u, (chunkWork + 8u) / 16u);
+        static constexpr uint32_t fan[] = {1u, 4u, 8u, 16u, 32u, 64u};
+        uint32_t best = 1u, bd = UINT32_MAX;
+        for (uint32_t f : fan) {
+            const uint32_t d = f > target ? f - target : target - f;
+            if (d <= bd) { best = f; bd = d; }
+        }
+        return best;
+    };
+    auto faFanForGroups = [&]() {
+        static constexpr uint32_t fan[] = {8u, 16u, 32u, 64u};
+        uint32_t best = 8u, bd = UINT32_MAX;
+        for (uint32_t f : fan) {
+            uint32_t groups = 0;
+            for (uint32_t s = 0; s < zdim; ++s)
+                groups += std::max(1u, (slotChunks[s] + f / 2u) / f);
+            const uint32_t d = groups > 16u ? groups - 16u : 16u - groups;
+            if (d <= bd) { best = f; bd = d; }
+        }
+        return best;
+    };
+    uint32_t faFan = 1u;
+    const bool balanced = minChunks * 2u >= splitChunks;
+    if (splitChunks >= 16u && balanced) {
+        faFan = nearestFaFan(liveChunks);
+    } else if (splitChunks >= 16u) {
+        uint32_t deep = 0;
+        bool bimodal = true;
+        for (uint32_t s = 0; s < zdim; ++s) {
+            if (slotChunks[s] * 4u >= splitChunks * 3u) deep++;
+            else if (slotChunks[s] * 4u > splitChunks) bimodal = false;
+        }
+        if (bimodal && (uint64_t)deep * splitChunks >= 96u)
+            faFan = faFanForGroups();
+    }
+    if (zdim == 1u && splitChunks <= 32u) faFan = 1u;
+    // Fan-4 only tied at the first balanced crossover in full-engine tests;
+    // require the first materially winning fan unless explicitly overridden.
+    if (faFan < 8u) faFan = 1u;
+    if (faFanOverride > 0) faFan = (uint32_t)faFanOverride;
+    const bool faUseWork = faDecodeWork && (faFan > 1u ||
+        (uint64_t)liveChunks * 4u < (uint64_t)zdim * splitChunks);
+    uint32_t faWorkN = 0;
+    if (faUseWork) {
+        uint32_t* work = (uint32_t*)bFaWork.contents;
+        if (faFan == 1u) {
+            for (uint32_t s = 0; s < zdim; ++s)
+                for (uint32_t c = 0; c < slotChunks[s]; ++c)
+                    work[faWorkN++] = (s << 16u) | c;
+        } else {
+            for (uint32_t s = 0; s < zdim; ++s) {
+                const uint32_t ng = std::max(
+                    1u, (slotChunks[s] + faFan / 2u) / faFan);
+                for (uint32_t g = 0; g < ng; ++g) {
+                    const uint32_t first = (uint64_t)g * slotChunks[s] / ng;
+                    const uint32_t end = (uint64_t)(g + 1u) * slotChunks[s] / ng;
+                    work[2u * faWorkN] = (s << 16u) | g;
+                    work[2u * faWorkN + 1u] = (first << 16u) | (end - first);
+                    ++faWorkN;
+                }
+            }
+        }
+    }
+    if (getenv("QK_FA_LOG")) {
+        static uint64_t lastSig = UINT64_MAX;
+        const uint64_t sig = (uint64_t)zdim << 56u | (uint64_t)splitChunks << 40u |
+            (uint64_t)liveChunks << 16u | (uint64_t)faFan << 8u | faUseWork;
+        if (sig != lastSig) {
+            fprintf(stderr, "[fa] slots=%u chunks=%u..%u live=%u fan=%u work=%u/%u\n",
+                    zdim, minChunks, splitChunks, liveChunks, faFan,
+                    faUseWork ? faWorkN : 0u, zdim * splitChunks);
+            lastSig = sig;
+        }
+    }
     struct { uint32_t pos, tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t maxChunks; }
         pcFaSplit{0, nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, (nCtx + 255u) / 256u};
     const uint32_t amWgs = (vocab + 4095) / 4096;
@@ -3615,11 +3715,20 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
             dsp(pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.st1, L.st2, bRope, bSlotPos},
                 &pcFa, 32, hQ + 2 * hKV, 256);
             bar();
-            if (faSplit) {
+            const bool useFaSplit = faDecodeSplit &&
+                !(zdim == 1u && splitChunks == 1u && faFanOverride < 0);
+            if (useFaSplit && !faUseWork) {
                 dspY(pAttnSplit, {bMid, L.st1, L.st2, bPartial, bSlotPos},
                      &pcFaSplit, 36, hQ, splitChunks, 256);
                 bar();
                 dsp(pAttnReduce, {bPartial, bBig, bAtt, bSlotPos}, &pcFaSplit, 36, hQ, 256);
+            } else if (useFaSplit) {
+                dspY(faFan == 1u ? pAttnCompact : pAttnMulti,
+                     {bMid, L.st1, L.st2, bPartial, bSlotPos, bFaWork},
+                     &pcFaSplit, 36, hQ, faWorkN, 256, 1);
+                bar();
+                dsp(pAttnReduce, {bPartial, bBig, bAtt, bSlotPos},
+                    &pcFaSplit, 36, hQ, 256);
             } else {
                 dsp(pAttn, {bMid, L.st1, L.st2, bBig, bAtt, bSlotPos}, &pcFa, 32, hQ, 256);
             }
@@ -5547,6 +5656,218 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     return pass;
 }
 
+// Synthetic serving/decode attention comparison.  Positions are distributed
+// linearly from minPos through maxPos so one invocation covers both homogeneous
+// (min=max) and maximally heterogeneous slot batches.  This deliberately
+// exercises the real per-slot KV strides and the split partial layout.
+static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
+                         uint32_t minPos, uint32_t iters) {
+    constexpr uint32_t dh = 256, hQ = 16, hKV = 2, CK = 256;
+    if (!slots || slots > 16 || minPos > maxPos || maxPos >= 49152) {
+        fprintf(stderr,
+                "fasrvcmp requires 1<=slots<=16 and 0<=min-pos<=max-pos<49152\n");
+        return false;
+    }
+    const uint32_t tmax = ((maxPos + 1u + CK - 1u) / CK) * CK;
+    const uint32_t maxChunks = (tmax + CK - 1u) / CK;
+    std::vector<uint32_t> pos(slots);
+    for (uint32_t s = 0; s < slots; ++s)
+        pos[s] = slots == 1 ? maxPos
+            : minPos + (uint64_t)(maxPos - minPos) * s / (slots - 1u);
+    if (slots > 1 && getenv("QK_FA_SKEW")) {
+        uint32_t nLong = std::min(
+            slots, (uint32_t)std::max(1, atoi(getenv("QK_FA_SKEW"))));
+        std::fill(pos.begin(), pos.end(), minPos);
+        std::fill(pos.end() - nLong, pos.end(), maxPos);
+    }
+
+    std::mt19937 rng(0x46535256u + slots * 17u + maxPos * 3u + minPos);
+    std::normal_distribution<float> qd(0.f, 0.20f), vd(0.f, 0.35f);
+    std::vector<float> qhat((size_t)slots * hQ * dh);
+    std::vector<float> qfull((size_t)slots * hQ * 2u * dh);
+    std::vector<float> kc((size_t)slots * hKV * tmax * dh);
+    std::vector<float> vc((size_t)slots * hKV * tmax * dh);
+    for (float& v : qhat) v = qd(rng);
+    for (float& v : qfull) v = qd(rng);
+    for (float& v : kc) v = qd(rng);
+    for (float& v : vc) v = vd(rng);
+
+    id<MTLBuffer> bQ = createBuf(c, qhat.size() * sizeof(float), qhat.data());
+    id<MTLBuffer> bK = createBuf(c, kc.size() * sizeof(float), kc.data());
+    id<MTLBuffer> bV = createBuf(c, vc.size() * sizeof(float), vc.data());
+    id<MTLBuffer> bQf = createBuf(c, qfull.size() * sizeof(float), qfull.data());
+    id<MTLBuffer> bPos = createBuf(c, pos.size() * sizeof(uint32_t), pos.data());
+    const size_t outN = (size_t)slots * hQ * dh;
+    id<MTLBuffer> bRef = createBuf(c, outN * sizeof(float));
+    id<MTLBuffer> bOut = createBuf(c, outN * sizeof(float));
+    id<MTLBuffer> bPartial = createBuf(
+        c, (size_t)slots * hQ * maxChunks * (dh + 2u) * sizeof(float));
+
+    struct FaPC {
+        uint32_t pos, tmax, dh_, nRot, hQ_, hKV_;
+        float eps, freqBase;
+    } pc{0u, tmax, dh, 64u, hQ, hKV, 1e-6f, 1000000.f};
+    struct FaSplitPC {
+        uint32_t pos, tmax, dh_, nRot, hQ_, hKV_;
+        float eps, freqBase;
+        uint32_t maxChunks;
+    } spc{0u, tmax, dh, 64u, hQ, hKV, 1e-6f, 1000000.f, maxChunks};
+
+    id<MTLComputePipelineState> pScalar =
+        getPipe(c, "fa_srv", "fa_attn_srv", 0);
+    id<MTLComputePipelineState> pSplit =
+        getPipe(c, "fa_srv", "fa_attn_srv_split", 0);
+    id<MTLComputePipelineState> pReduce =
+        getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
+    id<MTLComputePipelineState> pCompact =
+        getPipe(c, "fa_srv", "fa_attn_srv_split_compact", 0);
+    id<MTLComputePipelineState> pMulti =
+        getPipe(c, "fa_srv", "fa_attn_srv_split_multi", 0);
+    struct SplitVariant {
+        std::string name;
+        id<MTLComputePipelineState> split;
+        id<MTLBuffer> work;
+        uint32_t workN;
+    };
+    std::vector<SplitVariant> splitVars{
+        {"split256", pSplit, nil, 0u}};
+    std::vector<uint32_t> compactWork;
+    for (uint32_t s = 0; s < slots; ++s) {
+        const uint32_t chunks = (pos[s] + 1u + CK - 1u) / CK;
+        for (uint32_t c = 0; c < chunks; ++c)
+            compactWork.push_back((s << 16u) | c);
+    }
+    splitVars.push_back({"compact", pCompact,
+        createBuf(c, compactWork.size() * sizeof(uint32_t), compactWork.data()),
+        (uint32_t)compactWork.size()});
+    for (uint32_t fan : {1u, 4u, 8u, 16u, 32u, 64u}) {
+        std::vector<uint32_t> balancedWork;
+        uint32_t nBalanced = 0;
+        for (uint32_t s = 0; s < slots; ++s) {
+            const uint32_t chunks = (pos[s] + 1u + CK - 1u) / CK;
+            const uint32_t ng = fan == 1u ? chunks
+                : std::max(1u, (chunks + fan / 2u) / fan);
+            for (uint32_t g = 0; g < ng; ++g) {
+                const uint32_t first = (uint64_t)g * chunks / ng;
+                const uint32_t end = (uint64_t)(g + 1u) * chunks / ng;
+                balancedWork.push_back((s << 16u) | g);
+                balancedWork.push_back((first << 16u) | (end - first));
+                ++nBalanced;
+            }
+        }
+        char name[24];
+        snprintf(name, sizeof(name), "multi%u", fan);
+        id<MTLBuffer> bBalancedWork = createBuf(
+            c, balancedWork.size() * sizeof(uint32_t), balancedWork.data());
+        splitVars.push_back({name, pMulti, bBalancedWork, nBalanced});
+    }
+
+    auto bind = [](id<MTLComputeCommandEncoder> enc,
+                   id<MTLComputePipelineState> p,
+                   std::initializer_list<id<MTLBuffer>> bufs,
+                   const void* bytes, size_t size) {
+        [enc setComputePipelineState:p];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : bufs) [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:bytes length:size atIndex:i];
+    };
+    auto scalar = [&](id<MTLComputeCommandEncoder> enc, id<MTLBuffer> out) {
+        bind(enc, pScalar, {bQ, bK, bV, bQf, out, bPos}, &pc, sizeof(pc));
+        [enc dispatchThreadgroups:MTLSizeMake(hQ, 1, slots)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto split = [&](id<MTLComputeCommandEncoder> enc, id<MTLBuffer> out,
+                     const SplitVariant& v) {
+        if (v.work) {
+            bind(enc, v.split, {bQ, bK, bV, bPartial, bPos, v.work},
+                 &spc, sizeof(spc));
+            [enc dispatchThreadgroups:MTLSizeMake(hQ, v.workN, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            bind(enc, v.split, {bQ, bK, bV, bPartial, bPos}, &spc, sizeof(spc));
+            [enc dispatchThreadgroups:MTLSizeMake(hQ, maxChunks, slots)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        bind(enc, pReduce, {bPartial, bQf, out, bPos}, &spc, sizeof(spc));
+        [enc dispatchThreadgroups:MTLSizeMake(hQ, 1, slots)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto submit = [&](auto&& encode, uint32_t reps) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = getenv("QK_FA_CONCURRENT")
+                ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                : [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < reps; ++i) {
+                encode(enc);
+                if (i + 1u < reps)
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                fprintf(stderr, "fasrvcmp Metal failure: %s\n",
+                        cb.error.localizedDescription.UTF8String);
+                return -1.0;
+            }
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / reps;
+        }
+    };
+
+    if (submit([&](auto enc) { scalar(enc, bRef); }, 1) < 0) return false;
+    const float* ref = (const float*)bRef.contents;
+    double rms2 = 0.0;
+    for (size_t i = 0; i < outN; ++i) rms2 += (double)ref[i] * ref[i];
+    const double rms = std::sqrt(rms2 / outN);
+    const double floor = std::max(1e-6, rms * 1e-4);
+    uint64_t liveChunks = 0;
+    for (uint32_t p : pos) liveChunks += (p + 1u + CK - 1u) / CK;
+    const uint64_t launchedChunks = (uint64_t)slots * maxChunks;
+    const double scalarUs = iters
+        ? submit([&](auto enc) { scalar(enc, bRef); }, iters) : 0.0;
+    if (submit([&](auto enc) { split(enc, bOut, splitVars[0]); }, 1) < 0)
+        return false;
+    std::vector<float> splitRef(outN);
+    memcpy(splitRef.data(), bOut.contents, outN * sizeof(float));
+    printf("\n== fasrvcmp slots=%u pos=%u..%u tmax=%u chunks=%llu/%llu live ==\n",
+           slots, minPos, maxPos, tmax, (unsigned long long)liveChunks,
+           (unsigned long long)launchedChunks);
+    printf("  %-13s %10s %9s %10s %10s %11s %11s %8s\n",
+           "schedule", "gpu_us", "speedup", "diff", "split_diff",
+           "max_abs", "max_rel", "result");
+    printf("  %-13s %10.2f %9s %10s %10s %11s %11s %8s\n",
+           "scalar", scalarUs, "1.000x", "-", "-", "-", "-", "REF");
+    bool pass = true;
+    for (const SplitVariant& v : splitVars) {
+        if (submit([&](auto enc) { split(enc, bOut, v); }, 1) < 0) return false;
+        const double us = iters
+            ? submit([&](auto enc) { split(enc, bOut, v); }, iters) : 0.0;
+        const float* got = (const float*)bOut.contents;
+        double maxAbs = 0.0, maxRel = 0.0;
+        uint64_t nDiff = 0, nSplitDiff = 0;
+        for (size_t i = 0; i < outN; ++i) {
+            const double ae = std::fabs((double)got[i] - ref[i]);
+            maxAbs = std::max(maxAbs, ae);
+            maxRel = std::max(maxRel,
+                ae / std::max(floor, (double)std::fabs(ref[i])));
+            nDiff += got[i] != ref[i];
+            nSplitDiff += got[i] != splitRef[i];
+        }
+        const bool ok = maxAbs <= std::max(2e-5, rms * 2e-4);
+        pass &= ok;
+        printf("  %-13s %10.2f %8.3fx %10llu %10llu %11.4g %11.4g %8s\n",
+               v.name.c_str(), us, us > 0 ? scalarUs / us : 0.0,
+               (unsigned long long)nDiff, (unsigned long long)nSplitDiff,
+               maxAbs, maxRel, ok ? "PASS" : "FAIL");
+    }
+    printf("  positions:");
+    for (uint32_t p : pos) printf(" %u", p);
+    printf("\n");
+    return pass;
+}
+
 // Decode DeltaNet megakernel schedule comparison.  This uses nonzero conv and
 // matrix state, checks every mutated/output buffer bit-for-bit, and exercises
 // both head mappings used by the 35B (modulo) and 80B (consecutive) models.
@@ -6600,6 +6921,105 @@ int main(int argc, char** argv) {
             return exactTok ? 0 : 1;
         }
 
+        if (mode == "fadecode") {
+            const uint32_t B = argc > 2 ? (uint32_t)atoi(argv[2]) : 1u;
+            const uint32_t pos = argc > 3 ? (uint32_t)atoi(argv[3]) : 8192u;
+            const uint32_t steps = argc > 4 ? (uint32_t)atoi(argv[4]) : 64u;
+            constexpr uint32_t warm = 4u;
+            const uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5])
+                : pos + steps + warm + 64u;
+            const uint32_t minPos = argc > 6 ? (uint32_t)atoi(argv[6]) : pos;
+            if (!B || B > 16u || !pos || !steps || minPos > pos ||
+                pos + steps + warm > tmax) {
+                fprintf(stderr, "usage: qk fadecode [slots=1..16] [pos] [steps] "
+                                "[tmax] [min-pos]\n");
+                return 1;
+            }
+            qk_config cfg{B, tmax, 1u};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+
+            static constexpr uint32_t seed[] = {
+                12162u, 5028u, 264u, 854u, 11u, 303u, 264u,
+                11012u, 13721u, 85624u, 1881u, 1330u, 22767u, 11u,
+                1017u, 11815u, 449u, 2235u, 8598u, 24946u, 852u};
+            std::vector<uint32_t> prefix(pos);
+            for (uint32_t i = 0; i < pos; ++i) prefix[i] = seed[i % std::size(seed)];
+            std::vector<float> unused;
+            e->resetStripe(0);
+            for (uint32_t off = 0; off < pos; off += e->maxB) {
+                const uint32_t n = std::min(e->maxB, pos - off);
+                e->prefillBatchLast(prefix.data() + off, n, 0, unused,
+                                    /*wantLogits=*/false, off);
+            }
+            for (uint32_t s = 1; s < B; ++s) e->moveSlotState(0, s, pos);
+
+            uint32_t* slotIn = (uint32_t*)e->bSlotIn.contents;
+            uint32_t* slotPos = (uint32_t*)e->bSlotPos.contents;
+            const uint32_t* sampled = (const uint32_t*)e->bTok.contents;
+            std::vector<uint32_t> basePos(B, pos);
+            if (B > 1u && minPos < pos) {
+                for (uint32_t s = 0; s < B; ++s)
+                    basePos[s] = minPos + (uint64_t)(pos - minPos) * s / (B - 1u);
+                if (const char* skew = getenv("QK_FA_SKEW")) {
+                    const uint32_t nLong = std::min(
+                        B, (uint32_t)std::max(1, atoi(skew)));
+                    std::fill(basePos.begin(), basePos.end(), minPos);
+                    std::fill(basePos.end() - nLong, basePos.end(), pos);
+                }
+            }
+            const bool homogeneous = minPos == pos;
+            for (uint32_t s = 0; s < B; ++s) slotIn[s] = prefix.back();
+            double gpu = 0.0, wall = 0.0;
+            bool identical = true;
+            std::vector<uint32_t> gen;
+            std::vector<uint64_t> hash(B, 1469598103934665603ull);
+            for (uint32_t it = 0; it < warm + steps; ++it) {
+                for (uint32_t s = 0; s < B; ++s) slotPos[s] = basePos[s] + it;
+                auto t0 = std::chrono::steady_clock::now();
+                @autoreleasepool {
+                    id<MTLCommandBuffer> cb = [e->c.queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc =
+                        [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                    e->encodeStep(enc, B, homogeneous && B > 1u);
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                    if (cb.status != MTLCommandBufferStatusCompleted) {
+                        fprintf(stderr, "fadecode Metal failure: %s\n",
+                                cb.error.localizedDescription.UTF8String);
+                        qk_close(e); return 1;
+                    }
+                    if (it >= warm) gpu += cb.GPUEndTime - cb.GPUStartTime;
+                }
+                const double w = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                if (it >= warm) wall += w;
+                for (uint32_t s = 1; s < B; ++s) identical &= sampled[s] == sampled[0];
+                for (uint32_t s = 0; s < B; ++s) slotIn[s] = sampled[s];
+                if (it >= warm) {
+                    gen.push_back(sampled[0]);
+                    for (uint32_t s = 0; s < B; ++s) {
+                        hash[s] ^= sampled[s];
+                        hash[s] *= 1099511628211ull;
+                    }
+                }
+            }
+            printf("fadecode: B=%u pos=%u..%u steps=%u | gpu %.3f ms/step | "
+                   "wall %.3f ms/step | slots identical: %s\n",
+                   B, minPos, pos, steps, gpu * 1e3 / steps, wall * 1e3 / steps,
+                   identical ? "YES" : "NO (heterogeneous expected)");
+            printf("HASH:");
+            for (uint64_t h : hash) printf(" %016llx", (unsigned long long)h);
+            printf("\n");
+            printf("GEN:");
+            for (uint32_t t : gen) printf(" %u", t);
+            printf("\n");
+            qk_close(e);
+            return homogeneous && !identical ? 1 : 0;
+        }
+
         if (mode == "serve-test") {
             if (argc < 4) {
                 fprintf(stderr, "usage: qk serve-test <ids-file> <nGen> "
@@ -7281,6 +7701,9 @@ int main(int argc, char** argv) {
             ok = caseHeadCmp(c, argU(2, 8), argU(3, 20));
         } else if (mode == "facmp") {
             ok = caseFaCmp(c, argU(2, 512), argU(3, 0), argU(4, 20));
+        } else if (mode == "fasrvcmp") {
+            ok = caseFaSrvCmp(c, argU(2, 1), argU(3, 8191), argU(4, 0),
+                              argU(5, 100));
         } else if (mode == "dnstepcmp") {
             ok = caseDnStep(c, argU(2, 1), argU(3, 400));
         } else if (mode == "dncmp") {
