@@ -262,6 +262,48 @@ Status: split-K is in the prod build/ (opt-in, off). tron owns the 80B decode
 gate -- recommend enabling QK_FA_SPLIT=1 on the worker (dims match 35B) and
 gating, for the long-ctx serving win.
 
+## 2026-07-12 (later) -- perf-lever evaluation: what was tried, measured, removed
+
+Systematic pass over the remaining perf areas. Key result that reframes decode:
+
+**Decode is GPU-COMPUTE-bound at ~56% of bandwidth, NOT submit-latency-bound
+and NOT KV-bandwidth-bound.** Measured (QK_STEP_STATS, 35B, 80 decode steps):
+gpu 8.91 ms/step, encode 0.16 ms, commit+wait 9.11 ms -- so submit overhead is
+only ~0.2 ms (2%); the step is 96% GPU compute. 8.91 ms streams the 2.457 GB
+active set at 276 GB/s of the 493 ceiling. The 44% gap lives INSIDE the command
+buffer (post-barrier DRAM ramp across ~600 small per-layer dispatches), which
+M6a already showed fusion doesn't fix (<2%). Implication: kernel-level KV/GEMV
+tuning and command-buffer pipelining CANNOT move single-stream decode; only
+**speculative decoding** (amortize the per-step cost over K tokens) changes it.
+
+**f16 KV cache -- TRIED, no speed win, REMOVED.** Codex gpt-5.6-sol drafted
+full fp16 KV storage / fp32 compute (all kc/vc writers fa_prep{,_srv,_batch} +
+readers fa_attn{,_srv,_srv_split,_batch,_batch_mma} -> device half*, +the KV
+alloc strides *4->*2; DeltaNet state stays fp32). Built clean; self-consistent
+(scalar-proj prefillcmp 36/36 @ rel 6e-4, no float/half mismatch); short-ctx
+decode byte-identical to f32 KV. BUT ctx-8000 decode: f16 13424 ms vs f32
+13404 ms = NO win (decode is compute-bound per above, not KV-bandwidth-bound),
+and f16 KV diverges from f32 at long ctx (accumulated rounding flips the greedy
+path -- the accepted f16-KV class, but it forfeits our f32 token-exactness).
+Only upside is ~1.8 GB KV memory (of 32 GB wired) -> a modest MEMORY/context
+lever, not a speed lever. **Reverted** (git checkout, tree back to 2a8f8a2);
+kept the finding here. Revisit only if very-deep-ctx (49k) decode turns out
+bandwidth-bound (untestable locally -- 42 GB model won't mlock in free RAM).
+
+**Aggregate multi-slot -- plateaus at 8 slots.** 16 slots 199.6 tok/s vs 8
+slots 195.5 (+2%): confirms the weight-read cap (we re-read weights per slot,
+GEMV z=slots). Lever = slot-batched decode GEMV (read a weight row once, dot
+all slots) ~1.5x at 8 slots -- but the prod worker is 2 slots, so modest there;
+mainly a high-concurrency win. NOT yet implemented. Also found a CORRECTNESS
+BUG: at 16 slots serve-test reports "all slots identical: NO" (8 slots = YES) --
+same prompt must be deterministic-identical, so >8-slot serving is broken;
+needs a bisect (unrelated to the above changes).
+
+Standing map after this pass: single-stream decode near structural limit
+(spec-decode is the only game-changer, big project); prefill won (1.01x, DN
+solve/step MMA is the remaining ~10-20 ms incremental); aggregate has
+slot-batched GEMV (modest for 2-slot prod) gated behind the 16-slot bug.
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
