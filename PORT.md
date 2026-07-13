@@ -304,6 +304,33 @@ Standing map after this pass: single-stream decode near structural limit
 solve/step MMA is the remaining ~10-20 ms incremental); aggregate has
 slot-batched GEMV (modest for 2-slot prod) gated behind the 16-slot bug.
 
+## 2026-07-12 (Codex remaining-lever pass) -- compact DN solve, 9.6% kernel win
+
+Three token-exact forward-solve layouts were measured back-to-back at Tn=512.
+The two larger rewrites were removed:
+
+- Blocked 8x8 f32-MMA forward substitution: a prep kernel emitted N=-M and
+  four simdgroups solved four 8-column panels per TG. The first high-occupancy
+  geometry measured prep 144.9 + solve 399.3 us versus the scalar solve's
+  279.5 us; reusing M in one heavier TG measured 143.6 + 438.1 us. Both were
+  correct in dncmp, but AGX f32 MMA + the diagonal barriers lost decisively.
+- Split-RHS scalar solve: 256 threads shared M while each thread kept only one
+  float4[16] RHS live (half the per-thread solve state). It remained exact but
+  measured 292.4 us versus 277-280 us, so it was also removed.
+
+The kept change stores only M's strict lower triangle in threadgroup memory:
+2016 floats / 7.9 KiB instead of a zero-padded 4096 floats / 16 KiB. Arithmetic
+and output are bit-identical; the smaller allocation admits another resident
+solve TG per core. Interleaved isolated A/B/A/B: dense solve 281.0/281.8 us,
+compact 254.5/254.0 us (**9.6% faster**); full DN chain 960.5/963.3 ->
+937.4/937.4 us. pp512 is a small but repeatable end-to-end movement: five-way
+interleaved medians 347.06 -> 346.46 ms (1475 -> 1478 tok/s, ~0.17%).
+
+All acceptance gates green: scalar-projection prefillcmp 36/36 TOKEN-EXACT
+(worst rel 7.9e-7); dncmp all PASS for kDiv 0 and 2; block/ablock PASS; ids3
+20-token decode exact; serve-test 8-slot identical YES; prefilldecode HANDOFF
+EXACT.
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
