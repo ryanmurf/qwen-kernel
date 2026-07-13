@@ -160,3 +160,148 @@ kernel void fa_attn_srv(device const float* qhat    [[buffer(0)]],
         att[qho + h * dh + t] = o * (1.0f / (1.0f + exp(-g)));
     }
 }
+
+// Split-K (flash-decoding) variant of fa_attn_srv. Each split threadgroup
+// processes one 256-key chunk and leaves an unnormalized (acc, m, l) partial
+// for fa_attn_srv_reduce to merge.
+constant uint CK = 256u;
+
+struct FaSplitPC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+    uint maxChunks;
+};
+
+kernel void fa_attn_srv_split(device const float* qhat    [[buffer(0)]],
+                              device const float* kc      [[buffer(1)]],
+                              device const float* vc      [[buffer(2)]],
+                              device float*       partial [[buffer(3)]],
+                              device const uint*  slotPos [[buffer(4)]],
+                              constant FaSplitPC& pc      [[buffer(5)]],
+                              uint3 tid3  [[thread_position_in_threadgroup]],
+                              uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    const uint h  = tgpig.x;
+    const uint c  = tgpig.y;
+    const uint rq = tgpig.z;
+    const uint p0 = c * CK;
+    const uint n  = slotPos[rq] + 1u;
+    if (p0 >= n) return;
+
+    const uint t  = tid3.x;
+    const uint dh = pc.dh;
+    const uint ts = min(CK, n - p0);
+    const uint kv = h / (pc.hQ / pc.hKV);
+    const uint kvo = rq * pc.hKV * pc.tmax * dh;
+    const uint qho = rq * pc.hQ * dh;
+
+    threadgroup float q[256];
+    threadgroup float sc[256];
+    threadgroup float red[256];
+
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float qs = rsqrt(float(dh));
+    if (t < ts) {
+        float score = 0.0f;
+        device const float* kb = kc + kvo + (kv * pc.tmax + (p0 + t)) * dh;
+        for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+        sc[t] = score * qs;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    red[t] = (t < ts) ? sc[t] : -3.4e38f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float mLocal = red[0];
+    if (t < ts) sc[t] = exp(sc[t] - mLocal);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    red[t] = (t < ts) ? sc[t] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint partialStride = dh + 2u;
+    const uint partialBase = ((rq * pc.hQ + h) * pc.maxChunks + c) * partialStride;
+    if (t < dh) {
+        float accLocal = 0.0f;
+        for (uint j = 0u; j < ts; ++j) {
+            accLocal += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+        }
+        partial[partialBase + t] = accLocal;
+    }
+    if (t == 0u) {
+        partial[partialBase + dh] = mLocal;
+        partial[partialBase + dh + 1u] = red[0];
+    }
+}
+
+kernel void fa_attn_srv_reduce(device const float* partial [[buffer(0)]],
+                               device const float* qfull   [[buffer(1)]],
+                               device float*       att     [[buffer(2)]],
+                               device const uint*  slotPos [[buffer(3)]],
+                               constant FaSplitPC& pc      [[buffer(4)]],
+                               uint3 tid3  [[thread_position_in_threadgroup]],
+                               uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    const uint h  = tgpig.x;
+    const uint t  = tid3.x;
+    const uint rq = tgpig.z;
+    const uint dh = pc.dh;
+    const uint n  = slotPos[rq] + 1u;
+    const uint nc = (n + CK - 1u) / CK;
+    const uint partialStride = dh + 2u;
+    const uint partialBase = (rq * pc.hQ + h) * pc.maxChunks * partialStride;
+
+    threadgroup float red[256];
+    threadgroup float globalM;
+    threadgroup float globalL;
+
+    float laneM = -3.4e38f;
+    for (uint c = t; c < nc; c += 256u) {
+        laneM = max(laneM, partial[partialBase + c * partialStride + dh]);
+    }
+    red[t] = laneM;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) globalM = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float laneL = 0.0f;
+    for (uint c = t; c < nc; c += 256u) {
+        const uint cb = partialBase + c * partialStride;
+        laneL += partial[cb + dh + 1u] * exp(partial[cb + dh] - globalM);
+    }
+    red[t] = laneL;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) globalL = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (t < dh) {
+        float numerator = 0.0f;
+        for (uint c = 0u; c < nc; ++c) {
+            const uint cb = partialBase + c * partialStride;
+            numerator += partial[cb + t] * exp(partial[cb + dh] - globalM);
+        }
+        const uint qfo = rq * pc.hQ * 2u * dh;
+        const uint qho = rq * pc.hQ * dh;
+        const float g = qfull[qfo + h * 2u * dh + dh + t];
+        att[qho + h * dh + t] = (numerator / globalL) *
+                                (1.0f / (1.0f + exp(-g)));
+    }
+}
