@@ -16,7 +16,8 @@
 //   qk slotcmp <ids> <nGen> [nSlots] [tmax]  slot compaction/churn exactness
 //
 // Env: QK_DEVICE=<n> device index; QK_SHADER_DIR (dir with *.metal);
-//      QK_GGUF=<path>; QK_KV_F16=1 or QK_KV_Q8=1 selects a lossy KV tier.
+//      QK_GGUF=<path>; QK_KV_F16=1 or QK_KV_Q8=1 selects a lossy KV tier;
+//      QK_PREFILL_REPACK=1 trades 1.27 GiB for K-major 35B prefill weights.
 //
 // MSL is compiled at runtime from shaders/metal/*.metal (no offline metal
 // toolchain needed — mirrors the Vulkan loadSpv flow, QK_SHADER_DIR wins).
@@ -2667,7 +2668,8 @@ struct qk_engine {
         pAttnSplit, pAttnReduce, pMoeS,
         pMoeLA, pMoeLS, pAddNSg, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
-        pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBAligned;
+        pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB,
+        pGemmB, pGemmBAligned, pGemmBK;
     // Adaptive decode attention either coarsens f32 producer scheduling or
     // shares compact-cache reads across GQA heads. Both retain one original
     // 256-key partial per query head/chunk and the shipping reducer.
@@ -2708,6 +2710,8 @@ struct qk_engine {
     bool gemvFast = true;
     bool iq4FixedK = true;
     uint32_t slotBatchN = 0;
+    bool prefillRepack = false;
+    bool prefillRepackUse = true;
 
     struct Layer {
         bool rec = false, downQ6 = false;
@@ -2718,6 +2722,9 @@ struct qk_engine {
         WB qkvW{nil}, zW{nil}, alW{nil}, beW{nil}, dt{nil}, av{nil}, ker{nil},
            sn{nil}, outW{nil};                                       // rec
         WB wq{nil}, wk{nil}, wv{nil}, qn{nil}, kn{nil}, wo{nil};     // attn
+        // Prefill-only K-major copies. Decode keeps the native GGUF row-major
+        // tensors above so every GEMV continues to stream complete rows.
+        WB qkvP{nil}, zP{nil}, outP{nil}, wqP{nil}, wkP{nil}, wvP{nil}, woP{nil};
         WB mgi{nil}, mgis{nil}, mge{nil}, mue{nil}, mde{nil}, mgs{nil},
            mus{nil}, mds{nil};                                       // moe
         id<MTLBuffer> st1, st2;      // per-slot state: rec=(conv,S) attn=(kc,vc)
@@ -3154,6 +3161,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                     atoi(getenv("QK_PCACHE_COMPACT")) != 0;
     kvQ8 = getenv("QK_KV_Q8") && atoi(getenv("QK_KV_Q8")) != 0;
     kvF16 = !kvQ8 && getenv("QK_KV_F16") && atoi(getenv("QK_KV_F16")) != 0;
+    prefillRepack = getenv("QK_PREFILL_REPACK") &&
+                    atoi(getenv("QK_PREFILL_REPACK")) != 0;
+    if (const char* v = getenv("QK_PREFILL_REPACK_USE"))
+        prefillRepackUse = atoi(v) != 0;
     kvBytes = kvQ8 ? 1u : kvF16 ? 2u : 4u;
     kvRowBytes = kvQ8 ? 272u : dh * kvBytes;
     specOn = getenv("QK_SPEC") != nullptr;
@@ -3312,6 +3323,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (nExp < nUsed || nExp > 512 || ffE % 256 != 0)
             return fail("qk_open: expert shape unsupported (n_expert <= 512, n_ff_exp %% 256)");
         guIq4 = tge0->type == GGML_IQ4_XS;   // uniform per file (loadMoeT re-checks per layer)
+    }
+    if (prefillRepack && guIq4) {
+        fprintf(stderr, "qk_open: QK_PREFILL_REPACK is Q8-only; disabled for IQ4 model\n");
+        prefillRepack = false;
     }
     const size_t rbQ8e = ggmlRowBytes(GGML_Q8_0, nEmbd);
     const size_t rbQ8i = ggmlRowBytes(GGML_Q8_0, dIn);
@@ -3509,6 +3524,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (const char* v = getenv("QK_GEMM_ALIGNED")) gemmAligned = atoi(v) != 0;
         if (gemmAligned && !strcmp(fn, "gemm_q8_0_hp"))
             pGemmBAligned = getPipe(c, "gemm_q8_0", "gemm_q8_0_hp_aligned", 0);
+        if (prefillRepack && !strcmp(fn, "gemm_q8_0_hp"))
+            pGemmBK = getPipe(c, "gemm_q8_0", "gemm_q8_0_hp_kmajor", 0);
         gemmThreads = !strcmp(fn, "gemm_q8_0_sg") ? 128 : 256;  // sg is 4-simd; scalar+h are 256
         if (!strcmp(fn, "gemm_q8_0_h2")) { gemmBM = 64; gemmBN = 128; }
         if (!strcmp(fn, "gemm_q8_0_hp")) { gemmBM = 64; gemmBN = 32; gemmThreads = 128; }
@@ -3918,6 +3935,69 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         L.mus = W(moe.us, (size_t)moe.nFf * moe.rbGS);
         L.mds = W(moe.ds, (size_t)moe.nEmbd * moe.rbDS);
         if (denseBad) return fail("qk_open: dense projection tensor missing or bad type");
+    }
+    if (prefillRepack && pGemmBK) {
+        auto align256 = [](size_t x) { return (x + 255u) & ~(size_t)255u; };
+        size_t packedBytes = 0;
+        auto reserveQ8 = [&](bool iq4, uint32_t M, uint32_t K) {
+            if (!iq4) packedBytes = align256(packedBytes) +
+                                    (size_t)M * (K / 32u) * sizeof(block_q8_0);
+        };
+        for (uint32_t il = lFirst; il < lEnd; ++il) {
+            const Layer& L = layers[il];
+            if (L.rec) {
+                reserveQ8(L.iq4P1, chQkv, nEmbd);
+                reserveQ8(L.iq4P2, dIn, nEmbd);
+                reserveQ8(L.iq4Wo, nEmbd, dIn);
+            } else {
+                reserveQ8(L.iq4P1, chQkv, nEmbd);
+                reserveQ8(L.iq4P2, hKV * dh, nEmbd);
+                reserveQ8(L.iq4P3, hKV * dh, nEmbd);
+                reserveQ8(L.iq4Wo, nEmbd, dIn);
+            }
+        }
+        if (packedBytes > c.dev.maxBufferLength) {
+            fprintf(stderr,
+                    "qk_open: QK_PREFILL_REPACK needs %.2f GiB, above maxBufferLength; disabled\n",
+                    packedBytes / 1073741824.0);
+            prefillRepack = false;
+        } else {
+            const auto t0 = std::chrono::steady_clock::now();
+            id<MTLBuffer> packed = createBuf(c, packedBytes, nullptr, true);
+            size_t cursor = 0;
+            auto packQ8 = [&](WB src, WB& dst, bool iq4, uint32_t M, uint32_t K) {
+                if (iq4) return;
+                cursor = align256(cursor);
+                dst = WB{packed, (NSUInteger)cursor};
+                const uint32_t kb = K / 32u;
+                const block_q8_0* s = (const block_q8_0*)
+                    ((const uint8_t*)src.b.contents + src.o);
+                block_q8_0* d = (block_q8_0*)((uint8_t*)packed.contents + cursor);
+                for (uint32_t b = 0; b < kb; ++b)
+                    for (uint32_t m = 0; m < M; ++m)
+                        d[(size_t)b * M + m] = s[(size_t)m * kb + b];
+                cursor += (size_t)M * kb * sizeof(block_q8_0);
+            };
+            for (uint32_t il = lFirst; il < lEnd; ++il) {
+                Layer& L = layers[il];
+                if (L.rec) {
+                    packQ8(L.qkvW, L.qkvP, L.iq4P1, chQkv, nEmbd);
+                    packQ8(L.zW, L.zP, L.iq4P2, dIn, nEmbd);
+                    packQ8(L.outW, L.outP, L.iq4Wo, nEmbd, dIn);
+                } else {
+                    packQ8(L.wq, L.wqP, L.iq4P1, chQkv, nEmbd);
+                    packQ8(L.wk, L.wkP, L.iq4P2, hKV * dh, nEmbd);
+                    packQ8(L.wv, L.wvP, L.iq4P3, hKV * dh, nEmbd);
+                    packQ8(L.wo, L.woP, L.iq4Wo, nEmbd, dIn);
+                }
+            }
+            if (cursor != packedBytes) return fail("qk_open: prefill repack size mismatch");
+            extraBufs.push_back(packed);
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "qk_open: prefill K-major Q8 %.2f GiB packed in %.1f ms\n",
+                    packedBytes / 1073741824.0, ms);
+        }
     }
     if (carryCursor != sCarry) return fail("qk_open: recurrent carry layout mismatch");
     if (getenv("QK_MEM_STATS"))
@@ -4758,7 +4838,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         struct { uint32_t M, K, N; } pcG;
 
         // projection: tiled GEMM for n>=48 (weight reads amortized), else z=n GEMV
-        auto proj = [&](WB W, id<MTLBuffer> X, id<MTLBuffer> Y,
+        auto proj = [&](WB W, WB WP, id<MTLBuffer> X, id<MTLBuffer> Y,
                         uint32_t M, uint32_t K, bool isOut, bool iq4) {
             if (skProj) return;
             if (n >= 48) {
@@ -4767,6 +4847,10 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     dspz(pGemmB4Aligned && M % 64u == 0u && n % 32u == 0u
                              ? pGemmB4Aligned : pGemmB4,
                          {W, X, Y}, &pcG, 12, (M + 63) / 64, 128, (n + 31) / 32);
+                else if (prefillRepack && prefillRepackUse && WP.b && pGemmBK &&
+                         M % 64u == 0u && n % 32u == 0u)
+                    dspz(pGemmBK, {WP, X, Y}, &pcG, 12,
+                         M / 64u, 128, n / 32u);
                 else
                     dspz(pGemmBAligned && M % 64u == 0u && n % 32u == 0u
                              ? pGemmBAligned : pGemmB,
@@ -4801,8 +4885,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         for (uint32_t il = lFirst; il < lEnd; il++) {
             Layer& L = layers[il];
             if (L.rec) {
-                proj(L.qkvW, bbXn, bbBig, chQkv, nEmbd, false, L.iq4P1);
-                proj(L.zW, bbXn, bbMid, dIn, nEmbd, false, L.iq4P2);
+                proj(L.qkvW, L.qkvP, bbXn, bbBig, chQkv, nEmbd, false, L.iq4P1);
+                proj(L.zW, L.zP, bbXn, bbMid, dIn, nEmbd, false, L.iq4P2);
                 dspz(pAbB, {bbXn, L.alW, L.beW, L.dt, L.av, bbGb}, &pcAbB, 12,
                      (2 * hV + nsg - 1) / nsg, thrN, n);
                 bar();
@@ -4882,11 +4966,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 }
                 bar();
                 }
-                proj(L.outW, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
+                proj(L.outW, L.outP, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
             } else {
-                proj(L.wq, bbXn, bbBig, chQkv, nEmbd, false, L.iq4P1);
-                proj(L.wk, bbXn, bbKin, hKV * dh, nEmbd, false, L.iq4P2);
-                proj(L.wv, bbXn, bbVin, hKV * dh, nEmbd, false, L.iq4P3);
+                proj(L.wq, L.wqP, bbXn, bbBig, chQkv, nEmbd, false, L.iq4P1);
+                proj(L.wk, L.wkP, bbXn, bbKin, hKV * dh, nEmbd, false, L.iq4P2);
+                proj(L.wv, L.wvP, bbXn, bbVin, hKV * dh, nEmbd, false, L.iq4P3);
                 bar();
                 if (!skAttn) {
                 for (uint32_t q = 0; q < nSeq; ++q) {
@@ -4927,7 +5011,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 }
                 bar();
                 }
-                proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
+                proj(L.wo, L.woP, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
             }
             bar();
             if (useGrouped) {
@@ -5335,14 +5419,26 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
     if (gv && !strcmp(gv, "h2")) fn = "gemm_q8_0_h2";
     if (gv && !strcmp(gv, "hp")) fn = "gemm_q8_0_hp";
     if (gv && !strcmp(gv, "hpa")) fn = "gemm_q8_0_hp_aligned";
+    if (gv && !strcmp(gv, "kma")) fn = "gemm_q8_0_hp_kmajor";
     bool scalar = !strcmp(fn, "gemm_q8_0");
     const bool aligned = !strcmp(fn, "gemm_q8_0_hp_aligned");
-    const bool hp = !strcmp(fn, "gemm_q8_0_hp") || !strcmp(fn, "gemm_q8_0_hp_aligned");
+    const bool kmajor = !strcmp(fn, "gemm_q8_0_hp_kmajor");
+    const bool hp = !strcmp(fn, "gemm_q8_0_hp") || !strcmp(fn, "gemm_q8_0_hp_aligned") || kmajor;
     const uint32_t tBM = !strcmp(fn, "gemm_q8_0_h2") ? 64 : hp ? 64 : 128;
     const uint32_t tBN = !strcmp(fn, "gemm_q8_0_h2") ? 128 : hp ? 32 : 64;
     id<MTLComputePipelineState> pso = getPipe(c, "gemm_q8_0", fn, 0);
     printf("variant: %s\n", fn);
-    id<MTLBuffer> bW = createBuf(c, nb * sizeof(block_q8_0), blocks.data());
+    std::vector<block_q8_0> kmajorBlocks;
+    const block_q8_0* candidateBlocks = blocks.data();
+    if (kmajor) {
+        const uint32_t kb = K / 32u;
+        kmajorBlocks.resize(nb);
+        for (uint32_t b = 0; b < kb; ++b)
+            for (uint32_t m = 0; m < M; ++m)
+                kmajorBlocks[(size_t)b * M + m] = blocks[(size_t)m * kb + b];
+        candidateBlocks = kmajorBlocks.data();
+    }
+    id<MTLBuffer> bW = createBuf(c, nb * sizeof(block_q8_0), candidateBlocks);
     id<MTLBuffer> bX = createBuf(c, X.size() * 4, X.data());
     id<MTLBuffer> bY = createBuf(c, yref.size() * 4);
     struct { uint32_t M, K, N; } pc{M, K, N};
@@ -5361,15 +5457,17 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
         enc1(enc);
         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
     }
-    if (aligned) {
+    if (aligned || kmajor) {
         id<MTLBuffer> bSafe = createBuf(c, yref.size() * 4);
+        id<MTLBuffer> bSafeW = kmajor
+            ? createBuf(c, nb * sizeof(block_q8_0), blocks.data()) : bW;
         id<MTLComputePipelineState> pSafe =
             getPipe(c, "gemm_q8_0", "gemm_q8_0_hp", 0);
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [c.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pSafe];
-            [enc setBuffer:bW offset:0 atIndex:0];
+            [enc setBuffer:bSafeW offset:0 atIndex:0];
             [enc setBuffer:bX offset:0 atIndex:1];
             [enc setBuffer:bSafe offset:0 atIndex:2];
             [enc setBytes:&pc length:12 atIndex:3];
@@ -5381,8 +5479,36 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
         const uint32_t* ys = (const uint32_t*)bSafe.contents;
         size_t mismatches = 0;
         for (size_t i = 0; i < yref.size(); ++i) mismatches += ya[i] != ys[i];
-        printf("aligned-vs-safe: %zu/%zu bit mismatches -> %s\n",
-               mismatches, yref.size(), mismatches ? "FAIL" : "EXACT");
+        printf("%s-vs-safe: %zu/%zu bit mismatches -> %s\n",
+               kmajor ? "kmajor" : "aligned", mismatches, yref.size(),
+               mismatches ? "FAIL" : "EXACT");
+        if (kmajor && iters) {
+            auto timed = [&](id<MTLComputePipelineState> pipe, id<MTLBuffer> weights,
+                             id<MTLBuffer> out) -> double {
+                @autoreleasepool {
+                    id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    for (uint32_t i = 0; i < iters; ++i) {
+                        [enc setComputePipelineState:pipe];
+                        [enc setBuffer:weights offset:0 atIndex:0];
+                        [enc setBuffer:bX offset:0 atIndex:1];
+                        [enc setBuffer:out offset:0 atIndex:2];
+                        [enc setBytes:&pc length:12 atIndex:3];
+                        [enc dispatchThreadgroups:MTLSizeMake((M + 63u) / 64u, 1,
+                                                              (N + 31u) / 32u)
+                            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    }
+                    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / iters;
+                }
+            };
+            const double a0 = timed(pSafe, bSafeW, bSafe);
+            const double b0 = timed(pso, bW, bY);
+            const double b1 = timed(pso, bW, bY);
+            const double a1 = timed(pSafe, bSafeW, bSafe);
+            printf("layout bracket us: row %.1f / kmajor %.1f %.1f / row %.1f\n",
+                   a0, b0, b1, a1);
+        }
     }
     const float* yg = (const float*)bY.contents;
     double rms = 0;
