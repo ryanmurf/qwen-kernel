@@ -89,3 +89,87 @@ kernel void gemv_q6_k(device const block_q6_K* wb  [[buffer(0)]],
         if (slid == 0) y[(ulong)rq * M + first_row + row] = s;
     }
 }
+
+// Eight-query decode fast path. Quant bytes/scales are loaded once per row
+// and reused across all slot activations; the lane/block traversal and final
+// simd_sum match gemv_q6_k.
+kernel void gemv_q6_k_b8(device const block_q6_K* wb [[buffer(0)]],
+                         device const float*      x  [[buffer(1)]],
+                         device float*            y  [[buffer(2)]],
+                         constant uint2&          mk [[buffer(3)]],
+                         uint3 tgpig [[threadgroup_position_in_grid]],
+                         uint  sgid  [[simdgroup_index_in_threadgroup]],
+                         uint  slid  [[thread_index_in_simdgroup]])
+{
+    const uint M = mk.x;
+    const uint K = mk.y;
+    const uint nb = K / 256u;
+    const uint first_row = (tgpig.x * NSG + sgid) * 2u;
+    if (first_row >= M) return;
+    const uint nrow = min(2u, M - first_row);
+
+    const short tid = slid / 2;
+    const short ix  = slid % 2;
+    const short ip  = tid / 8;
+    const short il  = tid % 8;
+    const short l0  = 4 * il;
+    const short is  = 8 * ip + l0 / 16;
+    const uint y_offset   = 128u * ip + l0;
+    const uint q_offset_l =  64u * ip + l0;
+    const uint q_offset_h =  32u * ip + l0;
+
+    float sumf[8][2];
+#pragma unroll
+    for (uint rq = 0u; rq < 8u; ++rq) {
+        sumf[rq][0] = 0.0f;
+        sumf[rq][1] = 0.0f;
+    }
+
+    for (uint i = ix; i < nb; i += 2u) {
+        uchar4 q1v[2], q2v[2], qhv[2];
+        float4 dsc[2];
+        for (uint row = 0u; row < nrow; ++row) {
+            device const block_q6_K& blk = wb[(ulong)(first_row + row) * nb + i];
+            q1v[row] = uchar4(*(device const packed_uchar4*)(blk.ql + q_offset_l));
+            q2v[row] = uchar4(*(device const packed_uchar4*)(blk.ql + q_offset_l + 32u));
+            qhv[row] = uchar4(*(device const packed_uchar4*)(blk.qh + q_offset_h));
+            device const char* sc = blk.scales + is;
+            dsc[row] = float(blk.d) * float4(float(sc[0]), float(sc[2]),
+                                              float(sc[4]), float(sc[6]));
+        }
+
+#pragma unroll
+        for (uint rq = 0u; rq < 8u; ++rq) {
+            device const float* yb = x + (ulong)rq * K + i * 256u + y_offset;
+            float yl[16];
+            for (short l = 0; l < 4; ++l) {
+                yl[4*l + 0] = yb[l +  0];
+                yl[4*l + 1] = yb[l + 32];
+                yl[4*l + 2] = yb[l + 64];
+                yl[4*l + 3] = yb[l + 96];
+            }
+            for (uint row = 0u; row < nrow; ++row) {
+                float4 sums = 0.0f;
+                for (short l = 0; l < 4; ++l) {
+                    sums[0] += yl[4*l + 0] *
+                        float((char)((q1v[row][l] & 0xFu) | ((qhv[row][l] & 0x03u) << 4u)) - 32);
+                    sums[1] += yl[4*l + 1] *
+                        float((char)((q2v[row][l] & 0xFu) | ((qhv[row][l] & 0x0Cu) << 2u)) - 32);
+                    sums[2] += yl[4*l + 2] *
+                        float((char)((q1v[row][l] >> 4u) | ((qhv[row][l] & 0x30u) << 0u)) - 32);
+                    sums[3] += yl[4*l + 3] *
+                        float((char)((q2v[row][l] >> 4u) | ((qhv[row][l] & 0xC0u) >> 2u)) - 32);
+                }
+                sumf[rq][row] += dot(sums, dsc[row]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (uint rq = 0u; rq < 8u; ++rq) {
+        for (uint row = 0u; row < nrow; ++row) {
+            const float s = simd_sum(sumf[rq][row]);
+            if (slid == 0u) y[(ulong)rq * M + first_row + row] = s;
+        }
+    }
+}
