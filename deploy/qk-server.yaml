@@ -26,7 +26,9 @@ spec:
     metadata:
       labels:
         app: qk-server
-        gpu-llm: server   # shared label: the gemma-server Service selects this, so scaling flips traffic
+        # NB deliberately NOT gpu-llm: server since the 2026-07-12 both-live
+        # cutover — gemma-server routes to the switched backend (the 80B
+        # split); this pod is reached via the dedicated qk-35b Service.
     spec:
       containers:
       - name: qk-server
