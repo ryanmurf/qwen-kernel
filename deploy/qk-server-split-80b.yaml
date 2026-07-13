@@ -67,11 +67,12 @@ spec:
         - --split-next
         - REDACTED-LAN-IP:18200
         env:
-        # Pin the head to the 7900 XT — the XTX (1a:00.0) hosts the 35B
-        # full-time since 2026-07-12; first-discrete enumeration order is a
-        # boot-flip away from grabbing the wrong card. Needs image >= 6135b97.
+        # Pin the head to the 7900 XTX (24 GB). Since 2026-07-13 the XT
+        # (03:00.0) is the AUDIO card (kokoro TTS + whisper STT, coord-2's
+        # domain) — LLM backends live on the XTX, one at a time, and the
+        # 35B (also XTX-pinned) is a switched alternative to this backend.
         - name: QK_DEVICE_PCI
-          value: "03:00.0"
+          value: "1a:00.0"
         - name: QK_LAYERS
           value: "0:12"
         # Snapshot ENTRY COUNT for split cross-turn reuse (qk_state_n). Each

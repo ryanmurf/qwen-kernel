@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Backend switching for the gemma-server Service (selects `gpu-llm: server`).
-# Since the 2026-07-12 both-live cutover, tron has TWO discrete GPUs:
-#   - 7900 XTX (1a:00.0): qk-server — the 35B, ALWAYS-ON, reached via the
-#     dedicated qk-35b Service. Managed here with 35b-up/35b-down only;
-#     switching the main backend never touches it.
-#   - 7900 XT (03:00.0): the switched backends below share THIS card (plus
-#     midnight for the split ones) — still exactly ONE of them at a time.
+# Card roles since 2026-07-13 (Ryan's call: "audio on the XT, 80B on
+# XTX+midnight, don't care about the 35B"):
+#   - 7900 XT (03:00.0): AUDIO ONLY (kokoro TTS + whisper STT, coord-2's
+#     domain). No LLM backend may load here. DPM pin stays.
+#   - 7900 XTX (1a:00.0): the LLM card — 80B split head (default) or the
+#     35B (qk-server, on-demand via 35b-up), ONE at a time; both pinned
+#     1a:00.0. gemma-server (llama.cpp fallback) is UNPINNED and would
+#     land on the XT — do not scale it up while audio owns that card.
 #   ./switch.sh split80 -> qk-server-split-80b (80B: XT head [0,12) +
 #                          midnight :18200 pipe-worker, QK_PCACHE=6 BOTH sides)
 #   ./switch.sh split   -> qk-server-split (35B: XT head + midnight :18100)
@@ -17,7 +19,7 @@
 # vram_used matches the expected resident set before trusting benchmarks.
 set -euo pipefail
 NS=gemma
-SWITCHED="gemma-server qk-server-split qk-server-split-80b"
+SWITCHED="gemma-server qk-server-split qk-server-split-80b qk-server"
 up() {
   for d in $SWITCHED; do
     [ "$d" = "$1" ] || kubectl scale deploy "$d" -n $NS --replicas=0 2>/dev/null || true
