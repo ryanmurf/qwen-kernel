@@ -2271,9 +2271,13 @@ struct qk_engine {
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
         bbAV, bbAI, bbTok;
-    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4, pMoeGuG5,
-        pMoeDG4, pMoeDG6, pMoeDGH4, pMoeDGH6, pMoeDGP4, pMoeDGP6, pMoeDR, pLogG;
-    id<MTLBuffer> bbStart, bbATok, bbASlot, bbMDy;
+    id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGrpLive,
+        pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4, pMoeGuG4Live,
+        pMoeGuG5, pMoeGuG5Live,
+        pMoeDG4, pMoeDG6, pMoeDG4Live, pMoeDG6Live,
+        pMoeDGH4, pMoeDGH6, pMoeDGP4, pMoeDGP6,
+        pMoeDGP4Live, pMoeDGP6Live, pMoeDR, pLogG;
+    id<MTLBuffer> bbStart, bbATok, bbASlot, bbLive, bbMDy;
     // Grouped (decode-once) MoE gate+up for prefill chunks. Variants:
     // 1 = v1 read-once (SLOWER — kept as bit-exact control); 2 = v2 f32
     // narrow; 3 = v3 f16 64x32 (llama mul_mm_id class — fastest, opt-in);
@@ -2283,6 +2287,11 @@ struct qk_engine {
     // QK_MOE_GROUP_N overrides the threshold.
     int moeGrouped = 4;
     uint32_t moeGroupN = 192;
+    int moeSlotGrouped = 0;  // 35B default v4; env 0..5 selects/rolls back
+    int moeSlotParts = 3;    // bit 0=gate/up, bit 1=down
+    bool moeSlotLive = true;
+    uint32_t moeSlotMin = 8;
+    bool moeSlotSameOnly = true;
 
     struct Slot {
         bool active = false;
@@ -2298,6 +2307,7 @@ struct qk_engine {
         // Latest earlier occurrence of each specL-token gram in prompt+output.
         std::unordered_map<uint64_t, uint32_t> ngram;
         uint32_t ngramBuilt = 0;
+        uint64_t equivId = 0;  // exact-prompt trajectory class for MoE compaction
         uint32_t specRounds = 0, specFed = 0, specEmitted = 0, serialSteps = 0;
         void resetSpec() {
             outQ.clear();
@@ -2309,6 +2319,7 @@ struct qk_engine {
         }
     };
     std::vector<Slot> slots;
+    uint64_t equivClock = 0;
     bool specOn = false;
     uint32_t specL = 6, specK = 8;
     std::vector<uint32_t> specToks, specAm;
@@ -2349,7 +2360,8 @@ struct qk_engine {
     void verifyRound(const uint32_t* toks, uint32_t n, uint32_t slot, uint32_t base,
                      uint32_t* outIds);
     void promoteScratch(uint32_t slot) { copyDnStripes(nSlots, slot); }
-    void encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim);
+    void encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
+                    bool equivalentSlots = false);
 };
 
 void qk_engine::resetSlot(uint32_t slot) {
@@ -2700,11 +2712,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (!strcmp(fn, "gemm_q8_0_hp")) { gemmBM = 64; gemmBN = 32; gemmThreads = 128; }
     }
     pMoeGrp  = getPipe(c, "moe_grouped", "moe_group", 0);
+    pMoeGrpLive = getPipe(c, "moe_grouped", "moe_group_live", 0);
     pMoeGuG  = getPipe(c, "moe_grouped", "moe_gu_grouped", nsg);
     pMoeGuG2 = getPipe(c, "moe_grouped", "moe_gu_grouped2", 0);
     pMoeGuG3 = getPipe(c, "moe_grouped", "moe_gu_grouped3", 0);
     pMoeGuG4 = getPipe(c, "moe_grouped", "moe_gu_grouped4", 0);
+    pMoeGuG4Live = getPipe(c, "moe_grouped", "moe_gu_grouped4_live", 0);
     pMoeGuG5 = getPipe(c, "moe_grouped", "moe_gu_grouped5", 0);
+    pMoeGuG5Live = getPipe(c, "moe_grouped", "moe_gu_grouped5_live", 0);
     if (guIq4) {
         pGemv4    = getPipe(c, "gemv_iq4_xs", "gemv_iq4_xs", 2);   // NSG=2: 64 thr, 4 rows/tg
         pGemmB4   = getPipe(c, "gemm_iq4_xs", "gemm_iq4_xs_hp", 0);
@@ -2714,14 +2729,35 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
     pMoeDG4  = getPipe(c, "moe_down_grouped", "moe_down_grouped_iq4", 0);
     pMoeDG6  = getPipe(c, "moe_down_grouped", "moe_down_grouped_q6k", 0);
+    pMoeDG4Live = getPipe(c, "moe_down_grouped", "moe_down_grouped_live_iq4", 0);
+    pMoeDG6Live = getPipe(c, "moe_down_grouped", "moe_down_grouped_live_q6k", 0);
     pMoeDGH4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_iq4", 0);
     pMoeDGH6 = getPipe(c, "moe_down_grouped", "moe_down_grouped_h_q6k", 0);
     pMoeDGP4 = getPipe(c, "moe_down_grouped", "moe_down_grouped_p_iq4", 0);
     pMoeDGP6 = getPipe(c, "moe_down_grouped", "moe_down_grouped_p_q6k", 0);
+    pMoeDGP4Live = getPipe(c, "moe_down_grouped", "moe_down_grouped_p_live_iq4", 0);
+    pMoeDGP6Live = getPipe(c, "moe_down_grouped", "moe_down_grouped_p_live_q6k", 0);
     pMoeDR   = getPipe(c, "moe_down_grouped", "moe_down_reduce", 0);
     pLogG    = getPipe(c, "moe_logits", "moe_logits_gemm", 0);
     if (const char* mg = getenv("QK_MOE_GROUPED")) { moeGrouped = atoi(mg); moeGroupN = 0; }
     if (const char* mn = getenv("QK_MOE_GROUP_N")) moeGroupN = (uint32_t)atoi(mn);
+    // The compact decode gate/up kernels currently implement the 35B IQ3
+    // routed layout only. Keep other 256-expert layouts on their native path.
+    const bool slotGroupedFormat = nExp == 256 && !guIq4;
+    moeSlotGrouped = slotGroupedFormat ? 4 : 0;
+    if (const char* ms = getenv("QK_MOE_SLOT_GROUPED")) {
+        int v = atoi(ms);
+        if (v >= 0 && v <= 5 && (v == 0 || slotGroupedFormat)) moeSlotGrouped = v;
+        else fprintf(stderr,
+            "QK_MOE_SLOT_GROUPED=%d ignored (requires 0..5 and 256-expert IQ3 gate/up)\n", v);
+    }
+    if (const char* mp = getenv("QK_MOE_SLOT_PARTS")) moeSlotParts = atoi(mp) & 3;
+    if (const char* ml = getenv("QK_MOE_SLOT_LIVE")) moeSlotLive = atoi(ml) != 0;
+    if (const char* mm = getenv("QK_MOE_SLOT_MIN")) {
+        uint32_t v = (uint32_t)atoi(mm);
+        if (v >= 1) moeSlotMin = v;
+    }
+    if (const char* mf = getenv("QK_MOE_SLOT_FORCE")) moeSlotSameOnly = atoi(mf) == 0;
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 float4s");
 
     bXin = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
@@ -2808,6 +2844,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbStart = createBuf(c, (size_t)(nExp + 2) * 4, nullptr, true);
     bbATok = createBuf(c, (size_t)cap * (nUsed + 1) * 4, nullptr, true);
     bbASlot = createBuf(c, (size_t)cap * (nUsed + 1) * 4, nullptr, true);
+    bbLive = createBuf(c, ((size_t)cap * nUsed + 1) * 4, nullptr, true);
     bbMDy = createBuf(c, (size_t)cap * (nUsed + 1) * nEmbd * 4, nullptr, true);
     bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, nullptr, true);
     memset(bbCarry.contents, 0, (size_t)nLayer * chQkv * 3 * 4);
@@ -2962,7 +2999,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
 
 // Encode one serial decode/prefill step for slots [0, zdim): embed(+L0 norm)
 // -> 40 layers (srv attention) -> head -> argmax into bTok.
-void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
+void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
+                           bool equivalentSlots) {
     auto dsp = [&](id<MTLComputePipelineState> pso,
                    std::initializer_list<WB> bufs,
                    const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr,
@@ -3077,11 +3115,99 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
         bar();
         dsp(pMoeS, {bML, bMSel}, &pcv, 16, 1, 32);
         bar();
-        dsp(guIq4 ? pMoeGu4 : pMoeGu, {L.mge, L.mue, L.mgs, L.mus, bXn2, bMSel, bMH},
-            &pcv, 16, ((nUsed + 1) * ffE + nsg - 1) / nsg, thrN);
+        const bool slotGrouped = moeSlotGrouped && moeSlotParts && zdim >= moeSlotMin &&
+            (!moeSlotSameOnly || equivalentSlots);
+        const bool compactLive = slotGrouped &&
+            (moeSlotGrouped == 4 || moeSlotGrouped == 5) && moeSlotLive;
+        const uint32_t maxLive = equivalentSlots ? nUsed + 1u : zdim * nUsed + 1u;
+        if (slotGrouped) {
+            struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, ffE, nExp, nUsed, zdim};
+            if (compactLive)
+                dsp(pMoeGrpLive, {bMSel, bbStart, bbATok, bbASlot, bbLive},
+                    &pcg, 20, 1, 256, 1);
+            else
+                dsp(pMoeGrp, {bMSel, bbStart, bbATok, bbASlot},
+                    &pcg, 20, 1, 256, 1);
+            bar();
+        }
+        if (slotGrouped && (moeSlotParts & 1)) {
+            if (moeSlotGrouped == 5) {
+                if (compactLive)
+                    dsp(pMoeGuG5Live,
+                        {L.mge, L.mue, L.mgs, L.mus, bXn2, bbStart, bbATok,
+                         bbASlot, bMH, bbLive}, &pcv, 16,
+                        maxLive * (ffE / 32), 128, (zdim + 31) / 32);
+                else
+                    dsp(pMoeGuG5,
+                        {L.mge, L.mue, L.mgs, L.mus, bXn2, bbStart, bbATok,
+                         bbASlot, bMH}, &pcv, 16,
+                        (nExp + 1) * (ffE / 32), 128, (zdim + 31) / 32);
+            }
+            else if (moeSlotGrouped == 4) {
+                if (compactLive)
+                    dsp(pMoeGuG4Live,
+                        {L.mge, L.mue, L.mgs, L.mus, bXn2, bbStart, bbATok,
+                         bbASlot, bMH, bbLive}, &pcv, 16,
+                        maxLive * (ffE / 32), 128, 1);
+                else
+                    dsp(pMoeGuG4,
+                        {L.mge, L.mue, L.mgs, L.mus, bXn2, bbStart, bbATok,
+                         bbASlot, bMH}, &pcv, 16,
+                        (nExp + 1) * (ffE / 32), 128, 1);
+            }
+            else if (moeSlotGrouped == 3)
+                dsp(pMoeGuG3, {L.mge, L.mue, L.mgs, L.mus, bXn2, bbStart, bbATok,
+                                bbASlot, bMH}, &pcv, 16,
+                    (nExp + 1) * (ffE / 64), 256, 1);
+            else if (moeSlotGrouped == 2)
+                dsp(pMoeGuG2, {L.mge, L.mue, L.mgs, L.mus, bXn2, bbStart, bbATok,
+                                bbASlot, bMH}, &pcv, 16,
+                    (nExp + 1) * (ffE / 32), 128, 1);
+            else
+                dsp(pMoeGuG, {L.mge, L.mue, L.mgs, L.mus, bXn2, bbStart, bbATok,
+                               bbASlot, bMH}, &pcv, 16,
+                    ((nExp + 1) * ffE + nsg - 1) / nsg, thrN, 1);
+        } else {
+            dsp(guIq4 ? pMoeGu4 : pMoeGu,
+                {L.mge, L.mue, L.mgs, L.mus, bXn2, bMSel, bMH}, &pcv, 16,
+                ((nUsed + 1) * ffE + nsg - 1) / nsg, thrN);
+        }
         bar();
-        dsp(L.downQ6 ? pMoeD6 : pMoeD4, {L.mde, L.mds, bMH, bMSel, bMY}, &pcv, 16,
-            (nEmbd + nsg - 1) / nsg, thrN);
+        if (slotGrouped && (moeSlotParts & 2)) {
+            if (moeSlotGrouped == 5) {
+                if (compactLive)
+                    dsp(L.downQ6 ? pMoeDGP6Live : pMoeDGP4Live,
+                        {L.mde, L.mds, bMH, bbStart, bbATok, bbASlot, bbMDy, bbLive},
+                        &pcv, 16, maxLive * (nEmbd / 64), 128,
+                        (zdim + 31) / 32);
+                else
+                    dsp(L.downQ6 ? pMoeDGP6 : pMoeDGP4,
+                        {L.mde, L.mds, bMH, bbStart, bbATok, bbASlot, bbMDy},
+                        &pcv, 16, (nExp + 1) * (nEmbd / 64), 128,
+                        (zdim + 31) / 32);
+            }
+            else if (moeSlotGrouped == 3)
+                dsp(L.downQ6 ? pMoeDGH6 : pMoeDGH4,
+                    {L.mde, L.mds, bMH, bbStart, bbATok, bbASlot, bbMDy}, &pcv, 16,
+                    (nExp + 1) * (nEmbd / 64), 256, 1);
+            else {
+                if (compactLive)
+                    dsp(L.downQ6 ? pMoeDG6Live : pMoeDG4Live,
+                        {L.mde, L.mds, bMH, bbStart, bbATok, bbASlot, bbMDy, bbLive},
+                        &pcv, 16, maxLive * (nEmbd / 32), 128, 1);
+                else
+                    dsp(L.downQ6 ? pMoeDG6 : pMoeDG4,
+                        {L.mde, L.mds, bMH, bbStart, bbATok, bbASlot, bbMDy},
+                        &pcv, 16, (nExp + 1) * (nEmbd / 32), 128, 1);
+            }
+            bar();
+            dsp(pMoeDR, {bbMDy, bMSel, bMY}, &pcv, 16,
+                (nEmbd + 255) / 256, 256);
+        } else {
+            dsp(L.downQ6 ? pMoeD6 : pMoeD4,
+                {L.mde, L.mds, bMH, bMSel, bMY}, &pcv, 16,
+                (nEmbd + nsg - 1) / nsg, thrN);
+        }
         bar();
         WB nextNorm = il + 1 < nLayer ? layers[il + 1].aNorm : bONorm;
         dsp(pAddN, {bY, bMY, nextNorm, bXin, bXn}, &pcRms, 8, 1, 256);
@@ -3262,12 +3388,26 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         }
         if (!nAct || !need) break;
 
+        bool equivalentSlots = moeSlotGrouped && maxZ >= 2 && nAct == (int)maxZ;
+        if (equivalentSlots) {
+            const Slot& r = slots[0];
+            for (uint32_t s = 1; s < maxZ; ++s) {
+                const Slot& q = slots[s];
+                if (!q.active || q.equivId != r.equivId || q.cursor != r.cursor ||
+                    q.pos != r.pos || q.genTokens.size() != r.genTokens.size() ||
+                    q.last != r.last) {
+                    equivalentSlots = false;
+                    break;
+                }
+            }
+        }
+
         @autoreleasepool {
             auto he0 = std::chrono::steady_clock::now();
             id<MTLCommandBuffer> cb = [c.queue commandBuffer];
             id<MTLComputeCommandEncoder> enc =
                 [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-            encodeStep(enc, maxZ);
+            encodeStep(enc, maxZ, equivalentSlots);
             [enc endEncoding];
             auto he1 = std::chrono::steady_clock::now();
             [cb commit];
@@ -3765,6 +3905,13 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     s.genTokens.clear();
     s.gen = 0; s.maxGen = max_gen; s.last = 0;
     s.resetSpec();
+    s.equivId = 0;
+    for (uint32_t i = 0; i < e->nSlots; ++i) {
+        if (i == slot || !e->slots[i].active || e->slots[i].prompt != s.prompt) continue;
+        s.equivId = e->slots[i].equivId;
+        break;
+    }
+    if (!s.equivId) s.equivId = ++e->equivClock;
     if (e->shareFork && snapPos == 0 && done > start) e->snapshotSlot(slot);
     return 0;
 }
@@ -3774,6 +3921,7 @@ void qk_slot_cancel(qk_engine* e, uint32_t slot) {
     if (e && slot < e->nSlots) {
         e->slots[slot].active = false;
         e->slots[slot].prompt.clear();
+        e->slots[slot].equivId = 0;
         e->slots[slot].resetSpec();
     }
 }
