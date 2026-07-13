@@ -2305,7 +2305,8 @@ struct qk_engine {
     id<MTLComputePipelineState> pGemvA, pGemvO, pGemvAB, pGemvOB,
         pAb, pStep, pPrep, pAttn,
         pAttnSplit, pAttnReduce, pMoeS,
-        pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadB, pAm1, pAm2, pEmb,
+        pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
+        pHeadTop64, pHeadTopReduce, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB;
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemmB4, pMoeGu4, pMoeGuG4i, pMoeGuG5i;
@@ -2353,7 +2354,7 @@ struct qk_engine {
     double lastCbGpu = 0, lastCbWall = 0;
     id<MTLBuffer> bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO,
         bbAtt, bbAttnOut, bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbLogits, bbIds, bbCarry,
-        bbAV, bbAI, bbTok;
+        bbAV, bbAI, bbTok, bbHeadV, bbHeadI;
     id<MTLComputePipelineState> pRms, pMoeGrp, pMoeGrpLive, pMoeGrpWork,
         pMoeGuG, pMoeGuG2, pMoeGuG3, pMoeGuG4, pMoeGuG4Live,
         pMoeGuG5, pMoeGuG5Live, pMoeGuG5Work,
@@ -2767,7 +2768,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeD6 = getPipe(c, "moe_down_all", "moe_down_all_q6k", nsg);
     pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     pHead  = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
-    pHeadB = getPipe(c, "head_q6", "head_q6_gemm_b8_f32", 0);
+    pHeadTop = getPipe(c, "head_q6", "head_q6_gemm_b8_top1_f32", 0);
+    pHeadTop64 = getPipe(c, "head_q6", "head_q6_gemm_b8_top1_f32_m64", 0);
+    pHeadTopReduce = getPipe(c, "head_q6", "head_top1_reduce_batch", 0);
     pAm1   = getPipe(c, "argmax", "argmax1", 0);
     pAm2   = getPipe(c, "argmax", "argmax2", 0);
     pEmb   = getPipe(c, embQ8 ? "embed_q8_0" : "embed_q6k", embQ8 ? "embed_q8_0" : "embed_q6k", 0);
@@ -2938,11 +2941,22 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMH = createBuf(c, (size_t)cap * (nUsed + 1) * ffE * 4, nullptr, true);
     bbMSel = createBuf(c, (size_t)cap * 160, nullptr, true);   // sizeof(SelT)
     bbMY = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
-    bbLogits = lastStage() ? createBuf(c, (size_t)cap * vocab * 4, nullptr, true) : nil;
+    const uint32_t headLogitRows = headGemm
+        ? std::min(cap, std::max(1u, headGemmN - 1u)) : cap;
+    bbLogits = lastStage()
+        ? createBuf(c, (size_t)headLogitRows * vocab * 4, nullptr, true) : nil;
     if (lastStage()) {
         bbAV = createBuf(c, (size_t)cap * 64 * 4, nullptr, true);
         bbAI = createBuf(c, (size_t)cap * 64 * 4, nullptr, true);
         bbTok = createBuf(c, (size_t)cap * 4, nullptr, true);
+        if (headGemm) {
+            const size_t tiles32 = (vocab + 31u) / 32u;
+            const size_t tiles64 = (vocab + 63u) / 64u;
+            const size_t headPairs = std::max((size_t)std::min(cap, 7u) * tiles32,
+                                              (size_t)cap * tiles64);
+            bbHeadV = createBuf(c, headPairs * sizeof(float), nullptr, true);
+            bbHeadI = createBuf(c, headPairs * sizeof(uint32_t), nullptr, true);
+        }
     }
     bbIds = createBuf(c, (size_t)cap * 4, nullptr, true);
     bbStart = createBuf(c, (size_t)(nExp + 2) * 4, nullptr, true);
@@ -3819,28 +3833,38 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             // head for every row; logits-only callers need just the LAST row
             // — the z=n head is ~417 MB of Q6_K weight reads PER ROW.
             const uint32_t nh = argmaxOut ? n : 1;
-            lastRunRows = nh;
             const bool tiledHead = argmaxOut && headGemm && nh >= headGemmN;
             if (tiledHead) {
-                struct { uint32_t m, k, nn, span; } pcHead{vocab, nEmbd, nh, 0};
-                dspz(pHeadB, {bHeadW, bbXn, bbLogits}, &pcHead, 16,
-                     (vocab + 31) / 32, 128, (nh + 7) / 8);
+                const bool wide = nh >= 8u;
+                const uint32_t headRows = wide ? 64u : 32u;
+                const uint32_t headTiles = (vocab + headRows - 1u) / headRows;
+                const uint32_t materialize = (!scratchState || wantLogits) ? 1u : 0u;
+                struct { uint32_t m, k, nn, tiles, materialize; }
+                    pcHead{vocab, nEmbd, nh, headTiles, materialize};
+                dspz(wide ? pHeadTop64 : pHeadTop,
+                     {bHeadW, bbXn, bbHeadV, bbHeadI, bbLogits},
+                     &pcHead, 20, headTiles, wide ? 256 : 128, (nh + 7) / 8);
+                bar();
+                struct { uint32_t tiles, nn; } pcRed{headTiles, nh};
+                dspz(pHeadTopReduce, {bbHeadV, bbHeadI, bbTok}, &pcRed, 8, 1, 256, nh);
+                lastRunRows = 1;
             } else {
+                lastRunRows = nh;
                 struct { uint32_t m, k; } pcHead{vocab, nEmbd};
                 dspz(pHead,
                      {bHeadW, nh == 1 ? WB{bbXn, (NSUInteger)(n - 1) * nEmbd * 4}
                                       : WB{bbXn},
                       bbLogits},
                      &pcHead, 8, (vocab + 3) / 4, 64, nh);
-            }
-            if (argmaxOut) {
-                bar();
-                const uint32_t amWgs = (vocab + 4095) / 4096;
-                struct { uint32_t nn, span; } pcAm{vocab, 4096};
-                struct { uint32_t m, pos; } pcAm2{amWgs, 0};
-                dspz(pAm1, {bbLogits, bbAV, bbAI}, &pcAm, 8, amWgs, 256, n);
-                bar();
-                dspz(pAm2, {bbAV, bbAI, bbTok, bRbScratch}, &pcAm2, 8, 1, 256, n);
+                if (argmaxOut) {
+                    bar();
+                    const uint32_t amWgs = (vocab + 4095) / 4096;
+                    struct { uint32_t nn, span; } pcAm{vocab, 4096};
+                    struct { uint32_t m, pos; } pcAm2{amWgs, 0};
+                    dspz(pAm1, {bbLogits, bbAV, bbAI}, &pcAm, 8, amWgs, 256, n);
+                    bar();
+                    dspz(pAm2, {bbAV, bbAI, bbTok, bRbScratch}, &pcAm2, 8, 1, 256, n);
+                }
             }
         }
         [enc endEncoding];
@@ -3852,7 +3876,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     }
     if (wantLogits)
         memcpy(logits.data(),
-               (uint8_t*)bbLogits.contents + (argmaxOut ? (size_t)(n - 1) * vocab * 4 : 0),
+               (uint8_t*)bbLogits.contents + (size_t)(lastRunRows - 1u) * vocab * 4,
                (size_t)vocab * 4);
     if (argmaxOut) memcpy(argmaxOut, bbTok.contents, (size_t)n * 4);
     if (hiddenOut) memcpy(hiddenOut, bbXin.contents, (size_t)n * nEmbd * 4);   // UMA
@@ -4190,6 +4214,12 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     id<MTLComputePipelineState> pBase = getPipe(c, "gemv_q6_k", "gemv_q6_k", 2);
     id<MTLComputePipelineState> pGemm =
         getPipe(c, "head_q6", "head_q6_gemm_b8_f32", 0);
+    const uint32_t topM = getenv("QK_HEAD_TOP_M64") ? 64u : 32u;
+    const char* topFn = topM == 64u ? "head_q6_gemm_b8_top1_f32_m64"
+                                    : "head_q6_gemm_b8_top1_f32";
+    id<MTLComputePipelineState> pTop = getPipe(c, "head_q6", topFn, 0);
+    id<MTLComputePipelineState> pTopReduce =
+        getPipe(c, "head_q6", "head_top1_reduce_batch", 0);
     id<MTLComputePipelineState> pAm1 = getPipe(c, "argmax", "argmax1", 0);
     id<MTLComputePipelineState> pAm2 = getPipe(c, "argmax", "argmax2", 0);
 
@@ -4201,6 +4231,12 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     id<MTLBuffer> bAI = createBuf(c, (size_t)N * 64 * sizeof(uint32_t));
     id<MTLBuffer> bTok = createBuf(c, (size_t)N * sizeof(uint32_t));
     id<MTLBuffer> bRb = createBuf(c, sizeof(uint32_t));
+    const uint32_t nTiles = (M + topM - 1u) / topM;
+    const uint32_t topThreads = topM * 4u;
+    id<MTLBuffer> bTV = createBuf(c, (size_t)N * nTiles * sizeof(float));
+    id<MTLBuffer> bTI = createBuf(c, (size_t)N * nTiles * sizeof(uint32_t));
+    id<MTLBuffer> bLast = createBuf(c, (size_t)M * sizeof(float));
+    id<MTLBuffer> bTopTok = createBuf(c, (size_t)N * sizeof(uint32_t));
 
     struct HeadPC { uint32_t M, K, N, span; } pc{M, K, N, 0};
     struct Am1PC { uint32_t n, span; } pcAm1{M, 4096u};
@@ -4265,6 +4301,27 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, N)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     };
+    auto encTop = [&](id<MTLComputeCommandEncoder> enc) {
+        struct { uint32_t M, K, N, tiles, materialize; } topPc{M, K, N, nTiles, 1u};
+        [enc setComputePipelineState:pTop];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:bTV offset:0 atIndex:2];
+        [enc setBuffer:bTI offset:0 atIndex:3];
+        [enc setBuffer:bLast offset:0 atIndex:4];
+        [enc setBytes:&topPc length:sizeof(topPc) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(nTiles, 1, (N + 7u) / 8u)
+            threadsPerThreadgroup:MTLSizeMake(topThreads, 1, 1)];
+        barrier(enc);
+        struct { uint32_t tiles, N; } redPc{nTiles, N};
+        [enc setComputePipelineState:pTopReduce];
+        [enc setBuffer:bTV offset:0 atIndex:0];
+        [enc setBuffer:bTI offset:0 atIndex:1];
+        [enc setBuffer:bTopTok offset:0 atIndex:2];
+        [enc setBytes:&redPc length:sizeof(redPc) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, N)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
     auto submit = [&](auto&& encode, uint32_t reps) -> double {
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [c.queue commandBuffer];
@@ -4286,10 +4343,12 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     };
 
     if (submit([&](auto enc) { encBase(enc, true); }, 1) < 0 ||
-        submit([&](auto enc) { encGemm(enc, true); }, 1) < 0) return false;
+        submit([&](auto enc) { encGemm(enc, true); }, 1) < 0 ||
+        submit([&](auto enc) { encTop(enc); }, 1) < 0) return false;
     const float* yr = (const float*)bRef.contents;
     const float* yg = (const float*)bGemm.contents;
     const uint32_t* gt = (const uint32_t*)bTok.contents;
+    const uint32_t* tt = (const uint32_t*)bTopTok.contents;
     std::vector<uint32_t> refTok(N);
     double rms2 = 0.0, maxAbs = 0.0, maxRel = 0.0;
     for (size_t i = 0; i < (size_t)N * M; ++i) rms2 += (double)yr[i] * yr[i];
@@ -4303,10 +4362,10 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
             if (yg[(size_t)n * M + m] > yg[(size_t)n * M + gi]) gi = m;
         }
         refTok[n] = ri;
-        const bool ok = ri == gi && ri == gt[n];
+        const bool ok = ri == gi && ri == gt[n] && ri == tt[n];
         tokenBad += !ok;
-        printf("  row %u: ref=%u gemm=%u gpu-argmax=%u  %s\n",
-               n, ri, gi, gt[n], ok ? "EXACT" : "MISMATCH");
+        printf("  row %u: ref=%u gemm=%u gpu-argmax=%u fused=%u  %s\n",
+               n, ri, gi, gt[n], tt[n], ok ? "EXACT" : "MISMATCH");
     }
     for (size_t i = 0; i < (size_t)N * M; ++i) {
         const double ae = std::fabs((double)yg[i] - yr[i]);
@@ -4315,6 +4374,12 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     }
     printf("  tiled logits: rms=%.6g max_abs=%.6g max_rel(floor %.3g)=%.6g\n",
            rms, maxAbs, floor, maxRel);
+    double lastMax = 0.0;
+    const float* last = (const float*)bLast.contents;
+    for (uint32_t m = 0; m < M; ++m)
+        lastMax = std::max(lastMax,
+            std::fabs((double)last[m] - yg[(size_t)(N - 1u) * M + m]));
+    printf("  fused materialized last row max_abs=%.6g\n", lastMax);
 
     // Deliberate all-logit tie: both reductions must choose vocabulary id 0.
     memset(bX.contents, 0, x.size() * sizeof(float));
@@ -4323,13 +4388,18 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
     memcpy(tieRef.data(), bTok.contents, (size_t)N * sizeof(uint32_t));
     if (submit([&](auto enc) { encGemm(enc, true); }, 1) < 0) return false;
     const uint32_t* tieGot = (const uint32_t*)bTok.contents;
+    std::vector<uint32_t> tieGemm(N);
+    memcpy(tieGemm.data(), tieGot, (size_t)N * sizeof(uint32_t));
+    if (submit([&](auto enc) { encTop(enc); }, 1) < 0) return false;
+    const uint32_t* tieTop = (const uint32_t*)bTopTok.contents;
     uint32_t tieBad = 0;
-    for (uint32_t n = 0; n < N; ++n) tieBad += tieRef[n] != 0u || tieGot[n] != 0u;
+    for (uint32_t n = 0; n < N; ++n)
+        tieBad += tieRef[n] != 0u || tieGemm[n] != 0u || tieTop[n] != 0u;
     memcpy(bX.contents, x.data(), x.size() * sizeof(float));
     printf("  all-zero tie: %u/%u chose lower id 0\n", N - tieBad, N);
 
     const bool logitsClose = maxAbs <= std::max(1e-5, rms * 1e-4);
-    const bool pass = tokenBad == 0 && tieBad == 0 && logitsClose;
+    const bool pass = tokenBad == 0 && tieBad == 0 && logitsClose && lastMax == 0.0;
     printf("correctness: tiled argmax %u/%u exact, logits %s -> %s\n",
            N - tokenBad, N, logitsClose ? "CLOSE" : "DRIFT", pass ? "PASS" : "FAIL");
     if (pass && iters) {
@@ -4343,6 +4413,9 @@ static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
         bench("shipping GEMV + argmax", [&](auto enc) { encBase(enc, true); });
         bench("32x8 f32 GEMM", [&](auto enc) { encGemm(enc, false); });
         bench("32x8 f32 GEMM + argmax", [&](auto enc) { encGemm(enc, true); });
+        char topName[48];
+        snprintf(topName, sizeof(topName), "%ux8 fused candidates", topM);
+        bench(topName, [&](auto enc) { encTop(enc); });
     }
     return pass;
 }
@@ -5060,6 +5133,42 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (mode == "stagecmp") {
+            if (argc < 3) {
+                fprintf(stderr, "usage: qk stagecmp <ids-file> [topk] [tmax]\n");
+                return 1;
+            }
+            std::vector<uint32_t> toks;
+            FILE* f = fopen(argv[2], "r");
+            if (!f) { perror(argv[2]); return 1; }
+            int v;
+            while (fscanf(f, "%d%*[, \n]", &v) == 1) toks.push_back((uint32_t)v);
+            fclose(f);
+            const uint32_t k = argc > 3 ? (uint32_t)atoi(argv[3]) : 16u;
+            const uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 2048u;
+            qk_config cfg{1, tmax, 8};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            if (toks.empty() || toks.size() > tmax || k < 1 || k > 256) {
+                fprintf(stderr, "stagecmp: bad token count/topk\n");
+                qk_close(e);
+                return 1;
+            }
+            std::vector<uint32_t> ids(toks.size()), topIds(k);
+            std::vector<float> topVals(k);
+            const int rc = e->stageRun(0, toks.data(), nullptr, (uint32_t)toks.size(),
+                                       0, nullptr, ids.data());
+            const int trc = rc ? rc : e->stageTopK(k, topIds.data(), topVals.data());
+            bool ordered = true;
+            for (uint32_t i = 1; i < k; ++i) ordered &= topVals[i - 1] >= topVals[i];
+            const bool ok = trc == 0 && topIds[0] == ids.back() && ordered;
+            printf("stagecmp: final argmax=%u top1=%u top-%u ordered=%s -> %s\n",
+                   ids.back(), topIds[0], k, ordered ? "YES" : "NO", ok ? "PASS" : "FAIL");
+            qk_close(e);
+            return ok ? 0 : 1;
+        }
+
         if (mode == "verify") {
             // Spec-decode P0 harness: compare oracle-draft batched verification
             // rounds with the serial greedy stream. This is the full-accept
@@ -5404,9 +5513,11 @@ int main(int argc, char** argv) {
                     for (uint32_t i = 0; i < sz; i++) toks[i] = rng() % (e->vocab - 16) + 4;
 
                     std::vector<float> logitsS, logitsB;
+                    std::vector<uint32_t> argmaxB(sz);
                     uint32_t tokS = e->serialPrefillLogits(toks.data(), sz, 1, logitsS);
-                    e->prefillBatchLast(toks.data(), sz, 0, logitsB);
-                    uint32_t tokB = (uint32_t)(std::max_element(logitsB.begin(), logitsB.end()) - logitsB.begin());
+                    e->prefillBatchLast(toks.data(), sz, 0, logitsB, /*wantLogits=*/true,
+                                        /*base=*/0, argmaxB.data());
+                    uint32_t tokB = argmaxB.back();
 
                     double maxAbs = 0, refMax = 1e-9;
                     for (uint32_t i = 0; i < e->vocab; i++) {
