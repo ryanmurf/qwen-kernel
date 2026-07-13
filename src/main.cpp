@@ -2791,6 +2791,7 @@ struct qk_engine {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pGate, pGemvO, pAddN, pPrep, pAttn, pMoeL,
         pMoeS, pMoeGU, pMoeGUs, pMoeDn4, pMoeDn6, pMoeDnsB, pAdd3, pHead, pAm1, pAm2, pEmb;
+    Pipe pAttnS, pAttnR;  // split-K decode attention (QK_NO_SPLITK=1 -> legacy pAttn)
     Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
     // IQ4_XS twins of the dense-projection / routed-gateup pipes (80B weights).
     // Identical bindings and push constants — only the in-shader dequant differs,
@@ -2805,6 +2806,7 @@ struct qk_engine {
         std::vector<Buf> bufs;
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sGate, sWo, sAddN,
             sPrep, sAttn, sMoeL, sMoeS, sMoeGU, sMoeGUs, sMoeDn, sMoeDns, sAdd3;
+        VkDescriptorSet sAttnS, sAttnR;  // split-K decode attention
         VkBuffer aNormBuf = VK_NULL_HANDLE;
         // per-slot recurrent state (must be zeroed when a slot is reused):
         // rec -> (conv window, delta-rule S); attn -> (K cache, V cache).
@@ -2818,6 +2820,9 @@ struct qk_engine {
     Buf bXin, bXn, bBig, bMid, bKin, bVin, bGb, bConvOut, bO, bAtt, bAttnOut, bY, bXn2,
         bML, bMH, bMSel, bMY, bMY2, bONorm, bHeadW, bLogits, bEmbdW, bRope, bAV, bAI,
         bTok, bSlotIn, bSlotPos, bSamp, stage;
+    Buf bAttScratch;           // split-K partials: nSlots*hQ*attnSplitMax*(dh+2) floats
+    uint32_t attnChunk = 32;   // KV positions per split WG (QK_ATTN_CHUNK, 8..1024)
+    uint32_t attnSplitMax = 0; // ceil(nCtx/attnChunk) WGs dispatched per q-head
     VkDescriptorSet sHead, sAm1, sAm2, sEmb;
 
     uint32_t maxB = 0;
@@ -2894,6 +2899,12 @@ struct qk_engine {
     size_t snapSize = 0;
     uint64_t lruClock = 0;
 
+    // QK_STEP_PROF: one-shot per-stage GPU timestamps baked into the z=1 step
+    // CB (barriers serialize the chain, so consecutive deltas = stage cost).
+    VkQueryPool profQ = VK_NULL_HANDLE;
+    std::vector<const char*> profLbl;
+    bool profPrinted = false;
+
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
     // base=0: from-empty (resets slot, zero conv carry). base>0: CONTINUE an existing
@@ -2956,15 +2967,17 @@ qk_engine::~qk_engine() {
     for (auto& e : pcache) destroyBuf(c, e.snap);
     for (Buf* b : {&bXin, &bXn, &bBig, &bMid, &bKin, &bVin, &bGb, &bConvOut, &bO, &bAtt,
                    &bAttnOut, &bY, &bXn2, &bML, &bMH, &bMSel, &bMY, &bMY2, &bONorm, &bHeadW,
-                   &bLogits, &bEmbdW, &bRope, &bAV, &bAI, &bTok, &bSlotIn, &bSlotPos, &bSamp, &stage})
+                   &bLogits, &bEmbdW, &bRope, &bAV, &bAI, &bTok, &bSlotIn, &bSlotPos, &bSamp, &stage,
+                   &bAttScratch})
         destroyBuf(c, *b);
     for (Buf* b : {&bbXin, &bbXn, &bbBig, &bbMid, &bbKin, &bbVin, &bbGb, &bbConvOut, &bbO,
                    &bbAtt, &bbAttnOut, &bbY, &bbXn2, &bbML, &bbMH, &bbMSel, &bbMY, &bbMY2,
                    &bbLogits, &bbIds, &bbCarry, &bvAV, &bvAI, &bvTok, &bvSamp})
         destroyBuf(c, *b);
+    if (profQ) vkDestroyQueryPool(c.dev, profQ, nullptr);
     if (dpool) vkDestroyDescriptorPool(c.dev, dpool, nullptr);
     for (Pipe* pp : {&pRms, &pGemvA, &pAb, &pConvN, &pStep, &pGate, &pGemvO, &pAddN, &pPrep,
-                     &pAttn, &pMoeL, &pMoeS, &pMoeGU, &pMoeGUs, &pMoeDn4, &pMoeDn6, &pMoeDnsB,
+                     &pAttn, &pAttnS, &pAttnR, &pMoeL, &pMoeS, &pMoeGU, &pMoeGUs, &pMoeDn4, &pMoeDn6, &pMoeDnsB,
                      &pAdd3, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB, &pAbB, &pConvB,
                      &pStepB, &pGateB, &pGemmB})
         destroyPipe(c, *pp);
@@ -3203,6 +3216,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAddN = makePipe(c, "add_rmsnorm.spv", 5, 8);
     pPrep = makePipe(c, "fa_prep_srv.spv", 10, 32);
     pAttn = makePipe(c, "fa_attn_srv.spv", 6, 32);
+    pAttnS = makePipe(c, "fa_attn_srv_split.spv", 5, 40);
+    pAttnR = makePipe(c, "fa_attn_srv_reduce.spv", 4, 40);
     pMoeL = makePipe(c, "moe_logits.spv", 3, 16);
     pMoeS = makePipe(c, "moe_select.spv", 4, 16);
     pMoeGU = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
@@ -3238,6 +3253,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bConvOut = createBuf(c, (size_t)nB * chQkv * 4, stor, true);
     bO = createBuf(c, (size_t)nB * dIn * 4, stor, true);
     bAtt = createBuf(c, (size_t)nB * dIn * 4, stor, true);
+    if (const char* v = getenv("QK_ATTN_CHUNK")) {
+        long x = atol(v);
+        if (x >= 8 && x <= 1024) attnChunk = (uint32_t)x;
+    }
+    attnSplitMax = (tmax + attnChunk - 1) / attnChunk;
+    bAttScratch = createBuf(c, (size_t)nB * hQ * attnSplitMax * (dh + 2) * 4, stor, true);
     bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     bY = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
     bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, stor, true);
@@ -3507,6 +3528,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             L.sPrep = mkSet(pPrep, {bBig.buf, bKin.buf, bVin.buf, qn, kn, bMid.buf, kc, vc,
                                     bRope.buf, bSlotPos.buf});
             L.sAttn = mkSet(pAttn, {bMid.buf, kc, vc, bBig.buf, bAtt.buf, bSlotPos.buf});
+        L.sAttnS = mkSet(pAttnS, {bMid.buf, kc, vc, bAttScratch.buf, bSlotPos.buf});
+        L.sAttnR = mkSet(pAttnR, {bAttScratch.buf, bBig.buf, bAtt.buf, bSlotPos.buf});
             L.sWo = mkSet(pGemvO, {wo, bAtt.buf, bAttnOut.buf});
             BL.sRms = mkSet(pRms, {bbXin.buf, aNorm, bbXn.buf});
             BL.sP1 = mkSet(pGemvA, {wq, bbXn.buf, bbBig.buf});
@@ -3626,6 +3649,18 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         vkCmdPipelineBarrier(rcb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     };
+    bool prof = getenv("QK_STEP_PROF") != nullptr && c.hasTimestamps && !splitStage();
+    if (prof) {
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = 1024;
+        VK_CHECK(vkCreateQueryPool(c.dev, &qci, nullptr, &profQ));
+    }
+    auto stamp = [&](const char* lbl) {  // after a barrier: everything prior has drained
+        if (!prof || zdim != 1 || profLbl.size() >= 1024) return;
+        vkCmdWriteTimestamp(rcb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profQ, (uint32_t)profLbl.size());
+        profLbl.push_back(lbl);
+    };
     auto disp = [&](Pipe& pp, VkDescriptorSet ds, uint32_t wgs, const void* pc, uint32_t pcSize) {
         vkCmdBindPipeline(rcb, VK_PIPELINE_BIND_POINT_COMPUTE, pp.p);
         vkCmdBindDescriptorSets(rcb, VK_PIPELINE_BIND_POINT_COMPUTE, pp.pl, 0, 1, &ds, 0, nullptr);
@@ -3642,8 +3677,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     struct { uint32_t d, hk, hv, kdiv; } pcStep{dS, hK, hV, dnKDiv};
     struct { uint32_t d, hv; float e; } pcGate{dS, hV, eps};
     struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
-    struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; }
-        pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase};
+    struct { uint32_t pos, tmax, dh, nRot, hQ, hKV_; float eps, fb; uint32_t nSplit, pad; }
+        pcFa{0, tmax, dh, nRot, hQ, hKV, eps, kFreqBase, attnSplitMax, attnChunk};
+    bool useSplitK = getenv("QK_NO_SPLITK") == nullptr;  // split-K decode attention
     const uint32_t amWgs = (vocab + 4095) / 4096;
     struct { uint32_t n, span; } pcAm{vocab, 4096};
     struct { uint32_t m; } pcAm2{amWgs};
@@ -3656,11 +3692,15 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     zdim = z;
     rcb = stepCBs[z - 1];
     VK_CHECK(vkBeginCommandBuffer(rcb, &cbbi));
+    if (prof && z == 1) vkCmdResetQueryPool(rcb, profQ, 0, 1024);
     barrier();
+    stamp("t0");
     disp(pEmb, sEmb, 1, &pcE, 12);
     barrier();
+    stamp("emb");
     disp(pRms, layers[0].sRms, 1, &pcRms, 8);
     barrier();
+    stamp("rms0");
     for (uint32_t il = 0; il < nLayer; il++) {
         Layer& L = layers[il];
         if (L.rec) {
@@ -3668,44 +3708,67 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             disp(L.iq4P2 ? pGemvA4 : pGemvA, L.sP2, (dIn + 3) / 4, &pcZ, 8);
             disp(pAb, L.sAb, 2 * hV, &pcAb, 8);
             barrier();
+            stamp("dn.proj");
             disp(pConvN, L.sConv, chQkv / dS, &pcConvN, 16);
             barrier();
+            stamp("dn.conv");
             disp(pStep, L.sStep, hV, &pcStep, 16);
             barrier();
+            stamp("dn.step");
             disp(pGate, L.sGate, hV, &pcGate, 12);
             barrier();
+            stamp("dn.gate");
             disp(L.iq4Wo ? pGemvO4 : pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
         } else {
             disp(L.iq4P1 ? pGemvA4 : pGemvA, L.sP1, (chQkv + 3) / 4, &pcQkv, 8);
             disp(L.iq4P2 ? pGemvA4 : pGemvA, L.sP2, (hKV * dh + 3) / 4, &pcKV, 8);
             disp(L.iq4P3 ? pGemvA4 : pGemvA, L.sP3, (hKV * dh + 3) / 4, &pcKV, 8);
             barrier();
+            stamp("at.proj");
             disp(pPrep, L.sPrep, hQ + 2 * hKV, &pcFa, 32);
             barrier();
-            disp(pAttn, L.sAttn, hQ, &pcFa, 32);
+            stamp("at.prep");
+            if (useSplitK) {
+                disp(pAttnS, L.sAttnS, hQ * attnSplitMax, &pcFa, 40);
+                barrier();
+                stamp("at.split");
+                disp(pAttnR, L.sAttnR, hQ, &pcFa, 40);
+            } else {
+                disp(pAttn, L.sAttn, hQ, &pcFa, 32);
+            }
             barrier();
+            stamp("at.attn");
             disp(L.iq4Wo ? pGemvO4 : pGemvO, L.sWo, (nEmbd + 1) / 2, &pcWo, 8);
         }
         barrier();
+        stamp("wo");
         disp(pAddN, L.sAddN, 1, &pcRms, 8);
         barrier();
+        stamp("addN");
         disp(pMoeL, L.sMoeL, nExp, &pcv, 16);
         disp(pMoeGUs, L.sMoeGUs, ffE, &pcv, 16);
         barrier();
+        stamp("moe.route");
         disp(pMoeS, L.sMoeS, 1, &pcv, 16);
         barrier();
+        stamp("moe.sel");
         disp(guIq4 ? pMoeGU4 : pMoeGU, L.sMoeGU, nUsed * ffE, &pcv, 16);
         barrier();
+        stamp("moe.gu");
         disp(L.downQ6 ? pMoeDn6 : pMoeDn4, L.sMoeDn, nEmbd, &pcv, 16);
         disp(pMoeDnsB, L.sMoeDns, nEmbd, &pcv, 16);
         barrier();
+        stamp("moe.dn");
         disp(pAdd3, L.sAdd3, 1, &pcRms, 8);
         barrier();
+        stamp("add3");
     }
     disp(pHead, sHead, (vocab + 1) / 2, &pcHead, 8);
     barrier();
+    stamp("head");
     disp(pAm1, sAm1, amWgs, &pcAm, 8);
     barrier();
+    stamp("am1");
     disp(pAm2, sAm2, 1, &pcAm2, 4);
     VkMemoryBarrier m2{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     m2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -3714,6 +3777,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                          0, 1, &m2, 0, nullptr, 0, nullptr);
     VkBufferCopy ct{0, 0, (size_t)nB * 4};
     vkCmdCopyBuffer(rcb, bTok.buf, bSamp.buf, 1, &ct);
+    stamp("am2+copy");
     VK_CHECK(vkEndCommandBuffer(rcb));
     }  // for z = 1..nSlots
 
@@ -3867,6 +3931,35 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         si.commandBufferCount = 1; si.pCommandBuffers = &stepCBs[maxZ - 1];  // dispatch only up to the top active slot
         VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
         VK_CHECK(vkQueueWaitIdle(c.queue));
+
+        // QK_STEP_PROF: dump the per-stage timing of the first pure-decode step.
+        if (profQ && !profPrinted && maxZ == 1 && slots[0].cursor >= slots[0].prompt.size()) {
+            std::vector<uint64_t> ts(profLbl.size());
+            if (!ts.empty() &&
+                vkGetQueryPoolResults(c.dev, profQ, 0, (uint32_t)ts.size(), ts.size() * 8,
+                                      ts.data(), 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                double per = c.props.limits.timestampPeriod / 1000.0;  // ticks -> us
+                std::unordered_map<std::string, std::pair<uint32_t, double>> agg;
+                for (size_t i = 1; i < ts.size(); i++) {
+                    auto& a = agg[profLbl[i]];
+                    a.first++;
+                    a.second += (double)(ts[i] - ts[i - 1]) * per;
+                }
+                double tot = (double)(ts.back() - ts.front()) * per;
+                std::vector<std::pair<double, std::string>> rows;
+                for (auto& kv : agg) rows.push_back({kv.second.second, kv.first});
+                std::sort(rows.rbegin(), rows.rend());
+                fprintf(stderr, "[prof] decode step: %.0f us on-GPU across %zu stages\n",
+                        tot, ts.size() - 1);
+                for (auto& r : rows) {
+                    auto& a = agg[r.second];
+                    fprintf(stderr, "[prof]   %-10s n=%-3u tot=%8.1f us  avg=%6.2f us  %4.1f%%\n",
+                            r.second.c_str(), a.first, a.second, a.second / a.first,
+                            100.0 * a.second / tot);
+                }
+                profPrinted = true;
+            }
+        }
 
         for (uint32_t s = 0; s < nSlots; s++) {
             Slot& sl = slots[s];
@@ -4711,7 +4804,9 @@ int main(int argc, char** argv) {
         uint32_t nGen = (uint32_t)atoi(argv[3]);
         uint32_t nSlots = argc > 4 ? (uint32_t)atoi(argv[4]) : 1;
         uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 128;
-        qk_config cfg{nSlots, tmax, 8};
+        uint32_t chunk = 8; // QK_CHUNK: sweep GPU-steps-per-host-sync (1..32)
+        if (const char* e = getenv("QK_CHUNK")) chunk = (uint32_t)atoi(e);
+        qk_config cfg{nSlots, tmax, chunk};
         char err[256] = {0};
         qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
         if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }

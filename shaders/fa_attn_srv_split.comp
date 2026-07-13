@@ -1,0 +1,111 @@
+#version 450
+
+// Split-K half of serve-path flash-attention decode. The original
+// fa_attn_srv walked the whole KV stripe with ONE workgroup per q-head —
+// hQ workgroups total, DRAM-latency-bound, 40% of a decode step and
+// growing linearly with live context. Here hQ*nSplit workgroups each walk
+// only their chunk of [0, n) and emit an UNNORMALIZED partial (acc, m, l)
+// in flash-decode style; fa_attn_srv_reduce combines the partials and
+// applies the output gate.
+//
+// Workgroup x is linear: h = x / nSplit, s = x % nSplit (disp() may fold
+// x into a gy dimension only past 65535, far above hQ*nSplit).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQH { float qhat[]; };
+layout(std430, binding = 1) readonly  buffer BufKC { float kc[]; };
+layout(std430, binding = 2) readonly  buffer BufVC { float vc[]; };
+layout(std430, binding = 3) writeonly buffer BufS  { float part[]; };
+layout(std430, binding = 4) readonly  buffer BufPos { uint slotPos[]; };
+
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+    uint splitMax; uint chunk;  // splitMax = ceil(tmax/chunk) WGs dispatched per head
+} pc;
+
+shared float q[256];
+shared float sc[256];
+shared float red[256];
+shared float m;
+shared float l;
+
+void main() {
+    uint x  = gl_WorkGroupID.x;
+    uint h  = x / pc.splitMax;
+    uint s  = x % pc.splitMax;
+    uint t  = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+    uint rq = gl_WorkGroupID.z;
+    uint n  = slotPos[rq] + 1u;
+
+    // Fixed-size chunks: WGs past the live length exit before touching
+    // memory (uniform per-WG branch); the reduce only reads ceil(n/chunk)
+    // partials, so nothing neutral needs writing.
+    uint pStart = s * pc.chunk;
+    if (pStart >= n) return;
+    uint pEnd = min(n, pStart + pc.chunk);
+
+    uint kv = h / (pc.hQ / pc.hKV);
+    uint kvo = rq * pc.hKV * pc.tmax * dh;
+    uint qho = rq * pc.hQ * dh;
+    uint po  = ((rq * pc.hQ + h) * pc.splitMax + s) * (dh + 2u);
+
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
+    if (t == 0u) {
+        m = -3.4e38;
+        l = 0.0;
+    }
+    barrier();
+
+    float qs = inversesqrt(float(dh));
+    float acc = 0.0;
+    for (uint p0 = pStart; p0 < pEnd; p0 += 256u) {
+        uint ts = min(256u, pEnd - p0);
+
+        if (t < ts) {
+            float score = 0.0;
+            uint base = kvo + (kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kc[base + j];
+            sc[t] = score * qs;
+        }
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : -3.4e38;
+        barrier();
+        for (uint st = 128u; st > 0u; st >>= 1u) {
+            if (t < st) red[t] = max(red[t], red[t + st]);
+            barrier();
+        }
+
+        float oldm = m;
+        float newm = max(oldm, red[0]);
+        float corr = exp(oldm - newm);
+
+        acc *= corr;
+        if (t < ts) sc[t] = exp(sc[t] - newm);
+        if (t == 0u) l *= corr;
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : 0.0;
+        barrier();
+        for (uint st = 128u; st > 0u; st >>= 1u) {
+            if (t < st) red[t] += red[t + st];
+            barrier();
+        }
+
+        if (t < dh) {
+            for (uint j = 0u; j < ts; ++j)
+                acc += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+        }
+        if (t == 0u) {
+            l += red[0];
+            m = newm;
+        }
+        barrier();
+    }
+
+    if (t < dh) part[po + t] = acc;           // unnormalized, relative to local m
+    if (t == 0u) { part[po + dh] = m; part[po + dh + 1u] = l; }
+}

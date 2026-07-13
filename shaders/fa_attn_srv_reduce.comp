@@ -1,0 +1,76 @@
+#version 450
+
+// Reduce half of split-K flash-attention decode: one workgroup per q-head
+// combines the nSplit partials from fa_attn_srv_split (each acc is
+// unnormalized relative to its local max m_s) into the exact softmax
+// output, then applies the sigmoid output gate that the pre-split kernel
+// used to apply inline.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufS  { float part[]; };
+layout(std430, binding = 1) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 2) writeonly buffer BufA  { float att[]; };
+layout(std430, binding = 3) readonly  buffer BufPos { uint slotPos[]; };
+
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+    uint splitMax; uint chunk;
+} pc;
+
+shared float red[256];
+shared float M;
+shared float L;
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+    uint rq = gl_WorkGroupID.z;
+    uint n  = slotPos[rq] + 1u;
+    uint nUse = min(pc.splitMax, (n + pc.chunk - 1u) / pc.chunk);
+    uint qfo = rq * pc.hQ * 2u * dh;
+    uint qho = rq * pc.hQ * dh;
+    uint pbase = (rq * pc.hQ + h) * pc.splitMax * (dh + 2u);
+
+    // global max over partial maxima (lane-strided: nUse may exceed 256)
+    float mv = -3.4e38;
+    for (uint s = t; s < nUse; s += 256u)
+        mv = max(mv, part[pbase + s * (dh + 2u) + dh]);
+    red[t] = mv;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (t < st) red[t] = max(red[t], red[t + st]);
+        barrier();
+    }
+    if (t == 0u) M = red[0];
+    barrier();
+
+    // global normalizer: sum of l_s rescaled to M
+    float lv = 0.0;
+    for (uint s = t; s < nUse; s += 256u) {
+        float ms = part[pbase + s * (dh + 2u) + dh];
+        float ls = part[pbase + s * (dh + 2u) + dh + 1u];
+        lv += (ls > 0.0) ? ls * exp(ms - M) : 0.0;
+    }
+    red[t] = lv;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (t < st) red[t] += red[t + st];
+        barrier();
+    }
+    if (t == 0u) L = red[0];
+    barrier();
+
+    if (t < dh) {
+        float o = 0.0;
+        for (uint s = 0u; s < nUse; ++s) {
+            float ms = part[pbase + s * (dh + 2u) + dh];
+            o += part[pbase + s * (dh + 2u) + t] * exp(ms - M);
+        }
+        o /= L;
+        float g = qfull[qfo + h * 2u * dh + dh + t];
+        att[qho + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+    }
+}
