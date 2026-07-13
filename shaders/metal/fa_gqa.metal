@@ -14,7 +14,7 @@ struct FaBPC {
     uint Tn; uint qbase;
 };
 
-template <bool SIMD_SOFTMAX, bool HALF_KV>
+template <bool SIMD_SOFTMAX, bool HALF_KV, bool Q8_KV>
 static inline void fa_gqa2_body(device const float* qhat,
                                 device const uchar* kc,
                                 device const uchar* vc,
@@ -59,7 +59,20 @@ static inline void fa_gqa2_body(device const float* qhat,
                                        (ulong)(h0 + 1u) * DH + dt * 8u, pc.hQ * DH);
                 const ulong ko =
                     (ulong)(kv * pc.tmax + p0 + sgid * 8u) * DH + dt * 8u;
-                if (HALF_KV) {
+                if (Q8_KV) {
+                    threadgroup float* tile = KVf + sgid * 64u;
+                    for (uint e = slid; e < 64u; e += 32u) {
+                        const ulong row = (ulong)kv * pc.tmax + p0 +
+                                          sgid * 8u + e / 8u;
+                        const ulong rb = row * KV_Q8_ROW;
+                        const float d = *((device const float*)(kc + rb));
+                        const char qv = *((device const char*)(
+                            kc + rb + KV_Q8_DATA + dt * 8u + e % 8u));
+                        tile[e] = d * float(qv);
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_load(kf, tile, 8u, ulong2(0, 0), true);
+                } else if (HALF_KV) {
                     threadgroup float* tile = KVf + sgid * 64u;
                     for (uint e = slid; e < 64u; e += 32u)
                         tile[e] = float(((device const half*)kc)[
@@ -167,7 +180,20 @@ static inline void fa_gqa2_body(device const float* qhat,
                 simdgroup_load(p1f, Stg + QT * KB + kt * 8u, KB);
                 const ulong vo =
                     (ulong)(kv * pc.tmax + p0 + kt * 8u) * DH + dct * 8u;
-                if (HALF_KV) {
+                if (Q8_KV) {
+                    threadgroup float* tile = KVf + sgid * 64u;
+                    for (uint e = slid; e < 64u; e += 32u) {
+                        const ulong row = (ulong)kv * pc.tmax + p0 +
+                                          kt * 8u + e / 8u;
+                        const ulong rb = row * KV_Q8_ROW;
+                        const float d = *((device const float*)(vc + rb));
+                        const char qv = *((device const char*)(
+                            vc + rb + KV_Q8_DATA + dct * 8u + e % 8u));
+                        tile[e] = d * float(qv);
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_load(vf, tile, 8u);
+                } else if (HALF_KV) {
                     threadgroup float* tile = KVf + sgid * 64u;
                     for (uint e = slid; e < 64u; e += 32u)
                         tile[e] = float(((device const half*)vc)[
@@ -199,7 +225,7 @@ static inline void fa_gqa2_body(device const float* qhat,
     }
 }
 
-#define FA_GQA2_KERNEL(NAME, SIMD_SOFTMAX, HALF_KV, KV_SCRATCH)                  \
+#define FA_GQA2_KERNEL(NAME, SIMD_SOFTMAX, HALF_KV, Q8_KV, KV_SCRATCH)           \
 kernel void NAME(device const float* qhat [[buffer(0)]],                         \
                  device const uchar* kc [[buffer(1)]],                           \
                  device const uchar* vc [[buffer(2)]],                           \
@@ -214,12 +240,13 @@ kernel void NAME(device const float* qhat [[buffer(0)]],                        
     threadgroup float Stg[2u * 8u * 64u];                                       \
     threadgroup float mrow[16u], lrow[16u], corrTg[16u];                        \
     threadgroup float KVf[KV_SCRATCH];                                          \
-    fa_gqa2_body<SIMD_SOFTMAX, HALF_KV>(qhat, kc, vc, qfull, att, pc,           \
+    fa_gqa2_body<SIMD_SOFTMAX, HALF_KV, Q8_KV>(qhat, kc, vc, qfull, att, pc,    \
                                 Otg, Stg, mrow, lrow, corrTg, KVf,               \
                                 tid3, sgid, slid, tgpig);                        \
 }
 
-FA_GQA2_KERNEL(fa_attn_batch_gqa2, true, false, 1)
-FA_GQA2_KERNEL(fa_attn_batch_gqa2_exact, false, false, 1)
-FA_GQA2_KERNEL(fa_attn_batch_gqa2_f16, true, true, 16u * 64u)
+FA_GQA2_KERNEL(fa_attn_batch_gqa2, true, false, false, 1)
+FA_GQA2_KERNEL(fa_attn_batch_gqa2_exact, false, false, false, 1)
+FA_GQA2_KERNEL(fa_attn_batch_gqa2_f16, true, true, false, 16u * 64u)
+FA_GQA2_KERNEL(fa_attn_batch_gqa2_q8, true, false, true, 16u * 64u)
 #undef FA_GQA2_KERNEL
