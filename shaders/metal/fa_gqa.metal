@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "fa_kv.metal"
 
 // Two-head GQA prefill flash attention for Qwen's 16Q:2KV geometry. One
 // simdgroup retains each K/V fragment and applies it to two adjacent Q heads.
@@ -13,10 +14,10 @@ struct FaBPC {
     uint Tn; uint qbase;
 };
 
-template <bool SIMD_SOFTMAX>
+template <bool SIMD_SOFTMAX, bool HALF_KV>
 static inline void fa_gqa2_body(device const float* qhat,
-                                device const float* kc,
-                                device const float* vc,
+                                device const uchar* kc,
+                                device const uchar* vc,
                                 device const float* qfull,
                                 device float* att,
                                 constant FaBPC& pc,
@@ -25,6 +26,7 @@ static inline void fa_gqa2_body(device const float* qhat,
                                 threadgroup float* mrow,
                                 threadgroup float* lrow,
                                 threadgroup float* corrTg,
+                                threadgroup float* KVf,
                                 uint3 tid3, uint sgid, uint slid,
                                 uint3 tgpig) {
     constexpr uint HG = 2u, QT = 8u, KB = 64u, NS = 16u, DH = 256u;
@@ -55,8 +57,19 @@ static inline void fa_gqa2_body(device const float* qhat,
                                        (ulong)h0 * DH + dt * 8u, pc.hQ * DH);
                 simdgroup_load(q1, qhat + (ulong)qstart * pc.hQ * DH +
                                        (ulong)(h0 + 1u) * DH + dt * 8u, pc.hQ * DH);
-                simdgroup_load(kf, kc + (ulong)(kv * pc.tmax + p0 + sgid * 8u) * DH +
-                                      dt * 8u, DH, ulong2(0, 0), true);
+                const ulong ko =
+                    (ulong)(kv * pc.tmax + p0 + sgid * 8u) * DH + dt * 8u;
+                if (HALF_KV) {
+                    threadgroup float* tile = KVf + sgid * 64u;
+                    for (uint e = slid; e < 64u; e += 32u)
+                        tile[e] = float(((device const half*)kc)[
+                            ko + (e / 8u) * DH + e % 8u]);
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_load(kf, tile, 8u, ulong2(0, 0), true);
+                } else {
+                    simdgroup_load(kf, (device const float*)kc + ko,
+                                   DH, ulong2(0, 0), true);
+                }
                 simdgroup_multiply_accumulate(acc0, q0, kf, acc0);
                 simdgroup_multiply_accumulate(acc1, q1, kf, acc1);
             }
@@ -152,8 +165,18 @@ static inline void fa_gqa2_body(device const float* qhat,
                 simdgroup_float8x8 p0f, p1f, vf;
                 simdgroup_load(p0f, Stg + kt * 8u, KB);
                 simdgroup_load(p1f, Stg + QT * KB + kt * 8u, KB);
-                simdgroup_load(vf, vc + (ulong)(kv * pc.tmax + p0 + kt * 8u) * DH +
-                                      dct * 8u, DH);
+                const ulong vo =
+                    (ulong)(kv * pc.tmax + p0 + kt * 8u) * DH + dct * 8u;
+                if (HALF_KV) {
+                    threadgroup float* tile = KVf + sgid * 64u;
+                    for (uint e = slid; e < 64u; e += 32u)
+                        tile[e] = float(((device const half*)vc)[
+                            vo + (e / 8u) * DH + e % 8u]);
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_load(vf, tile, 8u);
+                } else {
+                    simdgroup_load(vf, (device const float*)vc + vo, DH);
+                }
                 simdgroup_multiply_accumulate(acc0, p0f, vf, acc0);
                 simdgroup_multiply_accumulate(acc1, p1f, vf, acc1);
             }
@@ -176,10 +199,10 @@ static inline void fa_gqa2_body(device const float* qhat,
     }
 }
 
-#define FA_GQA2_KERNEL(NAME, SIMD_SOFTMAX)                                       \
+#define FA_GQA2_KERNEL(NAME, SIMD_SOFTMAX, HALF_KV, KV_SCRATCH)                  \
 kernel void NAME(device const float* qhat [[buffer(0)]],                         \
-                 device const float* kc [[buffer(1)]],                           \
-                 device const float* vc [[buffer(2)]],                           \
+                 device const uchar* kc [[buffer(1)]],                           \
+                 device const uchar* vc [[buffer(2)]],                           \
                  device const float* qfull [[buffer(3)]],                        \
                  device float* att [[buffer(4)]],                                \
                  constant FaBPC& pc [[buffer(5)]],                               \
@@ -190,11 +213,13 @@ kernel void NAME(device const float* qhat [[buffer(0)]],                        
     threadgroup float Otg[2u * 8u * 256u];                                      \
     threadgroup float Stg[2u * 8u * 64u];                                       \
     threadgroup float mrow[16u], lrow[16u], corrTg[16u];                        \
-    fa_gqa2_body<SIMD_SOFTMAX>(qhat, kc, vc, qfull, att, pc,                    \
-                                Otg, Stg, mrow, lrow, corrTg,                    \
+    threadgroup float KVf[KV_SCRATCH];                                          \
+    fa_gqa2_body<SIMD_SOFTMAX, HALF_KV>(qhat, kc, vc, qfull, att, pc,           \
+                                Otg, Stg, mrow, lrow, corrTg, KVf,               \
                                 tid3, sgid, slid, tgpig);                        \
 }
 
-FA_GQA2_KERNEL(fa_attn_batch_gqa2, true)
-FA_GQA2_KERNEL(fa_attn_batch_gqa2_exact, false)
+FA_GQA2_KERNEL(fa_attn_batch_gqa2, true, false, 1)
+FA_GQA2_KERNEL(fa_attn_batch_gqa2_exact, false, false, 1)
+FA_GQA2_KERNEL(fa_attn_batch_gqa2_f16, true, true, 16u * 64u)
 #undef FA_GQA2_KERNEL

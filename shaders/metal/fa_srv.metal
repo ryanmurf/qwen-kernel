@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "fa_kv.metal"
 
 // Serving variants of the attention pair: per-slot positions come from a
 // slotPos buffer (slots at different sequence positions batch on grid z),
@@ -18,8 +19,8 @@ kernel void fa_prep_srv(device const float* qfull   [[buffer(0)]],
                         device const float* qn      [[buffer(3)]],
                         device const float* kn      [[buffer(4)]],
                         device float*       qhat    [[buffer(5)]],
-                        device float*       kc      [[buffer(6)]],
-                        device float*       vc      [[buffer(7)]],
+                        device uchar*       kc      [[buffer(6)]],
+                        device uchar*       vc      [[buffer(7)]],
                         device const float* ropeCS  [[buffer(8)]],
                         device const uint*  slotPos [[buffer(9)]],
                         constant FaPC&      pc      [[buffer(10)]],
@@ -40,7 +41,8 @@ kernel void fa_prep_srv(device const float* qfull   [[buffer(0)]],
 
     if (w >= pc.hQ + pc.hKV) {           // v: plain copy into cache
         const uint h = w - pc.hQ - pc.hKV;
-        if (t < dh) vc[kvo + (h * pc.tmax + pos) * dh + t] = vin[kio + h * dh + t];
+        if (t < dh) kv_store(vc, kvo + (h * pc.tmax + pos) * dh + t,
+                             vin[kio + h * dh + t]);
         return;
     }
 
@@ -77,13 +79,13 @@ kernel void fa_prep_srv(device const float* qfull   [[buffer(0)]],
             outV = sv[t];
         }
         if (isQ) qhat[qho + h * dh + t] = outV;
-        else     kc[kvo + (h * pc.tmax + pos) * dh + t] = outV;
+        else     kv_store(kc, kvo + (h * pc.tmax + pos) * dh + t, outV);
     }
 }
 
 kernel void fa_attn_srv(device const float* qhat    [[buffer(0)]],
-                        device const float* kc      [[buffer(1)]],
-                        device const float* vc      [[buffer(2)]],
+                        device const uchar* kc      [[buffer(1)]],
+                        device const uchar* vc      [[buffer(2)]],
                         device const float* qfull   [[buffer(3)]],
                         device float*       att     [[buffer(4)]],
                         device const uint*  slotPos [[buffer(5)]],
@@ -117,8 +119,8 @@ kernel void fa_attn_srv(device const float* qhat    [[buffer(0)]],
 
         if (t < ts) {
             float score = 0.0f;
-            device const float* kb = kc + kvo + (kv * pc.tmax + (p0 + t)) * dh;
-            for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+            const ulong kb = kvo + (ulong)(kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kv_load(kc, kb + j);
             sc[t] = score * qs;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -148,7 +150,8 @@ kernel void fa_attn_srv(device const float* qhat    [[buffer(0)]],
 
         if (t < dh) {
             for (uint j = 0u; j < ts; ++j)
-                acc += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+                acc += sc[j] * kv_load(
+                    vc, kvo + (ulong)(kv * pc.tmax + (p0 + j)) * dh + t);
         }
         if (t == 0u) { l += red[0]; m = newm; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -173,8 +176,8 @@ struct FaSplitPC {
 };
 
 kernel void fa_attn_srv_split(device const float* qhat    [[buffer(0)]],
-                              device const float* kc      [[buffer(1)]],
-                              device const float* vc      [[buffer(2)]],
+                              device const uchar* kc      [[buffer(1)]],
+                              device const uchar* vc      [[buffer(2)]],
                               device float*       partial [[buffer(3)]],
                               device const uint*  slotPos [[buffer(4)]],
                               constant FaSplitPC& pc      [[buffer(5)]],
@@ -205,8 +208,8 @@ kernel void fa_attn_srv_split(device const float* qhat    [[buffer(0)]],
     const float qs = rsqrt(float(dh));
     if (t < ts) {
         float score = 0.0f;
-        device const float* kb = kc + kvo + (kv * pc.tmax + (p0 + t)) * dh;
-        for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+        const ulong kb = kvo + (ulong)(kv * pc.tmax + (p0 + t)) * dh;
+        for (uint j = 0u; j < dh; ++j) score += q[j] * kv_load(kc, kb + j);
         sc[t] = score * qs;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -234,7 +237,8 @@ kernel void fa_attn_srv_split(device const float* qhat    [[buffer(0)]],
     if (t < dh) {
         float accLocal = 0.0f;
         for (uint j = 0u; j < ts; ++j) {
-            accLocal += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+            accLocal += sc[j] * kv_load(
+                vc, kvo + (ulong)(kv * pc.tmax + (p0 + j)) * dh + t);
         }
         partial[partialBase + t] = accLocal;
     }
@@ -247,8 +251,8 @@ kernel void fa_attn_srv_split(device const float* qhat    [[buffer(0)]],
 // Bit-exact compact grid for highly skewed batches. Unlike the rectangular
 // split grid, every work item names a live (slot, 256-key chunk) pair.
 kernel void fa_attn_srv_split_compact(device const float* qhat    [[buffer(0)]],
-                                      device const float* kc      [[buffer(1)]],
-                                      device const float* vc      [[buffer(2)]],
+                                      device const uchar* kc      [[buffer(1)]],
+                                      device const uchar* vc      [[buffer(2)]],
                                       device float*       partial [[buffer(3)]],
                                       device const uint*  slotPos [[buffer(4)]],
                                       device const uint*  work    [[buffer(5)]],
@@ -280,8 +284,8 @@ kernel void fa_attn_srv_split_compact(device const float* qhat    [[buffer(0)]],
     const float qs = rsqrt(float(dh));
     if (t < ts) {
         float score = 0.0f;
-        device const float* kb = kc + kvo + (kv * pc.tmax + (p0 + t)) * dh;
-        for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+        const ulong kb = kvo + (ulong)(kv * pc.tmax + (p0 + t)) * dh;
+        for (uint j = 0u; j < dh; ++j) score += q[j] * kv_load(kc, kb + j);
         sc[t] = score * qs;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -309,7 +313,8 @@ kernel void fa_attn_srv_split_compact(device const float* qhat    [[buffer(0)]],
     if (t < dh) {
         float accLocal = 0.0f;
         for (uint j = 0u; j < ts; ++j) {
-            accLocal += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+            accLocal += sc[j] * kv_load(
+                vc, kvo + (ulong)(kv * pc.tmax + (p0 + j)) * dh + t);
         }
         partial[partialBase + t] = accLocal;
     }
@@ -324,8 +329,8 @@ kernel void fa_attn_srv_split_compact(device const float* qhat    [[buffer(0)]],
 // reducer therefore sees byte-identical inputs in the same order; only q
 // loading and producer scheduling are amortized.
 kernel void fa_attn_srv_split_multi(device const float* qhat    [[buffer(0)]],
-                                    device const float* kc      [[buffer(1)]],
-                                    device const float* vc      [[buffer(2)]],
+                                    device const uchar* kc      [[buffer(1)]],
+                                    device const uchar* vc      [[buffer(2)]],
                                     device float*       partial [[buffer(3)]],
                                     device const uint*  slotPos [[buffer(4)]],
                                     device const uint2* work    [[buffer(5)]],
@@ -361,8 +366,8 @@ kernel void fa_attn_srv_split_multi(device const float* qhat    [[buffer(0)]],
         const uint ts = min(CK, n - p0);
         if (t < ts) {
             float score = 0.0f;
-            device const float* kb = kc + kvo + (kv * pc.tmax + (p0 + t)) * dh;
-            for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+            const ulong kb = kvo + (ulong)(kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kv_load(kc, kb + j);
             sc[t] = score * qs;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -390,7 +395,8 @@ kernel void fa_attn_srv_split_multi(device const float* qhat    [[buffer(0)]],
         if (t < dh) {
             float accLocal = 0.0f;
             for (uint j = 0u; j < ts; ++j)
-                accLocal += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+                accLocal += sc[j] * kv_load(
+                    vc, kvo + (ulong)(kv * pc.tmax + (p0 + j)) * dh + t);
             partial[partialBase + t] = accLocal;
         }
         if (t == 0u) {

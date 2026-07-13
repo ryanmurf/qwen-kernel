@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "fa_kv.metal"
 
 // Decode attention over the KV cache for one token, one THREADGROUP per
 // q-head (port of shaders/fa_attn.comp):
@@ -15,8 +16,8 @@ struct FaPC {
 };
 
 kernel void fa_attn(device const float* qhat  [[buffer(0)]],
-                    device const float* kc    [[buffer(1)]],
-                    device const float* vc    [[buffer(2)]],
+                    device const uchar* kc    [[buffer(1)]],
+                    device const uchar* vc    [[buffer(2)]],
                     device const float* qfull [[buffer(3)]],
                     device float*       att   [[buffer(4)]],
                     constant FaPC&      pc    [[buffer(5)]],
@@ -46,8 +47,8 @@ kernel void fa_attn(device const float* qhat  [[buffer(0)]],
     const float qs = rsqrt(float(dh));
     for (uint p = t; p < n; p += 256u) {
         float s = 0.0f;
-        device const float* kb = kc + kvo + (kv * pc.tmax + p) * dh;
-        for (uint j = 0u; j < dh; ++j) s += q[j] * kb[j];
+        const ulong kb = kvo + (ulong)(kv * pc.tmax + p) * dh;
+        for (uint j = 0u; j < dh; ++j) s += q[j] * kv_load(kc, kb + j);
         sc[p] = s * qs;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -86,7 +87,7 @@ kernel void fa_attn(device const float* qhat  [[buffer(0)]],
     if (t < dh) {
         float o = 0.0f;
         for (uint p = 0u; p < n; ++p)
-            o += sc[p] * vc[kvo + (kv * pc.tmax + p) * dh + t];
+            o += sc[p] * kv_load(vc, kvo + (ulong)(kv * pc.tmax + p) * dh + t);
         o *= inv;
         const float g = qfull[qfo + h * 2u * dh + dh + t];
         att[qho + h * dh + t] = o * (1.0f / (1.0f + exp(-g)));

@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "fa_kv.metal"
 
 // Batched-prefill attention pair: each z workgroup is a token offset within
 // one prompt chunk for a single slot; K/V cache writes use pos = base + n,
@@ -18,8 +19,8 @@ kernel void fa_prep_batch(device const float* qfull  [[buffer(0)]],
                           device const float* qn     [[buffer(3)]],
                           device const float* kn     [[buffer(4)]],
                           device float*       qhat   [[buffer(5)]],
-                          device float*       kc     [[buffer(6)]],
-                          device float*       vc     [[buffer(7)]],
+                          device uchar*       kc     [[buffer(6)]],
+                          device uchar*       vc     [[buffer(7)]],
                           device const float* ropeCS [[buffer(8)]],
                           constant FaBPC&     pc     [[buffer(9)]],
                           uint3 tid3  [[thread_position_in_threadgroup]],
@@ -38,7 +39,8 @@ kernel void fa_prep_batch(device const float* qfull  [[buffer(0)]],
 
     if (w >= pc.hQ + pc.hKV) {           // v: plain copy into cache
         const uint h = w - pc.hQ - pc.hKV;
-        if (t < dh) vc[(h * pc.tmax + pos) * dh + t] = vin[kio + h * dh + t];
+        if (t < dh) kv_store(vc, (h * pc.tmax + pos) * dh + t,
+                             vin[kio + h * dh + t]);
         return;
     }
 
@@ -75,13 +77,13 @@ kernel void fa_prep_batch(device const float* qfull  [[buffer(0)]],
             outV = sv[t];
         }
         if (isQ) qhat[qho + h * dh + t] = outV;
-        else     kc[(h * pc.tmax + pos) * dh + t] = outV;
+        else     kv_store(kc, (h * pc.tmax + pos) * dh + t, outV);
     }
 }
 
 kernel void fa_attn_batch(device const float* qhat  [[buffer(0)]],
-                          device const float* kc    [[buffer(1)]],
-                          device const float* vc    [[buffer(2)]],
+                          device const uchar* kc    [[buffer(1)]],
+                          device const uchar* vc    [[buffer(2)]],
                           device const float* qfull [[buffer(3)]],
                           device float*       att   [[buffer(4)]],
                           constant FaBPC&     pc    [[buffer(5)]],
@@ -114,8 +116,8 @@ kernel void fa_attn_batch(device const float* qhat  [[buffer(0)]],
 
         if (t < ts) {
             float score = 0.0f;
-            device const float* kb = kc + (kv * pc.tmax + (p0 + t)) * dh;
-            for (uint j = 0u; j < dh; ++j) score += q[j] * kb[j];
+            const ulong kb = (ulong)(kv * pc.tmax + (p0 + t)) * dh;
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kv_load(kc, kb + j);
             sc[t] = score * qs;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -145,7 +147,8 @@ kernel void fa_attn_batch(device const float* qhat  [[buffer(0)]],
 
         if (t < dh) {
             for (uint j = 0u; j < ts; ++j)
-                acc += sc[j] * vc[(kv * pc.tmax + (p0 + j)) * dh + t];
+                acc += sc[j] * kv_load(
+                    vc, (ulong)(kv * pc.tmax + (p0 + j)) * dh + t);
         }
         if (t == 0u) { l += red[0]; m = newm; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -173,8 +176,8 @@ constant uint KBM = 64u;   // key block (8 MMA col tiles)
 constant uint NSGM = 8u;   // simdgroups per threadgroup (256 threads)
 
 kernel void fa_attn_batch_mma(device const float* qhat  [[buffer(0)]],
-                              device const float* kc    [[buffer(1)]],
-                              device const float* vc    [[buffer(2)]],
+                              device const uchar* kc    [[buffer(1)]],
+                              device const uchar* vc    [[buffer(2)]],
                               device const float* qfull [[buffer(3)]],
                               device float*       att   [[buffer(4)]],
                               constant FaBPC&     pc    [[buffer(5)]],
@@ -223,8 +226,9 @@ kernel void fa_attn_batch_mma(device const float* qhat  [[buffer(0)]],
                 simdgroup_float8x8 qf, kf;
                 simdgroup_load(qf, qhat + (ulong)(qstart + rt * 8u) * hQ * dh +
                                         (ulong)h * dh + dt * 8u, hQ * dh);
-                simdgroup_load(kf, kc + (ulong)(kv * tmax + p0 + ct * 8u) * dh +
-                                      dt * 8u, dh, ulong2(0, 0), true);   // K^T
+                const ulong ko = (ulong)(kv * tmax + p0 + ct * 8u) * dh + dt * 8u;
+                simdgroup_load(kf, (device const float*)kc + ko,
+                               dh, ulong2(0, 0), true);                  // K^T
                 simdgroup_multiply_accumulate(acc, qf, kf, acc);
             }
             simdgroup_store(acc, Stg + (rt * 8u) * KBM + ct * 8u, KBM);
@@ -287,8 +291,8 @@ kernel void fa_attn_batch_mma(device const float* qhat  [[buffer(0)]],
                 if (p0 + kt * 8u >= nk) continue;  // P=0 there, skip V read
                 simdgroup_float8x8 pf, vf;
                 simdgroup_load(pf, Stg + (rt * 8u) * KBM + kt * 8u, KBM);
-                simdgroup_load(vf, vc + (ulong)(kv * tmax + p0 + kt * 8u) * dh +
-                                      dct * 8u, dh);
+                const ulong vo = (ulong)(kv * tmax + p0 + kt * 8u) * dh + dct * 8u;
+                simdgroup_load(vf, (device const float*)vc + vo, dh);
                 simdgroup_multiply_accumulate(acc, pf, vf, acc);
             }
             simdgroup_store(acc, Otg + (rt * 8u) * dh + dct * 8u, dh);
