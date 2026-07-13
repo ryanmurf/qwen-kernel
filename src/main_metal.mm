@@ -2909,7 +2909,8 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
                 continue;
             }
             if (prefilling) { sl.cursor = (uint32_t)sl.prompt.size(); sl.pos = (uint32_t)sl.prompt.size(); }
-            if (sampled == eosTok) {
+            static const bool noEos = getenv("QK_NO_EOS") != nullptr;  // bench: force nGen
+            if (sampled == eosTok && !noEos) {
                 if (!prefilling) sl.pos++;
                 snapshotSlot(s);
                 sl.active = false; *outFin |= 1u << s;

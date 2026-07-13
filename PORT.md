@@ -224,6 +224,44 @@ real remaining lever is tile/nsg geometry + register-vs-tgmem O, which needs
 on-GPU measurement (codex couldn't). Kept the change anyway (correct + the
 idiomatic exp2 path).
 
+## 2026-07-12 (later) -- split-K decode attention: 1.36x deep-context decode
+
+Decode/serving attention fa_attn_srv is ONE threadgroup per (q-head, slot)
+serially walking the whole KV in 256-key blocks -- fine at short ctx (attn
+tiny), but at the 80B worker's deep context it's a long serial walk in ~32 TGs
+on 40 cores (the pathology tron flagged; tron shipped split-K, byte-exact,
+2.4x deep-ctx on their Vulkan side). Short-ctx tg128 decode (120 tok/s) is
+near its structural limit -- the real decode lever is long-ctx, which is what
+prod serves.
+
+**fa_attn_srv_split + fa_attn_srv_reduce** (flash-decoding, fa_srv.metal):
+split runs one TG per 256-key chunk (grid hQ x nChunks x nSlots) emitting an
+unnormalized (acc[dh], m, l) partial (over-length chunk-TGs early-return);
+reduce merges partials per (head,slot) with the online-softmax rescale + gate.
+Mathematically exact. Kernels by Codex gpt-5.6-sol; engine wiring (partials
+scratch, dspY chunk-axis dispatch, host active-chunk count) mine. Opt-in
+QK_FA_SPLIT=1; default scalar unchanged.
+
+Measured (35B, ctx 8000 = 32 chunks, worker down, QK_NO_EOS forces 96 decode
+steps, QK_MLOCK, interleaved): scalar 15516 ms vs split 13027 ms for
+prefill+96 decode -> **25.9 ms/step decode savings** (prefill identical).
+Decode step 99 -> 73 ms = **1.36x deep-ctx decode**, grows with ctx. Gates:
+serve-test TOKEN-EXACT vs scalar at ctx 1040 (5 chunks) AND 8000 (32 chunks).
+
+**1.36x is a STRUCTURAL ceiling, not the inner loop.** CK sweep 64 vs 256
+perf-identical (512 TGs already fill 40 cores). A codex-authored coalesced
+simdgroup-per-key inner loop (32 lanes -> 32 contiguous dims + simd_sum,
+token-exact) measured 13176 ms = ~1% SLOWER than the scalar-parallel inner
+loop -- reverted. At ctx 8000 the KV reads run at ~40 GB/s of 493 (nowhere
+near bandwidth-bound), so the limit is the cold latency-bound per-step command
+buffer, not memory coalescing. Past 1.36x needs a structural change
+(command-buffer pipelining / multi-step batching / spec-decode), not kernel
+tuning. QK_NO_EOS = bench-only flag (force nGen, ignore EOS).
+
+Status: split-K is in the prod build/ (opt-in, off). tron owns the 80B decode
+gate -- recommend enabling QK_FA_SPLIT=1 on the worker (dims match 35B) and
+gating, for the long-ctx serving win.
+
 ## M0 — llama.cpp Metal baseline (2026-07-08)
 
 **Gate decision: NOT triggered — proceed with the port.** llama.cpp Metal
