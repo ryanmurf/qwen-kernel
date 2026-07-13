@@ -68,11 +68,11 @@ struct MtlCtx {
     id<MTLCommandQueue> queue = nil;
     std::map<std::string, id<MTLLibrary>> libs;                  // file -> lib
     std::map<std::string, id<MTLComputePipelineState>> pipes;    // file:fn:tpr -> pso
-    const char* argv0 = nullptr;
+    std::string argv0;
 };
 
 static void initMtl(MtlCtx& c, const char* argv0) {
-    c.argv0 = argv0;
+    c.argv0 = argv0 ? argv0 : "";
     if (const char* e = getenv("QK_DEVICE")) {
         NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
         int i = atoi(e);
@@ -287,18 +287,24 @@ static std::string loadMetalSource(const char* argv0, const char* name) {
 }
 
 // Pipeline cache: JIT-compile <file>.metal once, specialize per (fn, TPR).
-static id<MTLComputePipelineState> getPipe(MtlCtx& c, const char* file,
-                                           const char* fn, uint32_t tpr) {
-    std::string key = std::string(file) + ":" + fn + ":" + std::to_string(tpr);
+// sourcePrefix/sourceTag create a separate source-level variant when a shader
+// needs a compile-time define without exposing a mandatory function constant.
+static id<MTLComputePipelineState> getPipeVariant(
+        MtlCtx& c, const char* file, const char* fn, uint32_t tpr,
+        const char* sourcePrefix = nullptr, const char* sourceTag = "") {
+    const std::string libKey = std::string(file) + sourceTag;
+    std::string key = libKey + ":" + fn + ":" + std::to_string(tpr);
     auto it = c.pipes.find(key);
     if (it != c.pipes.end()) return it->second;
 
     id<MTLLibrary> lib = nil;
-    auto lit = c.libs.find(file);
+    auto lit = c.libs.find(libKey);
     if (lit != c.libs.end()) {
         lib = lit->second;
     } else {
-        std::string src = loadMetalSource(c.argv0, (std::string(file) + ".metal").c_str());
+        std::string src = loadMetalSource(c.argv0.c_str(),
+                                          (std::string(file) + ".metal").c_str());
+        if (sourcePrefix) src.insert(0, sourcePrefix);
         NSError* err = nil;
         lib = [c.dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
                                   options:nil
@@ -308,7 +314,7 @@ static id<MTLComputePipelineState> getPipe(MtlCtx& c, const char* file,
                     err.localizedDescription.UTF8String);
             exit(1);
         }
-        c.libs[file] = lib;
+        c.libs[libKey] = lib;
     }
 
     // tpr == 0: kernel has no function constants (mirrors makePipe's if (tpr))
@@ -335,6 +341,27 @@ static id<MTLComputePipelineState> getPipe(MtlCtx& c, const char* file,
     }
     c.pipes[key] = pso;
     return pso;
+}
+
+static id<MTLComputePipelineState> getPipe(MtlCtx& c, const char* file,
+                                           const char* fn, uint32_t tpr) {
+    return getPipeVariant(c, file, fn, tpr);
+}
+
+// KV width is a source-level constant so an older host that does not know
+// about the precision tiers can compile the same source with the f32 default.
+// Current hosts still get a separately compiled, fully constant-folded library
+// for each 1/2/4-byte representation.
+static id<MTLComputePipelineState> getKvPipe(MtlCtx& c, const char* file,
+                                             const char* fn, uint32_t kvBytes) {
+    if (kvBytes != 1u && kvBytes != 2u && kvBytes != 4u) {
+        fprintf(stderr, "invalid KV byte width %u\n", kvBytes);
+        exit(1);
+    }
+    char prefix[48], tag[16];
+    snprintf(prefix, sizeof prefix, "#define QK_KV_BYTES %uu\n", kvBytes);
+    snprintf(tag, sizeof tag, ":kv%u", kvBytes);
+    return getPipeVariant(c, file, fn, 0, prefix, tag);
 }
 
 // UMA buffer: shared storage, host pointer == GPU memory. No staging.
@@ -2144,8 +2171,8 @@ static bool caseABlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters)
     const uint32_t nsg = getenv("QK_MOE_NSG") ? (uint32_t)atoi(getenv("QK_MOE_NSG")) : 4;
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
-    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", kvBytes);
-    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", kvBytes);
+    id<MTLComputePipelineState> pPrep  = getKvPipe(c, "fa_prep", "fa_prep", kvBytes);
+    id<MTLComputePipelineState> pAttn  = getKvPipe(c, "fa_attn", "fa_attn", kvBytes);
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
@@ -2498,8 +2525,8 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
         ? getPipe(c, "dn_step", dnStateFn, 0) : nil;
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
-    id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", kvBytes);
-    id<MTLComputePipelineState> pAttn  = getPipe(c, "fa_attn", "fa_attn", kvBytes);
+    id<MTLComputePipelineState> pPrep  = getKvPipe(c, "fa_prep", "fa_prep", kvBytes);
+    id<MTLComputePipelineState> pAttn  = getKvPipe(c, "fa_attn", "fa_attn", kvBytes);
     id<MTLComputePipelineState> pMoeS  = getPipe(c, "moe_select", "moe_select", 0);
     id<MTLComputePipelineState> pMoeLA = getPipe(c, "moe_logits", "moe_logits_addn", nsg);
     bool moeGuFixed = ffE == 512u;
@@ -3333,7 +3360,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     specScratch = specOn || getenv("QK_SPEC_SCRATCH") != nullptr;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
-    initMtl(c, "libqk");
+    // Prefer the shader snapshot installed beside the running executable.
+    // Shared-library consumers without an adjacent snapshot still fall back
+    // to the working-tree path in loadMetalSource.
+    NSString* exePath = [NSBundle mainBundle].executablePath;
+    initMtl(c, exePath ? exePath.fileSystemRepresentation : "libqk");
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     // Model-shape KVs (arch-prefixed): 35B = qwen35moe 40/8, 80B = qwen3next 48/10.
     const std::string arch = g.kvStr("general.architecture", "");
@@ -3572,25 +3603,25 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (dnDecodeSplitMode < 0)
             pStepStateSimd = getPipe(c, "dn_step", "dn_step_state_rowsimd", 0);
     }
-    pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", kvBytes);
-    pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
-    pAttnSplit  = getPipe(c, "fa_srv",
+    pPrep  = getKvPipe(c, "fa_srv", "fa_prep_srv", kvBytes);
+    pAttn  = getKvPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
+    pAttnSplit  = getKvPipe(c, "fa_srv",
         kvQ8 ? "fa_attn_srv_split_q8" : "fa_attn_srv_split", kvBytes);
     pAttnReduce = getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
-    pAttnCompact = getPipe(c, "fa_srv", "fa_attn_srv_split_compact", kvBytes);
-    pAttnMulti = getPipe(c, "fa_srv", "fa_attn_srv_split_multi", kvBytes);
+    pAttnCompact = getKvPipe(c, "fa_srv", "fa_attn_srv_split_compact", kvBytes);
+    pAttnMulti = getKvPipe(c, "fa_srv", "fa_attn_srv_split_multi", kvBytes);
     if (kvQ8) {
-        pAttnQ8G2 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa2", kvBytes);
-        pAttnQ8G4 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa4", kvBytes);
-        pAttnQ8G8 = getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes);
+        pAttnQ8G2 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa2", kvBytes);
+        pAttnQ8G4 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa4", kvBytes);
+        pAttnQ8G8 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes);
     } else if (kvF16) {
-        pAttnF16G2 = getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa2", kvBytes);
-        pAttnF16G4 = getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa4", kvBytes);
-        pAttnF16G8 = getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa8", kvBytes);
+        pAttnF16G2 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa2", kvBytes);
+        pAttnF16G4 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa4", kvBytes);
+        pAttnF16G8 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa8", kvBytes);
     } else {
-        pAttnF32G2 = getPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa2", kvBytes);
-        pAttnF32G4 = getPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa4", kvBytes);
-        pAttnF32G8 = getPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa8", kvBytes);
+        pAttnF32G2 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa2", kvBytes);
+        pAttnF32G4 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa4", kvBytes);
+        pAttnF32G8 = getKvPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa8", kvBytes);
     }
     if (const char* v = getenv("QK_FA_SPLIT")) faDecodeSplit = atoi(v) != 0;
     if (const char* v = getenv("QK_FA_WORK")) faDecodeWork = atoi(v) != 0;
@@ -3642,30 +3673,30 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAm1   = getPipe(c, "argmax", "argmax1", 0);
     pAm2   = getPipe(c, "argmax", "argmax2", 0);
     pEmb   = getPipe(c, embQ8 ? "embed_q8_0" : "embed_q6k", embQ8 ? "embed_q8_0" : "embed_q6k", 0);
-    pPrepB = getPipe(c, "fa_batch", "fa_prep_batch", kvBytes);
-    pAttnB = getPipe(c, "fa_batch", "fa_attn_batch", kvBytes);
+    pPrepB = getKvPipe(c, "fa_batch", "fa_prep_batch", kvBytes);
+    pAttnB = getKvPipe(c, "fa_batch", "fa_attn_batch", kvBytes);
     // Two-Q-head Q8/K64/S16 geometry is the prefill-attention default. `exact`
     // retains the geometry but restores scalar softmax summation; `q16`
     // restores the original Q16/K64/S8 kernel for full rollback.
     const char* faGeom = getenv("QK_FA_GEOM");
     if (kvQ8) {
         faQTM = 8; faThreads = 512; faHeadGroup = 2;
-        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_q8", kvBytes);
+        pAttnBM = getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2_q8", kvBytes);
     } else if (kvF16) {
         // MSL cannot directly load half storage into a float matrix. The f16
         // twin expands one K/V fragment per simdgroup into float TG scratch,
         // retaining the default GQA reuse and f32 MMA accumulation.
         faQTM = 8; faThreads = 512; faHeadGroup = 2;
-        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_f16", kvBytes);
+        pAttnBM = getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2_f16", kvBytes);
     } else if (faGeom && !strcmp(faGeom, "q16")) {
         faQTM = 16; faThreads = 256; faHeadGroup = 1;
-        pAttnBM = getPipe(c, "fa_batch", "fa_attn_batch_mma", kvBytes);
+        pAttnBM = getKvPipe(c, "fa_batch", "fa_attn_batch_mma", kvBytes);
     } else if (faGeom && !strcmp(faGeom, "exact")) {
         faQTM = 8; faThreads = 512; faHeadGroup = 2;
-        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", kvBytes);
+        pAttnBM = getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", kvBytes);
     } else {
         faQTM = 8; faThreads = 512; faHeadGroup = 2;
-        pAttnBM = getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", kvBytes);
+        pAttnBM = getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2", kvBytes);
     }
     pAbB   = getPipe(c, "dn_batch", "dn_ab_batch", nsg);
     pConvB = getPipe(c, "dn_batch", "dn_conv_batch", 0);
@@ -6446,21 +6477,21 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     std::vector<Variant> vars;
     if (kvQ8) {
         vars.push_back({"gqa2_q8_k64_s16_q8", 8, 64, 16, 2,
-            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_q8", kvBytes)});
+            getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2_q8", kvBytes)});
     } else if (kvF16) {
         vars.push_back({"gqa2_q8_k64_s16_f16", 8, 64, 16, 2,
-            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_f16", kvBytes)});
+            getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2_f16", kvBytes)});
     } else {
         vars.push_back({"gqa2_q8_k64_s16_exact", 8, 64, 16, 2,
-            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", kvBytes)});
+            getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2_exact", kvBytes)});
         vars.push_back({"gqa2_q8_k64_s16_simd", 8, 64, 16, 2,
-            getPipe(c, "fa_gqa", "fa_attn_batch_gqa2", kvBytes)});
+            getKvPipe(c, "fa_gqa", "fa_attn_batch_gqa2", kvBytes)});
     }
     id<MTLComputePipelineState> pRef = (kvF16 || kvQ8)
-        ? getPipe(c, "fa_batch", "fa_attn_batch", kvBytes)
-        : getPipe(c, "fa_batch", "fa_attn_batch_mma", kvBytes);
+        ? getKvPipe(c, "fa_batch", "fa_attn_batch", kvBytes)
+        : getKvPipe(c, "fa_batch", "fa_attn_batch_mma", kvBytes);
     id<MTLComputePipelineState> pF32Ref = kvQ8
-        ? getPipe(c, "fa_batch", "fa_attn_batch", 4u) : pRef;
+        ? getKvPipe(c, "fa_batch", "fa_attn_batch", 4u) : pRef;
     const uint32_t refQt = (kvF16 || kvQ8) ? 1u : 16u;
 
     auto encode = [&](id<MTLComputeCommandEncoder> enc,
@@ -6665,18 +6696,18 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
     } spc{0u, tmax, dh, 64u, hQ, hKV, 1e-6f, 1000000.f, maxChunks};
 
     id<MTLComputePipelineState> pScalar =
-        getPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
+        getKvPipe(c, "fa_srv", "fa_attn_srv", kvBytes);
     id<MTLComputePipelineState> pScalarF32 = kvQ8
-        ? getPipe(c, "fa_srv", "fa_attn_srv", 4u) : pScalar;
+        ? getKvPipe(c, "fa_srv", "fa_attn_srv", 4u) : pScalar;
     id<MTLComputePipelineState> pSplit =
-        getPipe(c, "fa_srv", kvQ8 ? "fa_attn_srv_split_q8" : "fa_attn_srv_split",
+        getKvPipe(c, "fa_srv", kvQ8 ? "fa_attn_srv_split_q8" : "fa_attn_srv_split",
                 kvBytes);
     id<MTLComputePipelineState> pReduce =
         getPipe(c, "fa_srv", "fa_attn_srv_reduce", 0);
     id<MTLComputePipelineState> pCompact =
-        getPipe(c, "fa_srv", "fa_attn_srv_split_compact", kvBytes);
+        getKvPipe(c, "fa_srv", "fa_attn_srv_split_compact", kvBytes);
     id<MTLComputePipelineState> pMulti =
-        getPipe(c, "fa_srv", "fa_attn_srv_split_multi", kvBytes);
+        getKvPipe(c, "fa_srv", "fa_attn_srv_split_multi", kvBytes);
     struct SplitVariant {
         std::string name;
         id<MTLComputePipelineState> split;
@@ -6688,39 +6719,39 @@ static bool caseFaSrvCmp(MtlCtx& c, uint32_t slots, uint32_t maxPos,
         {"split256", pSplit, nil, 0u, 1u}};
     if (kvQ8)
         splitVars.push_back({"q8-gqa2",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa2", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa2", kvBytes),
             nil, 0u, 2u});
     if (kvQ8)
         splitVars.push_back({"q8-gqa4",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa4", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa4", kvBytes),
             nil, 0u, 4u});
     if (kvQ8)
         splitVars.push_back({"q8-gqa8",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_q8_gqa8", kvBytes),
             nil, 0u, 8u});
     if (kvF16)
         splitVars.push_back({"f16-gqa2",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa2", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa2", kvBytes),
             nil, 0u, 2u});
     if (kvF16)
         splitVars.push_back({"f16-gqa4",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa4", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa4", kvBytes),
             nil, 0u, 4u});
     if (kvF16)
         splitVars.push_back({"f16-gqa8",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa8", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_f16_gqa8", kvBytes),
             nil, 0u, 8u});
     if (!kvF16 && !kvQ8)
         splitVars.push_back({"f32-gqa2",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa2", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa2", kvBytes),
             nil, 0u, 2u});
     if (!kvF16 && !kvQ8)
         splitVars.push_back({"f32-gqa4",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa4", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa4", kvBytes),
             nil, 0u, 4u});
     if (!kvF16 && !kvQ8)
         splitVars.push_back({"f32-gqa8",
-            getPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa8", kvBytes),
+            getKvPipe(c, "fa_srv", "fa_attn_srv_split_f32_gqa8", kvBytes),
             nil, 0u, 8u});
     std::vector<uint32_t> compactWork;
     for (uint32_t s = 0; s < slots; ++s) {
