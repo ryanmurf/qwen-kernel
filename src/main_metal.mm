@@ -6,6 +6,7 @@
 // Usage:
 //   qk                        synthetic suite: f16, q8_0, q6_k, iq4_xs, iq3_xxs
 //   qk f16|q8_0|q6_k|iq4_xs|iq3_xxs [M] [K] [iters]
+//   qk slotgemv [M] [K] [B] [TPR] [iters]  Q8_0 slot-batch comparison
 //   qk gguf <tensor> [iters]  real weights (QK_GGUF overrides model path)
 //   qk list [filter]          list tensors in the GGUF
 //
@@ -369,6 +370,105 @@ static bool caseQ80(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
     }
     return runGemv(c, "gemv_q8_0", blocks.data(), nb * sizeof(block_q8_0),
                    x, M, K, yref, iters, K / 32);
+}
+
+// Compare a slot-batched Q8_0 kernel against the existing grid-z dispatch on
+// distinct RHS vectors. This catches accidental cross-slot reuse that the
+// identical-slot serving determinism test cannot see.
+static bool caseQ80Batch(MtlCtx& c, uint32_t M, uint32_t K, uint32_t B,
+                         uint32_t tpr, uint32_t iters) {
+    if (K % 32 || (B != 2 && B != 4 && B != 8) ||
+        (tpr != 32 && tpr != 64 && tpr != 128)) {
+        fprintf(stderr, "slotgemv requires K%%32=0, B={2,4,8}, TPR={32,64,128}\n");
+        return false;
+    }
+    const size_t nb = (size_t)M * K / 32;
+    std::vector<block_q8_0> blocks(nb);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        b.d = qk_f32_to_f16(0.005f + 0.02f * (rng() & 0xFFFF) / 65536.0f);
+        for (auto& q : b.qs) q = (int8_t)((int)(rng() % 255) - 127);
+    }
+    std::vector<float> x((size_t)B * K);
+    for (uint32_t rq = 0; rq < B; ++rq) {
+        auto xr = randomX(K, 100u + rq * 977u);
+        memcpy(x.data() + (size_t)rq * K, xr.data(), K * 4);
+    }
+
+    const size_t wBytes = blocks.size() * sizeof(block_q8_0);
+    const size_t xBytes = x.size() * 4;
+    const size_t yBytes = (size_t)B * M * 4;
+    id<MTLBuffer> bW = createBuf(c, wBytes, blocks.data());
+    id<MTLBuffer> bX = createBuf(c, xBytes, x.data());
+    id<MTLBuffer> bRef = createBuf(c, yBytes);
+    id<MTLBuffer> bBat = createBuf(c, yBytes);
+    id<MTLComputePipelineState> pRef = getPipe(c, "gemv_q8_0", "gemv_q8_0", tpr);
+    char fn[32];
+    snprintf(fn, sizeof fn, "gemv_q8_0_b%u", B);
+    id<MTLComputePipelineState> pBat = getPipe(c, "gemv_q8_0_batch", fn, tpr);
+    struct { uint32_t m, k; } pc{M, K};
+    const uint32_t rowsPerTg = 256u / tpr;
+    const uint32_t wgs = (M + rowsPerTg - 1u) / rowsPerTg;
+
+    auto dispatch = [&](id<MTLComputeCommandEncoder> enc,
+                        id<MTLComputePipelineState> pso, id<MTLBuffer> y,
+                        uint32_t gridZ) {
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bW offset:0 atIndex:0];
+        [enc setBuffer:bX offset:0 atIndex:1];
+        [enc setBuffer:y offset:0 atIndex:2];
+        [enc setBytes:&pc length:8 atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, gridZ)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto once = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> y,
+                    uint32_t gridZ) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            dispatch(enc, pso, y, gridZ);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+    };
+    once(pRef, bRef, B);
+    once(pBat, bBat, 1);
+
+    const float* ref = (const float*)bRef.contents;
+    const float* bat = (const float*)bBat.contents;
+    double maxAbs = 0.0, maxRel = 0.0;
+    size_t bitDiff = 0;
+    for (size_t i = 0; i < (size_t)B * M; ++i) {
+        if (memcmp(ref + i, bat + i, sizeof(float))) bitDiff++;
+        const double ae = std::fabs((double)bat[i] - ref[i]);
+        maxAbs = std::max(maxAbs, ae);
+        maxRel = std::max(maxRel, ae / std::max(1e-5, (double)std::fabs(ref[i])));
+    }
+    const bool pass = bitDiff == 0;
+    printf("\n== slot Q8_0 GEMV M=%u K=%u B=%u TPR=%u ==\n", M, K, B, tpr);
+    printf("correctness: bit_diff=%zu max_abs=%.3g max_rel=%.3g -> %s\n",
+           bitDiff, maxAbs, maxRel, pass ? "BIT-EXACT" : "FAIL");
+
+    if (pass && iters) {
+        auto bench = [&](id<MTLComputePipelineState> pso, id<MTLBuffer> y,
+                         uint32_t gridZ) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                for (uint32_t i = 0; i < iters; ++i) dispatch(enc, pso, y, gridZ);
+                [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                return (cb.GPUEndTime - cb.GPUStartTime) * 1e9 / iters;
+            }
+        };
+        bench(pRef, bRef, B); bench(pBat, bBat, 1);
+        const double nsRef = bench(pRef, bRef, B);
+        const double nsBat = bench(pBat, bBat, 1);
+        const double refTraffic = B * (double)wBytes + xBytes + yBytes;
+        const double batTraffic = (double)wBytes + xBytes + yBytes;
+        printf("serial-z: %8.1f us %7.1f GB/s | batched: %8.1f us %7.1f GB/s | %.2fx\n",
+               nsRef / 1e3, refTraffic / nsRef, nsBat / 1e3,
+               batTraffic / nsBat, nsRef / nsBat);
+    }
+    return pass;
 }
 
 static bool caseQ6K(MtlCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
@@ -2122,7 +2222,8 @@ struct qk_engine {
     float eps = 1e-6f;
     uint32_t nsg = 4;
 
-    id<MTLComputePipelineState> pGemvA, pGemvO, pAb, pStep, pPrep, pAttn,
+    id<MTLComputePipelineState> pGemvA, pGemvO, pGemvAB, pGemvOB,
+        pAb, pStep, pPrep, pAttn,
         pAttnSplit, pAttnReduce, pMoeS,
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB, pGemmB;
@@ -2140,6 +2241,9 @@ struct qk_engine {
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
     uint32_t gemmThreads = 256;
     uint32_t gemmBM = 128, gemmBN = 64;
+    bool slotBatch = false;
+    uint32_t slotTprA = 64, slotTprO = 128;
+    uint32_t slotBatchN = 0;
 
     struct Layer {
         bool rec = false, downQ6 = false;
@@ -2521,6 +2625,35 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
     pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
+    // Q8_0 dense projections can decode each weight block once for a group of
+    // slots. The 80B repack uses IQ4_XS dense weights and intentionally stays
+    // on its existing path. QK_SLOT_BATCH=0 is the benchmark/rollback switch.
+    if (!guIq4) {
+        slotBatchN = nSlots % 8u == 0u ? 8u : nSlots % 4u == 0u ? 4u
+                                                    : nSlots % 2u == 0u ? 2u : 0u;
+        slotBatch = slotBatchN != 0;
+    }
+    if (const char* sb = getenv("QK_SLOT_BATCH")) slotBatch = atoi(sb) != 0;
+    if (slotBatch) {
+        auto readTpr = [](const char* name, uint32_t dflt) {
+            const char* v = getenv(name);
+            uint32_t x = v ? (uint32_t)atoi(v) : dflt;
+            return x == 32 || x == 64 || x == 128 ? x : dflt;
+        };
+        slotTprA = readTpr("QK_SLOT_TPR_A", slotTprA);
+        slotTprO = readTpr("QK_SLOT_TPR_O", slotTprO);
+        if (const char* v = getenv("QK_SLOT_B")) {
+            uint32_t x = (uint32_t)atoi(v);
+            if ((x == 2 || x == 4 || x == 8) && nSlots % x == 0) slotBatchN = x;
+        }
+        if (!slotBatchN) slotBatch = false;
+    }
+    if (slotBatch) {
+        char fn[32];
+        snprintf(fn, sizeof fn, "gemv_q8_0_b%u", slotBatchN);
+        pGemvAB = getPipe(c, "gemv_q8_0_batch", fn, slotTprA);
+        pGemvOB = getPipe(c, "gemv_q8_0_batch", fn, slotTprO);
+    }
     pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
     pStep  = getPipe(c, "dn_step", "dn_step", 0);
     pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", 0);
@@ -2832,12 +2965,13 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
 void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
     auto dsp = [&](id<MTLComputePipelineState> pso,
                    std::initializer_list<WB> bufs,
-                   const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr) {
+                   const void* pc, uint32_t pcSize, uint32_t wgs, uint32_t thr,
+                   uint32_t gridZ = 0) {
         [enc setComputePipelineState:pso];
         uint32_t i = 0;
         for (const WB& b : bufs) [enc setBuffer:b.b offset:b.o atIndex:i++];
         [enc setBytes:pc length:pcSize atIndex:i];
-        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, zdim)
+        [enc dispatchThreadgroups:MTLSizeMake(wgs, 1, gridZ ? gridZ : zdim)
             threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
     };
     auto bar = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
@@ -2855,6 +2989,11 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
             threadsPerThreadgroup:MTLSizeMake(thr, 1, 1)];
     };
     const uint32_t thrN = nsg * 32;
+    const bool slotB = slotBatch && zdim >= slotBatchN && zdim % slotBatchN == 0;
+    auto bwgs = [](uint32_t rows, uint32_t tpr) {
+        const uint32_t rowsPerTg = 256u / tpr;
+        return (rows + rowsPerTg - 1u) / rowsPerTg;
+    };
 
     struct { uint32_t n; float e; } pcRms{nEmbd, eps};
     struct { uint32_t m, k; } pcQkv{chQkv, nEmbd}, pcZ{dIn, nEmbd}, pcKV{hKV * dh, nEmbd},
@@ -2884,9 +3023,13 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
         Layer& L = layers[il];
         if (L.rec) {
             if (L.iq4P1) dsp(pGemv4, {L.qkvW, bXn, bBig}, &pcQkv, 8, chQkv / 4, 64);
-            else         dsp(pGemvA, {L.qkvW, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+            else         dsp(slotB ? pGemvAB : pGemvA, {L.qkvW, bXn, bBig}, &pcQkv,
+                             8, slotB ? bwgs(chQkv, slotTprA) : chQkv / 4, 256,
+                             slotB ? zdim / slotBatchN : 0);
             if (L.iq4P2) dsp(pGemv4, {L.zW, bXn, bMid}, &pcZ, 8, dIn / 4, 64);
-            else         dsp(pGemvA, {L.zW, bXn, bMid}, &pcZ, 8, dIn / 4, 256);
+            else         dsp(slotB ? pGemvAB : pGemvA, {L.zW, bXn, bMid}, &pcZ,
+                             8, slotB ? bwgs(dIn, slotTprA) : dIn / 4, 256,
+                             slotB ? zdim / slotBatchN : 0);
             dsp(pAb, {bXn, L.alW, L.beW, L.dt, L.av, bGb}, &pcAb, 8,
                 (2 * hV + nsg - 1) / nsg, thrN);
             bar();
@@ -2894,14 +3037,22 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
                 &pcStep, 20, hK, dS);
             bar();
             if (L.iq4Wo) dsp(pGemv4, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
-            else         dsp(pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+            else         dsp(slotB ? pGemvOB : pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo,
+                             8, slotB ? bwgs(nEmbd, slotTprO) : nEmbd / 2, 256,
+                             slotB ? zdim / slotBatchN : 0);
         } else {
             if (L.iq4P1) dsp(pGemv4, {L.wq, bXn, bBig}, &pcQkv, 8, chQkv / 4, 64);
-            else         dsp(pGemvA, {L.wq, bXn, bBig}, &pcQkv, 8, chQkv / 4, 256);
+            else         dsp(slotB ? pGemvAB : pGemvA, {L.wq, bXn, bBig}, &pcQkv,
+                             8, slotB ? bwgs(chQkv, slotTprA) : chQkv / 4, 256,
+                             slotB ? zdim / slotBatchN : 0);
             if (L.iq4P2) dsp(pGemv4, {L.wk, bXn, bKin}, &pcKV, 8, hKV * dh / 4, 64);
-            else         dsp(pGemvA, {L.wk, bXn, bKin}, &pcKV, 8, hKV * dh / 4, 256);
+            else         dsp(slotB ? pGemvAB : pGemvA, {L.wk, bXn, bKin}, &pcKV,
+                             8, slotB ? bwgs(hKV * dh, slotTprA) : hKV * dh / 4, 256,
+                             slotB ? zdim / slotBatchN : 0);
             if (L.iq4P3) dsp(pGemv4, {L.wv, bXn, bVin}, &pcKV, 8, hKV * dh / 4, 64);
-            else         dsp(pGemvA, {L.wv, bXn, bVin}, &pcKV, 8, hKV * dh / 4, 256);
+            else         dsp(slotB ? pGemvAB : pGemvA, {L.wv, bXn, bVin}, &pcKV,
+                             8, slotB ? bwgs(hKV * dh, slotTprA) : hKV * dh / 4, 256,
+                             slotB ? zdim / slotBatchN : 0);
             bar();
             dsp(pPrep, {bBig, bKin, bVin, L.qn, L.kn, bMid, L.st1, L.st2, bRope, bSlotPos},
                 &pcFa, 32, hQ + 2 * hKV, 256);
@@ -2916,7 +3067,9 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim) {
             }
             bar();
             if (L.iq4Wo) dsp(pGemv4, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
-            else         dsp(pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
+            else         dsp(slotB ? pGemvOB : pGemvO, {L.wo, bAtt, bAttnOut}, &pcWo,
+                             8, slotB ? bwgs(nEmbd, slotTprO) : nEmbd / 2, 256,
+                             slotB ? zdim / slotBatchN : 0);
         }
         bar();
         dsp(pMoeLA, {L.mgi, L.mgis, bXin, bAttnOut, L.pn, bML, bY, bXn2}, &pcv5, 20,
@@ -4882,6 +5035,9 @@ int main(int argc, char** argv) {
             ok = caseF16(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
         } else if (mode == "q8_0") {
             ok = caseQ80(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+        } else if (mode == "slotgemv") {
+            ok = caseQ80Batch(c, argU(2, 8192), argU(3, 2048), argU(4, 8),
+                              argU(5, 64), argU(6, 100));
         } else if (mode == "q6_k") {
             ok = caseQ6K(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
         } else if (mode == "iq4_xs") {
