@@ -694,6 +694,112 @@ kernel void fa_attn_srv_split_q8_gqa8(device const float* qhat    [[buffer(0)]],
     }
 }
 
+// Half-KV split decode with the same GQA reuse as the Q8-row tier.  Each
+// threadgroup owns HG adjacent query heads that map to one KV head, loads each
+// half K/V element once, and retains one independent softmax/partial stream per
+// query head for the unchanged reducer.
+template <uint HG>
+static inline void fa_attn_srv_split_f16_gqa_body(
+    device const float* qhat, device const uchar* kc, device const uchar* vc,
+    device float* partial, device const uint* slotPos, constant FaSplitPC& pc,
+    threadgroup float* q, threadgroup float* sc, threadgroup float* red,
+    threadgroup float* ml, threadgroup float* ll,
+    uint3 tid3, uint3 tgpig)
+{
+    const uint h0 = tgpig.x * HG;
+    const uint c = tgpig.y, rq = tgpig.z, p0 = c * CK;
+    const uint n = slotPos[rq] + 1u;
+    if (p0 >= n) return;
+    const uint t = tid3.x, dh = pc.dh, ts = min(CK, n - p0);
+    const uint kv = h0 / (pc.hQ / pc.hKV), qho = rq * pc.hQ * dh;
+    const ulong row0 = ((ulong)rq * pc.hKV + kv) * pc.tmax + p0;
+
+    if (t < dh)
+        for (uint hr = 0u; hr < HG; ++hr)
+            q[hr * dh + t] = qhat[qho + (h0 + hr) * dh + t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float qs = rsqrt(float(dh));
+    if (t < ts) {
+        const ulong kb = (row0 + t) * dh;
+        device const half* kh = (device const half*)kc;
+        float score[HG];
+        for (uint hr = 0u; hr < HG; ++hr) score[hr] = 0.0f;
+        for (uint j = 0u; j < dh; j += 4u) {
+            const float4 x = float4(*((device const half4*)(kh + kb + j)));
+            for (uint k = 0u; k < 4u; ++k)
+                for (uint hr = 0u; hr < HG; ++hr)
+                    score[hr] += q[hr * dh + j + k] * x[k];
+        }
+        for (uint hr = 0u; hr < HG; ++hr) sc[hr * dh + t] = score[hr] * qs;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint hr = 0u; hr < HG; ++hr) {
+        const uint sb = hr * dh;
+        red[t] = t < ts ? sc[sb + t] : -3.4e38f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] = max(red[t], red[t + s]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t == 0u) ml[hr] = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t < ts) sc[sb + t] = exp(sc[sb + t] - ml[hr]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[t] = t < ts ? sc[sb + t] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] += red[t + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t == 0u) ll[hr] = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint ps = dh + 2u, hs = pc.maxChunks * ps;
+    if (t < dh) {
+        float acc[HG];
+        for (uint hr = 0u; hr < HG; ++hr) acc[hr] = 0.0f;
+        device const half* vp = (device const half*)vc + row0 * dh + t;
+        for (uint j = 0u; j < ts; ++j) {
+            const float vv = float(*vp);
+            for (uint hr = 0u; hr < HG; ++hr) acc[hr] += sc[hr * dh + j] * vv;
+            vp += dh;
+        }
+        const uint pb = ((rq * pc.hQ + h0) * pc.maxChunks + c) * ps;
+        for (uint hr = 0u; hr < HG; ++hr) partial[pb + hr * hs + t] = acc[hr];
+    }
+    if (t == 0u) {
+        const uint pb = ((rq * pc.hQ + h0) * pc.maxChunks + c) * ps;
+        for (uint hr = 0u; hr < HG; ++hr) {
+            partial[pb + hr * hs + dh] = ml[hr];
+            partial[pb + hr * hs + dh + 1u] = ll[hr];
+        }
+    }
+}
+
+#define FA_F16_GQA_KERNEL(NAME, HG)                                             \
+kernel void NAME(device const float* qhat    [[buffer(0)]],                     \
+                 device const uchar* kc      [[buffer(1)]],                     \
+                 device const uchar* vc      [[buffer(2)]],                     \
+                 device float*       partial [[buffer(3)]],                     \
+                 device const uint*  slotPos [[buffer(4)]],                     \
+                 constant FaSplitPC& pc      [[buffer(5)]],                     \
+                 uint3 tid3  [[thread_position_in_threadgroup]],                \
+                 uint3 tgpig [[threadgroup_position_in_grid]])                  \
+{                                                                               \
+    threadgroup float q[(HG) * 256u], sc[(HG) * 256u];                          \
+    threadgroup float red[256u], ml[(HG)], ll[(HG)];                            \
+    fa_attn_srv_split_f16_gqa_body<(HG)>(                                      \
+        qhat, kc, vc, partial, slotPos, pc, q, sc, red, ml, ll, tid3, tgpig);   \
+}
+
+FA_F16_GQA_KERNEL(fa_attn_srv_split_f16_gqa2, 2u)
+FA_F16_GQA_KERNEL(fa_attn_srv_split_f16_gqa4, 4u)
+FA_F16_GQA_KERNEL(fa_attn_srv_split_f16_gqa8, 8u)
+#undef FA_F16_GQA_KERNEL
+
 // Bit-exact compact grid for highly skewed batches. Unlike the rectangular
 // split grid, every work item names a live (slot, 256-key chunk) pair.
 kernel void fa_attn_srv_split_compact(device const float* qhat    [[buffer(0)]],
