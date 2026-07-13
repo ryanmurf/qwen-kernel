@@ -1493,7 +1493,24 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);   // K = n_embd
     id<MTLComputePipelineState> pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
-    id<MTLComputePipelineState> pStep  = getPipe(c, "dn_step", "dn_step", 0);
+    const bool dnDecodeOpt = !getenv("QK_DN_DECODE") ||
+                             atoi(getenv("QK_DN_DECODE")) != 0;
+    const bool dnDecodeResident = dnDecodeOpt &&
+        (!getenv("QK_DN_DECODE_RES") || atoi(getenv("QK_DN_DECODE_RES")) != 0);
+    const char* dnStepFn = dnDecodeResident ? "dn_step_res8" : "dn_step";
+    id<MTLComputePipelineState> pStep = getPipe(c, "dn_step", dnStepFn, 0);
+    int dnDecodeSplitMode = dnDecodeOpt ? -1 : 0;
+    if (const char* v = getenv("QK_DN_DECODE_SPLIT")) dnDecodeSplitMode = atoi(v) != 0;
+    const bool dnDecodeSimd = getenv("QK_DN_DECODE_SIMD") &&
+                              atoi(getenv("QK_DN_DECODE_SIMD")) != 0;
+    if (dnDecodeSimd) dnDecodeSplitMode = 1;
+    const bool dnDecodeSplit = dnDecodeSplitMode != 0;  // single-slot harness
+    id<MTLComputePipelineState> pStepPrep = dnDecodeSplit
+        ? getPipe(c, "dn_step", "dn_step_prep", 0) : nil;
+    const char* dnStateFn = dnDecodeResident ? "dn_step_state_res8" : "dn_step_state";
+    if (dnDecodeSimd) dnStateFn = "dn_step_state_rowsimd";
+    id<MTLComputePipelineState> pStepState = dnDecodeSplit
+        ? getPipe(c, "dn_step", dnStateFn, 0) : nil;
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);  // K = d_inner
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     id<MTLComputePipelineState> pAdd   = getPipe(c, "vec_add", "vec_add", 0);
@@ -1584,7 +1601,15 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
         dsp(enc, pGemvA, {bZW, bXn, bZ}, &pcZ, 8, dIn / 4, 256);
         dsp(enc, pAb, {bXn, bAlW, bBeW, bDt, bAv, bGb}, &pcAb, 8, (2 * hV + nsg - 1) / nsg, thrN);
         bar(enc);
-        dsp(enc, pStep, {bQkv, bConvSt, bKer, bGb, bS, bZ, bSN, bAtt}, &pcStep, 20, hK, dS);
+        if (dnDecodeSplit) {
+            dsp(enc, pStepPrep, {bQkv, bConvSt, bKer}, &pcStep, 20, hK, dS);
+            bar(enc);
+            dsp(enc, pStepState, {bQkv, bGb, bS, bZ, bSN, bAtt},
+                &pcStep, 20, hV, dS);
+        } else {
+            dsp(enc, pStep, {bQkv, bConvSt, bKer, bGb, bS, bZ, bSN, bAtt},
+                &pcStep, 20, hK, dS);
+        }
         bar(enc);
         dsp(enc, pGemvO, {bOutW, bAtt, bAttnOut}, &pcOut, 8, nEmbd / 2, 256);
         bar(enc);
@@ -1776,7 +1801,8 @@ static bool caseBlock(MtlCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
         };
         runBench();
         double ns = runBench();
-        printf("gpu: %8.1f µs/block | 11 dispatches, 1 submit\n", ns / 1e3);
+        printf("gpu: %8.1f µs/block | %u dispatches, 1 submit\n",
+               ns / 1e3, dnDecodeSplit ? 12u : 11u);
         printf("     30 deltanet blocks -> %.2f ms/token\n", ns * 30 / 1e6);
     }
     return pass;
@@ -2139,7 +2165,24 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
     id<MTLComputePipelineState> pRms   = getPipe(c, "rmsnorm", "rmsnorm", 0);
     id<MTLComputePipelineState> pGemvA = getPipe(c, "gemv_q8_0", "gemv_q8_0", 64);
     id<MTLComputePipelineState> pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
-    id<MTLComputePipelineState> pStep  = getPipe(c, "dn_step", "dn_step", 0);
+    const bool dnDecodeOpt = !getenv("QK_DN_DECODE") ||
+                             atoi(getenv("QK_DN_DECODE")) != 0;
+    const bool dnDecodeResident = dnDecodeOpt &&
+        (!getenv("QK_DN_DECODE_RES") || atoi(getenv("QK_DN_DECODE_RES")) != 0);
+    const char* dnStepFn = dnDecodeResident ? "dn_step_res8" : "dn_step";
+    id<MTLComputePipelineState> pStep = getPipe(c, "dn_step", dnStepFn, 0);
+    int dnDecodeSplitMode = dnDecodeOpt ? -1 : 0;
+    if (const char* v = getenv("QK_DN_DECODE_SPLIT")) dnDecodeSplitMode = atoi(v) != 0;
+    const bool dnDecodeSimd = getenv("QK_DN_DECODE_SIMD") &&
+                              atoi(getenv("QK_DN_DECODE_SIMD")) != 0;
+    if (dnDecodeSimd) dnDecodeSplitMode = 1;
+    const bool dnDecodeSplit = dnDecodeSplitMode != 0;  // token harness is one stream
+    id<MTLComputePipelineState> pStepPrep = dnDecodeSplit
+        ? getPipe(c, "dn_step", "dn_step_prep", 0) : nil;
+    const char* dnStateFn = dnDecodeResident ? "dn_step_state_res8" : "dn_step_state";
+    if (dnDecodeSimd) dnStateFn = "dn_step_state_rowsimd";
+    id<MTLComputePipelineState> pStepState = dnDecodeSplit
+        ? getPipe(c, "dn_step", dnStateFn, 0) : nil;
     id<MTLComputePipelineState> pGemvO = getPipe(c, "gemv_q8_0", "gemv_q8_0", 128);
     id<MTLComputePipelineState> pAddN  = getPipe(c, "add_rmsnorm", "add_rmsnorm", 0);
     id<MTLComputePipelineState> pPrep  = getPipe(c, "fa_prep", "fa_prep", 0);
@@ -2306,8 +2349,16 @@ static bool caseToken(MtlCtx& c, const char* idsFile, uint32_t nGen, uint32_t tm
                 dsp(enc, pAb, {bXn, L.alW, L.beW, L.dt, L.av, bGb}, &pcAb, 8,
                     (2 * hV + nsg - 1) / nsg, thrN);
                 bar(enc);
-                dsp(enc, pStep, {bBig, L.convSt, L.ker, bGb, L.S, bMid, L.sn, bAtt},
-                    &pcStep, 20, hK, dS);
+                if (dnDecodeSplit) {
+                    dsp(enc, pStepPrep, {bBig, L.convSt, L.ker},
+                        &pcStep, 20, hK, dS);
+                    bar(enc);
+                    dsp(enc, pStepState, {bBig, bGb, L.S, bMid, L.sn, bAtt},
+                        &pcStep, 20, hV, dS);
+                } else {
+                    dsp(enc, pStep, {bBig, L.convSt, L.ker, bGb, L.S, bMid, L.sn, bAtt},
+                        &pcStep, 20, hK, dS);
+                }
                 bar(enc);
                 dsp(enc, pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 2, 256);
             } else {
@@ -2455,7 +2506,7 @@ struct qk_engine {
     uint32_t nsg = 4;
 
     id<MTLComputePipelineState> pGemvA, pGemvO, pGemvAB, pGemvOB,
-        pAb, pStep, pPrep, pAttn,
+        pAb, pStep, pStepPrep, pStepState, pStepStateSimd, pPrep, pAttn,
         pAttnSplit, pAttnReduce, pMoeS,
         pMoeLA, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
@@ -2468,6 +2519,7 @@ struct qk_engine {
     id<MTLBuffer> bbDnKQ, bbDnUW, bbDnAtt, bbDnEl;
     bool dnChunk = true;   // QK_DN_CHUNK=0 falls back to dn_step_batch
     uint32_t dnStepPW = 8;  // resident row-panel width; 0 restores streamed control
+    int dnDecodeSplitMode = -1;  // -1 auto schedule, 0 fused rollback, 1 forced split
     // DeltaNet GQA k-pairing: 0 = h % hK (qwen35moe), else h / kDiv
     // (qwen3next: hV/hK = 2). Set from general.architecture at open.
     uint32_t dnKDiv = 0;
@@ -3034,7 +3086,25 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         pGemvOB = getPipe(c, "gemv_q8_0_batch", fn, slotTprO);
     }
     pAb    = getPipe(c, "dn_ab", "dn_ab", nsg);
-    pStep  = getPipe(c, "dn_step", "dn_step", 0);
+    const bool dnDecodeOpt = !getenv("QK_DN_DECODE") ||
+                             atoi(getenv("QK_DN_DECODE")) != 0;
+    const bool dnDecodeResident = dnDecodeOpt &&
+        (!getenv("QK_DN_DECODE_RES") || atoi(getenv("QK_DN_DECODE_RES")) != 0);
+    const char* dnStepFn = dnDecodeResident ? "dn_step_res8" : "dn_step";
+    pStep = getPipe(c, "dn_step", dnStepFn, 0);
+    dnDecodeSplitMode = dnDecodeOpt ? -1 : 0;
+    if (const char* v = getenv("QK_DN_DECODE_SPLIT")) dnDecodeSplitMode = atoi(v) != 0;
+    const bool dnDecodeSimd = getenv("QK_DN_DECODE_SIMD") &&
+                              atoi(getenv("QK_DN_DECODE_SIMD")) != 0;
+    if (dnDecodeSimd) dnDecodeSplitMode = 1;
+    if (dnDecodeSplitMode != 0) {
+        pStepPrep = getPipe(c, "dn_step", "dn_step_prep", 0);
+        const char* stateFn = dnDecodeResident ? "dn_step_state_res8" : "dn_step_state";
+        if (dnDecodeSimd) stateFn = "dn_step_state_rowsimd";
+        pStepState = getPipe(c, "dn_step", stateFn, 0);
+        if (dnDecodeSplitMode < 0)
+            pStepStateSimd = getPipe(c, "dn_step", "dn_step_state_rowsimd", 0);
+    }
     pPrep  = getPipe(c, "fa_srv", "fa_prep_srv", 0);
     pAttn  = getPipe(c, "fa_srv", "fa_attn_srv", 0);
     pAttnSplit  = getPipe(c, "fa_srv", "fa_attn_srv_split", 0);   // flash-decoding
@@ -3510,8 +3580,19 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
             dsp(pAb, {bXn, L.alW, L.beW, L.dt, L.av, bGb}, &pcAb, 8,
                 (2 * hV + nsg - 1) / nsg, thrN);
             bar();
-            dsp(pStep, {bBig, L.st1, L.ker, bGb, L.st2, bMid, L.sn, bAtt},
-                &pcStep, 20, hK, dS);
+            const bool useDnSplit = dnDecodeSplitMode == 1 ||
+                (dnDecodeSplitMode < 0 && (zdim <= 4u || zdim >= 7u));
+            if (useDnSplit) {
+                dsp(pStepPrep, {bBig, L.st1, L.ker}, &pcStep, 20, hK, dS);
+                bar();
+                id<MTLComputePipelineState> statePipe =
+                    dnDecodeSplitMode < 0 && zdim >= 7u ? pStepStateSimd : pStepState;
+                dsp(statePipe, {bBig, bGb, L.st2, bMid, L.sn, bAtt},
+                    &pcStep, 20, hV, dS);
+            } else {
+                dsp(pStep, {bBig, L.st1, L.ker, bGb, L.st2, bMid, L.sn, bAtt},
+                    &pcStep, 20, hK, dS);
+            }
             bar();
             if (L.iq4Wo) dsp(pGemv4O, {L.outW, bAtt, bAttnOut}, &pcWo, 8, nEmbd / 4, 64);
             else         dsp(slotB ? pGemvOB : pGemvO, {L.outW, bAtt, bAttnOut}, &pcWo,
@@ -5466,6 +5547,191 @@ static bool caseFaCmp(MtlCtx& c, uint32_t N, uint32_t base, uint32_t iters) {
     return pass;
 }
 
+// Decode DeltaNet megakernel schedule comparison.  This uses nonzero conv and
+// matrix state, checks every mutated/output buffer bit-for-bit, and exercises
+// both head mappings used by the 35B (modulo) and 80B (consecutive) models.
+static bool caseDnStep(MtlCtx& c, uint32_t slots, uint32_t iters) {
+    constexpr uint32_t dS = 128, hK = 16, hV = 32;
+    constexpr uint32_t chQkv = (2 * hK + hV) * dS;
+    if (!slots || slots > 16) return false;
+    std::mt19937 rng(0x44535445u + slots);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> qkv((size_t)slots * chQkv), conv0((size_t)slots * chQkv * 3u),
+        ker((size_t)chQkv * 4u), gb((size_t)slots * 2u * hV),
+        state0((size_t)slots * hV * dS * dS), z((size_t)slots * hV * dS), sn(dS);
+    for (float& v : qkv) v = 0.2f * nd(rng);
+    for (float& v : conv0) v = 0.1f * nd(rng);
+    for (float& v : ker) v = 0.2f * nd(rng);
+    for (float& v : state0) v = 0.03f * nd(rng);
+    for (float& v : z) v = 0.3f * nd(rng);
+    for (float& v : sn) v = 1.0f + 0.1f * nd(rng);
+    for (uint32_t r = 0; r < slots; ++r)
+        for (uint32_t h = 0; h < hV; ++h) {
+            gb[(size_t)r * 2u * hV + h] = -0.1f - 0.7f * std::fabs(nd(rng));
+            const float x = nd(rng);
+            gb[(size_t)r * 2u * hV + hV + h] = 1.0f / (1.0f + std::exp(-x));
+        }
+
+    id<MTLBuffer> bQ = createBuf(c, qkv.size() * 4u, qkv.data());
+    id<MTLBuffer> bQc = createBuf(c, qkv.size() * 4u, qkv.data());
+    id<MTLBuffer> bK = createBuf(c, ker.size() * 4u, ker.data());
+    id<MTLBuffer> bG = createBuf(c, gb.size() * 4u, gb.data());
+    id<MTLBuffer> bZ = createBuf(c, z.size() * 4u, z.data());
+    id<MTLBuffer> bN = createBuf(c, sn.size() * 4u, sn.data());
+    id<MTLBuffer> bCr = createBuf(c, conv0.size() * 4u);
+    id<MTLBuffer> bCc = createBuf(c, conv0.size() * 4u);
+    id<MTLBuffer> bSr = createBuf(c, state0.size() * 4u);
+    id<MTLBuffer> bSc = createBuf(c, state0.size() * 4u);
+    id<MTLBuffer> bOr = createBuf(c, z.size() * 4u);
+    id<MTLBuffer> bOc = createBuf(c, z.size() * 4u);
+    std::vector<float> refConv(conv0.size()), refState(state0.size()), refOut(z.size());
+    id<MTLComputePipelineState> pRef = getPipe(c, "dn_step", "dn_step", 0);
+    struct Variant { const char* name; id<MTLComputePipelineState> p; };
+    const Variant vars[] = {
+        {"cache8",  getPipe(c, "dn_step", "dn_step_res8", 0)},
+    };
+    id<MTLComputePipelineState> pPrep = getPipe(c, "dn_step", "dn_step_prep", 0);
+    const Variant splitVars[] = {
+        {"split0",  getPipe(c, "dn_step", "dn_step_state", 0)},
+        {"split8",  getPipe(c, "dn_step", "dn_step_state_res8", 0)},
+        {"rowSIMD", getPipe(c, "dn_step", "dn_step_state_rowsimd", 0)},
+    };
+    struct { uint32_t d, hk, hv; float e; uint32_t kd; } pc{dS, hK, hV, 1e-6f, 0};
+
+    auto reset = [&](id<MTLBuffer> bc, id<MTLBuffer> bs) {
+        memcpy(bc.contents, conv0.data(), conv0.size() * 4u);
+        memcpy(bs.contents, state0.data(), state0.size() * 4u);
+    };
+    auto submit = [&](id<MTLComputePipelineState> p, id<MTLBuffer> bc,
+                      id<MTLBuffer> bs, id<MTLBuffer> bo, uint32_t reps) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < reps; ++i) {
+                [enc setComputePipelineState:p];
+                id<MTLBuffer> bufs[] = {bQ, bc, bK, bG, bs, bZ, bN, bo};
+                for (uint32_t j = 0; j < 8; ++j) [enc setBuffer:bufs[j] offset:0 atIndex:j];
+                [enc setBytes:&pc length:20 atIndex:8];
+                [enc dispatchThreadgroups:MTLSizeMake(hK, 1, slots)
+                    threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+                if (i + 1u < reps)
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                fprintf(stderr, "dnstepcmp Metal failure: %s\n",
+                        cb.error.localizedDescription.UTF8String);
+                return -1.0;
+            }
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / reps;
+        }
+    };
+    auto submitSplit = [&](id<MTLComputePipelineState> state, id<MTLBuffer> bc,
+                           id<MTLBuffer> bs, id<MTLBuffer> bo, uint32_t reps) -> double {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            for (uint32_t i = 0; i < reps; ++i) {
+                [enc setComputePipelineState:pPrep];
+                [enc setBuffer:bQc offset:0 atIndex:0];
+                [enc setBuffer:bc offset:0 atIndex:1];
+                [enc setBuffer:bK offset:0 atIndex:2];
+                [enc setBytes:&pc length:20 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(hK, 1, slots)
+                    threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                [enc setComputePipelineState:state];
+                id<MTLBuffer> bufs[] = {bQc, bG, bs, bZ, bN, bo};
+                for (uint32_t j = 0; j < 6; ++j) [enc setBuffer:bufs[j] offset:0 atIndex:j];
+                [enc setBytes:&pc length:20 atIndex:6];
+                [enc dispatchThreadgroups:MTLSizeMake(hV, 1, slots)
+                    threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+                if (i + 1u < reps)
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return -1.0;
+            return (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / reps;
+        }
+    };
+    auto countDiff = [](const float* a, const float* b, size_t n, double& maxAbs) {
+        size_t d = 0; maxAbs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            d += a[i] != b[i];
+            maxAbs = std::max(maxAbs, std::fabs((double)a[i] - b[i]));
+        }
+        return d;
+    };
+
+    printf("\n== dnstepcmp decode megakernel, slots=%u ==\n", slots);
+    printf("  %-7s %-9s %11s %11s %11s %10s %10s\n",
+           "mapping", "variant", "conv_diff", "state_diff", "out_diff", "gpu_us", "speedup");
+    bool pass = true;
+    for (uint32_t kd : {0u, 2u}) {
+        pc.kd = kd;
+        reset(bCr, bSr);
+        if (submit(pRef, bCr, bSr, bOr, 1) < 0) return false;
+        memcpy(refConv.data(), bCr.contents, refConv.size() * 4u);
+        memcpy(refState.data(), bSr.contents, refState.size() * 4u);
+        memcpy(refOut.data(), bOr.contents, refOut.size() * 4u);
+        double usRef = 0.0;
+        if (iters) {
+            reset(bCr, bSr); submit(pRef, bCr, bSr, bOr, std::min(100u, iters));
+            reset(bCr, bSr); usRef = submit(pRef, bCr, bSr, bOr, iters);
+        }
+        printf("  kDiv=%-2u %-9s %11s %11s %11s %10.2f %10s\n",
+               kd, "stream", "-", "-", "-", usRef, "1.000x");
+        for (const Variant& v : vars) {
+            reset(bCc, bSc);
+            if (submit(v.p, bCc, bSc, bOc, 1) < 0) return false;
+            double ac, as, ao;
+            const size_t dc = countDiff(refConv.data(),
+                                        (const float*)bCc.contents, conv0.size(), ac);
+            const size_t ds = countDiff(refState.data(),
+                                        (const float*)bSc.contents, state0.size(), as);
+            const size_t dout = countDiff(refOut.data(),
+                                          (const float*)bOc.contents, z.size(), ao);
+            const bool exact = dc == 0 && ds == 0 && dout == 0;
+            pass &= exact;
+            double us = 0.0;
+            if (iters) {
+                reset(bCc, bSc); submit(v.p, bCc, bSc, bOc, std::min(100u, iters));
+                reset(bCc, bSc); us = submit(v.p, bCc, bSc, bOc, iters);
+            }
+            printf("  kDiv=%-2u %-9s %11zu %11zu %11zu %10.2f %9.3fx  %s (max %.3g)\n",
+                   kd, v.name, dc, ds, dout, us, us ? usRef / us : 0.0,
+                   exact ? "EXACT" : "FAIL", std::max({ac, as, ao}));
+        }
+        for (const Variant& v : splitVars) {
+            memcpy(bQc.contents, qkv.data(), qkv.size() * 4u);
+            reset(bCc, bSc);
+            if (submitSplit(v.p, bCc, bSc, bOc, 1) < 0) return false;
+            double ac, as, ao;
+            const size_t dc = countDiff(refConv.data(), (const float*)bCc.contents,
+                                        conv0.size(), ac);
+            const size_t ds = countDiff(refState.data(), (const float*)bSc.contents,
+                                        state0.size(), as);
+            const size_t dout = countDiff(refOut.data(), (const float*)bOc.contents,
+                                          z.size(), ao);
+            const bool exact = dc == 0 && ds == 0 && dout == 0;
+            pass &= exact;
+            double us = 0.0;
+            if (iters) {
+                memcpy(bQc.contents, qkv.data(), qkv.size() * 4u);
+                reset(bCc, bSc);
+                submitSplit(v.p, bCc, bSc, bOc, std::min(100u, iters));
+                memcpy(bQc.contents, qkv.data(), qkv.size() * 4u);
+                reset(bCc, bSc);
+                us = submitSplit(v.p, bCc, bSc, bOc, iters);
+            }
+            printf("  kDiv=%-2u %-9s %11zu %11zu %11zu %10.2f %9.3fx  %s (max %.3g)\n",
+                   kd, v.name, dc, ds, dout, us, us ? usRef / us : 0.0,
+                   exact ? "EXACT" : "FAIL", std::max({ac, as, ao}));
+        }
+    }
+    return pass;
+}
+
 // Chunked delta rule (dn_chunk_{kq,solve,step}) vs the sequential
 // dn_step_batch on random inputs with a NONZERO initial state. The sequential
 // kernel is the trusted reference (token-exact vs llama.cpp CPU end-to-end);
@@ -7015,6 +7281,8 @@ int main(int argc, char** argv) {
             ok = caseHeadCmp(c, argU(2, 8), argU(3, 20));
         } else if (mode == "facmp") {
             ok = caseFaCmp(c, argU(2, 512), argU(3, 0), argU(4, 20));
+        } else if (mode == "dnstepcmp") {
+            ok = caseDnStep(c, argU(2, 1), argU(3, 400));
         } else if (mode == "dncmp") {
             ok = caseDnChunk(c, argU(2, 512), argU(3, 30));
         } else if (mode == "token") {
