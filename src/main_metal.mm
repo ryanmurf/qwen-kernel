@@ -2675,6 +2675,7 @@ struct qk_engine {
            mus{nil}, mds{nil};                                       // moe
         id<MTLBuffer> st1, st2;      // per-slot state: rec=(conv,S) attn=(kc,vc)
         size_t ps1 = 0, ps2 = 0;     // per-slot byte stride
+        size_t carryOff = 0;          // compact offset in batched-prefill conv carry
     };
     std::vector<Layer> layers;
 
@@ -2746,7 +2747,7 @@ struct qk_engine {
     };
     std::vector<Slot> slots;
     uint64_t equivClock = 0;
-    bool specOn = false;
+    bool specOn = false, specScratch = false;
     uint32_t specL = 6, specK = 8;
     std::vector<uint32_t> specToks, specAm;
     uint32_t specDraft(uint32_t slot);
@@ -2935,6 +2936,7 @@ void qk_engine::copyDnStripes(uint32_t fromStripe, uint32_t toStripe) {
     // Every caller is synchronous: the preceding command buffer has completed
     // and the next one has not been committed, so shared-memory copies are
     // coherent without another Metal submission.
+    if ((fromStripe == nSlots || toStripe == nSlots) && !specScratch) abort();
     for (Layer& L : layers) {
         if (!L.rec || !L.st1) continue;
         memcpy((uint8_t*)L.st1.contents + (size_t)toStripe * L.ps1,
@@ -3000,6 +3002,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     shareFork = getenv("QK_FORK") != nullptr;
     prefillMulti = !getenv("QK_PREFILL_MULTI") || atoi(getenv("QK_PREFILL_MULTI")) != 0;
     slotCompact = !getenv("QK_SLOT_COMPACT") || atoi(getenv("QK_SLOT_COMPACT")) != 0;
+    specOn = getenv("QK_SPEC") != nullptr;
+    specScratch = specOn || getenv("QK_SPEC_SCRATCH") != nullptr;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
     initMtl(c, "libqk");
@@ -3392,23 +3396,35 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     if (const char* mf = getenv("QK_MOE_SLOT_FORCE")) moeSlotSameOnly = atoi(mf) == 0;
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 float4s");
 
-    bXin = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
-    bXn = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
-    bBig = createBuf(c, (size_t)nB * chQkv * 4, nullptr, true);
-    bMid = createBuf(c, (size_t)nB * dIn * 4, nullptr, true);
-    bKin = createBuf(c, (size_t)nB * hKV * dh * 4, nullptr, true);
-    bVin = createBuf(c, (size_t)nB * hKV * dh * 4, nullptr, true);
-    bGb = createBuf(c, (size_t)nB * 2 * hV * 4, nullptr, true);
-    bAtt = createBuf(c, (size_t)nB * dIn * 4, nullptr, true);
-    bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
-    bY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
-    bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+    // Decode and batched-prefill activations have the same strictly ordered
+    // phase graph and are never in flight together (every engine API call is
+    // synchronous).  The default arena below colors those lifetimes onto a
+    // small set of whole MTLBuffers, avoiding offset plumbing in every shader.
+    // Keep an independent-allocation mode as a correctness/perf rollback.
+    const bool scratchAlias = !getenv("QK_SCRATCH_ALIAS") ||
+                              atoi(getenv("QK_SCRATCH_ALIAS")) != 0;
+    if (!scratchAlias) {
+        bXin = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+        bXn = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+        bBig = createBuf(c, (size_t)nB * chQkv * 4, nullptr, true);
+        bMid = createBuf(c, (size_t)nB * dIn * 4, nullptr, true);
+        bKin = createBuf(c, (size_t)nB * hKV * dh * 4, nullptr, true);
+        bVin = createBuf(c, (size_t)nB * hKV * dh * 4, nullptr, true);
+        bGb = createBuf(c, (size_t)nB * 2 * hV * 4, nullptr, true);
+        bAtt = createBuf(c, (size_t)nB * dIn * 4, nullptr, true);
+        bAttnOut = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+        bY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+        bXn2 = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+        bML = createBuf(c, (size_t)nB * (nExp + 1) * 4, nullptr, true);
+        bMH = createBuf(c, (size_t)nB * (nUsed + 1) * ffE * 4, nullptr, true);
+        bMSel = createBuf(c, (size_t)nB * 160, nullptr, true);   // sizeof(SelT)
+        bMY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
+        bAV = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
+        bAI = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
+        bTok = createBuf(c, (size_t)nB * 4, nullptr, true);
+    }
     bMoeScale = pMoeLS
         ? createBuf(c, (size_t)nB * sizeof(float), nullptr, true) : nil;
-    bML = createBuf(c, (size_t)nB * (nExp + 1) * 4, nullptr, true);
-    bMH = createBuf(c, (size_t)nB * (nUsed + 1) * ffE * 4, nullptr, true);
-    bMSel = createBuf(c, (size_t)nB * 160, nullptr, true);   // sizeof(SelT)
-    bMY = createBuf(c, (size_t)nB * nEmbd * 4, nullptr, true);
     if (lastStage()) {
         bONorm = WOFF(tONorm);
     } else {
@@ -3420,19 +3436,19 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         bONorm = WB{z, 0};
     }
     bHeadW = WOFF(tHead);
-    bLogits = splitStage() ? nil : createBuf(c, (size_t)nB * vocab * 4, nullptr, true);
     bEmbdW = WOFF(tEmbd);
     bRope = createBuf(c, (size_t)tmax * (nRot / 2) * 2 * 4, nullptr, true);
-    bAV = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
-    bAI = createBuf(c, (size_t)nB * 64 * 4, nullptr, true);
-    bTok = createBuf(c, (size_t)nB * 4, nullptr, true);
     bRbScratch = createBuf(c, 64, nullptr, true);
     bSlotIn = createBuf(c, (size_t)nB * 4, nullptr, true);
     bSlotPos = createBuf(c, (size_t)nB * 4, nullptr, true);
-    // split-K decode-attention partials: [slot][head][chunk](acc[dh], m, l)
-    { const uint32_t maxChunks = (nCtx + 255u) / 256u;
-      bPartial = createBuf(c, (size_t)nB * hQ * maxChunks * (dh + 2) * 4, nullptr, true);
-      bFaWork = createBuf(c, (size_t)nB * maxChunks * 2u * sizeof(uint32_t), nullptr, true); }
+    // The arena allocation below also aliases decode-attention partials with
+    // the full decode-logit row: attention is finished before the head runs.
+    const uint32_t maxChunks = (nCtx + 255u) / 256u;
+    const size_t partialBytes = !splitStage() && faDecodeSplit
+        ? (size_t)nB * hQ * maxChunks * (dh + 2) * 4 : 0;
+    const size_t decodeLogitBytes = splitStage() ? 0 : (size_t)nB * vocab * 4;
+    bFaWork = partialBytes
+        ? createBuf(c, (size_t)nB * maxChunks * 2u * sizeof(uint32_t), nullptr, true) : nil;
     memset(bSlotIn.contents, 0, (size_t)nB * 4);
     memset(bSlotPos.contents, 0, (size_t)nB * 4);
     {
@@ -3455,60 +3471,170 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (x >= 16 && x <= 1024) cap = (uint32_t)x;
     }
     maxB = cap;
-    bbXin = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
-    bbXn = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
-    bbBig = createBuf(c, (size_t)cap * chQkv * 4, nullptr, true);
-    bbMid = createBuf(c, (size_t)cap * dIn * 4, nullptr, true);
-    bbKin = createBuf(c, (size_t)cap * hKV * dh * 4, nullptr, true);
-    bbVin = createBuf(c, (size_t)cap * hKV * dh * 4, nullptr, true);
-    bbGb = createBuf(c, (size_t)cap * 2 * hV * 4, nullptr, true);
-    bbConvOut = createBuf(c, (size_t)cap * chQkv * 4, nullptr, true);
-    bbO = createBuf(c, (size_t)((cap + 63) / 64 * 64) * dIn * 4, nullptr, true);
-    bbAtt = createBuf(c, (size_t)cap * dIn * 4, nullptr, true);
-    bbAttnOut = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
-    bbY = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
-    bbXn2 = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
-    bbML = createBuf(c, (size_t)cap * (nExp + 1) * 4, nullptr, true);
-    bbMH = createBuf(c, (size_t)cap * (nUsed + 1) * ffE * 4, nullptr, true);
-    bbMSel = createBuf(c, (size_t)cap * 160, nullptr, true);   // sizeof(SelT)
-    bbMY = createBuf(c, (size_t)cap * nEmbd * 4, nullptr, true);
     const uint32_t headLogitRows = headGemm
         ? std::min(cap, std::max(1u, headGemmN - 1u)) : cap;
-    bbLogits = lastStage()
-        ? createBuf(c, (size_t)headLogitRows * vocab * 4, nullptr, true) : nil;
-    if (lastStage()) {
-        bbAV = createBuf(c, (size_t)cap * 64 * 4, nullptr, true);
-        bbAI = createBuf(c, (size_t)cap * 64 * 4, nullptr, true);
-        bbTok = createBuf(c, (size_t)cap * 4, nullptr, true);
-        if (headGemm) {
-            const size_t tiles32 = (vocab + 31u) / 32u;
-            const size_t tiles64 = (vocab + 63u) / 64u;
-            const size_t headPairs = std::max((size_t)std::min(cap, 7u) * tiles32,
-                                              (size_t)cap * tiles64);
-            bbHeadV = createBuf(c, headPairs * sizeof(float), nullptr, true);
-            bbHeadI = createBuf(c, headPairs * sizeof(uint32_t), nullptr, true);
-        }
+    const size_t tiles32 = (vocab + 31u) / 32u;
+    const size_t tiles64 = (vocab + 63u) / 64u;
+    const size_t headPairs = lastStage() && headGemm
+        ? std::max((size_t)std::min(cap, 7u) * tiles32, (size_t)cap * tiles64) : 0;
+    const size_t sXin = (size_t)cap * nEmbd * 4;
+    const size_t sXn = sXin;
+    const size_t sBig = (size_t)cap * chQkv * 4;
+    const size_t sMid = (size_t)cap * dIn * 4;
+    const size_t sKin = (size_t)cap * hKV * dh * 4;
+    const size_t sVin = sKin;
+    const size_t sGb = (size_t)cap * 2 * hV * 4;
+    const size_t sConvOut = sBig;
+    const size_t sO = (size_t)((cap + 63) / 64 * 64) * dIn * 4;
+    const size_t sAtt = sMid;
+    const size_t sAttnOut = sXin;
+    const size_t sY = sXin;
+    const size_t sXn2 = sXin;
+    const size_t sML = (size_t)cap * (nExp + 1) * 4;
+    const size_t sMH = (size_t)cap * (nUsed + 1) * ffE * 4;
+    const size_t sMSel = (size_t)cap * 160;
+    const size_t sMY = sXin;
+    const size_t sLogits = lastStage() ? (size_t)headLogitRows * vocab * 4 : 0;
+    const size_t sAV = lastStage() ? (size_t)cap * 64 * 4 : 0;
+    const size_t sAI = sAV;
+    const size_t sTok = lastStage() ? (size_t)cap * 4 : 0;
+    const size_t sIds = (size_t)cap * 4;
+    uint32_t nRecOwned = 0;
+    for (uint32_t il = lFirst; il < lEnd; ++il) {
+        char rn[64];
+        snprintf(rn, sizeof rn, "blk.%u.ssm_a", il);
+        nRecOwned += g.find(rn) != nullptr;
     }
-    bbIds = createBuf(c, (size_t)cap * 4, nullptr, true);
+    const size_t carryStride = (size_t)nSlots * chQkv * 3 * 4;
+    const size_t sCarry = (size_t)nRecOwned * carryStride;
+    const size_t nChMax = (cap + 63) / 64;
+    const size_t sDnKQ = dnChunk ? nChMax * hK * 2 * 64 * 64 * 4 : 0;
+    const size_t sDnUW = dnChunk ? nChMax * hV * 4 * 64 * (size_t)dS * 4 : 0;
+    const size_t sDnAtt = dnChunk ? nChMax * hV * 64 * 64 * 4 : 0;
+    const size_t sDnEl = dnChunk ? nChMax * hV * 4 : 0;
+    const size_t sMDy = (size_t)cap * (nUsed + 1) * nEmbd * 4;
+
+    if (scratchAlias) {
+        // Whole-buffer lifetime coloring.  Existing buffer barriers separate
+        // every transition listed here; no kernel ever observes two logical
+        // members of one group at the same time.  Keeping offset zero also
+        // preserves all shader indexing and Metal alignment assumptions.
+        size_t logical = 0, physical = 0;
+        auto group = [&](std::initializer_list<size_t> sizes) -> id<MTLBuffer> {
+            size_t mx = 0;
+            for (size_t z : sizes) { logical += z; mx = std::max(mx, z); }
+            mx = std::max(mx, sizeof(uint32_t));
+            physical += mx;
+            return createBuf(c, mx, nullptr, true);
+        };
+        const size_t dXin = (size_t)nB * nEmbd * 4;
+        const size_t dXn = dXin;
+        const size_t dBig = (size_t)nB * chQkv * 4;
+        const size_t dMid = (size_t)nB * dIn * 4;
+        const size_t dKin = (size_t)nB * hKV * dh * 4;
+        const size_t dVin = dKin;
+        const size_t dGb = (size_t)nB * 2 * hV * 4;
+        const size_t dAtt = dMid;
+        const size_t dAttnOut = dXin;
+        const size_t dY = dXin;
+        const size_t dXn2 = dXin;
+        const size_t dML = (size_t)nB * (nExp + 1) * 4;
+        const size_t dMH = (size_t)nB * (nUsed + 1) * ffE * 4;
+        const size_t dMSel = (size_t)nB * 160;
+        const size_t dMY = dXin;
+        const size_t dAV = (size_t)nB * 64 * 4;
+        const size_t dAI = dAV;
+        const size_t dTok = (size_t)nB * 4;
+
+        bbXin = group({sXin, dXin});
+        bbXn = bbML = bbDnUW = bbMDy =
+            group({sXn, sML, sDnUW, sMDy, dXn, dML});
+        bbBig = bbDnKQ = bbMY = bbHeadI =
+            group({sBig, sDnKQ, sMY, headPairs * sizeof(uint32_t), dBig, dMY});
+        bbMid = bbY = bbLogits =
+            group({sMid, sY, sLogits, dMid, dY});
+        bbKin = bbAV = group({sKin, sAV, dKin, dAV});
+        bbVin = bbAI = group({sVin, sAI, dVin, dAI});
+        bbGb = bbMSel = bbTok = group({sGb, sMSel, sTok, dGb, dMSel, dTok});
+        bbConvOut = bbAttnOut = bbMH = bbIds =
+            group({sConvOut, sAttnOut, sMH, sIds, dAttnOut, dMH,
+                   dnChunk ? sO : 0});
+        bbO = dnChunk ? bbConvOut : group({sO});
+        bbAtt = bbDnAtt = bbXn2 =
+            group({sAtt, sDnAtt, sXn2, dAtt, dXn2});
+        bbCarry = bbHeadV = bPartial = bLogits =
+            group({sCarry, headPairs * sizeof(float), partialBytes, decodeLogitBytes});
+
+        // Decode uses the same phase-colored storage as prefill.  Synchronous
+        // API waits guarantee that the two command-buffer families never
+        // overlap, while encodeStep's grouped MoE intentionally uses bbMDy.
+        bXin = bbXin; bXn = bbXn; bBig = bbBig; bMid = bbMid;
+        bKin = bbKin; bVin = bbVin; bGb = bbGb; bAtt = bbAtt;
+        bAttnOut = bbAttnOut; bY = bbY; bXn2 = bbXn2; bML = bbML;
+        bMH = bbMH; bMSel = bbMSel; bMY = bbMY;
+        bAV = bbAV; bAI = bbAI; bTok = bbTok;
+        if (!partialBytes) bPartial = nil;
+        if (!decodeLogitBytes) bLogits = nil;
+        if (!headPairs) { bbHeadV = nil; bbHeadI = nil; }
+        if (!sLogits) bbLogits = nil;
+        if (!sAV) { bbAV = nil; bbAI = nil; bbTok = nil; }
+        if (!sDnKQ) { bbDnKQ = nil; bbDnUW = nil; bbDnAtt = nil; }
+        if (getenv("QK_MEM_STATS"))
+            fprintf(stderr, "qk_open: scratch aliases %.1f -> %.1f MiB (saved %.1f MiB)\n",
+                    logical / 1048576.0, physical / 1048576.0,
+                    (logical - physical) / 1048576.0);
+    } else {
+        bbXin = createBuf(c, sXin, nullptr, true);
+        bbXn = createBuf(c, sXn, nullptr, true);
+        bbBig = createBuf(c, sBig, nullptr, true);
+        bbMid = createBuf(c, sMid, nullptr, true);
+        bbKin = createBuf(c, sKin, nullptr, true);
+        bbVin = createBuf(c, sVin, nullptr, true);
+        bbGb = createBuf(c, sGb, nullptr, true);
+        bbConvOut = createBuf(c, sConvOut, nullptr, true);
+        bbO = createBuf(c, sO, nullptr, true);
+        bbAtt = createBuf(c, sAtt, nullptr, true);
+        bbAttnOut = createBuf(c, sAttnOut, nullptr, true);
+        bbY = createBuf(c, sY, nullptr, true);
+        bbXn2 = createBuf(c, sXn2, nullptr, true);
+        bbML = createBuf(c, sML, nullptr, true);
+        bbMH = createBuf(c, sMH, nullptr, true);
+        bbMSel = createBuf(c, sMSel, nullptr, true);
+        bbMY = createBuf(c, sMY, nullptr, true);
+        bbLogits = sLogits ? createBuf(c, sLogits, nullptr, true) : nil;
+        bbAV = sAV ? createBuf(c, sAV, nullptr, true) : nil;
+        bbAI = sAI ? createBuf(c, sAI, nullptr, true) : nil;
+        bbTok = sTok ? createBuf(c, sTok, nullptr, true) : nil;
+        bbHeadV = headPairs ? createBuf(c, headPairs * sizeof(float), nullptr, true) : nil;
+        bbHeadI = headPairs ? createBuf(c, headPairs * sizeof(uint32_t), nullptr, true) : nil;
+        bbIds = createBuf(c, sIds, nullptr, true);
+        bbMDy = createBuf(c, sMDy, nullptr, true);
+        bbCarry = sCarry ? createBuf(c, sCarry, nullptr, true) : nil;
+        bPartial = partialBytes ? createBuf(c, partialBytes, nullptr, true) : nil;
+        bLogits = decodeLogitBytes ? createBuf(c, decodeLogitBytes, nullptr, true) : nil;
+        if (dnChunk) {
+            bbDnKQ = createBuf(c, sDnKQ, nullptr, true);
+            bbDnUW = createBuf(c, sDnUW, nullptr, true);
+            bbDnAtt = createBuf(c, sDnAtt, nullptr, true);
+        }
+        if (getenv("QK_MEM_STATS"))
+            fprintf(stderr, "qk_open: scratch aliases disabled\n");
+    }
     bbStart = createBuf(c, (size_t)(nExp + 2) * 4, nullptr, true);
     bbATok = createBuf(c, (size_t)cap * (nUsed + 1) * 4, nullptr, true);
     bbASlot = createBuf(c, (size_t)cap * (nUsed + 1) * 4, nullptr, true);
     bbLive = createBuf(c, ((size_t)cap * nUsed + 1) * 4, nullptr, true);
     const size_t workCap = nExp + ((size_t)cap * nUsed + 31) / 32 + (cap + 31) / 32;
     bbWork = createBuf(c, workCap * 2 * 4, nullptr, true);
-    bbMDy = createBuf(c, (size_t)cap * (nUsed + 1) * nEmbd * 4, nullptr, true);
-    bbCarry = createBuf(c, (size_t)nLayer * nSlots * chQkv * 3 * 4, nullptr, true);
-    memset(bbCarry.contents, 0, (size_t)nLayer * nSlots * chQkv * 3 * 4);
+    if (sCarry) memset(bbCarry.contents, 0, sCarry);
     if (dnChunk) {   // chunked-DN scratch: per (chunk, head) tiles, reused per layer
-        const size_t nChMax = (cap + 63) / 64;
-        bbDnKQ  = createBuf(c, nChMax * hK * 2 * 64 * 64 * 4, nullptr, true);
-        bbDnUW  = createBuf(c, nChMax * hV * 4 * 64 * (size_t)dS * 4, nullptr, true);
-        bbDnAtt = createBuf(c, nChMax * hV * 64 * 64 * 4, nullptr, true);
-        bbDnEl  = createBuf(c, nChMax * hV * 4, nullptr, true);
+        bbDnEl = createBuf(c, sDnEl, nullptr, true);
     }
 
     layers.resize(nLayer);
     char nb[128];
+    size_t carryCursor = 0;
+    size_t specStripeBytes = 0;
     for (uint32_t il = lFirst; il < lEnd; il++) {
         Layer& L = layers[il];
         auto T = [&](const char* suffix) -> const GgufTensor* {
@@ -3536,6 +3662,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         L.aNorm = W(T("attn_norm.weight"), nEmbd * 4);
         L.pn = W(T("post_attention_norm.weight"), nEmbd * 4);
         if (L.rec) {
+            L.carryOff = carryCursor;
+            carryCursor += carryStride;
             L.qkvW = Wd("attn_qkv.weight", L.iq4P1);
             L.zW = Wd("attn_gate.weight", L.iq4P2);
             if (T("ssm_alpha.weight")) {
@@ -3578,6 +3706,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             L.outW = Wd("ssm_out.weight", L.iq4Wo);
             L.ps1 = (size_t)chQkv * 3 * 4;
             L.ps2 = (size_t)hV * dS * dS * 4;
+            specStripeBytes += L.ps1 + L.ps2;
         } else {
             L.wq = Wd("attn_q.weight", L.iq4P1);
             L.wk = Wd("attn_k.weight", L.iq4P2);
@@ -3592,11 +3721,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         // context (nk ~ tmax) the last slot's K/V load over-reads a few rows
         // past the buffer. One KBM(64)-key block of zeroed slack keeps it
         // in-bounds and finite (over-read rows are P=0, so contribute nothing).
-        const size_t stSlack = (size_t)64 * dh * 4;
-        // Recurrent layers reserve one shared spec-verification scratch stripe
-        // at index nSlots. Attention has rollback-free positional KV and needs
-        // only the live slot stripes.
-        const size_t nStateStripes = nB + (L.rec ? 1u : 0u);
+        const size_t stSlack = L.rec ? 0 : (size_t)64 * dh * 4;
+        // Spec-enabled recurrent layers reserve one shared verification
+        // scratch stripe at index nSlots. Normal engines and attention (whose
+        // positional KV is rollback-free) need only the live slot stripes.
+        const size_t nStateStripes = nB + (L.rec && specScratch ? 1u : 0u);
         L.st1 = createBuf(c, nStateStripes * L.ps1 + stSlack, nullptr, true);
         L.st2 = createBuf(c, nStateStripes * L.ps2 + stSlack, nullptr, true);
         memset(L.st1.contents, 0, nStateStripes * L.ps1 + stSlack);
@@ -3611,6 +3740,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         L.mds = W(moe.ds, (size_t)moe.nEmbd * moe.rbDS);
         if (denseBad) return fail("qk_open: dense projection tensor missing or bad type");
     }
+    if (carryCursor != sCarry) return fail("qk_open: recurrent carry layout mismatch");
+    if (getenv("QK_MEM_STATS"))
+        fprintf(stderr,
+                "qk_open: recurrent carry %u/%u layers %.1f MiB; spec stripe %s %.1f MiB\n",
+                nRecOwned, lEnd - lFirst, sCarry / 1048576.0,
+                specScratch ? "allocated" : "lazy-saved", specStripeBytes / 1048576.0);
 
     snapOff1.resize(nLayer);
     snapOff2.resize(nLayer);
@@ -3628,7 +3763,6 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pcache.resize(PCACHE_N);
     for (auto& e : pcache) e.snap.resize(snapSize);
 
-    specOn = getenv("QK_SPEC") != nullptr;
     if (const char* v = getenv("QK_SPEC_L")) {
         long x = atol(v);
         if (x >= 2 && x <= 64) specL = (uint32_t)x;
@@ -3747,7 +3881,7 @@ void qk_engine::encodeStep(id<MTLComputeCommandEncoder> enc, uint32_t zdim,
     // require the first materially winning fan unless explicitly overridden.
     if (faFan < 8u) faFan = 1u;
     if (faFanOverride > 0) faFan = (uint32_t)faFanOverride;
-    const bool faUseWork = faDecodeWork && (faFan > 1u ||
+    const bool faUseWork = faDecodeSplit && faDecodeWork && (faFan > 1u ||
         (uint64_t)liveChunks * 4u < (uint64_t)zdim * splitChunks);
     uint32_t faWorkN = 0;
     if (faUseWork) {
@@ -4327,6 +4461,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     };
     bool badSeq = nSeq < 1 || nSeq > nSlots || !seqN || seqN * nSeq != n ||
                   (size_t)nSeq * seqPad > ((maxB + 63u) & ~63u) ||
+                  (scratchState && !specScratch) ||
                   (nSeq > 1 && (!seqSlots || !seqBases || hiddenIn || wantLogits ||
                                 argmaxOut || scratchState));
     if (!badSeq) {
@@ -4363,7 +4498,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         for (uint32_t q = 0; q < nSeq; ++q) {
             const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
             uint8_t* dst = (uint8_t*)bbCarry.contents +
-                ((size_t)il * nSlots + q) * chQkv * 3 * 4;
+                layers[il].carryOff + (size_t)q * chQkv * 3 * 4;
             if (baseFor(q) == 0) memset(dst, 0, (size_t)chQkv * 3 * 4);
             else memcpy(dst, (uint8_t*)layers[il].st1.contents +
                              (size_t)stateSlot * layers[il].ps1,
@@ -4460,7 +4595,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
                     const size_t ro = (size_t)q * seqN;
                     const NSUInteger carryOff =
-                        ((NSUInteger)il * nSlots + q) * chQkv * 3 * 4;
+                        L.carryOff + (NSUInteger)q * chQkv * 3 * 4;
                     dspz(pConvB,
                          {WB{bbCarry, carryOff},
                           WB{bbBig, (NSUInteger)(ro * chQkv * 4)}, L.ker,
@@ -7486,7 +7621,13 @@ int main(int argc, char** argv) {
 
             qk_config cfg{1, 4096, 8};
             char err[256] = {0};
+            // The production engine allocates the 62.8-MiB recurrent rollback
+            // stripe only for enabled speculation.  This harness calls the
+            // private rollback path directly, so request that scratch without
+            // turning on n-gram speculation in the serial reference run.
+            setenv("QK_SPEC_SCRATCH", "1", 1);
             qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            unsetenv("QK_SPEC_SCRATCH");
             if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
             if (K < 2 || K > e->maxB) {
                 fprintf(stderr, "speccmp: K must be in [2,%u]\n", e->maxB);
