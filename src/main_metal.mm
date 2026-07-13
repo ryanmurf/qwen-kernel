@@ -2313,6 +2313,7 @@ struct qk_engine {
     id<MTLComputePipelineState> pDnKq, pDnSolve, pDnStepC;
     id<MTLBuffer> bbDnKQ, bbDnUW, bbDnAtt, bbDnEl;
     bool dnChunk = true;   // QK_DN_CHUNK=0 falls back to dn_step_batch
+    uint32_t dnStepPW = 8;  // resident row-panel width; 0 restores streamed control
     // DeltaNet GQA k-pairing: 0 = h % hK (qwen35moe), else h / kDiv
     // (qwen3next: hV/hK = 2). Set from general.architecture at open.
     uint32_t dnKDiv = 0;
@@ -2775,10 +2776,15 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pStepB = getPipe(c, "dn_batch", "dn_step_batch", 0);
     pGateB = getPipe(c, "dn_batch", "dn_gate_batch", nsg);
     if (const char* v = getenv("QK_DN_CHUNK")) dnChunk = atoi(v) != 0;
+    if (const char* v = getenv("QK_DN_STEP_RES")) {
+        const uint32_t x = (uint32_t)atoi(v);
+        if (x == 0u || x == 8u) dnStepPW = x;
+    }
     if (dnChunk) {
         pDnKq    = getPipe(c, "dn_chunk", "dn_chunk_kq", 0);
         pDnSolve = getPipe(c, "dn_chunk", "dn_chunk_solve", 0);
-        pDnStepC = getPipe(c, "dn_chunk", "dn_chunk_step", dS);   // fc(0)=dS
+        const char* stepFn = dnStepPW ? "dn_chunk_step_res8_s8" : "dn_chunk_step";
+        pDnStepC = getPipe(c, "dn_chunk", stepFn, dS);   // fc(0)=dS
     }
     {   // QK_GEMM=scalar|sg|h picks the prefill GEMM (default: exact scalar).
         // Default: the f16-fragment GEMM (llama.cpp Metal's prefill precision
@@ -3675,7 +3681,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                          &pcDnC, 20, hV, dS, nChDn);
                     bar();
                     dspz(pDnStepC, {bbDnUW, bbDnAtt, bbDnEl, bbO, WB{L.st2, so2}},
-                         &pcDnC, 20, hV, dS, 2);   // z = state column panel
+                         &pcDnC, 20, hV, dnStepPW ? 256u : dS,
+                         dnStepPW ? dS / dnStepPW : 2u);  // z = state-row panel
                 } else {
                     dspz(pStepB, {bbConvOut, bbGb, bbO, WB{L.st2, so2}},
                          &pcStepB, 20, hV, dS, 1);
@@ -4143,10 +4150,17 @@ static bool caseBGemm(MtlCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t it
 // max_rel over the o outputs and the final state.
 static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
     const uint32_t dS = 128, hK = 16, hV = 32;
+    uint32_t stepPW = 8;
+    if (const char* v = getenv("QK_DN_STEP_RES")) {
+        const uint32_t x = (uint32_t)atoi(v);
+        if (x == 0u || x == 8u) stepPW = x;
+    }
+    const uint32_t stepNsg = stepPW ? 8u : 4u;
+    const uint32_t stepPanels = stepPW ? dS / stepPW : 2u;
     const uint32_t chQkv = (2 * hK + hV) * dS;
     const uint32_t TnCap = std::max(TnMain, 512u);
-    printf("\n== dncmp  chunked delta rule vs dn_step_batch (dS=%u hK=%u hV=%u) ==\n",
-           dS, hK, hV);
+    printf("\n== dncmp  chunked delta rule vs dn_step_batch (dS=%u hK=%u hV=%u, step=%s, nsg=%u) ==\n",
+           dS, hK, hV, stepPW ? "resident-8" : "streamed-64", stepNsg);
 
     std::mt19937 rng(42);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -4172,8 +4186,10 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
     id<MTLBuffer> bGb = createBuf(c, gb.size() * 4, gb.data());
     id<MTLBuffer> bSa = createBuf(c, st0.size() * 4);
     id<MTLBuffer> bSb = createBuf(c, st0.size() * 4);
+    id<MTLBuffer> bSc = createBuf(c, st0.size() * 4);
     id<MTLBuffer> bOa = createBuf(c, (size_t)TnCap * hV * dS * 4);
     id<MTLBuffer> bOb = createBuf(c, (size_t)TnCap * hV * dS * 4);
+    id<MTLBuffer> bOc = createBuf(c, (size_t)TnCap * hV * dS * 4);
     const size_t nChMax = (TnCap + 63) / 64;
     id<MTLBuffer> bKQ = createBuf(c, nChMax * hK * 2 * 64 * 64 * 4);
     id<MTLBuffer> bUW = createBuf(c, nChMax * hV * 4 * 64 * (size_t)dS * 4);
@@ -4183,7 +4199,9 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
     id<MTLComputePipelineState> pSeq = getPipe(c, "dn_batch", "dn_step_batch", 0);
     id<MTLComputePipelineState> pKq = getPipe(c, "dn_chunk", "dn_chunk_kq", 0);
     id<MTLComputePipelineState> pSolve = getPipe(c, "dn_chunk", "dn_chunk_solve", 0);
-    id<MTLComputePipelineState> pStepC = getPipe(c, "dn_chunk", "dn_chunk_step", dS);
+    id<MTLComputePipelineState> pStepBase = getPipe(c, "dn_chunk", "dn_chunk_step", dS);
+    id<MTLComputePipelineState> pStepC = getPipe(c, "dn_chunk",
+        stepPW ? "dn_chunk_step_res8_s8" : "dn_chunk_step", dS);
 
     struct { uint32_t dS_, hK_, hV_, Tn, kd; } pc{dS, hK, hV, 0, 0};
     auto encSeq = [&](id<MTLComputeCommandEncoder> enc) {
@@ -4196,7 +4214,10 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
         [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
     };
-    auto encChain = [&](id<MTLComputeCommandEncoder> enc) {
+    auto encChainTo = [&](id<MTLComputeCommandEncoder> enc,
+                          id<MTLComputePipelineState> stepPipe,
+                          id<MTLBuffer> out, id<MTLBuffer> state,
+                          uint32_t panels, uint32_t threads) {
         const uint32_t nCh = (pc.Tn + 63) / 64;
         [enc setComputePipelineState:pKq];
         [enc setBuffer:bConv offset:0 atIndex:0];
@@ -4214,15 +4235,18 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
         [enc setBytes:&pc length:20 atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(hV, 1, nCh)
             threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
-        [enc setComputePipelineState:pStepC];
+        [enc setComputePipelineState:stepPipe];
         [enc setBuffer:bUW offset:0 atIndex:0];
         [enc setBuffer:bAtt offset:0 atIndex:1];
         [enc setBuffer:bEl offset:0 atIndex:2];
-        [enc setBuffer:bOb offset:0 atIndex:3];
-        [enc setBuffer:bSb offset:0 atIndex:4];
+        [enc setBuffer:out offset:0 atIndex:3];
+        [enc setBuffer:state offset:0 atIndex:4];
         [enc setBytes:&pc length:20 atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 2)
-            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, panels)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    };
+    auto encChain = [&](id<MTLComputeCommandEncoder> enc) {
+        encChainTo(enc, pStepC, bOb, bSb, stepPanels, stepNsg * 32u);
     };
     auto runOnce = [&](bool chain) {
         @autoreleasepool {
@@ -4264,6 +4288,32 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
     }
     }
     pc.kd = 0;
+
+    if (stepPW && TnMain <= TnCap) {
+        pc.Tn = TnMain;
+        memcpy(bSb.contents, st0.data(), st0.size() * 4);
+        memcpy(bSc.contents, st0.data(), st0.size() * 4);
+        runOnce(true);
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            encChainTo(enc, pStepBase, bOc, bSc, 2u, dS);
+            [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+        size_t diffO = 0, diffS = 0;
+        const float* ob = (const float*)bOb.contents;
+        const float* oc = (const float*)bOc.contents;
+        const float* sb = (const float*)bSb.contents;
+        const float* sc = (const float*)bSc.contents;
+        for (size_t i = 0; i < (size_t)TnMain * hV * dS; ++i)
+            if (ob[i] != oc[i]) ++diffO;
+        for (size_t i = 0; i < st0.size(); ++i)
+            if (sb[i] != sc[i]) ++diffS;
+        const bool exact = diffO == 0 && diffS == 0;
+        pass &= exact;
+        printf("  resident vs streamed @Tn=%u: o %zu differ, state %zu differ -> %s\n",
+               TnMain, diffO, diffS, exact ? "BIT-EXACT" : "FAIL");
+    }
 
     if (iters) {
         pc.Tn = TnMain;
@@ -4313,8 +4363,8 @@ static bool caseDnChunk(MtlCtx& c, uint32_t TnMain, uint32_t iters) {
                         [enc setBuffer:bOb offset:0 atIndex:3];
                         [enc setBuffer:bSb offset:0 atIndex:4];
                         [enc setBytes:&pc length:20 atIndex:5];
-                        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, 2)
-                            threadsPerThreadgroup:MTLSizeMake(dS, 1, 1)];
+                        [enc dispatchThreadgroups:MTLSizeMake(hV, 1, stepPanels)
+                            threadsPerThreadgroup:MTLSizeMake(stepNsg * 32u, 1, 1)];
                     }
                 }
                 [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];

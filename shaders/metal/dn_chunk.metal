@@ -337,3 +337,131 @@ kernel void dn_chunk_step(device const float* uw  [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
 }
+
+// Resident-state retile. Each 8-row panel is loaded once, advances every
+// 64-token chunk in about 6 KiB of threadgroup memory, and is written once.
+static inline void dn_chunk_step_res_body(device const float* uw,
+                                          device const float* att,
+                                          device const float* el,
+                                          device float* o,
+                                          device float* sS,
+                                          constant DnCPC& pc,
+                                          threadgroup float* Stg,
+                                          threadgroup float* Dtg,
+                                          threadgroup float* diagTg,
+                                          uint3 tid3, uint3 tgpig, uint sgid)
+{
+    constexpr uint PW = 8u;
+    constexpr uint NS = 8u;
+    const uint h   = tgpig.x;
+    const uint pan = tgpig.z;
+    const uint dS  = DSC;
+    const uint jp0 = pan * PW;
+    const uint nCh = (pc.Tn + C - 1u) / C;
+    const uint hVdS = pc.hV * dS;
+    constexpr uint nJT = PW / 8u;
+    const uint nKT = dS / 8u;
+
+    device float* S = sS + (ulong)h * dS * dS;
+
+    for (uint idx = tid3.x; idx < PW * dS; idx += NS * 32u) {
+        const uint j = idx / dS, k = idx % dS;
+        Stg[idx] = S[(ulong)(jp0 + j) * dS + k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = 0u; c < nCh; ++c) {
+        const ulong mb = ((ulong)(c * pc.hV + h) * 4u) * (C * (ulong)dS);
+        device const float* um = uw + mb;
+        device const float* wm = um + C * dS;
+        device const float* qm = wm + C * dS;
+        device const float* km = qm + C * dS;
+        device const float* ac = att + (ulong)(c * pc.hV + h) * (C * C);
+        const float elast = el[c * pc.hV + h];
+
+        if (tid3.x < 64u)
+            diagTg[tid3.x] = (tid3.x / 8u == (tid3.x & 7u)) ? elast : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // D = u~ + (-w~) S0^T
+        for (uint q = sgid; q < 8u * nJT; q += NS) {
+            const uint st = q / nJT, jt = q % nJT;
+            simdgroup_float8x8 cf;
+            simdgroup_load(cf, um + (st * nKT + jp0 / 8u + jt) * 64u, 8u);
+            for (uint kt = 0u; kt < nKT; ++kt) {
+                simdgroup_float8x8 af, bf;
+                simdgroup_load(af, wm + (st * nKT + kt) * 64u, 8u);
+                simdgroup_load(bf, Stg + (jt * 8u) * dS + kt * 8u, dS,
+                               ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(cf, af, bf, cf);
+            }
+            simdgroup_store(cf, Dtg + (st * nJT + jt) * 64u, 8u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O = q~ S0^T + Att D
+        for (uint q = sgid; q < 8u * nJT; q += NS) {
+            const uint tt = q / nJT, jt = q % nJT;
+            simdgroup_float8x8 cf = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint kt = 0u; kt < nKT; ++kt) {
+                simdgroup_float8x8 af, bf;
+                simdgroup_load(af, qm + (tt * nKT + kt) * 64u, 8u);
+                simdgroup_load(bf, Stg + (jt * 8u) * dS + kt * 8u, dS,
+                               ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(cf, af, bf, cf);
+            }
+            for (uint st = 0u; st < 8u; ++st) {
+                simdgroup_float8x8 af, bf;
+                simdgroup_load(af, ac + (tt * 8u + st) * 64u, 8u);
+                simdgroup_load(bf, Dtg + (st * nJT + jt) * 64u, 8u);
+                simdgroup_multiply_accumulate(cf, af, bf, cf);
+            }
+            simdgroup_store(cf, o + (ulong)(c * C + tt * 8u) * hVdS +
+                                    (ulong)h * dS + jp0 + jt * 8u, hVdS);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S = elast S + D^T K~, retained in Stg for the next chunk.
+        simdgroup_float8x8 df;
+        simdgroup_load(df, diagTg, 8u);
+        for (uint q = sgid; q < nJT * nKT; q += NS) {
+            const uint jt = q / nKT, it = q % nKT;
+            simdgroup_float8x8 cf = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint st = 0u; st < 8u; ++st) {
+                simdgroup_float8x8 af, bf;
+                simdgroup_load(af, Dtg + (st * nJT + jt) * 64u, 8u,
+                               ulong2(0, 0), true);
+                simdgroup_load(bf, km + (st * nKT + it) * 64u, 8u);
+                simdgroup_multiply_accumulate(cf, af, bf, cf);
+            }
+            simdgroup_float8x8 sf;
+            threadgroup float* sp = Stg + (jt * 8u) * dS + it * 8u;
+            simdgroup_load(sf, sp, dS);
+            simdgroup_multiply_accumulate(cf, df, sf, cf);
+            simdgroup_store(cf, sp, dS);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint idx = tid3.x; idx < PW * dS; idx += NS * 32u) {
+        const uint j = idx / dS, k = idx % dS;
+        S[(ulong)(jp0 + j) * dS + k] = Stg[idx];
+    }
+}
+
+kernel void dn_chunk_step_res8_s8(device const float* uw  [[buffer(0)]],
+                                  device const float* att [[buffer(1)]],
+                                  device const float* el  [[buffer(2)]],
+                                  device float*       o   [[buffer(3)]],
+                                  device float*       sS  [[buffer(4)]],
+                                  constant DnCPC&     pc  [[buffer(5)]],
+                                  uint3 tid3  [[thread_position_in_threadgroup]],
+                                  uint3 tgpig [[threadgroup_position_in_grid]],
+                                  uint  sgid  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float Stg[8u * 128u];
+    threadgroup float Dtg[C * 8u];
+    threadgroup float diagTg[64];
+    dn_chunk_step_res_body(uw, att, el, o, sS, pc, Stg, Dtg, diagTg,
+                           tid3, tgpig, sgid);
+}
