@@ -121,7 +121,10 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
     const uint kh = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
     const uint chQkv = (2u * pc.hK + pc.hV) * dS;
 
-    threadgroup float M[64 * 64];
+    // M is strictly lower triangular. Compact storage cuts threadgroup
+    // memory from 16 KiB to 7.9 KiB, increasing solve occupancy without
+    // changing the forward-substitution arithmetic.
+    threadgroup float M[64 * 63 / 2];
     threadgroup float Ltg[64];
     threadgroup float Btg[64];
 
@@ -141,13 +144,13 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
 
     for (uint idx = j; idx < C * C; idx += dS) {
         const uint t = idx >> 6u, s = idx & 63u;
-        float m = 0.0f, a = 0.0f;
+        float a = 0.0f;
         if (t < Cc && s <= t) {
             const float e = exp(Ltg[t] - Ltg[s]);
-            if (s < t) m = Btg[t] * e * kk[idx];
+            if (s < t)
+                M[t * (t - 1u) / 2u + s] = Btg[t] * e * kk[idx];
             a = e * rsqrt(float(dS)) * qk[idx];   // qScale folded here (QK is raw)
         }
-        M[idx] = m;
         // Att stored as packed 8x8 tiles for simdgroup_load in the step
         attO[((t >> 3u) * 8u + (s >> 3u)) * 64u + (t & 7u) * 8u + (s & 7u)] = a;
     }
@@ -168,7 +171,8 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
             const float4 us = u4[s4], ws = w4[s4];
 #pragma unroll
             for (uint l = 0u; l < 4u; ++l) {
-                threadgroup const float* mr = M + (g * 4u + l) * C + s4 * 4u;
+                const uint t = g * 4u + l;
+                threadgroup const float* mr = M + t * (t - 1u) / 2u + s4 * 4u;
                 const float4 mv = float4(mr[0], mr[1], mr[2], mr[3]);
                 uv[l] -= dot(mv, us);
                 wv[l] -= dot(mv, ws);
@@ -182,7 +186,7 @@ kernel void dn_chunk_solve(device const float* conv [[buffer(0)]],
             float ut = Btg[t] * conv[(ulong)(t0 + t) * chQkv + vOff + j] + uv[l];
             float wt = Btg[t] * exp(Ltg[t]) * conv[(ulong)(t0 + t) * chQkv + kOff + j] + wv[l];
             for (uint m = 0u; m < l; ++m) {
-                const float mm = M[t * C + g * 4u + m];
+                const float mm = M[t * (t - 1u) / 2u + g * 4u + m];
                 ut -= mm * uv[m];   // uv[m] now holds the SOLVED u[t'] (see below)
                 wt -= mm * wv[m];
             }
