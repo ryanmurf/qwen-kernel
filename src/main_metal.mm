@@ -2431,6 +2431,7 @@ struct qk_engine {
     id<MTLBuffer> gbuf;   // no-copy view of the whole GGUF mmap
     uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
     bool shareFork = false;
+    bool prefillMulti = true;
     bool slotCompact = true;
     bool slotsNeedCompact = false;
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
@@ -2590,10 +2591,13 @@ struct qk_engine {
 
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
+    void prefillPendingSlots();
     void prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
                           std::vector<float>& logits, bool wantLogits = true, uint32_t base = 0,
                           uint32_t* argmaxOut = nullptr, const float* hiddenIn = nullptr,
-                          float* hiddenOut = nullptr, bool scratchState = false);
+                          float* hiddenOut = nullptr, bool scratchState = false,
+                          uint32_t nSeq = 1, const uint32_t* seqSlots = nullptr,
+                          const uint32_t* seqBases = nullptr);
     int stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
                  uint32_t base, float* hiddenOut, uint32_t* idsOut);
     // Top-k (ids, logits) of the final position's row after a last-stage
@@ -2821,6 +2825,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     auto fail = [&](const char* m) { if (err && errLen) snprintf(err, errLen, "%s", m); return false; };
     nSlots = cfg.n_slots; nCtx = cfg.n_ctx; chunkN = cfg.chunk;
     shareFork = getenv("QK_FORK") != nullptr;
+    prefillMulti = !getenv("QK_PREFILL_MULTI") || atoi(getenv("QK_PREFILL_MULTI")) != 0;
     slotCompact = !getenv("QK_SLOT_COMPACT") || atoi(getenv("QK_SLOT_COMPACT")) != 0;
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
@@ -3228,7 +3233,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             }
     }
 
-    uint32_t cap = 128;
+    // Multi-slot 35B admission can coalesce prompt chunks into one
+    // weight-amortized prefill. Single-slot, split, and IQ4/80B engines retain
+    // the lean legacy default; QK_MAXB remains an explicit override.
+    uint32_t cap = !splitStage() && !guIq4 && nSlots >= 2 ? 1024u : 128u;
     if (const char* v = getenv("QK_MAXB")) {
         long x = atol(v);
         if (x >= 16 && x <= 1024) cap = (uint32_t)x;
@@ -3276,8 +3284,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     const size_t workCap = nExp + ((size_t)cap * nUsed + 31) / 32 + (cap + 31) / 32;
     bbWork = createBuf(c, workCap * 2 * 4, nullptr, true);
     bbMDy = createBuf(c, (size_t)cap * (nUsed + 1) * nEmbd * 4, nullptr, true);
-    bbCarry = createBuf(c, (size_t)nLayer * chQkv * 3 * 4, nullptr, true);
-    memset(bbCarry.contents, 0, (size_t)nLayer * chQkv * 3 * 4);
+    bbCarry = createBuf(c, (size_t)nLayer * nSlots * chQkv * 3 * 4, nullptr, true);
+    memset(bbCarry.contents, 0, (size_t)nLayer * nSlots * chQkv * 3 * 4);
     if (dnChunk) {   // chunked-DN scratch: per (chunk, head) tiles, reused per layer
         const size_t nChMax = (cap + 63) / 64;
         bbDnKQ  = createBuf(c, nChMax * hK * 2 * 64 * 64 * 4, nullptr, true);
@@ -3688,6 +3696,83 @@ uint32_t qk_engine::specDraft(uint32_t slot) {
     return nDraft + 1;
 }
 
+void qk_engine::prefillPendingSlots() {
+    // 80B's IQ4 grouped-MoE path changes activation arithmetic when prompt
+    // rows are unioned (the recurrent state diverges immediately after layer
+    // 0). Its production split path is identity-scheduled; keep unsplit 80B
+    // on serial prefill as well until a per-sequence IQ4 MoE union exists.
+    if (!prefillMulti || guIq4 || nSlots < 2 || maxB < 384) return;
+    std::vector<float> dummy;
+
+    // Coalesce only chunks large enough that each sequence independently uses
+    // the same exact grouped-MoE regime as serial prefill. Smaller unions can
+    // be much faster by crossing that threshold in aggregate, but recurrent
+    // trajectories then differ and are not eligible for the exact default.
+    while (true) {
+        struct Ready { uint32_t logical, rem; };
+        std::vector<Ready> ready;
+        for (uint32_t s = 0; s < nSlots; ++s) {
+            const Slot& sl = slots[s];
+            if (!sl.active || sl.finPending || sl.prompt.empty()) continue;
+            const uint32_t target = (uint32_t)sl.prompt.size() - 1u;
+            if (target > sl.cursor && target - sl.cursor >= 192u)
+                ready.push_back({s, target - sl.cursor});
+        }
+        std::sort(ready.begin(), ready.end(), [](const Ready& a, const Ready& b) {
+            return a.rem > b.rem;
+        });
+
+        uint32_t B = 0, Tn = 0;
+        for (uint32_t candidate : {8u, 4u, 2u}) {
+            if (candidate > ready.size()) continue;
+            uint32_t minRem = ready[0].rem;
+            for (uint32_t q = 1; q < candidate; ++q)
+                minRem = std::min(minRem, ready[q].rem);
+            const uint32_t lim = std::min(maxB / candidate, minRem);
+            const uint32_t tail = minRem - lim;
+            // Avoid creating a 16..191-token tail that cannot be coalesced and
+            // would require one separate prefill per client. A narrower union
+            // can often consume the whole remaining prefix instead.
+            if (tail >= 16u && tail < 192u) continue;
+            if (lim >= 192u) { B = candidate; Tn = lim; break; }
+        }
+        if (!B) break;
+
+        std::vector<uint32_t> ids((size_t)B * Tn), stripes(B), bases(B);
+        for (uint32_t q = 0; q < B; ++q) {
+            Slot& sl = slots[ready[q].logical];
+            memcpy(ids.data() + (size_t)q * Tn, sl.prompt.data() + sl.cursor,
+                   (size_t)Tn * sizeof(uint32_t));
+            stripes[q] = physicalSlot(ready[q].logical);
+            bases[q] = sl.cursor;
+        }
+        prefillBatchLast(ids.data(), B * Tn, 0, dummy, /*wantLogits=*/false, 0,
+                         nullptr, nullptr, nullptr, false, B,
+                         stripes.data(), bases.data());
+        for (uint32_t q = 0; q < B; ++q) {
+            Slot& sl = slots[ready[q].logical];
+            sl.cursor += Tn;
+            sl.pos += Tn;
+        }
+    }
+
+    // Finish each residual batchable prefix through the existing single-slot
+    // path. At most 191 tokens remain after a coalesced round; tails below 16
+    // stay in the serial multi-slot step, matching the legacy policy.
+    for (uint32_t s = 0; s < nSlots; ++s) {
+        Slot& sl = slots[s];
+        if (!sl.active || sl.finPending || sl.prompt.empty()) continue;
+        const uint32_t target = (uint32_t)sl.prompt.size() - 1u;
+        while (target > sl.cursor && target - sl.cursor >= 16u) {
+            const uint32_t cn = std::min(maxB, target - sl.cursor);
+            prefillBatchLast(sl.prompt.data() + sl.cursor, cn, physicalSlot(s), dummy,
+                             /*wantLogits=*/false, sl.cursor);
+            sl.cursor += cn;
+            sl.pos += cn;
+        }
+    }
+}
+
 int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
     for (uint32_t s = 0; s < nSlots; s++) outCnt[s] = 0;
     *outFin = 0;
@@ -3732,6 +3817,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         finish(s);
     }
     compactActiveSlots();
+    prefillPendingSlots();
 
     // V1 speculates only when exactly one unfinished slot is active. A verify
     // round blocks for about one serial chunk and would otherwise be unfair to
@@ -3905,13 +3991,29 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
 void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot,
                                  std::vector<float>& logits, bool wantLogits, uint32_t base,
                                  uint32_t* argmaxOut, const float* hiddenIn, float* hiddenOut,
-                                 bool scratchState) {
-    if ((!toks && !hiddenIn) || n < 1 || n > maxB || slot >= nSlots ||
-        (size_t)base + n > nCtx ||
+                                 bool scratchState, uint32_t nSeq,
+                                 const uint32_t* seqSlots, const uint32_t* seqBases) {
+    const uint32_t seqN = nSeq ? n / nSeq : 0;
+    const uint32_t seqPad = (seqN + 63u) & ~63u;
+    auto stateSlotFor = [&](uint32_t q) {
+        return nSeq == 1 ? slot : seqSlots[q];
+    };
+    auto baseFor = [&](uint32_t q) {
+        return nSeq == 1 ? base : seqBases[q];
+    };
+    bool badSeq = nSeq < 1 || nSeq > nSlots || !seqN || seqN * nSeq != n ||
+                  (size_t)nSeq * seqPad > ((maxB + 63u) & ~63u) ||
+                  (nSeq > 1 && (!seqSlots || !seqBases || hiddenIn || wantLogits ||
+                                argmaxOut || scratchState));
+    if (!badSeq) {
+        for (uint32_t q = 0; q < nSeq; ++q)
+            badSeq |= stateSlotFor(q) >= nSlots || (size_t)baseFor(q) + seqN > nCtx;
+    }
+    if ((!toks && !hiddenIn) || n < 1 || n > maxB || slot >= nSlots || badSeq ||
         (hiddenIn && firstStage()) || (!hiddenIn && !firstStage()) ||
         ((wantLogits || argmaxOut) && !lastStage())) {
-        fprintf(stderr, "prefillBatchLast: bad args n=%u slot=%u base=%u stage=[%u,%u)\n",
-                n, slot, base, lFirst, lEnd);
+        fprintf(stderr, "prefillBatchLast: bad args n=%u seq=%u slot=%u base=%u "
+                        "stage=[%u,%u)\n", n, nSeq, slot, base, lFirst, lEnd);
         exit(1);
     }
     if (hiddenIn) memcpy(bbXin.contents, hiddenIn, (size_t)n * nEmbd * 4);   // UMA
@@ -3929,16 +4031,20 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     // win vs llama). QK_FA_MMA=0 forces the old scalar kernel (rollback/debug).
     static const bool faMma = !getenv("QK_FA_MMA") || atoi(getenv("QK_FA_MMA")) != 0;
     if (wantLogits) logits.resize(vocab);
-    if (base == 0) resetStripe(slot);
-    // seed each deltanet layer's conv carry (plain UMA memcpy; GPU idle here)
+    for (uint32_t q = 0; q < nSeq; ++q)
+        if (baseFor(q) == 0) resetStripe(stateSlotFor(q));
+    // Seed each sequence's DeltaNet conv carry (plain UMA memcpy; GPU idle).
     for (uint32_t il = lFirst; il < lEnd; il++) {
         if (!layers[il].rec) continue;
-        const uint32_t stateSlot = scratchState ? nSlots : slot;
-        uint8_t* dst = (uint8_t*)bbCarry.contents + (size_t)il * chQkv * 3 * 4;
-        if (base == 0) memset(dst, 0, (size_t)chQkv * 3 * 4);
-        else memcpy(dst, (uint8_t*)layers[il].st1.contents +
-                         (size_t)stateSlot * layers[il].ps1,
-                    (size_t)chQkv * 3 * 4);
+        for (uint32_t q = 0; q < nSeq; ++q) {
+            const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
+            uint8_t* dst = (uint8_t*)bbCarry.contents +
+                ((size_t)il * nSlots + q) * chQkv * 3 * 4;
+            if (baseFor(q) == 0) memset(dst, 0, (size_t)chQkv * 3 * 4);
+            else memcpy(dst, (uint8_t*)layers[il].st1.contents +
+                             (size_t)stateSlot * layers[il].ps1,
+                        (size_t)chQkv * 3 * 4);
+        }
     }
 
     @autoreleasepool {
@@ -3962,15 +4068,17 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         struct { uint32_t m, k; } pcP;
         struct { uint32_t n, hv, Tn; } pcAbB{nEmbd, hV, n};
         struct { uint32_t channels, dState, qkCh; float e; uint32_t Tn; }
-            pcConvB{chQkv, dS, 2 * hK * dS, eps, n};
-        struct { uint32_t dState, hK_, hV_, Tn, kd; } pcStepB{dS, hK, hV, n, dnKDiv};
-        struct { uint32_t dState, hK_, hV_, Tn, kd; } pcDnC{dS, hK, hV, n, dnKDiv};
-        const uint32_t nChDn = (n + 63) / 64;
+            pcConvB{chQkv, dS, 2 * hK * dS, eps, seqN};
+        struct { uint32_t dState, hK_, hV_, Tn, kd; }
+            pcStepB{dS, hK, hV, seqN, dnKDiv};
+        struct { uint32_t dState, hK_, hV_, Tn, kd; }
+            pcDnC{dS, hK, hV, seqN, dnKDiv};
+        const uint32_t nChDn = (seqN + 63) / 64;
         struct { uint32_t dState, hV_; float e; uint32_t Tn; } pcGateB{dS, hV, eps, n};
         struct { uint32_t a, b, cc, d; } pcv{nEmbd, ffE, nExp, nUsed};
         struct { uint32_t a, b, cc, d; float e; } pcv5{nEmbd, ffE, nExp, nUsed, eps};
         struct { uint32_t tmax, dh_, nRot_, hQ_, hKV_; float e, fb; uint32_t base_, Tn, qbase; }
-            pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, base, n, 0};
+            pcFaB{nCtx, dh, nRot, hQ, hKV, eps, kFreqBase, baseFor(0), seqN, 0};
         struct { uint32_t k, idx, pr; float e; } pcE{nEmbd, 0, 1, eps};
         struct { uint32_t M, K, N; } pcG;
 
@@ -4011,13 +4119,12 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             dspz(pEmb, {bEmbdW, bbIds, bbXin, layers[lFirst].aNorm, bbXn}, &pcE, 16, 1, 256, n);
         }
         bar();
+        // Preserve the per-sequence numerical regime when rows from several
+        // prompts share the activation matrix. Crossing the grouped-MoE
+        // threshold only in aggregate changes recurrent trajectories.
+        const bool useGrouped = moeGrouped && seqN >= moeGroupN;
         for (uint32_t il = lFirst; il < lEnd; il++) {
             Layer& L = layers[il];
-            // Verify advances recurrent state in the shared scratch stripe;
-            // attention KV remains positional in the live slot and needs no
-            // rollback after a rejected suffix.
-            const uint32_t stateSlot = scratchState && L.rec ? nSlots : slot;
-            size_t so1 = (size_t)stateSlot * L.ps1, so2 = (size_t)stateSlot * L.ps2;
             if (L.rec) {
                 proj(L.qkvW, bbXn, bbBig, chQkv, nEmbd, false, L.iq4P1);
                 proj(L.zW, bbXn, bbMid, dIn, nEmbd, false, L.iq4P2);
@@ -4025,26 +4132,79 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                      (2 * hV + nsg - 1) / nsg, thrN, n);
                 bar();
                 if (!skDn) {
-                dspz(pConvB, {WB{bbCarry, (NSUInteger)il * chQkv * 3 * 4}, bbBig, L.ker,
-                              bbConvOut, WB{L.st1, so1}},
-                     &pcConvB, 20, chQkv / dS, dS, n);
-                bar();
-                if (dnChunk) {
-                    dspz(pDnKq, {bbConvOut, bbDnKQ}, &pcDnC, 20, hK, dS, nChDn);
-                    bar();
-                    dspz(pDnSolve, {bbConvOut, bbGb, bbDnKQ, bbDnUW, bbDnAtt, bbDnEl},
-                         &pcDnC, 20, hV, dS, nChDn);
-                    bar();
-                    dspz(pDnStepC, {bbDnUW, bbDnAtt, bbDnEl, bbO, WB{L.st2, so2}},
-                         &pcDnC, 20, hV, dnStepPW ? 256u : dS,
-                         dnStepPW ? dS / dnStepPW : 2u);  // z = state-row panel
-                } else {
-                    dspz(pStepB, {bbConvOut, bbGb, bbO, WB{L.st2, so2}},
-                         &pcStepB, 20, hV, dS, 1);
+                for (uint32_t q = 0; q < nSeq; ++q) {
+                    const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
+                    const size_t ro = (size_t)q * seqN;
+                    const NSUInteger carryOff =
+                        ((NSUInteger)il * nSlots + q) * chQkv * 3 * 4;
+                    dspz(pConvB,
+                         {WB{bbCarry, carryOff},
+                          WB{bbBig, (NSUInteger)(ro * chQkv * 4)}, L.ker,
+                          WB{bbConvOut, (NSUInteger)(ro * chQkv * 4)},
+                          WB{L.st1, (NSUInteger)((size_t)stateSlot * L.ps1)}},
+                         &pcConvB, 20, chQkv / dS, dS, seqN);
                 }
                 bar();
-                dspz(pGateB, {bbO, L.sn, bbMid, bbAtt}, &pcGateB, 16,
-                     (hV + nsg - 1) / nsg, thrN, n);
+                if (dnChunk) {
+                    const size_t kqStride = (size_t)nChDn * hK * 2 * 64 * 64 * 4;
+                    const size_t uwStride = (size_t)nChDn * hV * 4 * 64 * dS * 4;
+                    const size_t atStride = (size_t)nChDn * hV * 64 * 64 * 4;
+                    const size_t elStride = (size_t)nChDn * hV * 4;
+                    for (uint32_t q = 0; q < nSeq; ++q) {
+                        const size_t ro = (size_t)q * seqN;
+                        dspz(pDnKq,
+                             {WB{bbConvOut, (NSUInteger)(ro * chQkv * 4)},
+                              WB{bbDnKQ, (NSUInteger)(q * kqStride)}},
+                             &pcDnC, 20, hK, dS, nChDn);
+                    }
+                    bar();
+                    for (uint32_t q = 0; q < nSeq; ++q) {
+                        const size_t ro = (size_t)q * seqN;
+                        dspz(pDnSolve,
+                             {WB{bbConvOut, (NSUInteger)(ro * chQkv * 4)},
+                              WB{bbGb, (NSUInteger)(ro * 2 * hV * 4)},
+                              WB{bbDnKQ, (NSUInteger)(q * kqStride)},
+                              WB{bbDnUW, (NSUInteger)(q * uwStride)},
+                              WB{bbDnAtt, (NSUInteger)(q * atStride)},
+                              WB{bbDnEl, (NSUInteger)(q * elStride)}},
+                             &pcDnC, 20, hV, dS, nChDn);
+                    }
+                    bar();
+                    for (uint32_t q = 0; q < nSeq; ++q) {
+                        const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
+                        const size_t oo = (size_t)q * seqPad;
+                        dspz(pDnStepC,
+                             {WB{bbDnUW, (NSUInteger)(q * uwStride)},
+                              WB{bbDnAtt, (NSUInteger)(q * atStride)},
+                              WB{bbDnEl, (NSUInteger)(q * elStride)},
+                              WB{bbO, (NSUInteger)(oo * dIn * 4)},
+                              WB{L.st2, (NSUInteger)((size_t)stateSlot * L.ps2)}},
+                             &pcDnC, 20, hV, dnStepPW ? 256u : dS,
+                             dnStepPW ? dS / dnStepPW : 2u);
+                    }
+                } else {
+                    for (uint32_t q = 0; q < nSeq; ++q) {
+                        const uint32_t stateSlot = scratchState ? nSlots : stateSlotFor(q);
+                        const size_t ro = (size_t)q * seqN;
+                        const size_t oo = (size_t)q * seqPad;
+                        dspz(pStepB,
+                             {WB{bbConvOut, (NSUInteger)(ro * chQkv * 4)},
+                              WB{bbGb, (NSUInteger)(ro * 2 * hV * 4)},
+                              WB{bbO, (NSUInteger)(oo * dIn * 4)},
+                              WB{L.st2, (NSUInteger)((size_t)stateSlot * L.ps2)}},
+                             &pcStepB, 20, hV, dS, 1);
+                    }
+                }
+                bar();
+                for (uint32_t q = 0; q < nSeq; ++q) {
+                    const size_t ro = (size_t)q * seqN;
+                    const size_t oo = (size_t)q * seqPad;
+                    dspz(pGateB,
+                         {WB{bbO, (NSUInteger)(oo * dIn * 4)}, L.sn,
+                          WB{bbMid, (NSUInteger)(ro * dIn * 4)},
+                          WB{bbAtt, (NSUInteger)(ro * dIn * 4)}},
+                         &pcGateB, 16, (hV + nsg - 1) / nsg, thrN, seqN);
+                }
                 bar();
                 }
                 proj(L.outW, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
@@ -4054,22 +4214,48 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 proj(L.wv, bbXn, bbVin, hKV * dh, nEmbd, false, L.iq4P3);
                 bar();
                 if (!skAttn) {
-                dspz(pPrepB, {bbBig, bbKin, bbVin, L.qn, L.kn, bbMid, WB{L.st1, so1},
-                              WB{L.st2, so2}, bRope}, &pcFaB, 40, hQ + 2 * hKV, 256, n);
+                for (uint32_t q = 0; q < nSeq; ++q) {
+                    const uint32_t stateSlot = stateSlotFor(q);
+                    const size_t ro = (size_t)q * seqN;
+                    pcFaB.base_ = baseFor(q);
+                    dspz(pPrepB,
+                         {WB{bbBig, (NSUInteger)(ro * chQkv * 4)},
+                          WB{bbKin, (NSUInteger)(ro * hKV * dh * 4)},
+                          WB{bbVin, (NSUInteger)(ro * hKV * dh * 4)}, L.qn, L.kn,
+                          WB{bbMid, (NSUInteger)(ro * dIn * 4)},
+                          WB{L.st1, (NSUInteger)((size_t)stateSlot * L.ps1)},
+                          WB{L.st2, (NSUInteger)((size_t)stateSlot * L.ps2)}, bRope},
+                         &pcFaB, 40, hQ + 2 * hKV, 256, seqN);
+                }
                 bar();
-                if (faMma)
-                    dspz(pAttnBM, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
-                         &pcFaB, 40, hQ / faHeadGroup, faThreads,
-                         (n + faQTM - 1u) / faQTM);
-                else
-                    dspz(pAttnB, {bbMid, WB{L.st1, so1}, WB{L.st2, so2}, bbBig, bbAtt},
-                         &pcFaB, 40, hQ, 256, n);
+                for (uint32_t q = 0; q < nSeq; ++q) {
+                    const uint32_t stateSlot = stateSlotFor(q);
+                    const size_t ro = (size_t)q * seqN;
+                    pcFaB.base_ = baseFor(q);
+                    if (faMma)
+                        dspz(pAttnBM,
+                             {WB{bbMid, (NSUInteger)(ro * dIn * 4)},
+                              WB{L.st1, (NSUInteger)((size_t)stateSlot * L.ps1)},
+                              WB{L.st2, (NSUInteger)((size_t)stateSlot * L.ps2)},
+                              WB{bbBig, (NSUInteger)(ro * chQkv * 4)},
+                              WB{bbAtt, (NSUInteger)(ro * dIn * 4)}},
+                             &pcFaB, 40, hQ / faHeadGroup, faThreads,
+                             (seqN + faQTM - 1u) / faQTM);
+                    else
+                        dspz(pAttnB,
+                             {WB{bbMid, (NSUInteger)(ro * dIn * 4)},
+                              WB{L.st1, (NSUInteger)((size_t)stateSlot * L.ps1)},
+                              WB{L.st2, (NSUInteger)((size_t)stateSlot * L.ps2)},
+                              WB{bbBig, (NSUInteger)(ro * chQkv * 4)},
+                              WB{bbAtt, (NSUInteger)(ro * dIn * 4)}},
+                             &pcFaB, 40, hQ, 256, seqN);
+                }
                 bar();
                 }
                 proj(L.wo, bbAtt, bbAttnOut, nEmbd, dIn, true, L.iq4Wo);
             }
             bar();
-            if (moeGrouped && n >= moeGroupN) {
+            if (useGrouped) {
                 // grouped regime: residual+norm via add_rmsnorm (same y/xn2 as
                 // the fused kernel), router logits as one f32 GEMM
                 dspz(pAddN, {bbXin, bbAttnOut, L.pn, bbY, bbXn2}, &pcRms, 8, 1, 256, n);
@@ -4085,7 +4271,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             if (!skMoe) {
             dspz(pMoeS, {bbML, bbMSel}, &pcv, 16, 1, 32, n);
             bar();
-            if (moeGrouped && n >= moeGroupN) {
+            if (useGrouped) {
                 struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, ffE, nExp, nUsed, n};
                 const bool compactWork = (moeGrouped == 5 || moeGrouped == 6) &&
                                          !guIq4 && moeWork;
@@ -4375,6 +4561,10 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     }
     uint32_t target = n_prompt >= 1 ? n_prompt - 1 : 0;
     uint32_t done = start;
+    const bool deferPrefill = e->prefillMulti && !e->guIq4 && e->nSlots > 1 &&
+                              e->maxB >= 384 &&
+                              snap_prefix == 0 && !e->shareFork &&
+                              !getenv("QK_NO_BATCH");
     auto batch_to = [&](uint32_t limit) {
         while (limit > done && limit - done >= 16) {
             uint32_t chunk = std::min(e->maxB, limit - done);
@@ -4386,7 +4576,7 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
     };
     uint32_t snapAt = (snap_prefix > start && snap_prefix < target) ? snap_prefix : 0;
     uint32_t snapPos = 0;
-    if (!getenv("QK_NO_BATCH")) {
+    if (!deferPrefill && !getenv("QK_NO_BATCH")) {
         if (snapAt) {
             batch_to(snapAt);
             if (e->shareFork && done > start) {
@@ -5893,7 +6083,8 @@ int main(int argc, char** argv) {
 
         if (mode == "slotcmp") {
             if (argc < 4) {
-                fprintf(stderr, "usage: qk slotcmp <ids-file> <nGen> [nSlots] [tmax]\n");
+                fprintf(stderr, "usage: qk slotcmp <ids-file> <nGen> "
+                                "[nSlots] [tmax] [prompt-repeat]\n");
                 return 1;
             }
             std::vector<uint32_t> prompt;
@@ -5907,6 +6098,13 @@ int main(int argc, char** argv) {
             const uint32_t nGen = (uint32_t)atoi(argv[3]);
             const uint32_t ns = argc > 4 ? (uint32_t)atoi(argv[4]) : 8;
             const uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 512;
+            const uint32_t repeat = argc > 6 ? (uint32_t)atoi(argv[6]) : 1;
+            if (repeat > 1) {
+                const std::vector<uint32_t> one = prompt;
+                prompt.reserve(one.size() * repeat);
+                for (uint32_t r = 1; r < repeat; ++r)
+                    prompt.insert(prompt.end(), one.begin(), one.end());
+            }
             if (nGen < 8 || ns < 2 || ns > 16 || prompt.empty() ||
                 prompt.size() + nGen > tmax) {
                 fprintf(stderr, "slotcmp: require nGen>=8, 2<=nSlots<=16, prompt+nGen<=tmax\n");
@@ -5917,8 +6115,11 @@ int main(int argc, char** argv) {
             qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
             if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
             std::vector<std::vector<uint32_t>> prompts(ns, prompt);
-            for (uint32_t s = 1; s < ns; ++s)
+            for (uint32_t s = 1; s < ns; ++s) {
                 prompts[s][0] = (prompts[s][0] + 7919u * s) % e->vocab;
+                if (prompts[s].size() > 256u)
+                    prompts[s].resize(prompts[s].size() - (17u * s) % 64u);
+            }
             std::vector<uint32_t> outTok(ns), outCnt(ns);
             uint32_t fin = 0;
             auto stepInto = [&](std::vector<std::vector<uint32_t>>& gen) {
@@ -6000,9 +6201,143 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (mode == "prefillmulticmp") {
+            const uint32_t N = argc > 2 ? (uint32_t)atoi(argv[2]) : 64;
+            const uint32_t B = argc > 3 ? (uint32_t)atoi(argv[3]) : 2;
+            const uint32_t iters = argc > 4 ? (uint32_t)atoi(argv[4]) : 3;
+            const uint32_t base0 = argc > 5 ? (uint32_t)atoi(argv[5]) : 0;
+            if (!N || B < 2 || B > 16 || (size_t)N * B > 1024) {
+                fprintf(stderr, "usage: qk prefillmulticmp [N] [B=2..16] [iters]\n");
+                return 1;
+            }
+            qk_config cfg{B, std::max(128u, base0 + 5u * B + N + 16u), 1};
+            char err[256] = {0};
+            qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
+            if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
+            if ((size_t)N * B > e->maxB ||
+                (size_t)B * ((N + 63u) / 64u) > (e->maxB + 63u) / 64u) {
+                fprintf(stderr, "prefillmulticmp: B*N/chunk scratch exceeds QK_MAXB=%u\n",
+                        e->maxB);
+                qk_close(e); return 1;
+            }
+            std::mt19937 rng(0x504d554cu + N * 17u + B);
+            std::vector<uint32_t> toks((size_t)N * B), pending(B), slots(B), bases(B);
+            std::vector<std::vector<uint32_t>> prefix(B);
+            for (uint32_t q = 0; q < B; ++q) {
+                slots[q] = q;
+                bases[q] = base0 ? base0 + 5u * q : 0u;
+                prefix[q].resize(bases[q]);
+                for (uint32_t& t : prefix[q]) t = rng() % e->vocab;
+                pending[q] = rng() % e->vocab;
+                for (uint32_t i = 0; i < N; ++i) toks[(size_t)q * N + i] = rng() % e->vocab;
+            }
+            auto seedPrefixes = [&]() {
+                std::vector<float> unused;
+                for (uint32_t q = 0; q < B; ++q) {
+                    if (prefix[q].empty()) { e->resetStripe(q); continue; }
+                    e->prefillBatchLast(prefix[q].data(), bases[q], q, unused,
+                                        /*wantLogits=*/false);
+                }
+            };
+            std::vector<std::vector<uint8_t>> ref(B, std::vector<uint8_t>(e->snapSize));
+            std::vector<uint32_t> refTok(B), gotTok(B);
+            std::vector<float> logits;
+            double serialGpu = 0.0;
+            for (uint32_t q = 0; q < B; ++q) {
+                if (!prefix[q].empty())
+                    e->prefillBatchLast(prefix[q].data(), bases[q], q, logits,
+                                        /*wantLogits=*/false);
+                e->prefillBatchLast(toks.data() + (size_t)q * N, N, q, logits,
+                                    /*wantLogits=*/false, bases[q]);
+                serialGpu += e->lastCbGpu;
+                e->copyStripes(q, ref[q].data(), /*save=*/true, bases[q] + N);
+                e->prefillBatchLast(&pending[q], 1, q, logits, /*wantLogits=*/true,
+                                    bases[q] + N);
+                refTok[q] = (uint32_t)std::distance(
+                    logits.begin(), std::max_element(logits.begin(), logits.end()));
+            }
+            seedPrefixes();
+            e->prefillBatchLast(toks.data(), N * B, 0, logits, /*wantLogits=*/false, 0,
+                                nullptr, nullptr, nullptr, false, B,
+                                slots.data(), bases.data());
+            const double multiGpu = e->lastCbGpu;
+            double maxAbs = 0.0, sumD2 = 0.0, sumR2 = 0.0;
+            uint64_t nFloat = 0, bitDiff = 0;
+            std::vector<uint8_t> got(e->snapSize);
+            for (uint32_t q = 0; q < B; ++q) {
+                e->copyStripes(q, got.data(), /*save=*/true, bases[q] + N);
+                const float* a = (const float*)ref[q].data();
+                const float* b = (const float*)got.data();
+                for (size_t i = 0; i < e->snapSize / 4; ++i) {
+                    const double d = (double)b[i] - a[i];
+                    maxAbs = std::max(maxAbs, std::abs(d));
+                    sumD2 += d * d;
+                    sumR2 += (double)a[i] * a[i];
+                    bitDiff += a[i] != b[i];
+                }
+                if (getenv("QK_PMULTI_DETAIL")) {
+                    for (uint32_t il = 0; il < e->nLayer; ++il) {
+                        uint64_t nd = 0;
+                        double ma = 0.0;
+                        for (size_t off : {e->snapOff1[il], e->snapOff2[il]}) {
+                            const size_t nf = (off == e->snapOff1[il]
+                                ? e->layers[il].ps1 : e->layers[il].ps2) / 4;
+                            const float* la = (const float*)(ref[q].data() + off);
+                            const float* lb = (const float*)(got.data() + off);
+                            for (size_t i = 0; i < nf; ++i) {
+                                nd += la[i] != lb[i];
+                                ma = std::max(ma, std::abs((double)lb[i] - la[i]));
+                            }
+                        }
+                        if (nd) printf("    detail slot=%u layer=%u %s diff=%llu max=%.3g\n",
+                                       q, il, e->layers[il].rec ? "dn" : "attn",
+                                       (unsigned long long)nd, ma);
+                    }
+                }
+                nFloat += e->snapSize / 4;
+                e->prefillBatchLast(&pending[q], 1, q, logits, /*wantLogits=*/true,
+                                    bases[q] + N);
+                gotTok[q] = (uint32_t)std::distance(
+                    logits.begin(), std::max_element(logits.begin(), logits.end()));
+            }
+            bool exactTok = refTok == gotTok;
+            printf("prefillmulticmp: B=%u N=%u state bitdiff=%llu/%llu max_abs=%.3g "
+                   "rel_rms=%.3g handoff=%s\n", B, N,
+                   (unsigned long long)bitDiff, (unsigned long long)nFloat, maxAbs,
+                   sumR2 > 0 ? sqrt(sumD2 / sumR2) : 0.0,
+                   exactTok ? "EXACT" : "MISMATCH");
+            printf("  serial %.3f ms | coalesced %.3f ms | %.2fx\n",
+                   serialGpu * 1e3, multiGpu * 1e3,
+                   multiGpu > 0 ? serialGpu / multiGpu : 0.0);
+            for (uint32_t q = 0; q < B; ++q)
+                printf("  slot %u token %u/%u%s\n", q, refTok[q], gotTok[q],
+                       refTok[q] == gotTok[q] ? "" : " **DIFF**");
+            if (iters) {
+                double s = 0.0, m = 0.0;
+                for (uint32_t it = 0; it < iters; ++it) {
+                    seedPrefixes();
+                    for (uint32_t q = 0; q < B; ++q) {
+                        e->prefillBatchLast(toks.data() + (size_t)q * N, N, q, logits,
+                                            /*wantLogits=*/false, bases[q]);
+                        s += e->lastCbGpu;
+                    }
+                    seedPrefixes();
+                    e->prefillBatchLast(toks.data(), N * B, 0, logits,
+                                        /*wantLogits=*/false, 0, nullptr, nullptr, nullptr,
+                                        false, B, slots.data(), bases.data());
+                    m += e->lastCbGpu;
+                }
+                printf("  avg serial %.3f ms | coalesced %.3f ms | %.2fx (%u iters)\n",
+                       s * 1e3 / iters, m * 1e3 / iters, m > 0 ? s / m : 0.0, iters);
+            }
+            qk_close(e);
+            return exactTok ? 0 : 1;
+        }
+
         if (mode == "serve-test") {
             if (argc < 4) {
-                fprintf(stderr, "usage: qk serve-test <ids-file> <nGen> [nSlots] [tmax]\n");
+                fprintf(stderr, "usage: qk serve-test <ids-file> <nGen> "
+                                "[nSlots] [tmax] [prompt-repeat]\n");
                 return 1;
             }
             std::vector<uint32_t> prompt;
@@ -6016,6 +6351,13 @@ int main(int argc, char** argv) {
             uint32_t nGen = (uint32_t)atoi(argv[3]);
             uint32_t nSlots = argc > 4 ? (uint32_t)atoi(argv[4]) : 1;
             uint32_t tmax = argc > 5 ? (uint32_t)atoi(argv[5]) : 128;
+            uint32_t repeat = argc > 6 ? (uint32_t)atoi(argv[6]) : 1;
+            if (repeat > 1) {
+                const std::vector<uint32_t> one = prompt;
+                prompt.reserve(one.size() * repeat);
+                for (uint32_t r = 1; r < repeat; ++r)
+                    prompt.insert(prompt.end(), one.begin(), one.end());
+            }
             qk_config cfg{nSlots, tmax, 8};
             char err[256] = {0};
             qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
