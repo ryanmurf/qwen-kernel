@@ -6,12 +6,17 @@ metadata:
   labels:
     app: qk-server
 spec:
-  replicas: 0   # starts idle; only one of {gemma-server, qk-server} may hold the GPU at a time
+  replicas: 0   # starts idle; scale up via switch.sh (or directly — see below)
+  # Since 2026-07-12 this backend is PINNED to the 7900 XTX (1a:00.0, 24 GB)
+  # so it can serve concurrently with the 80B split head on the XT (03:00.0).
+  # It still carries the gpu-llm: server label (gemma-server Service default)
+  # until the both-live cutover; the qk-35b Service reaches it permanently.
   # Recreate, NOT RollingUpdate: two overlapping pods cannot both fit the
-  # ~17.6 GB model in 20 GB VRAM. Under overlap the new pod's weights silently
+  # model in VRAM on ONE card. Under overlap the new pod's weights silently
   # fall back to GTT (host RAM over PCIe) — the server comes up healthy at
-  # ~9 tok/s (symptom: card0 vram ~3 GB, gtt ~27 GB). Recreate kills the old
-  # pod first so the load always lands in VRAM.
+  # ~9 tok/s (symptom: vram ~3 GB, gtt ~27 GB). Recreate kills the old
+  # pod first so the load always lands in VRAM. (Cross-DEPLOYMENT overlap on
+  # the same card has the same hazard — switch.sh cannot see it; drain-check.)
   strategy:
     type: Recreate
   selector:
@@ -39,17 +44,23 @@ spec:
         # slots*ctx KV must fit VRAM beside the ~15.5 GB model (KV is allocated
         # upfront at open, so the open footprint is the whole story). Measured
         # clean-open at slots=2 (2026-07-10): ctx 16384 -> 17.65 GB, 24576 ->
-        # 18.28 GB, 32768 -> 18.92 GB, all stable under full-depth touch (29.5k-
-        # token prompt, zero GTT creep). 32768 ships: Claude Code >= 2.2's system
-        # prompt alone is ~29.8k tokens. slots=4/ctx=16384 (~18.1 GB + spikes)
-        # spilled historically; keep slots=2.
+        # 18.28 GB, 32768 -> 18.92 GB (KV ~0.64 GB per 16k per 2 slots).
+        # On the 24 GB XTX, ctx 49152 (~19.6 GB projected) gives agent
+        # sessions the same trim-loop headroom the 80B got, with ~4 GB spare
+        # for co-tenants (voice STT/TTS earmark). Verify VRAM on rollout; if
+        # it spills to GTT, drop back to 32768. slots=2 stays (4 spiked).
         - --slots
         - "2"
         - --ctx
-        - "32768"
+        - "49152"
         - --chunk
         - "8"
         env:
+        # Pin to the 7900 XTX — with two identical Navi31s, first-discrete
+        # enumeration order is a boot-flip away from landing on the 80B
+        # head's card. BDF suffix match; needs image >= 2026-07-12 (6135b97).
+        - name: QK_DEVICE_PCI
+          value: "1a:00.0"
         - name: QK_FORK           # same-prompt requests share one prefill (fork mode)
           value: "1"
         - name: QK_SPEC           # prompt-lookup speculative decoding (exact-output;

@@ -1,0 +1,20 @@
+# Dedicated, permanent endpoint for the 35B backend (qk-server, pinned to
+# the 7900 XTX since 2026-07-12). Unlike gemma-server — which selects the
+# gpu-llm: server label and therefore "whichever backend is switched up" —
+# this Service targets the qk-server Deployment specifically, so the 35B is
+# reachable even when prod's main endpoint points at the 80B split. This is
+# the both-models-live contract: gemma-server = the switched prod backend,
+# qk-35b = always the 35B.
+apiVersion: v1
+kind: Service
+metadata:
+  name: qk-35b
+  namespace: gemma
+  labels:
+    app: qk-server
+spec:
+  selector:
+    app: qk-server
+  ports:
+  - port: 8080
+    targetPort: 8080
