@@ -527,7 +527,9 @@ static inline void q8_stage16p(device const block_q8_0* mat, ulong rowBlocks,
     }
 }
 
-template <typename BLK, bool ISQ6>
+// MAP=0: dense expert grid + z token tile; MAP=1: compact live-expert map;
+// MAP=2: compact (expert,t0) work-pair map with no grid-z overlaunch.
+template <typename BLK, bool ISQ6, uint MAP>
 static inline void down_grouped_body_p(device const BLK*        dwE,
                                        device const block_q8_0* dwS,
                                        device const float*      h,
@@ -535,6 +537,7 @@ static inline void down_grouped_body_p(device const BLK*        dwE,
                                        device const uint*       aTok,
                                        device const uint*       aSlot,
                                        device float*            dY,
+                                       device const uint*       map,
                                        constant MoePC&          pc,
                                        threadgroup half*        Wsh,
                                        threadgroup half*        Xsh,
@@ -543,11 +546,14 @@ static inline void down_grouped_body_p(device const BLK*        dwE,
                                        uint sgid, uint slid)
 {
     const uint nrt = pc.n_embd / DHM;
-    const uint e  = tgx / nrt;
+    const uint ei = tgx / nrt;
+    const uint e  = MAP == 2u ? map[2u * ei] :
+                    MAP == 1u ? map[ei] : ei;
     const uint rt = tgx % nrt;
+    if (e > pc.n_expert) return;
     const uint s0 = start[e], c = start[e + 1u] - s0;
     if (c == 0u) return;
-    const uint t0 = tgz * DHN;
+    const uint t0 = MAP == 2u ? map[2u * ei + 1u] : tgz * DHN;
     if (t0 >= c) return;
 
     const uint K  = pc.n_ff;
@@ -643,7 +649,8 @@ kernel void moe_down_grouped_p_iq4(device const block_iq4_xs* dwE   [[buffer(0)]
     threadgroup half  Wsh[DHM * 32u];
     threadgroup half  Xsh[32u * DHN];
     threadgroup float outb[4u * 72u];
-    down_grouped_body_p<block_iq4_xs, false>(dwE, dwS, h, start, aTok, aSlot, dY, pc,
+    down_grouped_body_p<block_iq4_xs, false, 0>(dwE, dwS, h, start, aTok, aSlot,
+                                             dY, start, pc,
                                              Wsh, Xsh, outb, tid3.x, tgpig.x, tgpig.z, sgid, slid);
 }
 
@@ -663,7 +670,8 @@ kernel void moe_down_grouped_p_q6k(device const block_q6_K* dwE   [[buffer(0)]],
     threadgroup half  Wsh[DHM * 32u];
     threadgroup half  Xsh[32u * DHN];
     threadgroup float outb[4u * 72u];
-    down_grouped_body_p<block_q6_K, true>(dwE, dwS, h, start, aTok, aSlot, dY, pc,
+    down_grouped_body_p<block_q6_K, true, 0>(dwE, dwS, h, start, aTok, aSlot,
+                                          dY, start, pc,
                                           Wsh, Xsh, outb, tid3.x, tgpig.x, tgpig.z, sgid, slid);
 }
 
@@ -681,16 +689,11 @@ kernel void moe_down_grouped_p_live_iq4(device const block_iq4_xs* dwE [[buffer(
                                         uint sgid [[simdgroup_index_in_threadgroup]],
                                         uint slid [[thread_index_in_simdgroup]])
 {
-    const uint nrt = pc.n_embd / DHM;
-    const uint ei = tgpig.x / nrt;
-    const uint e = live[ei];
-    if (e > pc.n_expert) return;
-    const uint mapped = e * nrt + tgpig.x % nrt;
     threadgroup half Wsh[DHM * 32u];
     threadgroup half Xsh[32u * DHN];
     threadgroup float outb[4u * 72u];
-    down_grouped_body_p<block_iq4_xs, false>(dwE, dwS, h, start, aTok, aSlot,
-        dY, pc, Wsh, Xsh, outb, tid3.x, mapped, tgpig.z, sgid, slid);
+    down_grouped_body_p<block_iq4_xs, false, 1>(dwE, dwS, h, start, aTok, aSlot,
+        dY, live, pc, Wsh, Xsh, outb, tid3.x, tgpig.x, tgpig.z, sgid, slid);
 }
 
 kernel void moe_down_grouped_p_live_q6k(device const block_q6_K* dwE [[buffer(0)]],
@@ -707,14 +710,51 @@ kernel void moe_down_grouped_p_live_q6k(device const block_q6_K* dwE [[buffer(0)
                                         uint sgid [[simdgroup_index_in_threadgroup]],
                                         uint slid [[thread_index_in_simdgroup]])
 {
-    const uint nrt = pc.n_embd / DHM;
-    const uint ei = tgpig.x / nrt;
-    const uint e = live[ei];
-    if (e > pc.n_expert) return;
-    const uint mapped = e * nrt + tgpig.x % nrt;
     threadgroup half Wsh[DHM * 32u];
     threadgroup half Xsh[32u * DHN];
     threadgroup float outb[4u * 72u];
-    down_grouped_body_p<block_q6_K, true>(dwE, dwS, h, start, aTok, aSlot,
-        dY, pc, Wsh, Xsh, outb, tid3.x, mapped, tgpig.z, sgid, slid);
+    down_grouped_body_p<block_q6_K, true, 1>(dwE, dwS, h, start, aTok, aSlot,
+        dY, live, pc, Wsh, Xsh, outb, tid3.x, tgpig.x, tgpig.z, sgid, slid);
+}
+
+kernel void moe_down_grouped_p_work_iq4(device const block_iq4_xs* dwE [[buffer(0)]],
+                                        device const block_q8_0* dwS [[buffer(1)]],
+                                        device const float* h [[buffer(2)]],
+                                        device const uint* start [[buffer(3)]],
+                                        device const uint* aTok [[buffer(4)]],
+                                        device const uint* aSlot [[buffer(5)]],
+                                        device float* dY [[buffer(6)]],
+                                        device const uint* work [[buffer(7)]],
+                                        constant MoePC& pc [[buffer(8)]],
+                                        uint3 tid3 [[thread_position_in_threadgroup]],
+                                        uint3 tgpig [[threadgroup_position_in_grid]],
+                                        uint sgid [[simdgroup_index_in_threadgroup]],
+                                        uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup half Wsh[DHM * 32u];
+    threadgroup half Xsh[32u * DHN];
+    threadgroup float outb[4u * 72u];
+    down_grouped_body_p<block_iq4_xs, false, 2>(dwE, dwS, h, start, aTok, aSlot,
+        dY, work, pc, Wsh, Xsh, outb, tid3.x, tgpig.x, tgpig.z, sgid, slid);
+}
+
+kernel void moe_down_grouped_p_work_q6k(device const block_q6_K* dwE [[buffer(0)]],
+                                        device const block_q8_0* dwS [[buffer(1)]],
+                                        device const float* h [[buffer(2)]],
+                                        device const uint* start [[buffer(3)]],
+                                        device const uint* aTok [[buffer(4)]],
+                                        device const uint* aSlot [[buffer(5)]],
+                                        device float* dY [[buffer(6)]],
+                                        device const uint* work [[buffer(7)]],
+                                        constant MoePC& pc [[buffer(8)]],
+                                        uint3 tid3 [[thread_position_in_threadgroup]],
+                                        uint3 tgpig [[threadgroup_position_in_grid]],
+                                        uint sgid [[simdgroup_index_in_threadgroup]],
+                                        uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup half Wsh[DHM * 32u];
+    threadgroup half Xsh[32u * DHN];
+    threadgroup float outb[4u * 72u];
+    down_grouped_body_p<block_q6_K, true, 2>(dwE, dwS, h, start, aTok, aSlot,
+        dY, work, pc, Wsh, Xsh, outb, tid3.x, tgpig.x, tgpig.z, sgid, slid);
 }
