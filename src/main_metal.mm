@@ -2767,11 +2767,11 @@ struct qk_engine {
     // (expert,token-tile) work pairs (`QK_MOE_WORK=0` restores grid-z);
     // 6 is retained as an explicit compact-work alias.
     // Grouping only pays once
-    // experts see enough tokens: default fires at n >= moeGroupN (128) with
+    // experts see enough tokens: default fires at n >= moeGroupN (192) with
     // variant 4; QK_MOE_GROUPED forces a variant at ALL n (0 disables),
     // QK_MOE_GROUP_N overrides the threshold.
     int moeGrouped = 4;
-    uint32_t moeGroupN = 128;
+    uint32_t moeGroupN = 192;
     bool moeWork = true;     // compact packed-v5 prefill tiles; env 0 is rollback
     int moeSlotGrouped = 0;  // 35B default v4; env 0..5 selects/rolls back
     int moeSlotParts = 3;    // bit 0=gate/up, bit 1=down
