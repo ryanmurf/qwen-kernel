@@ -92,6 +92,35 @@ kernel void moe_logits_addn(device const float* gi      [[buffer(0)]],
     if (slid == 0u) logits[rq * (pc.n_expert + 1u) + e] = lg;
 }
 
+// Second half of the large-slot split-router path. add_rmsnorm_sg has
+// persisted y and the same scale computed by moe_logits_addn's e=0
+// simdgroup. Keep scale outside the dot exactly as the fused kernel does.
+kernel void moe_logits_scaled(device const float* gi      [[buffer(0)]],
+                              device const float* gis     [[buffer(1)]],
+                              device const float* y       [[buffer(2)]],
+                              device const float* pn      [[buffer(3)]],
+                              device const float* scales  [[buffer(4)]],
+                              device float*       logits  [[buffer(5)]],
+                              constant MoePC&     pc      [[buffer(6)]],
+                              uint3 tgpig [[threadgroup_position_in_grid]],
+                              uint  sgid  [[simdgroup_index_in_threadgroup]],
+                              uint  slid  [[thread_index_in_simdgroup]])
+{
+    const uint e = tgpig.x * NSG + sgid;
+    const uint rq = tgpig.z;
+    if (e > pc.n_expert) return;
+    const uint n4 = pc.n_embd / 4u;
+    device const float4* y4 = (device const float4*)(y + rq * pc.n_embd);
+    device const float4* pn4 = (device const float4*)pn;
+    device const float4* g4 = (device const float4*)
+        (e < pc.n_expert ? gi + (ulong)e * pc.n_embd : gis);
+    float acc = 0.0f;
+    for (uint k = slid; k < n4; k += 32u)
+        acc += dot(g4[k], y4[k] * pn4[k]);
+    const float lg = simd_sum(acc) * scales[rq];
+    if (slid == 0u) logits[rq * (pc.n_expert + 1u) + e] = lg;
+}
+
 // Batched router logits for grouped-prefill chunks: one f32 GEMM over the
 // 257 router rows (gis = virtual row 256) instead of a GEMV per token.
 // Same 32x32 f32-fragment skeleton as moe_gu_grouped4 minus the dequant;
