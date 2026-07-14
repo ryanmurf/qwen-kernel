@@ -50,6 +50,10 @@ struct qk_engine {
     qk_config cfg;
     slot_t    slots[16];
     uint32_t  l_first, l_end;
+    /* Last last-stage qk_stage_run: its final id and row count, so
+     * qk_stage_topk can answer for that position (and refuse before any run,
+     * like the engine's -2). */
+    uint32_t  last_id, last_rows;
 };
 
 qk_engine *qk_open(const char *gguf_path, const qk_config *cfg,
@@ -124,6 +128,24 @@ int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
             for (uint32_t j = 1; j < QK_NEMBD; j++)
                 hidden_out[i * QK_NEMBD + j] = (float)(e->l_end - e->l_first);
         }
+    }
+    if (last && n) e->last_id = ids_out[n - 1];
+    e->last_rows = last ? n : 0;
+    return 0;
+}
+
+/* Sampling hook (qk_stage_topk). Mirrors the engine's contract: the top-k of
+ * the FINAL position's row, descending, only on an engine that owns the lm
+ * head — which INCLUDES an unsplit one (`lastStage()` is `l_end == n_layer`),
+ * because that is exactly what the local driver relies on. The stub's "logits"
+ * are synthetic: the greedy id at rank 0, then id+1, id+2 …, with a sharp
+ * cliff after rank 3 so a top-p test has a well-defined nucleus. */
+int qk_stage_topk(qk_engine *e, uint32_t k, uint32_t *ids, float *vals) {
+    if (!e || e->l_end != QK_NLAYER || !ids || !vals || k < 1 || k > 256) return -1;
+    if (!e->last_rows) return -2;
+    for (uint32_t i = 0; i < k; i++) {
+        ids[i] = (e->last_id + i) % QK_VOCAB;
+        vals[i] = i < 4 ? 5.0f - (float)i : -20.0f;
     }
     return 0;
 }

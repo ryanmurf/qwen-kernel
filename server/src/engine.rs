@@ -148,6 +148,7 @@ impl EngineThread {
         model: &Path,
         cfg: QkConfig,
         split_next: Option<String>,
+        local_driver: bool,
     ) -> anyhow::Result<Self> {
         use anyhow::{Context, bail};
 
@@ -210,12 +211,43 @@ impl EngineThread {
             }
         };
 
+        // Unsplit + --local-driver: drive the whole model through the split
+        // driver with no worker. Same reason as split mode — the driver picks
+        // the next token, so temperature/top-p work. qk_step_chunk cannot,
+        // because it feeds its own fused argmax straight back in.
+        let local_driver = local_driver && split.is_none();
+        if local_driver {
+            if engine.stage_info().is_none() {
+                bail!("--local-driver requires an engine library with the stage ABI (qk_stage_run)");
+            }
+            if !engine.has_topk() {
+                bail!(
+                    "--local-driver requires qk_stage_topk in the engine library (the sampling hook)"
+                );
+            }
+            if std::env::var_os("QK_FORK").is_some() {
+                // The engine's internal prefix cache and the driver's snapshot
+                // registry index the SAME pcache entries (qk.h), and only the
+                // qk_slot_start path honours QK_FORK — which the driver never
+                // calls. Left set it would only mislead.
+                tracing::warn!(
+                    "QK_FORK does not apply with --local-driver; cross-turn reuse is the driver's \
+                     [split-cache] (QK_PCACHE entries), not the engine's internal pcache"
+                );
+            }
+            tracing::info!(
+                "local driver: all {} layers in-process, sampling via qk_stage_topk",
+                engine.stage_info().map_or(0, |i| i.n_layer)
+            );
+        }
+
         let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("qk-engine".to_owned())
-            .spawn(move || match split {
-                Some(link) => crate::split::run_split_engine_thread(engine, link, rx),
-                None => run_engine_thread(engine, rx),
+            .spawn(move || match (split, local_driver) {
+                (Some(link), _) => crate::split::run_split_engine_thread(engine, Some(link), rx),
+                (None, true) => crate::split::run_split_engine_thread(engine, None, rx),
+                (None, false) => run_engine_thread(engine, rx),
             })
             .map_err(anyhow::Error::from)?;
         Ok(Self {

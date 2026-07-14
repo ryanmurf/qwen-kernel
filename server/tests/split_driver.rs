@@ -178,7 +178,13 @@ fn split_driver_serves_the_serial_stream() {
     // a split engine with no --split-next…
     unsafe { std::env::set_var("QK_LAYERS", "0:20") };
     let Err(err) =
-        EngineThread::start(Path::new(env!("QK_STUB_LIB")), Path::new("/dev/null"), CFG, None)
+        EngineThread::start(
+            Path::new(env!("QK_STUB_LIB")),
+            Path::new("/dev/null"),
+            CFG,
+            None,
+            false,
+        )
     else {
         panic!("split engine without --split-next must fail")
     };
@@ -190,6 +196,7 @@ fn split_driver_serves_the_serial_stream() {
         Path::new("/dev/null"),
         CFG,
         Some(addr),
+        false,
     )
     .expect("head starts");
     unsafe { std::env::remove_var("QK_LAYERS") };
@@ -200,6 +207,7 @@ fn split_driver_serves_the_serial_stream() {
         Path::new("/dev/null"),
         CFG,
         Some("127.0.0.1:1".into()),
+        false,
     ) else {
         panic!("--split-next with an unsplit engine must fail")
     };
@@ -409,6 +417,7 @@ fn split_driver_serves_the_serial_stream() {
         Path::new("/dev/null"),
         CFG,
         Some(bad_addr),
+        false,
     )
     .expect("head starts (hello happens lazily)");
     unsafe { std::env::remove_var("QK_LAYERS") };
@@ -430,6 +439,7 @@ fn split_driver_serves_the_serial_stream() {
         Path::new("/dev/null"),
         CFG,
         Some(dead_port),
+        false,
     )
     .expect("head starts even with the worker down");
     unsafe { std::env::remove_var("QK_LAYERS") };

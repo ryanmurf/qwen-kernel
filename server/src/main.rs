@@ -35,6 +35,14 @@ struct Cli {
     /// to load the head stage (QK_LAYERS=0:S in the environment).
     #[arg(long)]
     split_next: Option<String>,
+    /// Drive an UNSPLIT engine through the split driver (one qk_stage_run per
+    /// position) instead of qk_step_chunk. Costs a host round trip per token
+    /// and buys sampling: qk_step_chunk decides the next token inside the
+    /// engine's fused argmax chain, so temperature/top-p can only be honoured
+    /// when the driver picks the token. Cross-turn reuse then comes from the
+    /// driver's [split-cache] (QK_PCACHE entries), not the engine's pcache.
+    #[arg(long, env = "QK_LOCAL_DRIVER")]
+    local_driver: bool,
     #[arg(long, default_value_t = 64)]
     queue: usize,
     #[arg(long, value_enum, default_value_t = CliTemplateMode::Auto)]
@@ -91,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             chunk: cli.chunk,
         },
         cli.split_next.clone(),
+        cli.local_driver,
     )?;
     let state = AppState {
         tokenizer,

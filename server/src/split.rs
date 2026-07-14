@@ -379,6 +379,113 @@ fn apply_sample(state: &mut SlotState, id: u32, eos: u32) -> bool {
 }
 
 
+/// What sits downstream of the engine this driver holds.
+///
+/// `Remote` is split serving: the engine owns layers [0,S) and forwards hidden
+/// rows to a pipe-worker that owns the rest and returns ids (+ candidates).
+///
+/// `Local` means nothing does: the engine owns EVERY layer, so the same
+/// `stage_run` that would produce a hidden row produces the ids itself, and the
+/// candidates come straight off `stage_topk`. That is legal on an unsplit
+/// engine — qk_stage_run accepts one ("toks in, ids out, the same forward
+/// pass") and qk_stage_topk gates on `lastStage()`, which is `lEnd == nLayer`.
+///
+/// Local mode exists so the SINGLE-BOX path can sample. qk_step_chunk decides
+/// the next token inside the engine's fused argmax chain and feeds it straight
+/// back in, so a driver has nowhere to inject a sampled pick — the reason the
+/// old single-box path was greedy-only. Driving the same engine one position at
+/// a time through stage_run puts the choice back on this side of the ABI, at
+/// the cost of one host round trip per token (what split serving already pays).
+/// Greedy is unaffected: with temp <= 0 no candidates are requested and the id
+/// is still the engine's own argmax.
+enum Downstream {
+    Remote(WorkerLink),
+    /// Results of frames already run, in send order — the local stand-in for
+    /// the worker's reply pipe, so the send/recv loop below is shape-identical.
+    Local(VecDeque<(Vec<u32>, Vec<(u32, f32)>)>),
+}
+
+impl Downstream {
+    /// Run one frame: `n` positions of `slot` from `base`. Remote sends the
+    /// hidden rows on and collects the reply later; Local finishes the whole
+    /// forward pass now and queues what the reply would have been.
+    fn run_frame(
+        &mut self,
+        engine: &mut Engine,
+        slot: u32,
+        toks: &[u32],
+        base: u32,
+        topk: u32,
+        hidden: &mut Vec<f32>,
+        n_embd: usize,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Remote(link) => {
+                hidden.clear();
+                hidden.resize(toks.len() * n_embd, 0.0);
+                engine.stage_run(slot, Some(toks), None, base, Some(hidden.as_mut_slice()), None)?;
+                link.send_run(slot, base, hidden, topk)
+            }
+            Self::Local(pipe) => {
+                let mut ids = vec![0u32; toks.len()];
+                engine.stage_run(slot, Some(toks), None, base, None, Some(ids.as_mut_slice()))?;
+                let mut cands = Vec::new();
+                if topk > 0 {
+                    let mut cid = vec![0u32; topk as usize];
+                    let mut cval = vec![0f32; topk as usize];
+                    engine.stage_topk(topk, &mut cid, &mut cval)?;
+                    cands = cid.into_iter().zip(cval).collect();
+                }
+                pipe.push_back((ids, cands));
+                Ok(())
+            }
+        }
+    }
+
+    /// Collect the next frame's reply, in send order.
+    fn recv_frame(
+        &mut self,
+        ids: &mut Vec<u32>,
+        cands: &mut Vec<(u32, f32)>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Remote(link) => link.recv_ids(ids, cands),
+            Self::Local(pipe) => {
+                let (i, c) = pipe
+                    .pop_front()
+                    .context("local driver: recv with no frame in flight")?;
+                *ids = i;
+                *cands = c;
+                Ok(())
+            }
+        }
+    }
+
+    /// Move the downstream stage's half of a snapshot. Local has no second
+    /// half — `engine.state_save/load` already moved the whole model's state.
+    fn state_op(&mut self, save: bool, slot: u32, idx: u32, n_tok: u32) -> anyhow::Result<()> {
+        match self {
+            Self::Remote(link) => link.state_op(save, slot, idx, n_tok),
+            Self::Local(_) => Ok(()),
+        }
+    }
+
+    fn bye(&mut self) {
+        if let Self::Remote(link) = self {
+            link.bye();
+        }
+    }
+
+    /// Drop frames that were run but never collected. The remote link poisons
+    /// its own socket on error; the local pipe would otherwise hand a stale
+    /// result to the NEXT request that lands on the slot.
+    fn reset_inflight(&mut self) {
+        if let Self::Local(pipe) = self {
+            pipe.clear();
+        }
+    }
+}
+
 /// Driver-side snapshot registry: which token prefix lives in each engine
 /// snapshot entry (the same index on the head and the worker — states move
 /// together). Mirrors the single-box engine's pcache, but keyed host-side.
@@ -410,7 +517,7 @@ fn best_snap(snaps: &[Option<SnapEntry>], prompt: &[u32]) -> Option<(u32, u32)> 
 /// slots keep decoding while this one prefills.
 fn admit_job(
     head: &mut Engine,
-    link: &mut WorkerLink,
+    down: &mut Downstream,
     slot: u32,
     prompt: Vec<u32>,
     snap_prefix: u32,
@@ -423,7 +530,7 @@ fn admit_job(
     if let Some((idx, len)) = best_snap(snaps, &prompt) {
         match head
             .state_load(slot, idx, len)
-            .and_then(|()| link.state_op(false, slot, idx, len))
+            .and_then(|()| down.state_op(false, slot, idx, len))
         {
             Ok(()) => {
                 start = len;
@@ -489,10 +596,18 @@ fn pick_entry(snaps: &[Option<SnapEntry>]) -> u32 {
 /// head stage + worker instead of `qk_step_chunk`. A worker or engine failure
 /// fails every unfinished slot (worker state is unknown at that point) and
 /// the next sequence reconnects from scratch.
-pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc::Receiver<Cmd>) {
+pub fn run_split_engine_thread(
+    mut head: Engine,
+    link: Option<WorkerLink>,
+    rx: mpsc::Receiver<Cmd>,
+) {
     let n_slots = head.n_slots() as usize;
     let eos = head.eos_token();
-    let n_embd = link.n_embd;
+    let n_embd = link.as_ref().map_or(0, |l| l.n_embd);
+    let mut down = match link {
+        Some(l) => Downstream::Remote(l),
+        None => Downstream::Local(VecDeque::new()),
+    };
     let mut queue = VecDeque::new();
     let mut slots: Vec<Option<(SlotState, Phase)>> = (0..n_slots).map(|_| None).collect();
     let mut hidden = Vec::new();
@@ -516,7 +631,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
             match cmd {
                 Cmd::Submit(job) => queue.push_back(job),
                 Cmd::Shutdown => {
-                    link.bye();
+                    down.bye();
                     return;
                 }
             }
@@ -532,7 +647,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
             let Some(job) = queue.pop_front() else { break };
             let prefill = admit_job(
                 &mut head,
-                &mut link,
+                &mut down,
                 slot as u32,
                 job.prompt_ids,
                 job.snap_prefix,
@@ -586,19 +701,16 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 }
                 match phase {
                     Phase::Decoding(seq) => {
-                        hidden.clear();
-                        hidden.resize(n_embd, 0.0);
                         let topk = if seq.sampling.is_greedy() { 0 } else { TOPK };
-                        let ok = head
-                            .stage_run(
-                                slot as u32,
-                                Some(&[seq.next]),
-                                None,
-                                seq.pos,
-                                Some(hidden.as_mut_slice()),
-                                None,
-                            )
-                            .and_then(|()| link.send_run(slot as u32, seq.pos, &hidden, topk));
+                        let ok = down.run_frame(
+                            &mut head,
+                            slot as u32,
+                            &[seq.next],
+                            seq.pos,
+                            topk,
+                            &mut hidden,
+                            n_embd,
+                        );
                         match ok {
                             Ok(()) => sent.push((slot, 0)),
                             Err(err) => {
@@ -617,23 +729,20 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                                 break; // waiting on the snapshot barrier below
                             }
                             let chunk = &p.prompt[p.done as usize..(p.done + n) as usize];
-                            hidden.clear();
-                            hidden.resize(n as usize * n_embd, 0.0);
                             let topk = if p.done + n == np && !p.sampling.is_greedy() {
                                 TOPK
                             } else {
                                 0
                             };
-                            let ok = head
-                                .stage_run(
-                                    slot as u32,
-                                    Some(chunk),
-                                    None,
-                                    p.done,
-                                    Some(hidden.as_mut_slice()),
-                                    None,
-                                )
-                                .and_then(|()| link.send_run(slot as u32, p.done, &hidden, topk));
+                            let ok = down.run_frame(
+                                &mut head,
+                                slot as u32,
+                                chunk,
+                                p.done,
+                                topk,
+                                &mut hidden,
+                                n_embd,
+                            );
                             match ok {
                                 Ok(()) => {
                                     sent.push((slot, n));
@@ -655,7 +764,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 if failure.is_some() {
                     break;
                 }
-                match link.recv_ids(&mut ids, &mut cands) {
+                match down.recv_frame(&mut ids, &mut cands) {
                     Ok(()) => {
                         let Some((slot_state, phase)) = slots[slot].as_mut() else {
                             continue;
@@ -708,7 +817,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                         let idx = pick_entry(&snaps);
                         match head
                             .state_save(slot as u32, idx, p.snap_at)
-                            .and_then(|()| link.state_op(true, slot as u32, idx, p.snap_at))
+                            .and_then(|()| down.state_op(true, slot as u32, idx, p.snap_at))
                         {
                             Ok(()) => {
                                 lru_clock += 1;
@@ -773,6 +882,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
                 // Worker (or head engine) state is unknown; fail everything
                 // that was still generating and void the snapshot registry
                 // (a restarted worker lost its half). Finished slots drain.
+                down.reset_inflight();
                 snaps.iter_mut().for_each(|e| *e = None);
                 for state in slots.iter_mut() {
                     let Some((slot_state, _)) = state.as_mut() else {
@@ -792,7 +902,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
             thread::sleep(Duration::from_millis(2));
         }
     }
-    link.bye();
+    down.bye();
 }
 
 #[cfg(test)]
