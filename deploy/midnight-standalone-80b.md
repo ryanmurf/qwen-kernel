@@ -59,11 +59,26 @@ Measured on a 4,745-token agent-shaped prompt: cold turn ~19 s, warm turns
 **0.26 s** (reuse=4742 prefill=3), with occasional ~2.8 s outliers — those track
 memory pressure, see below.
 
-Decode is **55-67 tok/s (median ~62)** on a machine the user is actively working
-on (GatherV2/Slack/WindowServer competing for the same GPU), and 71-73 tok/s when
-it is quiet. The FIRST request after an idle gap is slow (13-20 tok/s) even with
-mlock — Metal re-warms its residency — and then it settles. Compare: the split it
+Decode is **72-77 tok/s** steady when the Mac is quiet. Compare: the split it
 replaced was a steady 50.7.
+
+**The variance is the laptop, not the server.** When midnight is in active desktop
+use (GatherV2 video, Slack, Chrome all on the same GPU and the same memory), an
+individual request can drop to 10-20 tok/s. Two plausible-sounding explanations
+were tested and BOTH are wrong, so don't re-derive them:
+
+- *"Metal residency decays when idle; keep it warm."* A keepalive ping (even a
+  ~100-token prefill every 60 s) changed nothing: 15.9 tok/s on the first request
+  after idle WITH pings, 16.0 WITHOUT. The timer was removed.
+- *"The prefix-cache snapshot save is the cost."* Running with `QK_PCACHE=0`
+  (snapshots entirely off) produced the same wild spread (6.7 / 64.6 / 40.8 /
+  19.9 tok/s on four fresh prompts).
+
+What is left is contention on a machine someone is using. The 128 GB node is the
+fix; there is no software knob here.
+
+The first request after a server restart is genuinely slow (4-6 tok/s) while the
+model finishes becoming resident. That one is real and expected.
 
 ## The front door
 
