@@ -36,7 +36,14 @@ type QkStageRun = unsafe extern "C" fn(
     *mut u32,   // ids_out (last stage) or NULL
 ) -> c_int;
 
-type QkStateOp = unsafe extern "C" fn(*mut QkEngineOpaque, u32, u32) -> c_int;
+type QkStageTopK = unsafe extern "C" fn(
+    *mut QkEngineOpaque,
+    u32,      // k
+    *mut u32, // ids  (k out, descending)
+    *mut f32, // vals (k out, the logits)
+) -> c_int;
+
+type QkStateOp = unsafe extern "C" fn(*mut QkEngineOpaque, u32, u32, u32) -> c_int;
 
 /// Pipeline-split ABI (engine ≥ 240c63e). Resolved as a group; `None` on
 /// older engine libraries, which still serve unsplit.
@@ -46,6 +53,9 @@ struct StageSymbols {
     layer_end: QkGetter,
     n_layer: QkGetter,
     n_embd: QkGetter,
+    /// The sampling hook. Resolved on its own because it landed after the rest
+    /// of the group, and because a library may serve greedy without it.
+    stage_topk: Option<QkStageTopK>,
 }
 
 /// Snapshot ABI (engine ≥ #30): driver-managed state save/load for split
@@ -136,6 +146,7 @@ impl Engine {
                         layer_end: *end,
                         n_layer: *layers,
                         n_embd: *embd,
+                        stage_topk: lib.get(b"qk_stage_topk\0").ok().map(|s| *s),
                     }),
                     _ => None,
                 }
@@ -321,6 +332,34 @@ impl Engine {
         Ok(())
     }
 
+    /// Top-k (id, logit) of the FINAL position's row from the most recent
+    /// last-stage `stage_run`, descending — the sampling hook (qk_stage_topk).
+    /// The engine allows this on any engine that owns the lm head, split or
+    /// not (`lastStage()` is `lEnd == nLayer`), which is what lets the local
+    /// driver sample without a worker.
+    pub fn stage_topk(&mut self, k: u32, ids: &mut [u32], vals: &mut [f32]) -> Result<()> {
+        let stage = self.syms.stage.as_ref().context("no stage ABI")?;
+        let topk = stage
+            .stage_topk
+            .context("engine library has no qk_stage_topk (sampling hook)")?;
+        if ids.len() < k as usize || vals.len() < k as usize {
+            bail!("stage_topk: output buffers shorter than k={k}");
+        }
+        let rc = unsafe { topk(self.raw, k, ids.as_mut_ptr(), vals.as_mut_ptr()) };
+        if rc < 0 {
+            bail!("qk_stage_topk failed with code {rc}");
+        }
+        Ok(())
+    }
+
+    /// Whether the engine can hand back sampling candidates at all.
+    pub fn has_topk(&self) -> bool {
+        self.syms
+            .stage
+            .as_ref()
+            .is_some_and(|s| s.stage_topk.is_some())
+    }
+
     /// Number of driver-managed state snapshot entries (0 when the engine
     /// library predates the snapshot ABI).
     pub fn state_n(&self) -> u32 {
@@ -330,17 +369,19 @@ impl Engine {
             .map_or(0, |s| unsafe { (s.n)(self.raw) })
     }
 
-    pub fn state_save(&mut self, slot: u32, idx: u32) -> Result<()> {
+    /// `n_tok` bounds the attention-KV copy to the snapshot's live length
+    /// (0 = full stripes); pass the same value on save and load.
+    pub fn state_save(&mut self, slot: u32, idx: u32, n_tok: u32) -> Result<()> {
         let s = self.syms.state.as_ref().context("no snapshot ABI")?;
-        if unsafe { (s.save)(self.raw, slot, idx) } < 0 {
+        if unsafe { (s.save)(self.raw, slot, idx, n_tok) } < 0 {
             bail!("qk_state_save({slot}, {idx}) failed");
         }
         Ok(())
     }
 
-    pub fn state_load(&mut self, slot: u32, idx: u32) -> Result<()> {
+    pub fn state_load(&mut self, slot: u32, idx: u32, n_tok: u32) -> Result<()> {
         let s = self.syms.state.as_ref().context("no snapshot ABI")?;
-        if unsafe { (s.load)(self.raw, slot, idx) } < 0 {
+        if unsafe { (s.load)(self.raw, slot, idx, n_tok) } < 0 {
             bail!("qk_state_load({slot}, {idx}) failed");
         }
         Ok(())

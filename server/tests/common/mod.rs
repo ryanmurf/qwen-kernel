@@ -40,6 +40,7 @@ pub async fn spawn_server(model: &Path, queue: usize, slots: u32) -> anyhow::Res
             chunk: 4,
         },
         None,
+        false,
     )?;
     let state = AppState {
         tokenizer,
