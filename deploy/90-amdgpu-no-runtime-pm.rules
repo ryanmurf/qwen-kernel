@@ -1,0 +1,26 @@
+# Keep the discrete Navi31 GPUs powered on — never let amdgpu runtime-suspend them.
+#
+# Install:  sudo cp deploy/90-amdgpu-no-runtime-pm.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger -s pci
+# Verify:   cat /sys/bus/pci/devices/0000:1a:00.0/power/control   # -> on
+#
+# WHY (2026-07-14, cost most of a day and a wrong diagnosis):
+# amdgpu runtime-suspends an idle GPU to D3cold, and on suspend it EVICTS VRAM to
+# GTT (host RAM over PCIe). The next request resumes the card but the weights are
+# not migrated back — they keep being read over the bus. The server never notices:
+# /health stays 200 and it just runs ~3-4x slow forever. The 80B served at ~5 tok/s
+# like this, and the 35B fell from ~125 to 65 tok/s within minutes of going idle.
+#
+# The tell is `mem_info_vram_used` ~26 MB with `mem_info_gtt_used` in the GBs. While
+# the card is suspended, every power_dpm_*/hwmon read also returns EBUSY, which
+# looks exactly like a dead SMU — that misread cost a wasted reboot. A suspended
+# card and a wedged card are indistinguishable from sysfs; check power/runtime_status
+# before concluding anything about the SMU.
+#
+# The 7900 XT hid this for months because it always had a live model on it. The XTX
+# only showed it once it started idling between switches.
+#
+# `power/control = on` is the documented way to disable runtime PM per-device. It
+# does NOT force clocks (that is power_dpm_force_performance_level, and forcing a
+# state on the XTX ring-resets it on kernel 7.0.0-27 — leave the XTX on auto).
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1002", ATTR{device}=="0x744c", ATTR{power/control}="on"

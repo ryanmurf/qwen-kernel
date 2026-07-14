@@ -67,15 +67,18 @@ spec:
         - --split-next
         - REDACTED-LAN-IP:18200
         env:
-        # Head pinned to the 7900 XT (03:00.0) since 2026-07-14: the XTX's SMU
-        # went unresponsive (power_dpm_* and hwmon read EBUSY, PSP resume
-        # failures in dmesg). With the SMU dead the card still ENUMERATES with
-        # 24 GB, so the engine happily opens on it — and every allocation lands
-        # in GTT instead (symptom: mem_info_vram_used ~26 MB, gtt ~15.4 GB,
-        # decode ~5 tok/s at /health 200). amdgpu_gpu_recover does NOT clear it;
-        # only a host reboot re-inits the PSP. Move back to 1a:00.0 once the XTX
-        # reads a DPM level again — until then the XT is the only LLM card, so
-        # the 35B (also pinned here) stays a switched alternative, not a co-tenant.
+        # RETIRED 2026-07-14 — this whole deployment is superseded. midnight now
+        # serves the WHOLE 80B by itself, faster than this split did (71.5 vs
+        # 50.7 tok/s): see deploy/midnight-standalone-80b.md. Kept, scaled to 0,
+        # because it is the fallback if that Mac ever goes away — but note the
+        # gemma-server Service no longer has a selector (deploy/gemma-server-
+        # midnight.yaml), so scaling this up alone will NOT take traffic; restore
+        # the selector first.
+        #
+        # The card below reads 03:00.0 because the XTX appeared dead when this
+        # was last touched. It was not: amdgpu runtime PM had suspended it and
+        # evicted its VRAM to GTT (see qk-server.yaml / the udev rule). If this
+        # backend is ever revived, put the head back on 1a:00.0 (24 GB).
         - name: QK_DEVICE_PCI
           value: "03:00.0"
         - name: QK_LAYERS

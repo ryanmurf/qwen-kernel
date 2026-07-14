@@ -60,14 +60,23 @@ spec:
         - --chunk
         - "8"
         env:
-        # Pinned to the 7900 XT (03:00.0) since 2026-07-14 — the XTX's SMU is
-        # wedged (EBUSY on power_dpm_*/hwmon; allocations silently land in GTT
-        # at ~5 tok/s; only a reboot re-inits it — see qk-server-split-80b.yaml).
-        # With one usable LLM card the 35B is a SWITCHED alternative to the 80B
-        # again, never a co-tenant: two backends on one card = GTT fallback.
+        # Back on the 7900 XTX (1a:00.0, 24 GB) — and it now has the card to
+        # itself: since 2026-07-14 the 80B is served standalone from midnight
+        # (deploy/midnight-standalone-80b.md), so no LLM backend competes here.
+        #
+        # The XTX looked DEAD for most of 2026-07-14 (EBUSY on every power_dpm_*
+        # and hwmon read, weights silently in GTT, ~5 tok/s behind a 200 /health)
+        # and that was misdiagnosed as a wedged SMU. The real cause is amdgpu
+        # RUNTIME PM: an idle GPU suspends to D3cold, VRAM is evicted to GTT on
+        # the way down, and the resume never migrates it back — so the card runs
+        # from host RAM forever. A suspended card reads EBUSY exactly like a dead
+        # one. Fixed for good by deploy/90-amdgpu-no-runtime-pm.rules
+        # (power/control=on, applied by udev at boot). CHECK power/runtime_status
+        # before ever concluding a card is broken.
+        #
         # BDF suffix match; needs image >= 2026-07-12 (6135b97).
         - name: QK_DEVICE_PCI
-          value: "03:00.0"
+          value: "1a:00.0"
         - name: QK_FORK           # same-prompt requests share one prefill (fork mode)
           value: "1"
         - name: QK_SPEC           # prompt-lookup speculative decoding (exact-output;
