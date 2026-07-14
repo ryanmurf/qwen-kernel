@@ -1,0 +1,51 @@
+#version 450
+
+// Counting-sort the selected (expert, token, slot) tuples into one contiguous
+// range per expert.  Pair order inside a range is deliberately irrelevant:
+// grouped kernels write every result back to its original token/slot address.
+
+layout(local_size_x = 256) in;
+
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
+layout(std430, binding = 0) readonly buffer Sel { SelT sel[]; };
+layout(std430, binding = 1) writeonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 2) writeonly buffer Pairs { uint pairs[]; };
+
+layout(push_constant) uniform PC { uint n_expert; uint n_used; uint n_tokens; } pc;
+
+shared uint counts[512];
+shared uint cursors[512];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint e = tid; e < pc.n_expert; e += 256u) counts[e] = 0u;
+    barrier();
+
+    uint np = pc.n_tokens * pc.n_used;
+    for (uint p = tid; p < np; p += 256u) {
+        uint rq = p / pc.n_used;
+        uint s = p - rq * pc.n_used;
+        uint e = min(sel[rq].ids[s], pc.n_expert - 1u);
+        atomicAdd(counts[e], 1u);
+    }
+    barrier();
+
+    if (tid == 0u) {
+        uint off = 0u;
+        for (uint e = 0u; e < pc.n_expert; ++e) {
+            offsets[e] = off;
+            cursors[e] = off;
+            off += counts[e];
+        }
+        offsets[pc.n_expert] = off;
+    }
+    barrier();
+
+    for (uint p = tid; p < np; p += 256u) {
+        uint rq = p / pc.n_used;
+        uint s = p - rq * pc.n_used;
+        uint e = min(sel[rq].ids[s], pc.n_expert - 1u);
+        uint dst = atomicAdd(cursors[e], 1u);
+        pairs[dst] = (rq << 4u) | s;
+    }
+}

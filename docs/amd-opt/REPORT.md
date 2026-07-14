@@ -1,23 +1,23 @@
 # AMD RDNA3 kernel optimization report
 
 Date: 2026-07-13
-Branch: `amd-opt`
+Branch: `main`
 Models: Qwen3.6-35B-A3B full model and Qwen3-Next-80B-A3B head stage `[0,12)`
 
 ## Outcome
 
-The decode roof is bandwidth-bound on both cards. The proof below gives an implementation-independent cache-best bound, a tighter cold-stream DRAM model for the retained split-K path, and a measured dequant-aware target for the current kernels. The final 35B build reaches 49–57% of that measured target, depending on card/context, while remaining greedy-byte-exact. The 80B head reaches 38% on XT and 46% on XTX.
+The decode roof is bandwidth-bound on both cards. The proof below gives an implementation-independent cache-best bound, a tighter cold-stream DRAM model for the retained split-K path, and a measured dequant-aware target for the current kernels. Phase 2 attributes the XTX's residual latency stage by stage, isolates the `auto`-DPM cold-start tax, and raises short-context 35B decode to **126.61 tok/s on XT** and **180.38 tok/s on XTX** while remaining greedy-byte-exact. Those are 41.90%/49.74% of the cold-stream ceilings and 49.61%/57.28% of the measured practical roofs.
 
 Phase-matched `big_a` results:
 
 | Workload | Card | Baseline prefill | Final prefill | Baseline decode | Final decode | Decode gain |
 |---|---:|---:|---:|---:|---:|---:|
-| 35B full | 7900 XT | 495.53 tok/s | **565.66 tok/s** | 114.37 tok/s | **125.31 tok/s** | **+9.57%** |
-| 35B full | 7900 XTX | 719.31 tok/s | **820.28 tok/s** | 153.48 tok/s | **178.67 tok/s** | **+16.41%** |
+| 35B full | 7900 XT | 495.53 tok/s | **593.11 tok/s** | 114.37 tok/s | **126.61 tok/s** | **+10.70%** |
+| 35B full | 7900 XTX | 719.31 tok/s | **848.19 tok/s** | 153.48 tok/s | **180.38 tok/s** | **+17.53%** |
 | 80B head `[0,12)` | 7900 XT | 1,277.55 stage-tok/s | **1,374.37** | 393.89 stage-tok/s | **427.19** | **+8.45%** |
 | 80B head `[0,12)` | 7900 XTX | 1,820.11 stage-tok/s | **1,922.88** | 531.79 stage-tok/s | **631.72** | **+18.79%** |
 
-At 4,852-token context, the final 35B steady decode is **131.71 tok/s on XT** and **164.06 tok/s on XTX**. This is faster than the XT short-context result because the adaptive kernel begins reusing each KV read across four query heads above 2,048 tokens.
+At 4,852-token context, the final 35B steady decode is **133.04 tok/s on XT** and **164.80 tok/s on XTX**. This is faster than the XT short-context result because the adaptive kernel begins reusing each KV read across four query heads above 2,048 tokens.
 
 ## 1. Hardware model and conventions
 
@@ -252,6 +252,9 @@ The final benchmarks use `QK_MAXB=1024` for 35B and 256 for 80B, which reduces r
 - **Register state** (`QK_DN_STEP_REG`): state row loaded once; `dn.step` fell 30.0% XT and 25.9% XTX.
 - **Step+gate fusion** (`QK_DN_STEP_GATE_FUSED`): removes intermediate output and one stage per recurrent layer.
 - **128-lane IQ4 down** (`QK_MOE_DOWN_128`): 5–6% routed-down stage win for 35B; used on the 80B XTX only after card-specific measurement.
+- **Hierarchical fused selector** (`QK_MOE_SELECT_HIER`): exact local-top-k union removes 24 workgroup barriers per selection.
+- **Shared gate/up local64** (`QK_MOE_SHARED_GU_64`): removes six empty waves for 2,048-wide Q8 rows.
+- **Shared down local32** (`QK_MOE_SHARED_DOWN_32`): removes seven empty waves for 512-wide Q8 rows.
 - **Wider prefill**: MAXB1024 improves 35B prefill 13–19%; MAXB256 is the stable 80B point.
 
 ### Rejected or bounded
@@ -264,9 +267,68 @@ The final benchmarks use `QK_MAXB=1024` for 35B and 256 for 80B, which reduces r
 - Attention budget 2M→4M: only ~1% long-prefill gain; 4M is optional.
 - `dn.proj`, `wo`, and head are already near their format-specific bandwidth roofs. The TPR experiment confirmed there is no simple occupancy win.
 - Prior repack experiments (`9c4d3a`) measured 5.81 versus 5.82 ms and are not repeated; RoPE, host chunk sync, and already-fused addN/add3 were likewise excluded by prior evidence in the brief/history.
+- Delta-state transpose, scalar broadcast, split tiling, and atomic last-tile fusion all failed the performance gate and were removed; exact numbers are in the Phase-2 section.
 - True grouped prefill MoE remains the largest architectural lever. An expert-major scan without a sorted pair list merely exchanges weight traffic for `expert × token` selection work, so it was not shipped as a nominal optimization.
 
 Full experiment chronology and all intermediate numbers are in [NOTES.md](NOTES.md).
+
+## Phase 2 — residual decode gap and XTX clock residency
+
+### Stage-by-stage roof attribution
+
+The Phase-1 ceiling proof remains unchanged: at `C=1,213`, the retained implementation must move at least 2,641,653,648 bytes/token, hence
+
+```text
+XT:  T >= 2,641,653,648 / 800e9 = 3.3021 ms, ceiling <= 302.84 tok/s
+XTX: T >= 2,641,653,648 / 960e9 = 2.7517 ms, ceiling <= 363.41 tok/s
+```
+
+Matched warm `QK_STEP_PROF` steps were 7.645 ms on XT and 5.4936 ms on XTX. The XTX therefore has 2.7419 ms between its measured step and raw byte floor. Using the large-matrix format rates from Section 3 for parameter stages, and raw bandwidth for F32 state/scratch, gives:
+
+| Stage | Represented bytes | XT floor / observed | XTX floor / observed | XTX floor efficiency |
+|---|---:|---:|---:|---:|
+| `dn.proj` | 817.90 MB Q8/F32 | 1,055.2 / 1,260.6 us | 881.7 / 1,047.5 us | 84.2% |
+| `moe.r+s` | 173.34 MB F32/shared-Q8 | 223.1 / 812.0 us | 187.8 / 606.5 us | **31.0%** |
+| `moe.gu` | 256.90 MB IQ3 | 609.1 / 791.9 us | 472.3 / 544.1 us | 86.8% |
+| `wo` | 356.52 MB Q8 | 460.0 / 605.6 us | 384.3 / 508.4 us | 75.6% |
+| `moe.dn` | 230.10 MB IQ4/Q6/shared-Q8 | 374.2 / 878.8 us | 300.0 / 471.9 us | **63.6%** |
+| `at.split` | 403.73 MB actually executed | 504.7 / 507.8 us | 420.6 / 421.4 us | 99.8% |
+| `dn.s+g` | 127.82 MB unique F32 state | 164.1 / 629.2 us | 139.3 / 396.9 us | **35.1%** |
+| `at.proj` | 200.54 MB Q8 | 258.8 / 314.4 us | 216.1 / 261.0 us | 82.8% |
+
+The XTX raw-roof residual decomposes as:
+
+| Class | Measured | Floor | Residual | Share of 2.7419 ms gap |
+|---|---:|---:|---:|---:|
+| Parameter-bearing stages | 3.8955 ms | 2.5595 ms | 1.3360 ms | **48.7%** |
+| Attention | 0.5793 ms | 0.0550 ms unique floor | 0.5243 ms | **19.1%** |
+| Recurrent/state | 0.5555 ms | 0.1372 ms | 0.4183 ms | **15.3%** |
+| Small serialized stages | 0.4633 ms | negligible bytes | 0.4633 ms | **16.9%** |
+
+Against the 315.49 tok/s format-calibrated roof, the gap shares are 39.9% parameter, 22.5% attention, 19.9% small/launch, and 17.7% recurrent. `at.split` already sustains about 958 GB/s over its *executed* bytes; its unique-GQA gap is redundant group-1 work, while prior group-4 short-context trials lost occupancy. The top actionable stages are therefore `moe.r+s` (418.7 us XTX calibrated residual), `dn.s+g` (257.6 us), and `moe.dn` (171.9 us).
+
+The causes are distinguishable from cross-card scaling and source layout:
+
+- `moe.r+s` scales XT→XTX by 1.339x, near the FP/CU ratio rather than bandwidth ratio. Its fused selector performs device-scope arbitration and repeated workgroup barriers; its concurrent shared-Q8 gate/up uses only 64 useful lanes in a local-256 group.
+- `dn.s+g` exposes only 32 four-wave workgroups per layer on 96 CUs, holds 32 `vec4` state values per lane, and fixed-`i` lanes touch row-major rows 512 bytes apart. Multiple exact tiling/layout trials show the kernel is already near the point where extra synchronization costs more than added occupancy.
+- `moe.dn` combines healthy routed IQ4/Q6 work with a shared-Q8 pass having only 16 useful lanes in a local-256 group.
+- Stable per-layer detail has no periodic spikes characteristic of instruction-cache churn. Launch serialization, barriers/atomics, and underfilled accesses explain the measured deficits without invoking IC misses.
+
+### Retained Phase-2 kernels
+
+- `QK_MOE_SELECT_HIER=1`: each subgroup retains its local top-k, then one subgroup selects the global top-k from that union. A candidate below local rank `k` already has `k` candidates ahead of it and cannot enter global top-k; lower-ID ties and normalization order are unchanged. This removes 24 whole-workgroup barriers. A specialization keeps the 35B top-8 path at two candidates/lane and the supported 80B top-10 path at four.
+- `QK_MOE_SHARED_GU_64=1`: exact local-64 shared gate/up removes six waves that contributed only zeroes while preserving the two useful subgroup reductions.
+- `QK_MOE_SHARED_DOWN_32=1`: exact local-32 shared down removes seven zero waves while preserving the sole useful subgroup reduction.
+
+Representative XTX stage samples moved `moe.r+s` from 606.5 to 581–590 us and `moe.dn` from 471.9 to 428.0 us. On XT, the composed profile moved them from 812.0 to 755.3 us and 878.8 to 586.7 us. Because timestamp instrumentation perturbs wall time and XTX `auto` varies with power state, achieved rates use non-profiled matched medians: **125.07→126.61 tok/s XT** and **178.65→180.38 tok/s XTX**. The long-context final samples are 133.04/164.80 tok/s.
+
+Four byte-exact `dn.s+g` designs were measured and removed: transposed batch/decode state (495.1 us XTX), four one-wave tiles plus the old gate (403.5 us), scalar decay/beta broadcast (401.5 us), and a two-tile atomic last-writer epilogue (406.8 us). The baseline was 396.9 us. Their failure, despite addressing coalescing or occupancy directly, bounds this lever: broader cross-operator fusion is required to amortize synchronization.
+
+### XTX `auto`-DPM experiment
+
+Seven ABBA-counterbalanced runs used the same prompt, 256 unmeasured generated tokens, then a 128-token measured window. Warm/continuous load averaged **161.064 ± 0.206 tok/s**; a 3,000 ms idle before measurement averaged **159.607 ± 0.363 tok/s**. Thus cold auto-DPM residency costs **0.913%**, or 7.255 ms over 128 tokens.
+
+The tax is a startup transient. A representative first 8-token chunk took 44.709 ms warm and 60.151 ms cold. Cold UCLK began at 96 MHz and reached 1,249 MHz by about 18 ms; GFX reached about 3.0 GHz by 39 ms. A deferred first-token profile was **5.588 ms warm versus 12.824 ms cold**: early `dn.proj`, `dn.s+g`, and `moe.r+s` inflated 2–3x, but the late head had already recovered (455.2 versus 458.4 us). Full-window warm UCLK-high residency was 100%, cold 93.8%. The telemetry sampler's observer effect was 161.25 versus 161.22 tok/s (0.019%). Therefore inability to pin the XTX costs isolated post-idle bursts, but does **not** explain the sustained 42.7% practical-roof gap.
 
 ## 7. Final configurations and achieved fraction of roof
 
@@ -279,8 +341,11 @@ QK_ATTN_LIVE_DISPATCH=1
 QK_ATTN_GQA_AUTO=1
 QK_MOE_SELECT_FAST=1
 QK_MOE_ROUTE_FUSED=1
+QK_MOE_SELECT_HIER=1
+QK_MOE_SHARED_GU_64=1
 QK_DN_STEP_GATE_FUSED=1
 QK_MOE_DOWN_128=1
+QK_MOE_SHARED_DOWN_32=1
 ```
 
 80B XT adds the same live/chunk/AUTO, fast selector, route fusion, fused step/gate, and `QK_MAXB=256`, but leaves IQ4 down at 256 lanes. The XTX uses the fast standalone selector and 128-lane IQ4 down.
@@ -289,10 +354,10 @@ The table uses the average roof over each measured, growing decode window (`C=1,
 
 | Workload | Card | Achieved | Cold-stream roof | % cold | Measured practical roof | % practical |
 |---|---:|---:|---:|---:|---:|---:|
-| 35B decode C=1,213…1,468 | XT | 125.31 | 302.20 | 41.47% | 255.20 | **49.10%** |
-| 35B decode C=1,213…1,468 | XTX | 178.67 | 362.64 | 49.27% | 314.89 | **56.74%** |
-| 35B decode C=4,852…4,915 | XT | 131.71 | 285.56 | 46.12% | 242.92 | **54.22%** |
-| 35B decode C=4,852…4,915 | XTX | 164.06 | 342.67 | 47.88% | 299.06 | **54.86%** |
+| 35B decode C=1,213…1,468 | XT | 126.61 | 302.20 | 41.90% | 255.20 | **49.61%** |
+| 35B decode C=1,213…1,468 | XTX | 180.38 | 362.64 | 49.74% | 314.89 | **57.28%** |
+| 35B decode C=4,852…4,915 | XT | 133.04 | 285.56 | 46.59% | 242.92 | **54.77%** |
+| 35B decode C=4,852…4,915 | XTX | 164.80 | 342.67 | 48.09% | 299.06 | **55.11%** |
 | 80B head decode C=1,213…1,468 | XT | 427.19 | 1,429.08 | 29.89% | 1,120.57 | **38.12%** |
 | 80B head decode C=1,213…1,468 | XTX | 631.72 | 1,714.89 | 36.84% | 1,382.98 | **45.68%** |
 
@@ -307,12 +372,12 @@ Final-build `serve-test` was run on both cards with all common 35B flags:
 | `big_a`, 256 generated | `201f416edb24cc1f5c630bdfe66471d0f12442b53503e1f88da627853c3f60a4` | exact | exact |
 | `big4`, 64 generated | `98b14c52ffa9f983059f81184b680b6a108a6ed84f3b1cb20bc314e33b4667ef` | exact | exact |
 
-Final request times were 4,205.3/2,967.7 ms (`big_a`, XT/XTX) and 10,880.6/7,511.8 ms (`big4`). Both cards passed all five built-in format correctness cases. The system CTest binary reports no registered tests. `cmake --build build -j` and `git diff --check` pass.
+The Phase-2 cleanup binary reproduced all four hashes after the final selector specialization. Both cards passed all five built-in format correctness cases; final XT/XTX rates were F16 769.1/912.9, Q8 1,412.6/1,434.0, Q6 682.5/709.6, IQ4 643.9/665.1, and IQ3 430.5/427.7 GB/s. The system CTest binary reports no registered tests. The three new SPIR-V modules pass `spirv-val --target-env vulkan1.2`; the final build and `git diff --check` pass.
 
 After the campaign, `gemma/qk-server-split-80b` was restored to its original single replica and verified `1/1` ready/available. The XTX remained on `auto`; no GPU benchmark ran after restoration.
 
-The 80B stage has no LM head in `[0,12)`, so verification uses byte hashes of all exported hidden rows. Repeated runs were deterministic; XT final hashes are `cde0335a3bb4f888` / `3331a4356b41c1d4`, and XTX card-best hashes are `d85e23e8adb10a02` / `d488fb24d6592dcd` (prefill/decode). The difference is expected because XTX enables the top10 128-lane down reduction; running either configuration on both cards yields matching hashes.
+The 80B stage has no LM head in `[0,12)`, so verification uses byte hashes of all exported hidden rows. Repeated runs were deterministic; XT final hashes are `cde0335a3bb4f888` / `3331a4356b41c1d4`, and XTX card-best hashes are `d85e23e8adb10a02` / `d488fb24d6592dcd` (prefill/decode). A dedicated baseline/hierarchical top-10 comparison also matched exactly at `d85e23e8adb10a02` / `c5ed7d32532f02bd` for the 1,213-row prefill/eight-row decode test.
 
 ## 9. Remaining opportunity
 
-The next material step is a grouped prefill MoE primitive: generate and sort `(expert, token, slot)` pairs, dispatch one expert-row tile over all matching tokens, and reuse dequantized rows. That directly attacks the 84–92% prefill roof gap. For decode, remaining fixed work is mostly format-limited expert/dense GEMV plus launch-separated residual/norm stages; closing much more than the current 38–57% practical-roof fraction requires broader multi-op fusion or a weight layout/kernel that raises IQ3/IQ4/Q6 effective bandwidth.
+The next material step is a grouped prefill MoE primitive: generate and sort `(expert, token, slot)` pairs, dispatch one expert-row tile over all matching tokens, and reuse dequantized rows. That directly attacks the prefill roof gap. For decode, `dn.s+g` now has direct negative evidence for layout-only and tile-only changes; closing much more than the current 38–57% practical-roof fraction requires broader multi-op fusion or a weight layout/kernel that raises IQ3/IQ4/Q6 effective bandwidth.

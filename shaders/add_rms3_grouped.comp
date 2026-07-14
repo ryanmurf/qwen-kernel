@@ -1,0 +1,51 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Grouped-prefill layer tail.  Routed expert contributions are stored by
+// original token/slot; fold them in slot order before adding the shared path.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BA { float a[]; };
+layout(std430, binding = 1) readonly buffer BR { float routed[]; };
+layout(std430, binding = 2) readonly buffer BC { float c2[]; };
+layout(std430, binding = 3) readonly buffer BW { float w[]; };
+layout(std430, binding = 4) writeonly buffer BS { float s[]; };
+layout(std430, binding = 5) writeonly buffer BN { float xn[]; };
+
+layout(push_constant) uniform PC { uint n; float eps; uint n_used; } pc;
+
+shared float red[256];
+shared float scale;
+
+float valueAt(uint rq, uint i) {
+    float v = a[rq * pc.n + i];
+    for (uint k = 0u; k < pc.n_used; ++k)
+        v += routed[(rq * pc.n_used + k) * pc.n + i];
+    return v + c2[rq * pc.n + i];
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+    float ss = 0.0;
+    for (uint i = t; i < pc.n; i += 256u) {
+        float v = valueAt(rq, i);
+        s[rq * pc.n + i] = v;
+        ss += v * v;
+    }
+    float sg = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = sg;
+    barrier();
+    if (t == 0u) {
+        float tot = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += red[i];
+        scale = 1.0 / sqrt(tot / float(pc.n) + pc.eps);
+    }
+    barrier();
+    for (uint i = t; i < pc.n; i += 256u) {
+        float v = valueAt(rq, i);
+        xn[rq * pc.n + i] = v * scale * w[i];
+    }
+}

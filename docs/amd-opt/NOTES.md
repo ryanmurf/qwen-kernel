@@ -229,3 +229,80 @@ Every GPU command in this log is explicitly pinned with `QK_DEVICE_PCI`.
 - Corrected the B128 prefill reference for the final partial chunks: 35B is `9×128+60`, 80B is `9×128+61`, not ten full-width chunks. With independent-uniform route unions, the exact 112 distinct embedding rows in `big_a`, and the retained ideal state/KV addends, expected payload is **133,035,436 B/token** (35B) and **81,237,788 B/token** (80B head). The corrected nominal XT/XTX ceilings are **6,013/7,216 tok/s** and **9,848/11,817 stage-tok/s**. This supersedes the representative B128 figures in the 07:20 checkpoint.
 - Tightened the report's proof language: the q64 scratch and full cold-stream weight equations describe the retained implementation, while the parameter-minus-one-cache-capacity table is the formal implementation-independent bandwidth upper bound. The prefill min/full-union columns bound active unique payload under a one-fetch cache ideal, not observed DRAM traffic.
 - Recomputed achieved fractions against roofs averaged over the measured growing-context windows. Practical-roof fractions are **49.10/56.74%** (35B short XT/XTX), **54.22/54.86%** (35B long), and **38.12/45.68%** (80B head).
+
+## Phase 2 — residual decode gap, XTX priority
+
+### 17:01 — Intake and merged-main handoff
+
+- Ryan accepted Phase 1 and requested per-stage roof attribution, an XTX `auto`-DPM cold/warm residency measurement, and env-gated attempts on the top three remaining stages with the same byte-exact gates.
+- The worktree was clean on `amd-opt` at `5f15bba`; local `main` still pointed to its parent `2663cac`. Fast-forwarded local `main` to the accepted Phase-1 commit and will place the Phase-2 commit directly on `main` as requested.
+- Re-adopted all original rails: every GPU command explicitly sets `QK_DEVICE_PCI`; never use `qk token`; never write XTX DPM controls; preserve the XT manual pin; scale only `gemma/qk-server-split-80b` and restore one replica; read the 35B model in place without modifying llama.cpp.
+- Stable inputs remain `/tmp/amd-opt-big_a.ids` (1,213 tokens, SHA-256 `79f318133b5db687bef0bc1a886f788393ca97b48a48e93b5bef48fa2226a251`) and `/tmp/amd-opt-big4.ids` (4,852 tokens, `5c7e187e8abf7008d8854fc013e745c67d1a669e078749cf461040efc1ec64e8`).
+- Intake state: XTX deployment `1/1/1`, XTX DPM `auto` with advertised 500/2,371 MHz sclk states, and idle readback at the 0 MHz marker. Fresh `/usr/bin/cmake --build build --parallel` passed on `main`.
+- Spawned independent read-only audits for exact per-stage roof accounting, safe XTX DPM methodology, and source-grounded ranking of the next kernel levers. GPU work remains centrally serialized.
+
+### 17:04 — Phase-2 matched per-stage baseline
+
+- Scaled only `gemma/qk-server-split-80b` from one replica to zero, waited for pod deletion, then verified XTX VRAM/GTT drained to 28,004,352/15,994,880 bytes and DPM remained `auto` before any model load.
+- Profile command on each card used `QK_STEP_PROF=1 QK_CHUNK=8 QK_MAXB=1024 QK_ATTN_CHUNK=64 QK_ATTN_LIVE_DISPATCH=1 QK_ATTN_GQA_AUTO=1 QK_MOE_SELECT_FAST=1 QK_MOE_ROUTE_FUSED=1 QK_DN_STEP_GATE_FUSED=1 QK_MOE_DOWN_128=1`, `big_a`, eight generated tokens, and the required explicit PCI BDF.
+- XT (`03:00.0`, manual) first pure-decode step: **7,645 us / 375 stages**. Aggregate stage times in us: `dn.proj` 1,260.6; `moe.dn` 878.8; `moe.r+s` 812.0; `moe.gu` 791.9; `head` 644.9; `dn.s+g` 629.2; `wo` 605.6; `at.split` 507.8; `addN` 429.8; `add3` 361.1; `at.proj` 314.4; `dn.conv` 195.9; `at.prep` 87.6; `at.attn` 86.5; `am1` 21.0; `emb` 8.0; `rms0` 7.6; `am2+copy` 2.8.
+- XTX (`1a:00.0`, auto) matched step: **5,493 us / 375 stages**. Aggregate stage times in us: `dn.proj` 1,047.5; `moe.r+s` 606.5; `moe.gu` 544.1; `wo` 508.4; `moe.dn` 471.9; `head` 456.1; `at.split` 421.4; `dn.s+g` 396.9; `at.proj` 261.0; `addN` 223.0; `add3` 217.4; `dn.conv` 158.6; `at.attn` 82.4; `at.prep` 75.5; `am1` 10.8; `rms0` 6.3; `emb` 3.4; `am2+copy` 2.4.
+- Both selected the intended device and generated the immutable first eight IDs `271 248068 198 8160 579 264 7047 1817`. These tables follow a full prompt prefill, so they are warm-load stage baselines; the dedicated auto-DPM experiment will force an idle interval before decode.
+
+### 17:18 — Exact XTX stage-floor attribution
+
+- The 35B start-context implementation floor is **2.7517 ms/token** at the XTX's nominal 960 GB/s, versus the measured **5.4936 ms** step: **2.7419 ms** remains. Grouped by cause, parameter-bearing stages account for **1.3360 ms / 48.7%** of that raw-roof gap, attention **0.5243 ms / 19.1%**, recurrent work **0.4183 ms / 15.3%**, and small serialized stages **0.4633 ms / 16.9%**. Against the format-calibrated 315.49 tok/s practical roof, the 2.3239 ms gap splits 39.9% parameter, 22.5% attention, 19.9% small/launch, and 17.7% recurrent.
+- Principal per-stage XTX floors (decimal bytes and microseconds):
+
+| Stage | Payload represented by floor | Floor | Observed | Floor/observed | Residual |
+|---|---:|---:|---:|---:|---:|
+| `dn.proj` | 817.90 MB Q8/F32 | 881.7 us | 1,047.5 us | 84.2% | 165.8 us |
+| `moe.r+s` | 173.34 MB F32 + shared Q8 | 187.8 us | 606.5 us | 31.0% | **418.7 us** |
+| `moe.gu` | 256.90 MB IQ3 | 472.3 us | 544.1 us | 86.8% | 71.8 us |
+| `wo` | 356.52 MB Q8 | 384.3 us | 508.4 us | 75.6% | 124.1 us |
+| `moe.dn` | 230.10 MB IQ4/Q6/shared Q8 | 300.0 us | 471.9 us | 63.6% | **171.9 us** |
+| `head` | 417.18 MB Q6 | 434.6 us raw | 456.1 us | 95.3% | 21.5 us |
+| `at.split` | 403.73 MB actually executed at C=1,213 | 420.6 us | 421.4 us | 99.8% | 0.8 us |
+| `dn.s+g` | 127.82 MB unique F32 state | 139.3 us | 396.9 us | 35.1% | **257.6 us** |
+| `at.proj` | 200.54 MB Q8 | 216.1 us | 261.0 us | 82.8% | 44.9 us |
+
+- `head` and `at.split` are already within 5% of their nominal raw roofs; the latter's gap to the *unique-GQA* model is redundant group-1 KV execution, not low bandwidth. Prior group-4 trials lost to fewer workgroups/serial reduction, so it is not one of the top three under the retained executed-byte floor.
+- The actionable order is therefore `moe.r+s`, `dn.s+g`, `moe.dn`. `moe.r+s` scales XT->XTX by 1.339x, essentially the FP/CU ratio rather than memory-bandwidth ratio, consistent with its selector barriers/device atomic and a shared-Q8 kernel with only 64 useful lanes in a local-256 group. `dn.s+g` launches only 32 four-wave groups per recurrent layer on 96 CUs and its fixed-`i` lanes touch row-major state 512 bytes apart. `moe.dn` has a shared-Q8 pass with only 16 useful lanes in local-256. Stable per-layer detail and the absence of periodic outliers do not support instruction-cache misses as the primary cause; launch granularity, synchronization, and underfilled memory access explain the observed scaling.
+
+### 17:31 — XTX `auto`-DPM cold/warm residency
+
+- Added harness-only controls: `QK_BENCH_PREFIX`, `QK_BENCH_IDLE_MS`, per-chunk trace, deferred one-shot profiler arming, 50 ms `gpu_metrics` v1.3 sampling (10 ms for the first-token study), and token-list suppression via deterministic FNV hashes. The sampler observer-effect gate was **161.25 tok/s off versus 161.22 on** (0.019%). XTX remained `auto`; no DPM sysfs control was written.
+- Seven ABBA-counterbalanced process runs used the identical `big_a` prompt, 256 unmeasured generated tokens, then 128 measured tokens. Warm/continuous results were **161.064 ± 0.206 tok/s**; after a 3,000 ms idle, cold results were **159.607 ± 0.363 tok/s**. The cold-start loss is **1.457 tok/s / 0.913%**, or **7.255 ms per 128-token window**. Every prefix hash was `9194f8e9b036fd8e` and every measured hash `3e28d49873ce1eb4`.
+- The cost is front-loaded: representative first 8-token chunks were **44.709 ms warm** versus **60.151 ms cold** (+15.442 ms); subsequent pre-threshold chunks converged to about 44 versus 43.7 ms. At the first cold sample UCLK was **96 MHz** and GFX **1,509 MHz**; by the next 50 ms sample UCLK was 1,249 MHz. Across full windows, warm UCLK-high residency was **100%**, cold **93.8%**; GFX-high residency was 93.8% in both because the first sample catches ramp-up.
+- Deferred `QK_STEP_PROF` makes the mechanism explicit: the first warm token was **5.588 ms**, while the first token after idle was **12.824 ms**. The 10 ms telemetry series was UCLK 96 -> 1,249 MHz by ~18 ms and GFX 1,708 -> 2,526 -> 2,987 MHz by ~39 ms. Early parameter/state stages inflated 2-3x (`dn.proj` 1,043.7 -> 2,689.4 us, `dn.s+g` 404.9 -> 1,207.6, `moe.r+s` 609.6 -> 1,393.0), whereas the late head had already recovered (455.2 -> 458.4 us). Thus auto-DPM residency costs isolated decode bursts, but not the sustained ceiling gap. The later context-window slowdown appeared in both warm and cold traces after clocks were resident; it is not a cold-clock effect.
+
+### 18:07 — Top-three env-gated kernel trials
+
+- `moe.r+s` trial A, `QK_MOE_SHARED_GU_64=1`: exact local-64 shared Q8 gate/up preserves the two useful subgroup reductions and removes six zero waves. XTX `moe.r+s` sampled **606.5 -> 590.0 us** and the 256-token window reached 180.25 tok/s; the full decode FNV remained `9194f8e9b036fd8e`.
+- `moe.r+s` trial B, `QK_MOE_SELECT_HIER=1`: each subgroup keeps its local top-8, then one subgroup selects from their union. A candidate omitted from a local top-8 already has eight candidates ahead of it, proving it cannot be in the global top-8; value ordering and lower-ID tie breaks are unchanged. This removes 24 whole-workgroup barriers. XTX `moe.r+s` sampled **606.5 -> 581.3 us**, 180.60 tok/s, exact FNV. Generalized the union scan to up to 128 candidates so the opt-in path also covers the model's supported top-10/512-expert shape.
+- `moe.dn`, `QK_MOE_SHARED_DOWN_32=1`: exact local-32 shared-Q8 down keeps the sole useful subgroup and removes seven zero waves. XTX `moe.dn` sampled **471.9 -> 428.0 us** and 180.79 tok/s, exact FNV.
+- `dn.s+g` was pursued through four independent flags, all byte-exact after correction but rejected on performance:
+  - `QK_DN_STATE_TRANSPOSED=1` paired transposed batch/decode state kernels to make fixed-`i` lane accesses contiguous; `dn.s+g` regressed to **495.1 us** and decode to 175.10 tok/s. Row-major per-thread cache-line reuse outweighed coalescing.
+  - `QK_DN_STEP_TILED=1` exposed 128 one-wave state-update groups then ran the unchanged gate; synchronization erased the occupancy gain (**403.5 us**, 178.33 tok/s).
+  - `QK_DN_STEP_SCALAR=1` broadcast the head-uniform decay exponential/beta via the existing q/k barrier; the compiler was already effectively uniform (**401.5 us**, 179.36 tok/s).
+  - `QK_DN_STEP_TILE_FUSED=1` used two local-64 update tiles and a monotonic atomic last-tile gate. The initial hard-coded two-subgroup reduction failed the hash gate and was immediately corrected to use `gl_NumSubgroups`; the corrected stream was exact, but **406.8 us / 177.57 tok/s**. None is retained in the final configuration.
+- Retained composition (`QK_MOE_SELECT_HIER=1 QK_MOE_SHARED_DOWN_32=1`, with shared-GU64 separately available) stayed exact. Four ABBA XTX baseline/candidate 256-token samples averaged **182.08 -> 183.59 tok/s** (+0.83%); medians were **182.68 -> 184.30**. On the manual-pinned XT, a direct no-profiler pair was **125.36 -> 126.83 tok/s** (+1.17%). A composed XT profile reduced `moe.r+s` **812.0 -> 755.3 us** and `moe.dn` **878.8 -> 586.7 us**; the timestamp profiler itself perturbed wall throughput, so achieved rates use non-profiled windows.
+
+### 18:46 — Cleanup-build medians and byte-exact gates
+
+- Removed all four rejected DeltaNet shader/pipeline variants after recording their results. The final tree retains only the profiling/DPM harness plus `moe_route_select_hier`, `moe_gateup_q8_64`, and `moe_down_q8b_32`. Hierarchical global-candidate fan-in is specialization-controlled: two candidates/lane for top-8 and four for the supported top-10 shape, avoiding top-10 generality overhead on 35B.
+- Final flags add `QK_MOE_SELECT_HIER=1 QK_MOE_SHARED_GU_64=1 QK_MOE_SHARED_DOWN_32=1` to the Phase-1 common configuration. Contemporaneous non-profiled three-run medians:
+  - XTX `auto`: Phase-1 flags **178.65 tok/s** versus final **180.38 tok/s** (+0.97%). The longer five-sample final series was 181.36 / 181.66 / 180.77 / 180.20 / 179.80; auto-DPM/power variance is why the matched median is reported rather than the best sample.
+  - XT manual: after one warm-up outlier, final samples were 126.61 / 126.63 tok/s versus baseline 125.07 / 125.13, so final achieved is **126.61 tok/s** (+about 1.2% contemporaneously; +1.04% versus the accepted 125.31 Phase-1 result).
+  - Final long-context single samples: XT **133.04 tok/s** and XTX **164.80 tok/s**, with identical FNV `74f1a8a1435d4aa8`.
+- Fractions over the exact growing windows are now: short XT **41.90% raw / 49.61% practical**, short XTX **49.74% / 57.28%**; long XT **46.59% / 54.77%**, long XTX **48.09% / 55.11%**.
+- Final-build mandatory `serve-test` matrix, every command explicitly PCI-pinned and with all final flags:
+  - `big_a`, 256: XT and XTX both exactly **`201f416edb24cc1f5c630bdfe66471d0f12442b53503e1f88da627853c3f60a4`**.
+  - `big4`, 64: XT and XTX both exactly **`98b14c52ffa9f983059f81184b680b6a108a6ed84f3b1cb20bc314e33b4667ef`**.
+- The top-10/512-expert compatibility gate compared baseline versus hierarchical 80B head `[0,12)` on XTX; both produced prefill/decode hidden hashes **`d85e23e8adb10a02` / `c5ed7d32532f02bd`**.
+- Built-in five-format suite passed both cards. XT/XTX: F16 769.1/912.9, Q8 1,412.6/1,434.0, Q6 682.5/709.6, IQ4 643.9/665.1, IQ3 430.5/427.7 GB/s. All three new modules passed `spirv-val --target-env vulkan1.2`; CTest reported no registered tests.
+
+### 18:58 — Production restoration
+
+- After the final GPU command, XTX VRAM/GTT had drained to 27,947,008/15,970,304 bytes. Scaled only `gemma/deployment/qk-server-split-80b` from zero back to its original one replica and waited for rollout.
+- Final deployment spec/updated/ready/available is **1/1/1/1**; pod `qk-server-split-80b-cfd797b74-ldrhl` is `1/1 Running` with zero restarts. Final DPM readbacks are XTX **`auto`** and XT **`manual`**. No GPU benchmark ran after restoration.

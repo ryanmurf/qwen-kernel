@@ -1,0 +1,158 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_memory_scope_semantics : require
+
+// Exact router-logit GEMVs plus hierarchical top-k selection.  Every subgroup
+// first retains its local top n_used.  The global top n_used must be in that
+// union: a discarded candidate already has n_used candidates ahead of it in
+// its own subgroup.  This replaces three whole-workgroup barriers per pick
+// with one barrier after all local candidates are ready.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint CANDIDATES_PER_LANE = 2u;
+
+layout(std430, binding = 0) readonly buffer BufW { float gi[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) coherent buffer BufL { float logits[]; };
+layout(std430, binding = 3) readonly buffer BufGIS { float gis[]; };
+struct SelT {
+    uint ids[16];
+    float weight[16];
+    float wShared;
+    uint routeDone;
+    float pad[6];
+};
+layout(std430, binding = 4) coherent buffer Sel { SelT sel[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float partial[256];
+shared uint isLast;
+shared float red[512];
+shared float localVal[128];
+shared uint localId[128];
+
+float saneLogit(uint rq, uint id) {
+    float v = id < pc.n_expert ? logits[rq * pc.n_expert + id] : -3.4e38;
+    return (isnan(v) || isinf(v)) ? -3.4e38 : v;
+}
+
+void main() {
+    uint e = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+
+    // Preserve moe_logits.comp's accumulation and reduction order.
+    float acc = 0.0;
+    if (e < pc.n_expert) {
+        uint base = e * pc.n_embd;
+        for (uint k = t; k < pc.n_embd; k += 256u)
+            acc += gi[base + k] * x[rq * pc.n_embd + k];
+    }
+    float v = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = v;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) total += partial[i];
+        if (e < pc.n_expert) logits[rq * pc.n_expert + e] = total;
+        memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+        uint prior = atomicAdd(sel[rq].routeDone, 1u, gl_ScopeDevice,
+                               gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+        isLast = uint(prior + 1u == pc.n_expert);
+    }
+    barrier();
+    if (isLast == 0u) return;
+    memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire);
+
+    uint u = t + 256u;
+    float lo = saneLogit(rq, t);
+    float hi = saneLogit(rq, u);
+
+    // Preserve the shared-gate 512-lane addition tree exactly.
+    float a = 0.0, b = 0.0;
+    for (uint k = t; k < pc.n_embd; k += 512u)
+        a += gis[k] * x[rq * pc.n_embd + k];
+    for (uint k = u; k < pc.n_embd; k += 512u)
+        b += gis[k] * x[rq * pc.n_embd + k];
+    red[t] = a;
+    red[u] = b;
+    barrier();
+    for (uint s = 256u; s > 0u; s >>= 1u) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    if (t == 0u) sel[rq].wShared = 1.0 / (1.0 + exp(-red[0]));
+    barrier();
+
+    // Per-subgroup top-k from its two candidates per lane.  subgroupMax/Min
+    // broadcasts the winner, so no workgroup synchronization is needed here.
+    for (uint pick = 0u; pick < pc.n_used; ++pick) {
+        float cv = lo;
+        uint ci = t;
+        if (hi > cv) { cv = hi; ci = u; }
+        float wv = subgroupMax(cv);
+        uint wi = subgroupMin(cv == wv ? ci : 0xffffffffu);
+        if (gl_SubgroupInvocationID == 0u) {
+            uint dst = gl_SubgroupID * pc.n_used + pick;
+            localVal[dst] = wv;
+            localId[dst] = wi;
+        }
+        if (wi == t) lo = -3.4e38;
+        if (wi == u) hi = -3.4e38;
+    }
+    barrier();
+
+    // One subgroup selects the global top-k from at most 8*8=64 candidates.
+    if (gl_SubgroupID != 0u) return;
+    uint lane = gl_SubgroupInvocationID;
+    uint nc = gl_NumSubgroups * pc.n_used;
+    uint i0 = lane;
+    uint i1 = lane + gl_SubgroupSize;
+    float g0 = i0 < nc ? localVal[i0] : -3.4e38;
+    float g1 = i1 < nc ? localVal[i1] : -3.4e38;
+    uint id0 = i0 < nc ? localId[i0] : 0xffffffffu;
+    uint id1 = i1 < nc ? localId[i1] : 0xffffffffu;
+    float g2 = -3.4e38, g3 = -3.4e38;
+    uint id2 = 0xffffffffu, id3 = 0xffffffffu;
+    if (CANDIDATES_PER_LANE > 2u) {
+        uint i2 = lane + 2u * gl_SubgroupSize;
+        uint i3 = lane + 3u * gl_SubgroupSize;
+        g2 = i2 < nc ? localVal[i2] : -3.4e38;
+        g3 = i3 < nc ? localVal[i3] : -3.4e38;
+        id2 = i2 < nc ? localId[i2] : 0xffffffffu;
+        id3 = i3 < nc ? localId[i3] : 0xffffffffu;
+    }
+    for (uint pick = 0u; pick < pc.n_used; ++pick) {
+        float cv = g0;
+        uint ci = id0;
+        if (g1 > cv || (g1 == cv && id1 < ci)) { cv = g1; ci = id1; }
+        if (CANDIDATES_PER_LANE > 2u) {
+            if (g2 > cv || (g2 == cv && id2 < ci)) { cv = g2; ci = id2; }
+            if (g3 > cv || (g3 == cv && id3 < ci)) { cv = g3; ci = id3; }
+        }
+        float gv = subgroupMax(cv);
+        uint gi = subgroupMin(cv == gv ? ci : 0xffffffffu);
+        if (lane == 0u) {
+            sel[rq].ids[pick] = min(gi, pc.n_expert - 1u);
+            sel[rq].weight[pick] = gv;
+        }
+        if (gi == id0) g0 = -3.4e38;
+        if (gi == id1) g1 = -3.4e38;
+        if (CANDIDATES_PER_LANE > 2u) {
+            if (gi == id2) g2 = -3.4e38;
+            if (gi == id3) g3 = -3.4e38;
+        }
+    }
+
+    if (lane == 0u) {
+        float m = sel[rq].weight[0];
+        float sum = 0.0;
+        for (uint i = 0u; i < pc.n_used; ++i) {
+            sel[rq].weight[i] = exp(sel[rq].weight[i] - m);
+            sum += sel[rq].weight[i];
+        }
+        for (uint i = 0u; i < pc.n_used; ++i) sel[rq].weight[i] /= sum;
+    }
+}

@@ -1,0 +1,110 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Expert-major prefill gate/up.  One workgroup owns one (expert,row),
+// dequantizes its IQ3_XXS gate/up row once, then applies it to every selected
+// token/slot in that expert's counting-sorted pair range.
+
+layout(local_size_x = 256) in;
+
+#include "iq_tables.glsl"
+
+struct block_iq3_xxs { float16_t d; uint8_t qs[96]; };
+layout(std430, binding = 0) readonly buffer BufG { block_iq3_xxs gw[]; };
+layout(std430, binding = 1) readonly buffer BufU { block_iq3_xxs uw[]; };
+layout(std430, binding = 2) readonly buffer BufX { float x[]; };
+layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 4) readonly buffer Pairs { uint pairs[]; };
+layout(std430, binding = 5) writeonly buffer BufH { float h[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float pg[8];
+shared float pu[8];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint eid = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (r >= pc.n_ff || eid >= pc.n_expert) return;
+
+    uint kb = pc.n_embd / 256u;
+    uint nu = kb * 32u;
+    float mg[8], mu[8];
+    float dg = 0.0, du = 0.0;
+    for (uint j = 0u; j < 8u; ++j) { mg[j] = 0.0; mu[j] = 0.0; }
+
+    if (tid < nu) {
+        uint b = tid >> 5u;
+        uint g8 = tid & 31u;
+        uint ib32 = g8 >> 2u;
+        uint l = g8 & 3u;
+        uint ao = 64u + 4u * ib32;
+        uint qo = ib32 * 8u + 2u * l;
+        uint bi = (eid * pc.n_ff + r) * kb + b;
+
+        uint ag = uint(gw[bi].qs[ao]) | (uint(gw[bi].qs[ao + 1u]) << 8u) |
+                  (uint(gw[bi].qs[ao + 2u]) << 16u) | (uint(gw[bi].qs[ao + 3u]) << 24u);
+        uint sg = iq_signbyte((ag >> (7u * l)) & 127u);
+        uint gg1 = iq3xxs_grid[uint(gw[bi].qs[qo])];
+        uint gg2 = iq3xxs_grid[uint(gw[bi].qs[qo + 1u])];
+        dg = float(gw[bi].d) * (0.5 + float(ag >> 28u)) * 0.5;
+
+        uint au = uint(uw[bi].qs[ao]) | (uint(uw[bi].qs[ao + 1u]) << 8u) |
+                  (uint(uw[bi].qs[ao + 2u]) << 16u) | (uint(uw[bi].qs[ao + 3u]) << 24u);
+        uint su = iq_signbyte((au >> (7u * l)) & 127u);
+        uint ug1 = iq3xxs_grid[uint(uw[bi].qs[qo])];
+        uint ug2 = iq3xxs_grid[uint(uw[bi].qs[qo + 1u])];
+        du = float(uw[bi].d) * (0.5 + float(au >> 28u)) * 0.5;
+
+        for (uint j = 0u; j < 4u; ++j) {
+            float a = float((gg1 >> (8u * j)) & 255u);
+            float b2 = float((gg2 >> (8u * j)) & 255u);
+            mg[j] = (sg & (1u << j)) != 0u ? -a : a;
+            mg[4u + j] = (sg & (1u << (4u + j))) != 0u ? -b2 : b2;
+            a = float((ug1 >> (8u * j)) & 255u);
+            b2 = float((ug2 >> (8u * j)) & 255u);
+            mu[j] = (su & (1u << j)) != 0u ? -a : a;
+            mu[4u + j] = (su & (1u << (4u + j))) != 0u ? -b2 : b2;
+        }
+    }
+
+    uint begin = offsets[eid], end = offsets[eid + 1u];
+    for (uint pi = begin; pi < end; ++pi) {
+        uint pair = pairs[pi];
+        uint rq = pair >> 4u;
+        uint s = pair & 15u;
+        float ag = 0.0, au = 0.0;
+        if (tid < nu) {
+            uint b = tid >> 5u;
+            uint g8 = tid & 31u;
+            uint ib32 = g8 >> 2u;
+            uint l = g8 & 3u;
+            uint xo = rq * pc.n_embd + b * 256u + ib32 * 32u + l * 8u;
+            float sg = 0.0, su = 0.0;
+            for (uint j = 0u; j < 8u; ++j) {
+                float xv = x[xo + j];
+                sg += mg[j] * xv;
+                su += mu[j] * xv;
+            }
+            ag = dg * sg;
+            au = du * su;
+        }
+        float gs = subgroupAdd(ag);
+        float us = subgroupAdd(au);
+        if (gl_SubgroupInvocationID == 0u) { pg[gl_SubgroupID] = gs; pu[gl_SubgroupID] = us; }
+        barrier();
+        if (tid == 0u) {
+            float g = 0.0, u = 0.0;
+            for (uint w = 0u; w < gl_NumSubgroups; ++w) { g += pg[w]; u += pu[w]; }
+            uint ho = (rq * (pc.n_used + 1u) + s) * pc.n_ff + r;
+            h[ho] = (g / (1.0 + exp(-g))) * u;
+        }
+        barrier();
+    }
+}

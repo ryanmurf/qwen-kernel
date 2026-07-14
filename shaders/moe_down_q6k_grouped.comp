@@ -1,0 +1,73 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32) in;
+
+struct block_q6_K { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; float16_t d; };
+layout(std430, binding = 0) readonly buffer BufW { block_q6_K dw[]; };
+layout(std430, binding = 1) readonly buffer BufH { float h[]; };
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
+layout(std430, binding = 2) readonly buffer Sel { SelT sel[]; };
+layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 4) readonly buffer Pairs { uint pairs[]; };
+layout(std430, binding = 5) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+void main() {
+    uint o = gl_WorkGroupID.x;
+    uint eid = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (o >= pc.n_embd || eid >= pc.n_expert) return;
+
+    uint kb = pc.n_ff / 256u;
+    uint ng = kb * 16u;
+    float qv[16];
+    float ds = 0.0;
+    for (uint j = 0u; j < 16u; ++j) qv[j] = 0.0;
+    if (tid < ng) {
+        uint b = tid >> 4u;
+        uint gg = tid & 15u;
+        uint hh = gg >> 3u;
+        uint r = (gg & 7u) >> 1u;
+        uint is = gg & 1u;
+        uint bi = (eid * pc.n_embd + o) * kb + b;
+        ds = float(dw[bi].d) * float(int(dw[bi].scales[hh * 8u + r * 2u + is]));
+        uint qlBase = hh * 64u + (r & 1u) * 32u + is * 16u;
+        uint qhBase = hh * 32u + is * 16u;
+        uint shift = r * 2u;
+        bool hi = r >= 2u;
+        for (uint j = 0u; j < 16u; ++j) {
+            uint ql = uint(dw[bi].ql[qlBase + j]);
+            uint qh = uint(dw[bi].qh[qhBase + j]);
+            uint lo = hi ? ql >> 4u : ql & 15u;
+            qv[j] = float(int(lo | (((qh >> shift) & 3u) << 4u)) - 32);
+        }
+    }
+
+    uint begin = offsets[eid], end = offsets[eid + 1u];
+    for (uint pi = begin; pi < end; ++pi) {
+        uint pair = pairs[pi];
+        uint rq = pair >> 4u;
+        uint s = pair & 15u;
+        float acc = 0.0;
+        if (tid < ng) {
+            uint b = tid >> 4u;
+            uint gg = tid & 15u;
+            uint ho = (rq * (pc.n_used + 1u) + s) * pc.n_ff + b * 256u + gg * 16u;
+            float dot = 0.0;
+            for (uint j = 0u; j < 16u; ++j) dot += qv[j] * h[ho + j];
+            acc = ds * dot;
+        }
+        float sum = subgroupAdd(acc);
+        if (tid == 0u) {
+            uint yo = (rq * pc.n_used + s) * pc.n_embd + o;
+            y[yo] = sel[rq].w[s] * sum;
+        }
+    }
+}

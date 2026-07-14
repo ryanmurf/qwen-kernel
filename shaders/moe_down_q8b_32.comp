@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Exact local-32 specialization of moe_down_q8b.comp.  n_ff=512 has only 16
+// Q8 blocks per row; one wave performs all useful work and the original seven
+// waves only contribute zeroes.
+
+layout(local_size_x = 32) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly buffer BufW { block_q8_0 dw[]; };
+layout(std430, binding = 1) readonly buffer BufH { float h[]; };
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
+layout(std430, binding = 2) readonly buffer Sel { SelT sel[]; };
+layout(std430, binding = 3) writeonly buffer BufY { float y2[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float partial;
+
+void main() {
+    uint o   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint rq  = gl_WorkGroupID.z;
+
+    float acc = 0.0;
+    if (o < pc.n_embd) {
+        uint kb    = pc.n_ff / 32u;
+        uint base  = o * kb;
+        uint hbase = rq * (pc.n_used + 1u) * pc.n_ff + pc.n_used * pc.n_ff;
+        for (uint b = tid; b < kb; b += 32u) {
+            uint  hoff = hbase + b * 32u;
+            float s = 0.0;
+            [[unroll]] for (uint i = 0u; i < 32u; ++i)
+                s += float(int(dw[base + b].qs[i])) * h[hoff + i];
+            acc += float(dw[base + b].d) * s;
+        }
+    }
+
+    float v = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial = v;
+    barrier();
+    if (tid == 0u && o < pc.n_embd)
+        y2[rq * pc.n_embd + o] = sel[rq].wShared * partial;
+}

@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -34,6 +35,7 @@
 #include <new>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -2794,8 +2796,10 @@ struct qk_engine {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pStepReg, pStepGate, pGate, pGemvO,
         pAddN, pAddNRoute,
-        pPrep, pAttn, pMoeL, pMoeRS, pMoeS, pMoeS256, pMoeGU, pMoeGUs, pMoeDn4,
-        pMoeDn4_128, pMoeDn6, pMoeDnsB, pAdd3, pHead,
+        pPrep, pAttn, pMoeL, pMoeRS, pMoeRSHier, pMoeS, pMoeS256, pMoeGroupPairs,
+        pMoeGU, pMoeGUGroup3,
+        pMoeGUs, pMoeGUs64, pMoeDn4, pMoeDn4_128, pMoeDn6, pMoeDnsB,
+        pMoeDnsB32, pMoeDnGroup4, pMoeDnGroup6, pAdd3, pAdd3Group, pHead,
         pAm1, pAm2, pEmb;
     Pipe pAttnS, pAttnSG2, pAttnSG4, pAttnSG8, pAttnR;
     // split-K decode attention (QK_NO_SPLITK=1 -> legacy pAttn); SG variants
@@ -2840,7 +2844,11 @@ struct qk_engine {
     bool attnGqaAuto = false; // QK_ATTN_GQA_AUTO selects group1/4 by live context
     bool moeSelect256 = false; // QK_MOE_SELECT_FAST subgroup selector
     bool moeRouteFused = false; // QK_MOE_ROUTE_FUSED selects in the last router WG
+    bool moeSelectHier = false; // QK_MOE_SELECT_HIER removes per-pick WG barriers
+    bool moeSharedGu64 = false; // QK_MOE_SHARED_GU_64 uses only the 64 useful lanes
     bool moeDown128 = false; // QK_MOE_DOWN_128 shrinks underfilled routed IQ4 down WGs
+    bool moeSharedDown32 = false; // QK_MOE_SHARED_DOWN_32 uses one useful wave
+    bool moeGroupPrefill = false; // QK_MOE_GROUP_PREFILL expert-major routed MoE
     bool dnStepReg = false; // QK_DN_STEP_REG caches each state row across both passes
     bool dnStepGate = false; // QK_DN_STEP_GATE_FUSED removes the o[] round trip
     Buf bbPos;                 // 1-entry position buffer: the batch n==1 split-K
@@ -2849,15 +2857,16 @@ struct qk_engine {
 
     uint32_t maxB = 0;
     Buf bbXin, bbXn, bbBig, bbMid, bbKin, bbVin, bbGb, bbConvOut, bbO, bbAtt, bbAttnOut,
-        bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbMY2, bbLogits, bbIds, bbCarry;
+        bbY, bbXn2, bbML, bbMH, bbMSel, bbMY, bbMY2, bbMOffsets, bbMPairs,
+        bbMContrib, bbLogits, bbIds, bbCarry;
     struct BLayer {
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sStepGate, sGate, sWo, sAddN,
             sAddNRoute, sPrep, sAttn, sMoeL, sMoeRS, sMoeS, sMoeS256, sMoeGU,
-            sMoeGUs, sMoeDn, sMoeDns, sAdd3;
+            sMoeGUs, sMoeDn, sMoeDns, sMoeGUGroup, sMoeDnGroup, sAdd3, sAdd3Group;
         VkDescriptorSet sAttnS, sAttnR;  // split-K for the n==1 (decode) batch case
     };
     std::vector<BLayer> blayers;
-    VkDescriptorSet sbEmb, sbHead;
+    VkDescriptorSet sbEmb, sbHead, sbMoeGroupPairs;
     uint32_t* bbIdsMap = nullptr;
 
     // Spec-decode verify (P0): per-position greedy argmax over bbLogits rows.
@@ -2929,6 +2938,7 @@ struct qk_engine {
     VkQueryPool profQ = VK_NULL_HANDLE;
     std::vector<const char*> profLbl;
     bool profPrinted = false;
+    bool profArmed = true;  // QK_STEP_PROF_DEFER lets a harness arm after warmup/idle
 
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
@@ -2997,6 +3007,7 @@ qk_engine::~qk_engine() {
         destroyBuf(c, *b);
     for (Buf* b : {&bbXin, &bbXn, &bbBig, &bbMid, &bbKin, &bbVin, &bbGb, &bbConvOut, &bbO,
                    &bbAtt, &bbAttnOut, &bbY, &bbXn2, &bbML, &bbMH, &bbMSel, &bbMY, &bbMY2,
+                   &bbMOffsets, &bbMPairs, &bbMContrib,
                    &bbLogits, &bbIds, &bbCarry, &bbPos, &bvAV, &bvAI, &bvTok, &bvSamp})
         destroyBuf(c, *b);
     if (profQ) vkDestroyQueryPool(c.dev, profQ, nullptr);
@@ -3006,9 +3017,11 @@ qk_engine::~qk_engine() {
                      &pGate, &pGemvO,
                      &pGemvO4, &pAddN, &pAddNRoute, &pPrep,
                      &pAttn, &pAttnS, &pAttnSG2, &pAttnSG4, &pAttnSG8, &pAttnR,
-                     &pMoeL, &pMoeRS, &pMoeS, &pMoeS256, &pMoeGU,
-                     &pMoeGUs, &pMoeDn4, &pMoeDn4_128, &pMoeDn6, &pMoeDnsB,
-                     &pMoeGU4, &pAdd3, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB,
+                     &pMoeL, &pMoeRS, &pMoeRSHier, &pMoeS, &pMoeS256, &pMoeGroupPairs,
+                     &pMoeGU, &pMoeGUGroup3,
+                     &pMoeGUs, &pMoeGUs64, &pMoeDn4, &pMoeDn4_128, &pMoeDn6,
+                     &pMoeDnsB, &pMoeDnsB32, &pMoeDnGroup4, &pMoeDnGroup6,
+                     &pMoeGU4, &pAdd3, &pAdd3Group, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB,
                      &pAbB, &pConvB, &pStepB, &pGateB, &pGemmB, &pGemmB4})
         destroyPipe(c, *pp);
     if (c.pool) vkDestroyCommandPool(c.dev, c.pool, nullptr);
@@ -3256,16 +3269,25 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAttnR = makePipe(c, "fa_attn_srv_reduce.spv", 4, 40);
     pMoeL = makePipe(c, "moe_logits.spv", 3, 16);
     pMoeRS = makePipe(c, "moe_route_select.spv", 5, 16);
+    pMoeRSHier = makePipe(c, "moe_route_select_hier.spv", 5, 16,
+                          nUsed <= 8 ? 2 : 4);
     pMoeS = makePipe(c, "moe_select.spv", 4, 16);
     pMoeS256 = makePipe(c, "moe_select_256.spv", 4, 16);
+    pMoeGroupPairs = makePipe(c, "moe_group_pairs.spv", 3, 12);
     pMoeGU = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
+    pMoeGUGroup3 = makePipe(c, "moe_gateup_iq3_grouped.spv", 6, 16);
     pMoeGU4 = makePipe(c, "moe_gateup_iq4.spv", 5, 16);
     pMoeGUs = makePipe(c, "moe_gateup_q8.spv", 4, 16);
+    pMoeGUs64 = makePipe(c, "moe_gateup_q8_64.spv", 4, 16);
     pMoeDn4 = makePipe(c, "moe_down_iq4.spv", 4, 16, 256);
     pMoeDn4_128 = makePipe(c, "moe_down_iq4.spv", 4, 16, 128);
     pMoeDn6 = makePipe(c, "moe_down_q6k.spv", 4, 16);
     pMoeDnsB = makePipe(c, "moe_down_q8b.spv", 4, 16);
+    pMoeDnsB32 = makePipe(c, "moe_down_q8b_32.spv", 4, 16);
+    pMoeDnGroup4 = makePipe(c, "moe_down_iq4_grouped.spv", 6, 16);
+    pMoeDnGroup6 = makePipe(c, "moe_down_q6k_grouped.spv", 6, 16);
     pAdd3 = makePipe(c, "add_rms3.spv", 6, 8);
+    pAdd3Group = makePipe(c, "add_rms3_grouped.spv", 6, 12);
     pHead = makePipe(c, "gemv_q6_k.spv", 3, 8, 128);
     pAm1 = makePipe(c, "argmax1.spv", 3, 8);
     pAm2 = makePipe(c, "argmax2.spv", 3, 4);
@@ -3430,6 +3452,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMSel = createBuf(c, (size_t)cap * 160, stor, true);
     bbMY = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbMY2 = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
+    bbMOffsets = createBuf(c, (size_t)(nExp + 1) * 4, stor, true);
+    bbMPairs = createBuf(c, (size_t)cap * nUsed * 4, stor, true);
+    bbMContrib = createBuf(c, (size_t)cap * nUsed * nEmbd * 4, stor, true);
     if (lastStage()) bbLogits = createBuf(c, (size_t)cap * vocab * 4, storSrc, true);
     bbIds = createBuf(c, (size_t)cap * 4, stor, false);
     bbPos = createBuf(c, 4, stor, false);
@@ -3628,6 +3653,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         BL.sMoeGUs = mkSet(pMoeGUs, {mgs, mus, bbXn2.buf, bbMH.buf});
         BL.sMoeDn = mkSet(L.downQ6 ? pMoeDn6 : pMoeDn4, {mde, bbMH.buf, bbMSel.buf, bbMY.buf});
         BL.sMoeDns = mkSet(pMoeDnsB, {mds, bbMH.buf, bbMSel.buf, bbMY2.buf});
+        BL.sMoeGUGroup = mkSet(pMoeGUGroup3,
+                               {mge, mue, bbXn2.buf, bbMOffsets.buf, bbMPairs.buf,
+                                bbMH.buf});
+        BL.sMoeDnGroup = mkSet(L.downQ6 ? pMoeDnGroup6 : pMoeDnGroup4,
+                               {mde, bbMH.buf, bbMSel.buf, bbMOffsets.buf,
+                                bbMPairs.buf, bbMContrib.buf});
     }
     // A stage's LAST layer pre-norms with the next stage's first attn_norm in the
     // full model; here it binds bONorm instead — real weight on the last stage
@@ -3642,6 +3673,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         blayers[il].sAdd3 = mkSet(pAdd3, {bbY.buf, bbMY.buf, bbMY2.buf,
                                           il + 1 < lEnd ? layers[il + 1].aNormBuf : bONorm.buf,
                                           bbXin.buf, bbXn.buf});
+    for (uint32_t il = lFirst; il < lEnd; il++)
+        blayers[il].sAdd3Group = mkSet(pAdd3Group,
+                                      {bbY.buf, bbMContrib.buf, bbMY2.buf,
+                                       il + 1 < lEnd ? layers[il + 1].aNormBuf : bONorm.buf,
+                                       bbXin.buf, bbXn.buf});
     if (lastStage()) {
         sHead = mkSet(pHead, {bHeadW.buf, bXn.buf, bLogits.buf});
         sAm1 = mkSet(pAm1, {bLogits.buf, bAV.buf, bAI.buf});
@@ -3654,6 +3690,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         sEmb = mkSet(pEmb, {bEmbdW.buf, bSlotIn.buf, bXin.buf});
         sbEmb = mkSet(pEmb, {bEmbdW.buf, bbIds.buf, bbXin.buf});
     }
+    sbMoeGroupPairs = mkSet(pMoeGroupPairs,
+                            {bbMSel.buf, bbMOffsets.buf, bbMPairs.buf});
 
     // ---- prefix cache: host-resident snapshots of the per-slot state stripes ----
     {
@@ -3715,6 +3753,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     };
     bool prof = getenv("QK_STEP_PROF") != nullptr && c.hasTimestamps && !splitStage();
+    profArmed = getenv("QK_STEP_PROF_DEFER") == nullptr;
     if (prof) {
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -3758,7 +3797,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
     moeSelect256 = getenv("QK_MOE_SELECT_FAST") != nullptr;
     moeRouteFused = getenv("QK_MOE_ROUTE_FUSED") != nullptr;
+    moeSelectHier = getenv("QK_MOE_SELECT_HIER") != nullptr;
+    moeSharedGu64 = getenv("QK_MOE_SHARED_GU_64") != nullptr;
     moeDown128 = getenv("QK_MOE_DOWN_128") != nullptr;
+    moeSharedDown32 = getenv("QK_MOE_SHARED_DOWN_32") != nullptr;
+    moeGroupPrefill = getenv("QK_MOE_GROUP_PREFILL") != nullptr;
     dnStepReg = getenv("QK_DN_STEP_REG") != nullptr;
     dnStepGate = getenv("QK_DN_STEP_GATE_FUSED") != nullptr;
     const uint32_t amWgs = (vocab + 4095) / 4096;
@@ -3854,9 +3897,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
              moeRouteFused ? L.sAddNRoute : L.sAddN, 1, &pcRms, 8);
         barrier();
         stamp("addN");
-        disp(moeRouteFused ? pMoeRS : pMoeL,
+        disp(moeRouteFused ? (moeSelectHier ? pMoeRSHier : pMoeRS) : pMoeL,
              moeRouteFused ? L.sMoeRS : L.sMoeL, nExp, &pcv, 16);
-        disp(pMoeGUs, L.sMoeGUs, ffE, &pcv, 16);
+        disp(moeSharedGu64 ? pMoeGUs64 : pMoeGUs, L.sMoeGUs, ffE, &pcv, 16);
         barrier();
         stamp(moeRouteFused ? "moe.r+s" : "moe.route");
         if (!moeRouteFused) {
@@ -3870,7 +3913,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         stamp("moe.gu");
         disp(L.downQ6 ? pMoeDn6 : (moeDown128 ? pMoeDn4_128 : pMoeDn4),
              L.sMoeDn, nEmbd, &pcv, 16);
-        disp(pMoeDnsB, L.sMoeDns, nEmbd, &pcv, 16);
+        disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
+             L.sMoeDns, nEmbd, &pcv, 16);
         barrier();
         stamp("moe.dn");
         disp(pAdd3, L.sAdd3, 1, &pcRms, 8);
@@ -4063,7 +4107,8 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
         VK_CHECK(vkQueueWaitIdle(c.queue));
 
         // QK_STEP_PROF: dump the per-stage timing of the first pure-decode step.
-        if (profQ && !profPrinted && maxZ == 1 && slots[0].cursor >= slots[0].prompt.size()) {
+        if (profQ && profArmed && !profPrinted && maxZ == 1 &&
+            slots[0].cursor >= slots[0].prompt.size()) {
             std::vector<uint64_t> ts(profLbl.size());
             if (!ts.empty() &&
                 vkGetQueryPoolResults(c.dev, profQ, 0, (uint32_t)ts.size(), ts.size() * 8,
@@ -4086,6 +4131,19 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
                     fprintf(stderr, "[prof]   %-10s n=%-3u tot=%8.1f us  avg=%6.2f us  %4.1f%%\n",
                             r.second.c_str(), a.first, a.second, a.second / a.first,
                             100.0 * a.second / tot);
+                }
+                if (getenv("QK_STEP_PROF_DETAIL")) {
+                    uint32_t layer = 0;
+                    std::unordered_map<std::string, uint32_t> occurrence;
+                    for (size_t i = 1; i < ts.size(); i++) {
+                        const char* lbl = profLbl[i];
+                        uint32_t occ = occurrence[lbl]++;
+                        double us = (double)(ts[i] - ts[i - 1]) * per;
+                        fprintf(stderr,
+                                "[prof-detail] seq=%-3zu layer=%-2u occ=%-2u %-10s %8.2f us\n",
+                                i, layer, occ, lbl, us);
+                        if (strcmp(lbl, "add3") == 0) layer++;
+                    }
                 }
                 profPrinted = true;
             }
@@ -4445,9 +4503,9 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         disp(fuseRoute ? pAddNRoute : pAddN,
              fuseRoute ? BL.sAddNRoute : BL.sAddN, 1, &pcRms, 8);
         barrier();
-        disp(fuseRoute ? pMoeRS : pMoeL,
+        disp(fuseRoute ? (moeSelectHier ? pMoeRSHier : pMoeRS) : pMoeL,
              fuseRoute ? BL.sMoeRS : BL.sMoeL, nExp, &pcv, 16);
-        disp(pMoeGUs, BL.sMoeGUs, ffE, &pcv, 16);
+        disp(moeSharedGu64 ? pMoeGUs64 : pMoeGUs, BL.sMoeGUs, ffE, &pcv, 16);
         barrier();
         if (!fuseRoute) {
             bool fastSelect = moeSelect256 || moeRouteFused;
@@ -4455,13 +4513,50 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                  fastSelect ? BL.sMoeS256 : BL.sMoeS, 1, &pcv, 16);
             barrier();
         }
-        disp(guIq4 ? pMoeGU4 : pMoeGU, BL.sMoeGU, nUsed * ffE, &pcv, 16);
+        // The grouped primitive is intentionally prefill-only and currently
+        // targets the 35B IQ3 routed gate/up format.  Decode (n==1) and the
+        // 80B IQ4 gate/up shape retain their measured card-best paths.
+        bool groupMoe = moeGroupPrefill && n > 1 && !guIq4 && !tapsDir;
+        if (groupMoe) {
+            struct { uint32_t nExpert, nUsed, nTokens; } pcPairs{nExp, nUsed, n};
+            zdim = 1;
+            disp(pMoeGroupPairs, sbMoeGroupPairs, 1, &pcPairs, 12);
+            barrier();
+
+            vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pMoeGUGroup3.p);
+            vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pMoeGUGroup3.pl, 0, 1, &BL.sMoeGUGroup, 0, nullptr);
+            vkCmdPushConstants(c.cb, pMoeGUGroup3.pl, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, 16, &pcv);
+            vkCmdDispatch(c.cb, ffE, nExp, 1);
+        } else {
+            zdim = n;
+            disp(guIq4 ? pMoeGU4 : pMoeGU, BL.sMoeGU, nUsed * ffE, &pcv, 16);
+        }
         barrier();
-        disp(L.downQ6 ? pMoeDn6 : (moeDown128 ? pMoeDn4_128 : pMoeDn4),
-             BL.sMoeDn, nEmbd, &pcv, 16);
-        disp(pMoeDnsB, BL.sMoeDns, nEmbd, &pcv, 16);
-        barrier();
-        disp(pAdd3, BL.sAdd3, 1, &pcRms, 8);
+        if (groupMoe) {
+            Pipe& pgd = L.downQ6 ? pMoeDnGroup6 : pMoeDnGroup4;
+            vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pgd.p);
+            vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pgd.pl, 0, 1, &BL.sMoeDnGroup, 0, nullptr);
+            vkCmdPushConstants(c.cb, pgd.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pcv);
+            vkCmdDispatch(c.cb, nEmbd, nExp, 1);
+            zdim = n;
+            disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
+                 BL.sMoeDns, nEmbd, &pcv, 16);
+            barrier();
+            struct { uint32_t n; float e; uint32_t nUsed; }
+                pcGroupTail{nEmbd, eps, nUsed};
+            disp(pAdd3Group, BL.sAdd3Group, 1, &pcGroupTail, 12);
+        } else {
+            zdim = n;
+            disp(L.downQ6 ? pMoeDn6 : (moeDown128 ? pMoeDn4_128 : pMoeDn4),
+                 BL.sMoeDn, nEmbd, &pcv, 16);
+            disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
+                 BL.sMoeDns, nEmbd, &pcv, 16);
+            barrier();
+            disp(pAdd3, BL.sAdd3, 1, &pcRms, 8);
+        }
         barrier();
         if ((il + 1 - lFirst) % flushEvery == 0 && il + 1 < lEnd) flushCB();
     }
@@ -4912,6 +5007,34 @@ static uint64_t fnv1a64(const void* data, size_t n,
     return h;
 }
 
+struct GpuMetricSample {
+    double ms = 0.0;
+    uint16_t hotspot = 0xffff, memTemp = 0xffff;
+    uint16_t gfxActivity = 0xffff, memActivity = 0xffff, socketPower = 0xffff;
+    uint16_t avgGfx = 0xffff, avgUclk = 0xffff;
+    uint16_t gfx = 0xffff, uclk = 0xffff;
+    uint32_t throttle = 0;
+    uint64_t indepThrottle = 0;
+};
+
+static bool readGpuMetricsV13(const char* path, GpuMetricSample& s) {
+    uint8_t b[128] = {};
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    size_t n = fread(b, 1, sizeof b, f);
+    fclose(f);
+    auto u16 = [&](size_t off) { uint16_t v; memcpy(&v, b + off, 2); return v; };
+    auto u32 = [&](size_t off) { uint32_t v; memcpy(&v, b + off, 4); return v; };
+    auto u64 = [&](size_t off) { uint64_t v; memcpy(&v, b + off, 8); return v; };
+    if (n < 120 || u16(0) < 120 || b[2] != 1 || b[3] != 3) return false;
+    s.hotspot = u16(6); s.memTemp = u16(8);
+    s.gfxActivity = u16(16); s.memActivity = u16(18); s.socketPower = u16(22);
+    s.avgGfx = u16(40); s.avgUclk = u16(44);
+    s.gfx = u16(54); s.uclk = u16(58);
+    s.throttle = u32(68); s.indepThrottle = u64(112);
+    return true;
+}
+
 #ifndef QK_LIBRARY
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "suite";
@@ -4936,10 +5059,14 @@ int main(int argc, char** argv) {
         uint32_t tmax = argc > 4 ? (uint32_t)atoi(argv[4]) : 8192;
         uint32_t chunk = 8;
         if (const char* v = getenv("QK_CHUNK")) chunk = (uint32_t)atoi(v);
-        if (!nDecode || !chunk || nDecode % chunk ||
-            prompt.size() + (size_t)nDecode + 1 > tmax) {
-            fprintf(stderr, "serve-bench: need nDecode>0 divisible by QK_CHUNK=%u and "
-                            "prompt+nDecode+1 <= tmax\n", chunk);
+        uint32_t prefix = 0, idleMs = 0;
+        if (const char* v = getenv("QK_BENCH_PREFIX")) prefix = (uint32_t)atoi(v);
+        if (const char* v = getenv("QK_BENCH_IDLE_MS")) idleMs = (uint32_t)atoi(v);
+        bool trace = getenv("QK_BENCH_TRACE") != nullptr;
+        if (!nDecode || !chunk || nDecode % chunk || prefix % chunk ||
+            prompt.size() + (size_t)prefix + nDecode + 1 > tmax) {
+            fprintf(stderr, "serve-bench: need nDecode>0 and prefix/decode divisible by "
+                            "QK_CHUNK=%u, with prompt+prefix+nDecode+1 <= tmax\n", chunk);
             return 1;
         }
         qk_config cfg{1, tmax, chunk};
@@ -4947,36 +5074,161 @@ int main(int argc, char** argv) {
         qk_engine* e = qk_open(ggufPath(), &cfg, err, sizeof err);
         if (!e) { fprintf(stderr, "qk_open failed: %s\n", err); return 1; }
         auto p0 = std::chrono::steady_clock::now();
-        int rc = qk_slot_start(e, 0, prompt.data(), (uint32_t)prompt.size(), nDecode + 1, 0);
+        int rc = qk_slot_start(e, 0, prompt.data(), (uint32_t)prompt.size(),
+                               prefix + nDecode + 1, 0);
         auto p1 = std::chrono::steady_clock::now();
         if (rc) { fprintf(stderr, "serve-bench: slot_start rc=%d\n", rc); qk_close(e); return 1; }
 
-        std::vector<uint32_t> outTok(chunk), outCnt(1), gen;
+        std::vector<uint32_t> outTok(chunk), outCnt(1), prefixGen, gen;
+        prefixGen.reserve(prefix);
         gen.reserve(nDecode);
         uint32_t finMask = 0;
-        auto d0 = std::chrono::steady_clock::now();
-        while (gen.size() < nDecode) {
-            int active = qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask);
-            if (active <= 0 || finMask || outCnt[0] == 0) {
-                fprintf(stderr, "serve-bench: early stop active=%d fin=%u produced=%zu\n",
-                        active, finMask, gen.size());
-                qk_close(e);
-                return 1;
+        auto drive = [&](uint32_t want, std::vector<uint32_t>& dst,
+                         const char* phase, bool traceChunks) -> bool {
+            while (dst.size() < want) {
+                auto c0 = std::chrono::steady_clock::now();
+                int active = qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask);
+                auto c1 = std::chrono::steady_clock::now();
+                if (active <= 0 || finMask || outCnt[0] == 0) {
+                    fprintf(stderr,
+                            "serve-bench: %s early stop active=%d fin=%u produced=%zu\n",
+                            phase, active, finMask, dst.size());
+                    return false;
+                }
+                dst.insert(dst.end(), outTok.begin(), outTok.begin() + outCnt[0]);
+                if (traceChunks) {
+                    double cms = std::chrono::duration<double, std::milli>(c1 - c0).count();
+                    fprintf(stderr,
+                            "[bench-trace] phase=%s end=%zu tokens=%u ms=%.3f tok/s=%.2f\n",
+                            phase, dst.size(), outCnt[0], cms, outCnt[0] * 1000.0 / cms);
+                }
             }
-            gen.insert(gen.end(), outTok.begin(), outTok.begin() + outCnt[0]);
+            return true;
+        };
+
+        auto w0 = std::chrono::steady_clock::now();
+        if (prefix && !drive(prefix, prefixGen, "prefix", false)) {
+            qk_close(e);
+            return 1;
+        }
+        auto w1 = std::chrono::steady_clock::now();
+        if (prefix) {
+            fprintf(stderr, "[bench] prefix complete: %u tokens; idle=%u ms\n", prefix, idleMs);
+            fflush(stderr);
+        }
+        if (idleMs) std::this_thread::sleep_for(std::chrono::milliseconds(idleMs));
+        if (getenv("QK_STEP_PROF_DEFER")) e->profArmed = true;
+        fprintf(stderr, "[bench] measure begin: %u tokens\n", nDecode);
+        fflush(stderr);
+
+        const char* metricPath = getenv("QK_BENCH_GPU_METRICS");
+        uint32_t metricMs = 50;
+        if (const char* v = getenv("QK_BENCH_METRICS_MS"))
+            metricMs = std::max(10u, (uint32_t)atoi(v));
+        std::atomic<bool> metricStop{false};
+        std::vector<GpuMetricSample> metrics;
+        auto metricOrigin = std::chrono::steady_clock::now();
+        std::thread metricThread;
+        if (metricPath) {
+            metricThread = std::thread([&]() {
+                while (!metricStop.load(std::memory_order_relaxed)) {
+                    auto m0 = std::chrono::steady_clock::now();
+                    GpuMetricSample s;
+                    if (readGpuMetricsV13(metricPath, s)) {
+                        auto m1 = std::chrono::steady_clock::now();
+                        s.ms = std::chrono::duration<double, std::milli>(
+                                   m0 + (m1 - m0) / 2 - metricOrigin).count();
+                        metrics.push_back(s);
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(metricMs));
+                }
+            });
+        }
+        auto d0 = std::chrono::steady_clock::now();
+        if (!drive(nDecode, gen, "measure", trace)) {
+            metricStop.store(true, std::memory_order_relaxed);
+            if (metricThread.joinable()) metricThread.join();
+            qk_close(e);
+            return 1;
         }
         auto d1 = std::chrono::steady_clock::now();
+        metricStop.store(true, std::memory_order_relaxed);
+        if (metricThread.joinable()) metricThread.join();
         qk_slot_cancel(e, 0);
         double pms = std::chrono::duration<double, std::milli>(p1 - p0).count();
+        double wms = std::chrono::duration<double, std::milli>(w1 - w0).count();
         double dms = std::chrono::duration<double, std::milli>(d1 - d0).count();
         size_t pn = prompt.size() - 1;
         printf("serve-bench: prompt %zu | batch-prefill %zu tokens in %.1f ms = %.2f tok/s "
-               "| decode %u tokens in %.1f ms = %.2f tok/s (%.3f ms/tok)\n",
-               prompt.size(), pn, pms, pn * 1000.0 / pms, nDecode, dms,
+               "| prefix %u in %.1f ms | idle %u ms | decode %u tokens in %.1f ms "
+               "= %.2f tok/s (%.3f ms/tok)\n",
+               prompt.size(), pn, pms, pn * 1000.0 / pms, prefix, wms, idleMs,
+               nDecode, dms,
                nDecode * 1000.0 / dms, dms / nDecode);
-        printf("GEN:");
-        for (uint32_t t : gen) printf(" %u", t);
-        printf("\n");
+        if (!metrics.empty()) {
+            double gfxSum = 0.0, gfxInv = 0.0, uclkSum = 0.0;
+            double activity = 0.0, memActivity = 0.0, power = 0.0;
+            uint32_t gfxN = 0, gfxNonzero = 0, gfxHigh = 0, gfxZero = 0;
+            uint32_t uclkN = 0, uclkHigh = 0, statN = 0;
+            uint16_t maxHotspot = 0, maxMemTemp = 0;
+            uint32_t throttle = 0; uint64_t indepThrottle = 0;
+            for (const auto& s : metrics) {
+                if (s.gfx != 0xffff) {
+                    gfxN++; gfxSum += s.gfx;
+                    if (s.gfx == 0) gfxZero++;
+                    else { gfxNonzero++; gfxInv += 1.0 / s.gfx; }
+                    if (s.gfx >= 2134) gfxHigh++;
+                }
+                if (s.uclk != 0xffff) {
+                    uclkN++; uclkSum += s.uclk;
+                    if (s.uclk >= 1200) uclkHigh++;
+                }
+                if (s.gfxActivity != 0xffff && s.memActivity != 0xffff &&
+                    s.socketPower != 0xffff) {
+                    statN++; activity += s.gfxActivity; memActivity += s.memActivity;
+                    power += s.socketPower;
+                }
+                if (s.hotspot != 0xffff) maxHotspot = std::max(maxHotspot, s.hotspot);
+                if (s.memTemp != 0xffff) maxMemTemp = std::max(maxMemTemp, s.memTemp);
+                throttle |= s.throttle; indepThrottle |= s.indepThrottle;
+                if (getenv("QK_BENCH_METRICS_DETAIL"))
+                    fprintf(stderr,
+                            "[dpm-sample] ms=%7.2f gfx=%u uclk=%u avg_gfx=%u avg_uclk=%u "
+                            "gfx_busy=%u mem_busy=%u power=%u hotspot=%u memtemp=%u\n",
+                            s.ms, s.gfx, s.uclk, s.avgGfx, s.avgUclk,
+                            s.gfxActivity, s.memActivity, s.socketPower,
+                            s.hotspot, s.memTemp);
+            }
+            fprintf(stderr,
+                    "[dpm] samples=%zu interval=%ums gfx_mean=%.1f gfx_hmean=%.1f "
+                    "gfx_high=%.1f%% gfx_zero=%.1f%% uclk_mean=%.1f uclk_high=%.1f%% "
+                    "gfx_busy=%.1f%% mem_busy=%.1f%% power=%.1fW hotspot_max=%uC "
+                    "memtemp_max=%uC throttle=0x%x indep=0x%llx\n",
+                    metrics.size(), metricMs, gfxN ? gfxSum / gfxN : 0.0,
+                    gfxNonzero ? gfxNonzero / gfxInv : 0.0,
+                    gfxN ? 100.0 * gfxHigh / gfxN : 0.0,
+                    gfxN ? 100.0 * gfxZero / gfxN : 0.0,
+                    uclkN ? uclkSum / uclkN : 0.0,
+                    uclkN ? 100.0 * uclkHigh / uclkN : 0.0,
+                    statN ? activity / statN : 0.0,
+                    statN ? memActivity / statN : 0.0,
+                    statN ? power / statN : 0.0, maxHotspot, maxMemTemp,
+                    throttle, (unsigned long long)indepThrottle);
+        }
+        if (getenv("QK_BENCH_NO_TOKENS")) {
+            printf("serve-bench hashes: prefix=%016llx decode=%016llx\n",
+                   (unsigned long long)fnv1a64(prefixGen.data(), prefixGen.size() * 4),
+                   (unsigned long long)fnv1a64(gen.data(), gen.size() * 4));
+        } else {
+            if (prefix) {
+                printf("PREFIX:");
+                for (uint32_t t : prefixGen) printf(" %u", t);
+                printf("\n");
+            }
+            printf("GEN:");
+            for (uint32_t t : gen) printf(" %u", t);
+            printf("\n");
+        }
         qk_close(e);
         return 0;
     }
