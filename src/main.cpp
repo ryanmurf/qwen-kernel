@@ -2818,7 +2818,7 @@ struct qk_engine {
         std::vector<Buf> bufs;
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sStepReg, sStepGate,
             sGate, sWo, sAddN,
-            sAddNRoute, sPrep, sAttn, sMoeL, sMoeRS, sMoeS, sMoeS256, sMoeGU,
+            sAddNRoute, sPrep, sAttn, sMoeL, sMoeRS, sMoeS, sMoeS256, sMoeGU, sMoeGURow,
             sMoeGUs, sMoeDn, sMoeDns, sAdd3;
         VkDescriptorSet sAttnS, sAttnR;  // split-K decode attention
         VkBuffer aNormBuf = VK_NULL_HANDLE;
@@ -2863,7 +2863,7 @@ struct qk_engine {
         bbMContrib, bbLogits, bbIds, bbCarry;
     struct BLayer {
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sStepGate, sGate, sWo, sAddN,
-            sAddNRoute, sPrep, sAttn, sMoeL, sMoeRS, sMoeS, sMoeS256, sMoeGU, sMoeGURow,
+            sAddNRoute, sPrep, sAttn, sMoeL, sMoeRS, sMoeS, sMoeS256, sMoeGU,
             sMoeGUs, sMoeDn, sMoeDns, sMoeGUGroup, sMoeDnGroup, sAdd3, sAdd3Group;
         VkDescriptorSet sAttnS, sAttnR;  // split-K for the n==1 (decode) batch case
     };
