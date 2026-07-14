@@ -19,7 +19,7 @@ typedef struct qk_engine qk_engine;
 
 typedef struct qk_config {
     uint32_t n_slots; /* max concurrent sequences, 1..16 */
-    uint32_t n_ctx;   /* per-slot capacity (prompt + generated), 64..32768 */
+    uint32_t n_ctx;   /* per-slot capacity (prompt + generated), 64..65536 */
     uint32_t chunk;   /* GPU steps per host sync, 1..32 */
 } qk_config;
 
@@ -116,9 +116,11 @@ int qk_stage_topk(qk_engine *e, uint32_t k, uint32_t *ids, float *vals);
  * unsplit engine the internal prefix cache uses the same entries and will
  * clobber them. Returns 0 on success, negative on bad args. */
 uint32_t qk_state_n(const qk_engine *e);
-/* n_tok: the snapshot live token count. Attention KV is copied only up to
- * that many positions per kv-head (recurrent state always copies whole).
- * 0 = full stripes. Pass the SAME n_tok on save and load. */
+/* n_tok: the snapshot's live token count. Attention KV is copied only up to
+ * that many positions per kv-head (recurrent state always copies whole), so
+ * snapshot cost and resident pages track the conversation, not capacity.
+ * 0 = copy full stripes (the pre-n_tok behavior). Pass the SAME n_tok when
+ * loading that was passed when saving. */
 int qk_state_save(qk_engine *e, uint32_t slot, uint32_t idx, uint32_t n_tok);
 int qk_state_load(qk_engine *e, uint32_t slot, uint32_t idx, uint32_t n_tok);
 

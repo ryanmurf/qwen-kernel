@@ -217,14 +217,16 @@ impl WorkerLink {
     /// worker's snapshot entry `idx`. Mirrors the head-side qk_state_save/
     /// load so both stages' states move together. Must not interleave with
     /// in-flight op1 frames (replies would misalign).
-    pub fn state_op(&mut self, save: bool, slot: u32, idx: u32) -> Result<()> {
+    /// `n_tok` bounds the attention-KV copy to the snapshot's live length on
+    /// the worker (0 = full stripes); ride it in the header's 5th word.
+    pub fn state_op(&mut self, save: bool, slot: u32, idx: u32, n_tok: u32) -> Result<()> {
         if !self.pending.is_empty() {
             anyhow::bail!("state_op with {} run frames in flight", self.pending.len());
         }
         let result = (|| {
             let stream = self.stream()?;
             let mut frame = [0u8; 20];
-            for (i, word) in [if save { 3u32 } else { 4 }, slot, idx, 0, 0]
+            for (i, word) in [if save { 3u32 } else { 4 }, slot, idx, 0, n_tok]
                 .iter()
                 .enumerate()
             {
@@ -264,6 +266,33 @@ struct Seq {
     next: u32,
     sampling: Sampling,
     rng: SplitMix64,
+}
+
+/// A slot mid-prefill. Prefill is INTERLEAVED with other slots' decode: the
+/// main loop feeds one chunk per pass (two, pipelined, when the slot is
+/// alone), so admitting a long prompt no longer blocks a decoding neighbor
+/// for the whole prefill — the worst-case decode stall is one chunk.
+struct Prefill {
+    prompt: Vec<u32>,
+    done: u32,
+    reuse: u32,   // restored prefix length (for the [split-cache] line)
+    snap_at: u32, // pending history-boundary snapshot (0 = none/failed)
+    snapped: bool,
+    sampling: Sampling,
+    rng: SplitMix64,
+    last_id: Option<u32>,
+    cands: Vec<(u32, f32)>,
+}
+
+enum Phase {
+    Prefilling(Prefill),
+    Decoding(Seq),
+}
+
+/// Prefill chunk width: 128 when the slot is alone (bulk throughput), 32 when
+/// sharing the engine with another active slot (bounds their decode stall).
+fn chunk_cap(shared: bool) -> u32 {
+    if shared { 32 } else { CHUNK as u32 }
 }
 
 /// SplitMix64: tiny deterministic per-request stream (one draw per sampled
@@ -349,49 +378,112 @@ fn apply_sample(state: &mut SlotState, id: u32, eos: u32) -> bool {
     true
 }
 
-/// Chunked prefill of `prompt[start..end)` through both stages from
-/// base=start (start 0 resets the slot on both engines; start>0 continues
-/// restored state); returns the worker's id after position end-1.
-/// PIPELINED: the frame for chunk k is in flight while the head computes
-/// chunk k+1, so wall time ≈ max(head, worker) per chunk, not the sum.
-/// Returns with nothing in flight. `topk > 0` requests sampling candidates
-/// on the FINAL frame; since replies are FIFO, `cands` holds that frame's
-/// candidates on return (recv clears it on every earlier reply).
-#[allow(clippy::too_many_arguments)]
-fn split_prefill(
-    head: &mut Engine,
-    link: &mut WorkerLink,
-    slot: u32,
-    prompt: &[u32],
-    start: u32,
-    end: u32,
-    n_embd: usize,
-    hidden: &mut Vec<f32>,
-    ids: &mut Vec<u32>,
-    topk: u32,
-    cands: &mut Vec<(u32, f32)>,
-) -> Result<u32> {
-    let mut base = start;
-    let mut last = None;
-    let span = &prompt[start as usize..end as usize];
-    let n_chunks = span.chunks(CHUNK).count();
-    for (i, chunk) in span.chunks(CHUNK).enumerate() {
-        hidden.clear();
-        hidden.resize(chunk.len() * n_embd, 0.0);
-        head.stage_run(slot, Some(chunk), None, base, Some(hidden.as_mut_slice()), None)?;
-        let want = if i + 1 == n_chunks { topk } else { 0 };
-        link.send_run(slot, base, hidden, want)?;
-        while link.in_flight() > 1 {
-            link.recv_ids(ids, cands)?;
-            last = ids.last().copied();
+
+/// What sits downstream of the engine this driver holds.
+///
+/// `Remote` is split serving: the engine owns layers [0,S) and forwards hidden
+/// rows to a pipe-worker that owns the rest and returns ids (+ candidates).
+///
+/// `Local` means nothing does: the engine owns EVERY layer, so the same
+/// `stage_run` that would produce a hidden row produces the ids itself, and the
+/// candidates come straight off `stage_topk`. That is legal on an unsplit
+/// engine — qk_stage_run accepts one ("toks in, ids out, the same forward
+/// pass") and qk_stage_topk gates on `lastStage()`, which is `lEnd == nLayer`.
+///
+/// Local mode exists so the SINGLE-BOX path can sample. qk_step_chunk decides
+/// the next token inside the engine's fused argmax chain and feeds it straight
+/// back in, so a driver has nowhere to inject a sampled pick — the reason the
+/// old single-box path was greedy-only. Driving the same engine one position at
+/// a time through stage_run puts the choice back on this side of the ABI, at
+/// the cost of one host round trip per token (what split serving already pays).
+/// Greedy is unaffected: with temp <= 0 no candidates are requested and the id
+/// is still the engine's own argmax.
+enum Downstream {
+    Remote(WorkerLink),
+    /// Results of frames already run, in send order — the local stand-in for
+    /// the worker's reply pipe, so the send/recv loop below is shape-identical.
+    Local(VecDeque<(Vec<u32>, Vec<(u32, f32)>)>),
+}
+
+impl Downstream {
+    /// Run one frame: `n` positions of `slot` from `base`. Remote sends the
+    /// hidden rows on and collects the reply later; Local finishes the whole
+    /// forward pass now and queues what the reply would have been.
+    fn run_frame(
+        &mut self,
+        engine: &mut Engine,
+        slot: u32,
+        toks: &[u32],
+        base: u32,
+        topk: u32,
+        hidden: &mut Vec<f32>,
+        n_embd: usize,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Remote(link) => {
+                hidden.clear();
+                hidden.resize(toks.len() * n_embd, 0.0);
+                engine.stage_run(slot, Some(toks), None, base, Some(hidden.as_mut_slice()), None)?;
+                link.send_run(slot, base, hidden, topk)
+            }
+            Self::Local(pipe) => {
+                let mut ids = vec![0u32; toks.len()];
+                engine.stage_run(slot, Some(toks), None, base, None, Some(ids.as_mut_slice()))?;
+                let mut cands = Vec::new();
+                if topk > 0 {
+                    let mut cid = vec![0u32; topk as usize];
+                    let mut cval = vec![0f32; topk as usize];
+                    engine.stage_topk(topk, &mut cid, &mut cval)?;
+                    cands = cid.into_iter().zip(cval).collect();
+                }
+                pipe.push_back((ids, cands));
+                Ok(())
+            }
         }
-        base += chunk.len() as u32;
     }
-    while link.in_flight() > 0 {
-        link.recv_ids(ids, cands)?;
-        last = ids.last().copied();
+
+    /// Collect the next frame's reply, in send order.
+    fn recv_frame(
+        &mut self,
+        ids: &mut Vec<u32>,
+        cands: &mut Vec<(u32, f32)>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Remote(link) => link.recv_ids(ids, cands),
+            Self::Local(pipe) => {
+                let (i, c) = pipe
+                    .pop_front()
+                    .context("local driver: recv with no frame in flight")?;
+                *ids = i;
+                *cands = c;
+                Ok(())
+            }
+        }
     }
-    last.context("split prefill produced no ids")
+
+    /// Move the downstream stage's half of a snapshot. Local has no second
+    /// half — `engine.state_save/load` already moved the whole model's state.
+    fn state_op(&mut self, save: bool, slot: u32, idx: u32, n_tok: u32) -> anyhow::Result<()> {
+        match self {
+            Self::Remote(link) => link.state_op(save, slot, idx, n_tok),
+            Self::Local(_) => Ok(()),
+        }
+    }
+
+    fn bye(&mut self) {
+        if let Self::Remote(link) = self {
+            link.bye();
+        }
+    }
+
+    /// Drop frames that were run but never collected. The remote link poisons
+    /// its own socket on error; the local pipe would otherwise hand a stale
+    /// result to the NEXT request that lands on the slot.
+    fn reset_inflight(&mut self) {
+        if let Self::Local(pipe) = self {
+            pipe.clear();
+        }
+    }
 }
 
 /// Driver-side snapshot registry: which token prefix lives in each engine
@@ -420,41 +512,25 @@ fn best_snap(snaps: &[Option<SnapEntry>], prompt: &[u32]) -> Option<(u32, u32)> 
 }
 
 /// Admit one job: restore the longest snapshotted prefix if any (both
-/// stages), prefill the remainder, and take a history-boundary snapshot at
-/// job-specified `snap_prefix` on the way through. Returns the first
-/// generated token — the worker's greedy pick, or a draw from its top-k
-/// candidates when the job samples.
-#[allow(clippy::too_many_arguments)]
-fn split_admit(
+/// stages — a fast, bounded state copy) and hand back a `Prefill` cursor.
+/// The prompt itself is fed chunk-by-chunk from the main loop so other
+/// slots keep decoding while this one prefills.
+fn admit_job(
     head: &mut Engine,
-    link: &mut WorkerLink,
+    down: &mut Downstream,
     slot: u32,
-    prompt: &[u32],
+    prompt: Vec<u32>,
     snap_prefix: u32,
-    sampling: &Sampling,
-    rng: &mut SplitMix64,
+    sampling: Sampling,
     snaps: &mut [Option<SnapEntry>],
     lru_clock: &mut u64,
-    n_embd: usize,
-    hidden: &mut Vec<f32>,
-    ids: &mut Vec<u32>,
-) -> Result<u32> {
-    let topk = if sampling.is_greedy() { 0 } else { TOPK };
-    let mut cands: Vec<(u32, f32)> = Vec::new();
-    if topk > 0 {
-        tracing::info!(
-            "[sample] slot={slot} temp={} top_p={} seed={:#018x}",
-            sampling.temp,
-            sampling.top_p,
-            sampling.seed
-        );
-    }
+) -> Prefill {
     let np = prompt.len() as u32;
     let mut start = 0u32;
-    if let Some((idx, len)) = best_snap(snaps, prompt) {
+    if let Some((idx, len)) = best_snap(snaps, &prompt) {
         match head
-            .state_load(slot, idx)
-            .and_then(|()| link.state_op(false, slot, idx))
+            .state_load(slot, idx, len)
+            .and_then(|()| down.state_op(false, slot, idx, len))
         {
             Ok(()) => {
                 start = len;
@@ -471,60 +547,31 @@ fn split_admit(
             }
         }
     }
-    let mut snap_at = if snap_prefix > start && snap_prefix < np && !snaps.is_empty() {
+    let snap_at = if snap_prefix > start && snap_prefix < np && !snaps.is_empty() {
         snap_prefix
     } else {
         0
     };
-    let first = if snap_at > 0 {
-        // Prefill to the history boundary, snapshot BOTH stages there, then
-        // finish the prompt — the next turn restores at the boundary and
-        // prefills only its delta. The phase boundary holds even if the
-        // snapshot fails (re-feeding fed tokens would corrupt DeltaNet state).
-        let boundary = snap_at;
-        split_prefill(
-            head, link, slot, prompt, start, boundary, n_embd, hidden, ids, 0, &mut cands,
-        )?;
-        let idx = pick_entry(snaps);
-        match head
-            .state_save(slot, idx)
-            .and_then(|()| link.state_op(true, slot, idx))
-        {
-            Ok(()) => {
-                *lru_clock += 1;
-                snaps[idx as usize] = Some(SnapEntry {
-                    tokens: prompt[..boundary as usize].to_vec(),
-                    lru: *lru_clock,
-                });
-            }
-            Err(err) => {
-                // Snapshot is an optimization; the request itself proceeds.
-                tracing::warn!("split-cache snapshot failed: {err}");
-                snaps[idx as usize] = None;
-                snap_at = 0;
-            }
-        }
-        split_prefill(
-            head, link, slot, prompt, boundary, np, n_embd, hidden, ids, topk, &mut cands,
-        )?
-    } else {
-        split_prefill(
-            head, link, slot, prompt, start, np, n_embd, hidden, ids, topk, &mut cands,
-        )?
-    };
-    tracing::info!(
-        "[split-cache] slot={slot} prompt={np} reuse={start} prefill={} snap={snap_at}",
-        np - start
-    );
-    if topk > 0 && !cands.is_empty() {
-        return Ok(sample_candidates(
-            &cands,
+    if !sampling.is_greedy() {
+        tracing::info!(
+            "[sample] slot={slot} temp={} top_p={} seed={:#018x}",
             sampling.temp,
             sampling.top_p,
-            rng.next_f64(),
-        ));
+            sampling.seed
+        );
     }
-    Ok(first)
+    let seed = sampling.seed;
+    Prefill {
+        prompt,
+        done: start,
+        reuse: start,
+        snap_at,
+        snapped: false,
+        sampling,
+        rng: SplitMix64::new(seed),
+        last_id: None,
+        cands: Vec::new(),
+    }
 }
 
 /// LRU entry choice: first empty slot, else the least recently used.
@@ -549,12 +596,20 @@ fn pick_entry(snaps: &[Option<SnapEntry>]) -> u32 {
 /// head stage + worker instead of `qk_step_chunk`. A worker or engine failure
 /// fails every unfinished slot (worker state is unknown at that point) and
 /// the next sequence reconnects from scratch.
-pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc::Receiver<Cmd>) {
+pub fn run_split_engine_thread(
+    mut head: Engine,
+    link: Option<WorkerLink>,
+    rx: mpsc::Receiver<Cmd>,
+) {
     let n_slots = head.n_slots() as usize;
     let eos = head.eos_token();
-    let n_embd = link.n_embd;
+    let n_embd = link.as_ref().map_or(0, |l| l.n_embd);
+    let mut down = match link {
+        Some(l) => Downstream::Remote(l),
+        None => Downstream::Local(VecDeque::new()),
+    };
     let mut queue = VecDeque::new();
-    let mut slots: Vec<Option<(SlotState, Seq)>> = (0..n_slots).map(|_| None).collect();
+    let mut slots: Vec<Option<(SlotState, Phase)>> = (0..n_slots).map(|_| None).collect();
     let mut hidden = Vec::new();
     let mut ids = Vec::new();
     let mut cands: Vec<(u32, f32)> = Vec::new();
@@ -576,50 +631,32 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
             match cmd {
                 Cmd::Submit(job) => queue.push_back(job),
                 Cmd::Shutdown => {
-                    link.bye();
+                    down.bye();
                     return;
                 }
             }
         }
 
-        // Admit queued jobs into free slots; the whole prefill runs here,
-        // exactly like qk_slot_start does on the serial path.
+        // Admit queued jobs into free slots. Admission only restores the
+        // longest snapshotted prefix (bounded state copy); the prompt itself
+        // is fed chunk-by-chunk below, interleaved with other slots' decode.
         for (slot, state) in slots.iter_mut().enumerate() {
             if state.is_some() {
                 continue;
             }
             let Some(job) = queue.pop_front() else { break };
-            let mut rng = SplitMix64::new(job.sampling.seed);
-            match split_admit(
+            let prefill = admit_job(
                 &mut head,
-                &mut link,
+                &mut down,
                 slot as u32,
-                &job.prompt_ids,
+                job.prompt_ids,
                 job.snap_prefix,
-                &job.sampling,
-                &mut rng,
+                job.sampling,
                 &mut snaps,
                 &mut lru_clock,
-                n_embd,
-                &mut hidden,
-                &mut ids,
-            ) {
-                Ok(first) => {
-                    let mut slot_state = SlotState::new(job.events, job.max_gen, job.permit);
-                    let live = apply_sample(&mut slot_state, first, eos);
-                    let seq = Seq {
-                        pos: job.prompt_ids.len() as u32,
-                        next: if live { first } else { 0 },
-                        sampling: job.sampling,
-                        rng,
-                    };
-                    *state = Some((slot_state, seq));
-                }
-                Err(err) => {
-                    let _ = job.events.try_send(SlotEvent::Error(err.to_string()));
-                    snaps.iter_mut().for_each(|e| *e = None);
-                }
-            }
+            );
+            let slot_state = SlotState::new(job.events, job.max_gen, job.permit);
+            *state = Some((slot_state, Phase::Prefilling(prefill)));
         }
 
         // Flush backlogs; find out who still needs GPU work.
@@ -644,76 +681,208 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
         }
 
         if any_active {
-            // One token per active slot per pass, PIPELINED: fire every
-            // slot's frame after its local stage (phase 1) so the worker
-            // computes slot A while the head computes slot B; collect the
-            // replies in send order (phase 2). Worker+net time hides behind
-            // local compute whenever >1 slot is active.
+            // ONE PASS: every decoding slot advances one token, every
+            // prefilling slot advances one chunk (two, pipelined, when it is
+            // the only occupant), all PIPELINED through the worker: send
+            // phase fires every frame, recv phase collects in send order.
+            // A long admit therefore stalls a decoding neighbor by at most
+            // one small chunk, not a whole prompt.
+            let occupied = slots.iter().filter(|s| s.is_some()).count();
+            let shared = occupied > 1;
             let mut failure: Option<String> = None;
-            let mut stepped: Vec<usize> = Vec::with_capacity(n_slots);
+            // (slot, chunk_len) per sent frame, in order; chunk_len 0 = decode frame.
+            let mut sent: Vec<(usize, u32)> = Vec::with_capacity(n_slots + 1);
             for (slot, state) in slots.iter_mut().enumerate() {
-                let Some((slot_state, seq)) = state.as_mut() else {
+                let Some((slot_state, phase)) = state.as_mut() else {
                     continue;
                 };
                 if slot_state.finished {
                     continue;
                 }
-                hidden.clear();
-                hidden.resize(n_embd, 0.0);
-                let topk = if seq.sampling.is_greedy() { 0 } else { TOPK };
-                let sent = head
-                    .stage_run(
-                        slot as u32,
-                        Some(&[seq.next]),
-                        None,
-                        seq.pos,
-                        Some(hidden.as_mut_slice()),
-                        None,
-                    )
-                    .and_then(|()| link.send_run(slot as u32, seq.pos, &hidden, topk));
-                match sent {
-                    Ok(()) => stepped.push(slot),
-                    Err(err) => {
-                        failure = Some(err.to_string());
-                        break;
+                match phase {
+                    Phase::Decoding(seq) => {
+                        let topk = if seq.sampling.is_greedy() { 0 } else { TOPK };
+                        let ok = down.run_frame(
+                            &mut head,
+                            slot as u32,
+                            &[seq.next],
+                            seq.pos,
+                            topk,
+                            &mut hidden,
+                            n_embd,
+                        );
+                        match ok {
+                            Ok(()) => sent.push((slot, 0)),
+                            Err(err) => {
+                                failure = Some(err.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    Phase::Prefilling(p) => {
+                        let np = p.prompt.len() as u32;
+                        let bursts = if shared { 1 } else { 2 };
+                        for _ in 0..bursts {
+                            let stop = if p.snap_at > 0 && !p.snapped { p.snap_at } else { np };
+                            let n = chunk_cap(shared).min(stop - p.done);
+                            if n == 0 {
+                                break; // waiting on the snapshot barrier below
+                            }
+                            let chunk = &p.prompt[p.done as usize..(p.done + n) as usize];
+                            let topk = if p.done + n == np && !p.sampling.is_greedy() {
+                                TOPK
+                            } else {
+                                0
+                            };
+                            let ok = down.run_frame(
+                                &mut head,
+                                slot as u32,
+                                chunk,
+                                p.done,
+                                topk,
+                                &mut hidden,
+                                n_embd,
+                            );
+                            match ok {
+                                Ok(()) => {
+                                    sent.push((slot, n));
+                                    p.done += n; // reply pending; positions are fed
+                                }
+                                Err(err) => {
+                                    failure = Some(err.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        if failure.is_some() {
+                            break;
+                        }
                     }
                 }
             }
-            for slot in stepped {
+            for (slot, chunk_len) in sent {
                 if failure.is_some() {
                     break;
                 }
-                match link.recv_ids(&mut ids, &mut cands) {
+                match down.recv_frame(&mut ids, &mut cands) {
                     Ok(()) => {
-                        let Some((slot_state, seq)) = slots[slot].as_mut() else {
+                        let Some((slot_state, phase)) = slots[slot].as_mut() else {
                             continue;
                         };
-                        seq.pos += 1;
-                        let id = if cands.is_empty() {
-                            ids[0]
-                        } else {
-                            sample_candidates(
-                                &cands,
-                                seq.sampling.temp,
-                                seq.sampling.top_p,
-                                seq.rng.next_f64(),
-                            )
-                        };
-                        if apply_sample(slot_state, id, eos) {
-                            seq.next = id;
-                        }
-                        match flush_slot(slot_state) {
-                            FlushOutcome::Live => {}
-                            FlushOutcome::Drained | FlushOutcome::Closed => slots[slot] = None,
+                        match phase {
+                            Phase::Decoding(seq) => {
+                                seq.pos += 1;
+                                let id = if cands.is_empty() {
+                                    ids[0]
+                                } else {
+                                    sample_candidates(
+                                        &cands,
+                                        seq.sampling.temp,
+                                        seq.sampling.top_p,
+                                        seq.rng.next_f64(),
+                                    )
+                                };
+                                if apply_sample(slot_state, id, eos) {
+                                    seq.next = id;
+                                }
+                                match flush_slot(slot_state) {
+                                    FlushOutcome::Live => {}
+                                    FlushOutcome::Drained | FlushOutcome::Closed => {
+                                        slots[slot] = None
+                                    }
+                                }
+                            }
+                            Phase::Prefilling(p) => {
+                                let _ = chunk_len;
+                                p.last_id = ids.last().copied();
+                                if !cands.is_empty() {
+                                    p.cands = cands.clone();
+                                }
+                            }
                         }
                     }
                     Err(err) => failure = Some(err.to_string()),
+                }
+            }
+            // Barrier work (pipe now empty): boundary snapshots and
+            // prefill->decode transitions.
+            if failure.is_none() {
+                for (slot, state) in slots.iter_mut().enumerate() {
+                    let Some((slot_state, phase)) = state.as_mut() else {
+                        continue;
+                    };
+                    let Phase::Prefilling(p) = phase else { continue };
+                    let np = p.prompt.len() as u32;
+                    if p.snap_at > 0 && !p.snapped && p.done == p.snap_at {
+                        let idx = pick_entry(&snaps);
+                        match head
+                            .state_save(slot as u32, idx, p.snap_at)
+                            .and_then(|()| down.state_op(true, slot as u32, idx, p.snap_at))
+                        {
+                            Ok(()) => {
+                                lru_clock += 1;
+                                snaps[idx as usize] = Some(SnapEntry {
+                                    tokens: p.prompt[..p.snap_at as usize].to_vec(),
+                                    lru: lru_clock,
+                                });
+                            }
+                            Err(err) => {
+                                // Snapshot is an optimization; the request proceeds.
+                                tracing::warn!("split-cache snapshot failed: {err}");
+                                snaps[idx as usize] = None;
+                                p.snap_at = 0;
+                            }
+                        }
+                        p.snapped = true;
+                    }
+                    if p.done == np {
+                        tracing::info!(
+                            "[split-cache] slot={slot} prompt={np} reuse={} prefill={} snap={}",
+                            p.reuse,
+                            np - p.reuse,
+                            if p.snapped { p.snap_at } else { 0 }
+                        );
+                        let first = match (p.last_id, p.cands.is_empty()) {
+                            (Some(_), false) => sample_candidates(
+                                &p.cands,
+                                p.sampling.temp,
+                                p.sampling.top_p,
+                                p.rng.next_f64(),
+                            ),
+                            (Some(id), true) => id,
+                            (None, _) => {
+                                let _ = slot_state
+                                    .events
+                                    .try_send(SlotEvent::Error("prefill produced no ids".into()));
+                                *state = None;
+                                continue;
+                            }
+                        };
+                        let live = apply_sample(slot_state, first, eos);
+                        let seq = Seq {
+                            pos: np,
+                            next: if live { first } else { 0 },
+                            sampling: p.sampling,
+                            rng: SplitMix64::new(0), // replaced below
+                        };
+                        // Move the request rng into the decode phase so draws
+                        // continue the same per-request stream.
+                        let rng = std::mem::replace(&mut p.rng, SplitMix64::new(0));
+                        let mut seq = seq;
+                        seq.rng = rng;
+                        *phase = Phase::Decoding(seq);
+                        match flush_slot(slot_state) {
+                            FlushOutcome::Live => {}
+                            FlushOutcome::Drained | FlushOutcome::Closed => *state = None,
+                        }
+                    }
                 }
             }
             if let Some(message) = failure {
                 // Worker (or head engine) state is unknown; fail everything
                 // that was still generating and void the snapshot registry
                 // (a restarted worker lost its half). Finished slots drain.
+                down.reset_inflight();
                 snaps.iter_mut().for_each(|e| *e = None);
                 for state in slots.iter_mut() {
                     let Some((slot_state, _)) = state.as_mut() else {
@@ -733,7 +902,7 @@ pub fn run_split_engine_thread(mut head: Engine, mut link: WorkerLink, rx: mpsc:
             thread::sleep(Duration::from_millis(2));
         }
     }
-    link.bye();
+    down.bye();
 }
 
 #[cfg(test)]
