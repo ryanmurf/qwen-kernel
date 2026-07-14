@@ -14,8 +14,8 @@ using namespace metal;
 constant uint NSG [[function_constant(0)]];
 
 // One-threadgroup counting sort of the n*(nUsed) routed assignments over
-// 256 experts, plus the shared expert as virtual expert 256 holding every
-// token. Outputs: start[n_expert+2] prefix offsets, aTok/aSlot assignment lists.
+// n_expert experts, plus the shared expert as virtual expert n_expert holding
+// every token. Outputs: start[n_expert+2] prefix offsets, aTok/aSlot lists.
 struct GroupPC { uint n_embd; uint n_ff; uint n_expert; uint n_used; uint n; };
 
 kernel void moe_group(device const SelT* sel   [[buffer(0)]],
@@ -58,7 +58,7 @@ kernel void moe_group(device const SelT* sel   [[buffer(0)]],
     }
     for (uint i = tid; i < n; i += 256u) {          // shared expert: all tokens
         aTok[start[pc.n_expert] + i] = i;
-        aSlot[start[256] + i] = pc.n_used;
+        aSlot[start[pc.n_expert] + i] = pc.n_used;
     }
 }
 
