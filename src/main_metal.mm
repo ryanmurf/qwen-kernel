@@ -3465,8 +3465,11 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         // faults (the standalone-80B garbage-token + 2026-07-13 panic chain).
         // llama.cpp wraps every weight buffer in an MTLResidencySet; attaching
         // ours to the queue keeps the windows resident for every submit.
+        // Full-model engines only: the set holds whole windows, so a split
+        // stage would wire the entire file — the same trap the stage-scoped
+        // QK_MLOCK below avoids. Split stages keep lazy wiring + mlock.
         // QK_NO_RSET=1 disables (A/B; matches GGML_METAL_NO_RESIDENCY).
-        if (!getenv("QK_NO_RSET")) {
+        if (!getenv("QK_NO_RSET") && !splitStage()) {
             if (@available(macOS 15.0, *)) {
                 MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
                 rd.label = @"qk weights";
