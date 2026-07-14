@@ -3277,7 +3277,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeS256 = makePipe(c, "moe_select_256.spv", 4, 16);
     pMoeGroupPairs = makePipe(c, "moe_group_pairs.spv", 3, 12);
     pMoeGU = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
-    pMoeGURow3 = makePipe(c, "moe_gateup_iq3_rowtile.spv", 5, 16, 8);
+    pMoeGURow3 = makePipe(c, "moe_gateup_iq3_rowtile.spv", 5, 16, 4);
     pMoeGUGroup3 = makePipe(c, "moe_gateup_iq3_grouped.spv", 6, 16);
     pMoeGU4 = makePipe(c, "moe_gateup_iq4.spv", 5, 16);
     pMoeGUs = makePipe(c, "moe_gateup_q8.spv", 4, 16);
@@ -3916,7 +3916,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             stamp("moe.sel");
         }
         if (moeGuRowTile && !guIq4)
-            disp(pMoeGURow3, L.sMoeGURow, nUsed * ((ffE + 7) / 8), &pcv, 16);
+            disp(pMoeGURow3, L.sMoeGURow, nUsed * ((ffE + 3) / 4), &pcv, 16);
         else
             disp(guIq4 ? pMoeGU4 : pMoeGU, L.sMoeGU, nUsed * ffE, &pcv, 16);
         barrier();
