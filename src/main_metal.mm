@@ -6151,6 +6151,93 @@ static bool caseIQ4Gemm(MtlCtx& c, const std::string& tensorName,
     return mismatches == 0;
 }
 
+// Token-embedding lookup comparison (embed_q8_0 / embed_q6k vs CPU dequant +
+// rmsnorm).  embed_q8_0 is the one kernel unique to the standalone full 80B:
+// the 35B exercises embed_q6k daily and the split head embeds off-box, so the
+// Q8_0 path had zero coverage before this harness.
+static bool caseEmbCmp(MtlCtx& c, uint32_t N) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    const GgufTensor* tE = g.find("token_embd.weight");
+    const GgufTensor* tN = g.find("blk.0.attn_norm.weight");
+    if (!tE || !tN || (tE->type != GGML_Q8_0 && tE->type != GGML_Q6_K)) {
+        fprintf(stderr, "embcmp: need Q8_0/Q6_K token_embd + blk.0.attn_norm\n");
+        return false;
+    }
+    const bool q8 = tE->type == GGML_Q8_0;
+    const uint32_t K = (uint32_t)tE->ne[0], V = (uint32_t)tE->ne[1];
+    const float eps = 1e-6f;
+    if (!N) N = 8;
+    printf("\n== embcmp  %s token_embd[%u,%u], N=%u ==\n",
+           q8 ? "Q8_0" : "Q6_K", V, K, N);
+
+    // ids: fixed edge/known rows first, then a deterministic spread
+    std::vector<uint32_t> ids;
+    for (uint32_t v : {0u, 1u, 15u, 100u, V / 2u, V - 1u})
+        if (ids.size() < N) ids.push_back(v);
+    std::mt19937 rng(0x454d4243u);
+    while (ids.size() < N) ids.push_back(rng() % V);
+
+    const size_t rowBytes = ggmlRowBytes(tE->type, K);
+    id<MTLBuffer> bW = createBuf(c, (size_t)V * rowBytes, tE->data);
+    id<MTLBuffer> bIds = createBuf(c, N * sizeof(uint32_t), ids.data());
+    id<MTLBuffer> bX = createBuf(c, (size_t)N * K * sizeof(float));
+    id<MTLBuffer> bNw = createBuf(c, (size_t)K * sizeof(float), tN->data);
+    id<MTLBuffer> bXn = createBuf(c, (size_t)N * K * sizeof(float));
+    const char* fn = q8 ? "embed_q8_0" : "embed_q6k";
+    id<MTLComputePipelineState> pE = getPipe(c, fn, fn, 0);
+    struct { uint32_t k, idx, pr; float e; } pc{K, 0, 1, eps};
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [c.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pE];
+        uint32_t i = 0;
+        for (id<MTLBuffer> b : {bW, bIds, bX, bNw, bXn})
+            [enc setBuffer:b offset:0 atIndex:i++];
+        [enc setBytes:&pc length:sizeof(pc) atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, N)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            fprintf(stderr, "embcmp: Metal failure: %s\n",
+                    cb.error.localizedDescription.UTF8String);
+            return false;
+        }
+    }
+
+    const float* gx = (const float*)bX.contents;
+    const float* gxn = (const float*)bXn.contents;
+    const float* nw = (const float*)tN->data;
+    std::vector<float> row(K), xnr(K);
+    size_t xBits = 0;
+    double worstXn = 0;
+    for (uint32_t q = 0; q < N; ++q) {
+        const uint8_t* src = tE->data + (size_t)ids[q] * rowBytes;
+        if (q8) dequant_row_q8_0((const block_q8_0*)src, row.data(), K);
+        else    dequant_row_q6_K((const block_q6_K*)src, row.data(), K);
+        double ss = 0;
+        for (uint32_t k = 0; k < K; ++k) ss += (double)row[k] * row[k];
+        const double sc = 1.0 / std::sqrt(ss / K + eps);
+        double rms = std::sqrt(ss / K) + 1e-30;
+        for (uint32_t k = 0; k < K; ++k) {
+            if (row[k] != gx[(size_t)q * K + k]) ++xBits;
+            xnr[k] = (float)(row[k] * sc * nw[k]);
+            const double d = std::fabs(xnr[k] - gxn[(size_t)q * K + k]);
+            const double rel = d / (std::fabs(xnr[k]) + rms * 1e-3);
+            worstXn = std::max(worstXn, rel);
+        }
+    }
+    printf("raw dequant: %zu/%u values differ from CPU (want 0)\n",
+           xBits, N * K);
+    printf("normed:      worst rel %.3e (want < 1e-4)\n", worstXn);
+    const bool pass = xBits == 0 && worstXn < 1e-4;
+    printf("embcmp %s\n", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
 // Real Q6_K output-head comparison.  The shipping GEMV is the exact-logit
 // reference and the tiled path targets verifier batches.
 static bool caseHeadCmp(MtlCtx& c, uint32_t N, uint32_t iters) {
@@ -8902,6 +8989,8 @@ int main(int argc, char** argv) {
             ok = caseQ6GemvCmp(c, argU(2, 2), argU(3, 10));
         } else if (mode == "headcmp") {
             ok = caseHeadCmp(c, argU(2, 8), argU(3, 20));
+        } else if (mode == "embcmp") {
+            ok = caseEmbCmp(c, argU(2, 16));
         } else if (mode == "facmp") {
             ok = caseFaCmp(c, argU(2, 512), argU(3, 0), argU(4, 20));
         } else if (mode == "fasrvcmp") {
