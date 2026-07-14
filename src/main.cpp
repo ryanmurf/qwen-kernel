@@ -2797,7 +2797,7 @@ struct qk_engine {
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pStepReg, pStepGate, pGate, pGemvO,
         pAddN, pAddNRoute,
         pPrep, pAttn, pMoeL, pMoeRS, pMoeRSHier, pMoeS, pMoeS256, pMoeGroupPairs,
-        pMoeGU, pMoeGUGroup3,
+        pMoeGU, pMoeGURow3, pMoeGUGroup3,
         pMoeGUs, pMoeGUs64, pMoeDn4, pMoeDn4_128, pMoeDn6, pMoeDnsB,
         pMoeDnsB32, pMoeDnGroup4, pMoeDnGroup6, pAdd3, pAdd3Group, pHead,
         pAm1, pAm2, pEmb;
@@ -2846,6 +2846,7 @@ struct qk_engine {
     bool moeRouteFused = false; // QK_MOE_ROUTE_FUSED selects in the last router WG
     bool moeSelectHier = false; // QK_MOE_SELECT_HIER removes per-pick WG barriers
     bool moeSharedGu64 = false; // QK_MOE_SHARED_GU_64 uses only the 64 useful lanes
+    bool moeGuRowTile = false; // QK_MOE_GU_ROWTILE reuses x across 8 IQ3 rows
     bool moeDown128 = false; // QK_MOE_DOWN_128 shrinks underfilled routed IQ4 down WGs
     bool moeSharedDown32 = false; // QK_MOE_SHARED_DOWN_32 uses one useful wave
     bool moeGroupPrefillGu = false;   // expert-major routed gate/up in batch prefill
@@ -2862,7 +2863,7 @@ struct qk_engine {
         bbMContrib, bbLogits, bbIds, bbCarry;
     struct BLayer {
         VkDescriptorSet sRms, sP1, sP2, sP3, sAb, sConv, sStep, sStepGate, sGate, sWo, sAddN,
-            sAddNRoute, sPrep, sAttn, sMoeL, sMoeRS, sMoeS, sMoeS256, sMoeGU,
+            sAddNRoute, sPrep, sAttn, sMoeL, sMoeRS, sMoeS, sMoeS256, sMoeGU, sMoeGURow,
             sMoeGUs, sMoeDn, sMoeDns, sMoeGUGroup, sMoeDnGroup, sAdd3, sAdd3Group;
         VkDescriptorSet sAttnS, sAttnR;  // split-K for the n==1 (decode) batch case
     };
@@ -3019,7 +3020,7 @@ qk_engine::~qk_engine() {
                      &pGemvO4, &pAddN, &pAddNRoute, &pPrep,
                      &pAttn, &pAttnS, &pAttnSG2, &pAttnSG4, &pAttnSG8, &pAttnR,
                      &pMoeL, &pMoeRS, &pMoeRSHier, &pMoeS, &pMoeS256, &pMoeGroupPairs,
-                     &pMoeGU, &pMoeGUGroup3,
+                     &pMoeGU, &pMoeGURow3, &pMoeGUGroup3,
                      &pMoeGUs, &pMoeGUs64, &pMoeDn4, &pMoeDn4_128, &pMoeDn6,
                      &pMoeDnsB, &pMoeDnsB32, &pMoeDnGroup4, &pMoeDnGroup6,
                      &pMoeGU4, &pAdd3, &pAdd3Group, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB,
@@ -3276,6 +3277,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeS256 = makePipe(c, "moe_select_256.spv", 4, 16);
     pMoeGroupPairs = makePipe(c, "moe_group_pairs.spv", 3, 12);
     pMoeGU = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
+    pMoeGURow3 = makePipe(c, "moe_gateup_iq3_rowtile.spv", 5, 16, 8);
     pMoeGUGroup3 = makePipe(c, "moe_gateup_iq3_grouped.spv", 6, 16);
     pMoeGU4 = makePipe(c, "moe_gateup_iq4.spv", 5, 16);
     pMoeGUs = makePipe(c, "moe_gateup_q8.spv", 4, 16);
@@ -3640,6 +3642,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         L.sMoeS = mkSet(pMoeS, {bML.buf, mgis, bXn2.buf, bMSel.buf});
         L.sMoeS256 = mkSet(pMoeS256, {bML.buf, mgis, bXn2.buf, bMSel.buf});
         L.sMoeGU = mkSet(guIq4 ? pMoeGU4 : pMoeGU, {mge, mue, bXn2.buf, bMSel.buf, bMH.buf});
+        L.sMoeGURow = mkSet(pMoeGURow3, {mge, mue, bXn2.buf, bMSel.buf, bMH.buf});
         L.sMoeGUs = mkSet(pMoeGUs, {mgs, mus, bXn2.buf, bMH.buf});
         L.sMoeDn = mkSet(L.downQ6 ? pMoeDn6 : pMoeDn4, {mde, bMH.buf, bMSel.buf, bMY.buf});
         L.sMoeDns = mkSet(pMoeDnsB, {mds, bMH.buf, bMSel.buf, bMY2.buf});
@@ -3800,6 +3803,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     moeRouteFused = getenv("QK_MOE_ROUTE_FUSED") != nullptr;
     moeSelectHier = getenv("QK_MOE_SELECT_HIER") != nullptr;
     moeSharedGu64 = getenv("QK_MOE_SHARED_GU_64") != nullptr;
+    moeGuRowTile = getenv("QK_MOE_GU_ROWTILE") != nullptr;
     moeDown128 = getenv("QK_MOE_DOWN_128") != nullptr;
     moeSharedDown32 = getenv("QK_MOE_SHARED_DOWN_32") != nullptr;
     bool groupAll = getenv("QK_MOE_GROUP_PREFILL") != nullptr;
@@ -3911,7 +3915,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             barrier();
             stamp("moe.sel");
         }
-        disp(guIq4 ? pMoeGU4 : pMoeGU, L.sMoeGU, nUsed * ffE, &pcv, 16);
+        if (moeGuRowTile && !guIq4)
+            disp(pMoeGURow3, L.sMoeGURow, nUsed * ((ffE + 7) / 8), &pcv, 16);
+        else
+            disp(guIq4 ? pMoeGU4 : pMoeGU, L.sMoeGU, nUsed * ffE, &pcv, 16);
         barrier();
         stamp("moe.gu");
         disp(L.downQ6 ? pMoeDn6 : (moeDown128 ? pMoeDn4_128 : pMoeDn4),
