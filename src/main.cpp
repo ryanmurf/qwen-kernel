@@ -2848,7 +2848,8 @@ struct qk_engine {
     bool moeSharedGu64 = false; // QK_MOE_SHARED_GU_64 uses only the 64 useful lanes
     bool moeDown128 = false; // QK_MOE_DOWN_128 shrinks underfilled routed IQ4 down WGs
     bool moeSharedDown32 = false; // QK_MOE_SHARED_DOWN_32 uses one useful wave
-    bool moeGroupPrefill = false; // QK_MOE_GROUP_PREFILL expert-major routed MoE
+    bool moeGroupPrefillGu = false;   // expert-major routed gate/up in batch prefill
+    bool moeGroupPrefillDown = false; // expert-major routed down in batch prefill
     bool dnStepReg = false; // QK_DN_STEP_REG caches each state row across both passes
     bool dnStepGate = false; // QK_DN_STEP_GATE_FUSED removes the o[] round trip
     Buf bbPos;                 // 1-entry position buffer: the batch n==1 split-K
@@ -3801,7 +3802,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     moeSharedGu64 = getenv("QK_MOE_SHARED_GU_64") != nullptr;
     moeDown128 = getenv("QK_MOE_DOWN_128") != nullptr;
     moeSharedDown32 = getenv("QK_MOE_SHARED_DOWN_32") != nullptr;
-    moeGroupPrefill = getenv("QK_MOE_GROUP_PREFILL") != nullptr;
+    bool groupAll = getenv("QK_MOE_GROUP_PREFILL") != nullptr;
+    moeGroupPrefillGu = groupAll || getenv("QK_MOE_GROUP_PREFILL_GU") != nullptr;
+    moeGroupPrefillDown = groupAll || getenv("QK_MOE_GROUP_PREFILL_DOWN") != nullptr;
     dnStepReg = getenv("QK_DN_STEP_REG") != nullptr;
     dnStepGate = getenv("QK_DN_STEP_GATE_FUSED") != nullptr;
     const uint32_t amWgs = (vocab + 4095) / 4096;
@@ -4516,13 +4519,16 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         // The grouped primitive is intentionally prefill-only and currently
         // targets the 35B IQ3 routed gate/up format.  Decode (n==1) and the
         // 80B IQ4 gate/up shape retain their measured card-best paths.
-        bool groupMoe = moeGroupPrefill && n * nUsed >= nExp && !guIq4 && !tapsDir;
-        if (groupMoe) {
+        bool groupEligible = n * nUsed >= nExp && !guIq4 && !tapsDir;
+        bool groupGu = groupEligible && moeGroupPrefillGu;
+        bool groupDown = groupEligible && moeGroupPrefillDown;
+        if (groupGu || groupDown) {
             struct { uint32_t nExpert, nUsed, nTokens; } pcPairs{nExp, nUsed, n};
             zdim = 1;
             disp(pMoeGroupPairs, sbMoeGroupPairs, 1, &pcPairs, 12);
             barrier();
-
+        }
+        if (groupGu) {
             vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pMoeGUGroup3.p);
             vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pMoeGUGroup3.pl, 0, 1, &BL.sMoeGUGroup, 0, nullptr);
@@ -4534,7 +4540,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             disp(guIq4 ? pMoeGU4 : pMoeGU, BL.sMoeGU, nUsed * ffE, &pcv, 16);
         }
         barrier();
-        if (groupMoe) {
+        if (groupDown) {
             Pipe& pgd = L.downQ6 ? pMoeDnGroup6 : pMoeDnGroup4;
             vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pgd.p);
             vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,

@@ -28,7 +28,7 @@ void main() {
     uint kb = pc.n_ff / 256u;
     uint ng = kb * 16u;
     float qv[16];
-    float ds = 0.0;
+    float d = 0.0, sc = 0.0;
     for (uint j = 0u; j < 16u; ++j) qv[j] = 0.0;
     if (tid < ng) {
         uint b = tid >> 4u;
@@ -37,7 +37,8 @@ void main() {
         uint r = (gg & 7u) >> 1u;
         uint is = gg & 1u;
         uint bi = (eid * pc.n_embd + o) * kb + b;
-        ds = float(dw[bi].d) * float(int(dw[bi].scales[hh * 8u + r * 2u + is]));
+        d = float(dw[bi].d);
+        sc = float(int(dw[bi].scales[hh * 8u + r * 2u + is]));
         uint qlBase = hh * 64u + (r & 1u) * 32u + is * 16u;
         uint qhBase = hh * 32u + is * 16u;
         uint shift = r * 2u;
@@ -62,7 +63,7 @@ void main() {
             uint ho = (rq * (pc.n_used + 1u) + s) * pc.n_ff + b * 256u + gg * 16u;
             float dot = 0.0;
             for (uint j = 0u; j < 16u; ++j) dot += qv[j] * h[ho + j];
-            acc = sel[rq].w[s] * ds * dot;
+            acc = sel[rq].w[s] * d * sc * dot;
         }
         float sum = subgroupAdd(acc);
         if (tid == 0u) {
