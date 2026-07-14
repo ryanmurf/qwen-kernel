@@ -2872,7 +2872,7 @@ struct qk_engine {
         pMoeLA, pMoeLS, pAddNSg, pMoeGu, pMoeD4, pMoeD6, pAddN, pHead, pHeadTop,
         pHeadTop64, pHeadF8, pHeadF16, pHeadF32, pHeadTopReduce, pAm1, pAm2, pEmb,
         pPrepB, pAttnB, pAttnBM, pAbB, pConvB, pStepB, pGateB,
-        pGemmB, pGemmBAligned, pGemmBK;
+        pGemmB, pGemmBExact, pGemmBAligned, pGemmBK;
     // Adaptive decode attention either coarsens f32 producer scheduling or
     // shares compact-cache reads across GQA heads. Both retain one original
     // 256-key partial per query head/chunk and the shipping reducer.
@@ -2886,7 +2886,7 @@ struct qk_engine {
     int moeNormSplitMode = -1;  // -1 auto, 0 fused recompute, 1 split/reuse
     // IQ4_XS twins for the 80B: dense-proj gemv/gemm + routed gate/up.
     id<MTLComputePipelineState> pGemv4, pGemv4O, pGemmB4, pGemmB4Aligned,
-        pMoeGu4, pMoeGuG4i, pMoeGuG5i;
+        pMoeGu4, pMoeGuG4i, pMoeGuG4iShared, pMoeGuG5i, pMoeGuG5iWork;
     // chunked delta rule (prefill DN): parallel kq/solve + chunk-serial step
     id<MTLComputePipelineState> pDnKq, pDnSolve, pDnStepC;
     id<MTLBuffer> bbDnKQ, bbDnUW, bbDnAtt, bbDnEl;
@@ -2959,13 +2959,13 @@ struct qk_engine {
     // Grouped (decode-once) MoE gate+up for prefill chunks. Variants:
     // 1 = v1 read-once (SLOWER — kept as bit-exact control); 2 = v2 f32
     // narrow; 3 = v3 f16 64x32 (llama mul_mm_id class — fastest, opt-in);
-    // 4 = v4 f32 32x32 (exact-class, default); 5 = packed-f16 with compact
+    // 4 = v4 f32 32x32 (35B default); 5 = packed-f16 with compact
     // (expert,token-tile) work pairs (`QK_MOE_WORK=0` restores grid-z);
+    // 80B IQ4 defaults to v5 with its shared expert retained in v4 f32;
     // 6 is retained as an explicit compact-work alias.
-    // Grouping only pays once
-    // experts see enough tokens: default fires at n >= moeGroupN (192) with
-    // variant 4; QK_MOE_GROUPED forces a variant at ALL n (0 disables),
-    // QK_MOE_GROUP_N overrides the threshold.
+    // Grouping only pays once experts see enough tokens: the selected model
+    // default fires at n >= moeGroupN (192); QK_MOE_GROUPED forces a variant
+    // at ALL n (0 disables), and QK_MOE_GROUP_N overrides the threshold.
     int moeGrouped = 4;
     uint32_t moeGroupN = 192;
     bool moeWork = true;     // compact packed-v5 prefill tiles; env 0 is rollback
@@ -3772,6 +3772,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (gv && !strcmp(gv, "h2")) fn = "gemm_q8_0_h2";
         if (gv && !strcmp(gv, "hp")) fn = "gemm_q8_0_hp";
         pGemmB = getPipe(c, "gemm_q8_0", fn, 0);
+        pGemmBExact = !strcmp(fn, "gemm_q8_0")
+            ? pGemmB : getPipe(c, "gemm_q8_0", "gemm_q8_0", 0);
         if (const char* v = getenv("QK_GEMM_ALIGNED")) gemmAligned = atoi(v) != 0;
         if (gemmAligned && !strcmp(fn, "gemm_q8_0_hp"))
             pGemmBAligned = getPipe(c, "gemm_q8_0", "gemm_q8_0_hp_aligned", 0);
@@ -3805,7 +3807,9 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             pGemmB4Aligned = getPipe(c, "gemm_iq4_xs", "gemm_iq4_xs_hp_aligned", 0);
         pMoeGu4   = getPipe(c, "moe_gateup_all", "moe_gateup_all_iq4", nsg);
         pMoeGuG4i = getPipe(c, "moe_grouped", "moe_gu_grouped4_iq4", 0);
+        pMoeGuG4iShared = getPipe(c, "moe_grouped", "moe_gu_grouped4_shared_iq4", 0);
         pMoeGuG5i = getPipe(c, "moe_grouped", "moe_gu_grouped5_iq4", 0);
+        pMoeGuG5iWork = getPipe(c, "moe_grouped", "moe_gu_grouped5_iq4_work", 0);
     }
     pMoeDG4  = getPipe(c, "moe_down_grouped", "moe_down_grouped_iq4", 0);
     pMoeDG6  = getPipe(c, "moe_down_grouped", "moe_down_grouped_q6k", 0);
@@ -3821,7 +3825,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeDGP6Work = getPipe(c, "moe_down_grouped", "moe_down_grouped_p_work_q6k", 0);
     pMoeDR   = getPipe(c, "moe_down_grouped", "moe_down_reduce", 0);
     pLogG    = getPipe(c, "moe_logits", "moe_logits_gemm", 0);
-    if (const char* mg = getenv("QK_MOE_GROUPED")) { moeGrouped = atoi(mg); moeGroupN = 0; }
+    if (const char* mg = getenv("QK_MOE_GROUPED")) {
+        moeGrouped = atoi(mg);
+        moeGroupN = 0;
+    } else if (guIq4 && nExp == 512u) {
+        moeGrouped = 5;
+    }
     if (const char* mn = getenv("QK_MOE_GROUP_N")) moeGroupN = (uint32_t)atoi(mn);
     if (const char* mw = getenv("QK_MOE_WORK")) moeWork = atoi(mw) != 0;
     // The compact decode gate/up kernels currently implement the 35B IQ3
@@ -5107,6 +5116,12 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     dspz(pGemmB4Aligned && M % 64u == 0u && n % 32u == 0u
                              ? pGemmB4Aligned : pGemmB4,
                          {W, X, Y}, &pcG, 12, (M + 63) / 64, 128, (n + 31) / 32);
+                else if (n < 64u)
+                    // The first tiled shape (N=48) is a correctness cliff for
+                    // the 35B's near-tie gate under f16 fragments. Its f32
+                    // twin retains weight reuse without changing N>=64 perf.
+                    dspz(pGemmBExact, {W, X, Y}, &pcG, 12,
+                         (M + 127) / 128, 256, (n + 63) / 64);
                 else if (prefillRepack && prefillRepackUse && WP.b && pGemmBK &&
                          M % 64u == 0u && n % 32u == 0u)
                     dspz(pGemmBK, {WP, X, Y}, &pcG, 12,
@@ -5314,8 +5329,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             nextPass("select");
             if (useGrouped) {
                 struct { uint32_t a, b, cc, d, n; } pcg{nEmbd, ffE, nExp, nUsed, n};
-                const bool compactWork = (moeGrouped == 5 || moeGrouped == 6) &&
-                                         !guIq4 && moeWork;
+                const bool compactWork = (moeGrouped == 5 || moeGrouped == 6) && moeWork;
                 const uint32_t workCap = nExp + (n * nUsed + 31) / 32 + (n + 31) / 32;
                 if (compactWork)
                     dspz(pMoeGrpWork, {bbMSel, bbStart, bbATok, bbASlot, bbWork},
@@ -5327,7 +5341,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 nextPass("moe-group");
                 if (!skGu) {
                 if (compactWork)
-                    dspz(pMoeGuG5Work,
+                    dspz(guIq4 ? pMoeGuG5iWork : pMoeGuG5Work,
                          {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
                           bbASlot, bbMH, bbWork}, &pcv, 16,
                          workCap * (ffE / 32), 128, 1);
@@ -5352,6 +5366,10 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                     dspz(pMoeGuG, {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
                                    bbASlot, bbMH}, &pcv, 16, ((nExp + 1) * ffE + nsg - 1) / nsg,
                          thrN, 1);
+                if (compactWork && guIq4)
+                    dspz(pMoeGuG4iShared,
+                         {L.mge, L.mue, L.mgs, L.mus, bbXn2, bbStart, bbATok,
+                          bbASlot, bbMH}, &pcv, 16, ffE / 32, 128, (n + 31) / 32);
                 }
                 bar();
                 nextPass("moe-gateup");

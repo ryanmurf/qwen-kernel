@@ -963,24 +963,27 @@ kernel void moe_gu_grouped5_work(device const block_iq3_xxs* gwE [[buffer(0)]],
 
 // ---- IQ4_XS routed gate/up twins (80B) ----
 
-kernel void moe_gu_grouped4_iq4(device const block_iq4_xs*  gwE   [[buffer(0)]],
-                            device const block_iq4_xs*  uwE   [[buffer(1)]],
-                            device const block_q8_0*    gwS   [[buffer(2)]],
-                            device const block_q8_0*    uwS   [[buffer(3)]],
-                            device const float*         x     [[buffer(4)]],
-                            device const uint*          start [[buffer(5)]],
-                            device const uint*          aTok  [[buffer(6)]],
-                            device const uint*          aSlot [[buffer(7)]],
-                            device float*               h     [[buffer(8)]],
-                            constant MoePC&             pc    [[buffer(9)]],
-                            uint3 tid3  [[thread_position_in_threadgroup]],
-                            uint3 tgpig [[threadgroup_position_in_grid]],
-                            uint  sgid  [[simdgroup_index_in_threadgroup]],
-                            uint  slid  [[thread_index_in_simdgroup]])
+template <bool SHARED>
+static inline void moe_gu_grouped4_iq4_body(device const block_iq4_xs* gwE,
+                                             device const block_iq4_xs* uwE,
+                                             device const block_q8_0* gwS,
+                                             device const block_q8_0* uwS,
+                                             device const float* x,
+                                             device const uint* start,
+                                             device const uint* aTok,
+                                             device const uint* aSlot,
+                                             device float* h,
+                                             constant MoePC& pc,
+                                             threadgroup float* WgSh,
+                                             threadgroup float* WuSh,
+                                             threadgroup float* Xsh,
+                                             threadgroup float* outb,
+                                             uint3 tid3, uint3 tgpig,
+                                             uint sgid, uint slid)
 {
     const uint tid = tid3.x;                 // 0..127, 4 simdgroups
     const uint nrt = pc.n_ff / G4M;          // row tiles per expert
-    const uint e  = tgpig.x / nrt;           // 0..255 routed, 256 shared
+    const uint e  = SHARED ? pc.n_expert : tgpig.x / nrt;
     const uint rt = tgpig.x % nrt;
     const uint s0 = start[e], c = start[e + 1u] - s0;
     if (c == 0u) return;
@@ -989,17 +992,14 @@ kernel void moe_gu_grouped4_iq4(device const block_iq4_xs*  gwE   [[buffer(0)]],
     const uint hs = (pc.n_used + 1u) * pc.n_ff;
     const uint row0 = rt * G4M;
 
-    threadgroup float WgSh[G4M * G4S];
-    threadgroup float WuSh[G4M * G4S];
-    threadgroup float Xsh[G4N * G4S];
-    threadgroup float outb[4u * 144u];       // per-simd G(72)|U(72) bounce
-
     const uint smat = tid >> 6;              // 0 = gate, 1 = up
     const uint srow = (tid >> 1) & 31u;
     const uint sgrp = tid & 1u;
     threadgroup float* dst = (smat ? WuSh : WgSh) + srow * G4S + sgrp * 32u;
 
-    for (uint t0 = 0u; t0 < c; t0 += G4N) {
+    const uint tBegin = SHARED ? tgpig.z * G4N : 0u;
+    const uint tEnd = SHARED ? min(tBegin + G4N, c) : c;
+    for (uint t0 = tBegin; t0 < tEnd; t0 += G4N) {
         simdgroup_float8x8 accG[4], accU[4];
         for (uint i = 0u; i < 4u; ++i) {
             accG[i] = simdgroup_float8x8(0.0f);
@@ -1086,6 +1086,52 @@ kernel void moe_gu_grouped4_iq4(device const block_iq4_xs*  gwE   [[buffer(0)]],
     }
 }
 
+kernel void moe_gu_grouped4_iq4(device const block_iq4_xs* gwE [[buffer(0)]],
+                                 device const block_iq4_xs* uwE [[buffer(1)]],
+                                 device const block_q8_0* gwS [[buffer(2)]],
+                                 device const block_q8_0* uwS [[buffer(3)]],
+                                 device const float* x [[buffer(4)]],
+                                 device const uint* start [[buffer(5)]],
+                                 device const uint* aTok [[buffer(6)]],
+                                 device const uint* aSlot [[buffer(7)]],
+                                 device float* h [[buffer(8)]],
+                                 constant MoePC& pc [[buffer(9)]],
+                                 uint3 tid3 [[thread_position_in_threadgroup]],
+                                 uint3 tgpig [[threadgroup_position_in_grid]],
+                                 uint sgid [[simdgroup_index_in_threadgroup]],
+                                 uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup float WgSh[G4M * G4S];
+    threadgroup float WuSh[G4M * G4S];
+    threadgroup float Xsh[G4N * G4S];
+    threadgroup float outb[4u * 144u];
+    moe_gu_grouped4_iq4_body<false>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot,
+        h, pc, WgSh, WuSh, Xsh, outb, tid3, tgpig, sgid, slid);
+}
+
+kernel void moe_gu_grouped4_shared_iq4(device const block_iq4_xs* gwE [[buffer(0)]],
+                                        device const block_iq4_xs* uwE [[buffer(1)]],
+                                        device const block_q8_0* gwS [[buffer(2)]],
+                                        device const block_q8_0* uwS [[buffer(3)]],
+                                        device const float* x [[buffer(4)]],
+                                        device const uint* start [[buffer(5)]],
+                                        device const uint* aTok [[buffer(6)]],
+                                        device const uint* aSlot [[buffer(7)]],
+                                        device float* h [[buffer(8)]],
+                                        constant MoePC& pc [[buffer(9)]],
+                                        uint3 tid3 [[thread_position_in_threadgroup]],
+                                        uint3 tgpig [[threadgroup_position_in_grid]],
+                                        uint sgid [[simdgroup_index_in_threadgroup]],
+                                        uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup float WgSh[G4M * G4S];
+    threadgroup float WuSh[G4M * G4S];
+    threadgroup float Xsh[G4N * G4S];
+    threadgroup float outb[4u * 144u];
+    moe_gu_grouped4_iq4_body<true>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot,
+        h, pc, WgSh, WuSh, Xsh, outb, tid3, tgpig, sgid, slid);
+}
+
 
 // IQ4_XS twin of moe_gu_grouped5 (80B routed experts).
 // Both MMA operands are staged as contiguous 64-half blocks so every
@@ -1097,36 +1143,40 @@ kernel void moe_gu_grouped4_iq4(device const block_iq4_xs*  gwE   [[buffer(0)]],
 // 32 rows/matrix x 32 tokens, K-chunk 64; f16 staging, f32 accumulators
 // (llama-identical numeric class); 14.6 KB threadgroup. Token tiles ride
 // grid z (early-return past c) so hot experts fan out instead of looping.
-kernel void moe_gu_grouped5_iq4(device const block_iq4_xs*  gwE   [[buffer(0)]],
-                            device const block_iq4_xs*  uwE   [[buffer(1)]],
-                            device const block_q8_0*    gwS   [[buffer(2)]],
-                            device const block_q8_0*    uwS   [[buffer(3)]],
-                            device const float*         x     [[buffer(4)]],
-                            device const uint*          start [[buffer(5)]],
-                            device const uint*          aTok  [[buffer(6)]],
-                            device const uint*          aSlot [[buffer(7)]],
-                            device float*               h     [[buffer(8)]],
-                            constant MoePC&             pc    [[buffer(9)]],
-                            uint3 tid3  [[thread_position_in_threadgroup]],
-                            uint3 tgpig [[threadgroup_position_in_grid]],
-                            uint  sgid  [[simdgroup_index_in_threadgroup]],
-                            uint  slid  [[thread_index_in_simdgroup]])
+// MAP=0 uses that dense grid; MAP=2 consumes moe_group_work's compact
+// (expert,token-tile) pairs and launches no empty expert/tile combinations.
+template <uint MAP>
+static inline void moe_gu_grouped5_iq4_body(device const block_iq4_xs* gwE,
+                                             device const block_iq4_xs* uwE,
+                                             device const block_q8_0* gwS,
+                                             device const block_q8_0* uwS,
+                                             device const float* x,
+                                             device const uint* start,
+                                             device const uint* aTok,
+                                             device const uint* aSlot,
+                                             device float* h,
+                                             device const uint* map,
+                                             constant MoePC& pc,
+                                             threadgroup half* WgSh,
+                                             threadgroup half* WuSh,
+                                             threadgroup half* Xsh,
+                                             threadgroup float* outb,
+                                             uint3 tid3, uint3 tgpig,
+                                             uint sgid, uint slid)
 {
     const uint tid = tid3.x;                 // 0..127, 4 simdgroups
     const uint nrt = pc.n_ff / G4M;          // 32-row tiles per expert
-    const uint e  = tgpig.x / nrt;           // 0..255 routed, 256 shared
+    const uint ei = tgpig.x / nrt;
+    const uint e  = MAP == 2u ? map[2u * ei] : ei;
     const uint rt = tgpig.x % nrt;
+    if (e > pc.n_expert) return;              // compact-work sentinel
+    if (MAP == 2u && e == pc.n_expert) return; // f32 shared companion owns it
     const uint s0 = start[e], c = start[e + 1u] - s0;
     if (c == 0u) return;
 
     const uint K = pc.n_embd;
     const uint hs = (pc.n_used + 1u) * pc.n_ff;
     const uint row0 = rt * G4M;
-
-    threadgroup half  WgSh[G4M * 64u];
-    threadgroup half  WuSh[G4M * 64u];
-    threadgroup half  Xsh[64u * G4N];
-    threadgroup float outb[4u * 144u];       // per-simd G(72)|U(72) bounce
 
     // staging assignment: one (matrix, row, 32-group) per thread per chunk
     const uint smat = tid >> 6;              // 0 = gate, 1 = up
@@ -1135,7 +1185,7 @@ kernel void moe_gu_grouped5_iq4(device const block_iq4_xs*  gwE   [[buffer(0)]],
     threadgroup half* wsh = (smat ? WuSh : WgSh)
                           + ((srow >> 3) * 8u) * 64u + (srow & 7u) * 8u;
 
-    const uint t0 = tgpig.z * G4N;               // token tile (grid z)
+    const uint t0 = MAP == 2u ? map[2u * ei + 1u] : tgpig.z * G4N;
     if (t0 >= c) return;
     {
         simdgroup_float8x8 accG[4], accU[4];
@@ -1239,4 +1289,51 @@ kernel void moe_gu_grouped5_iq4(device const block_iq4_xs*  gwE   [[buffer(0)]],
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
+}
+
+kernel void moe_gu_grouped5_iq4(device const block_iq4_xs* gwE [[buffer(0)]],
+                                 device const block_iq4_xs* uwE [[buffer(1)]],
+                                 device const block_q8_0* gwS [[buffer(2)]],
+                                 device const block_q8_0* uwS [[buffer(3)]],
+                                 device const float* x [[buffer(4)]],
+                                 device const uint* start [[buffer(5)]],
+                                 device const uint* aTok [[buffer(6)]],
+                                 device const uint* aSlot [[buffer(7)]],
+                                 device float* h [[buffer(8)]],
+                                 constant MoePC& pc [[buffer(9)]],
+                                 uint3 tid3 [[thread_position_in_threadgroup]],
+                                 uint3 tgpig [[threadgroup_position_in_grid]],
+                                 uint sgid [[simdgroup_index_in_threadgroup]],
+                                 uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup half WgSh[G4M * 64u];
+    threadgroup half WuSh[G4M * 64u];
+    threadgroup half Xsh[64u * G4N];
+    threadgroup float outb[4u * 144u];
+    moe_gu_grouped5_iq4_body<0>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot, h,
+        start, pc, WgSh, WuSh, Xsh, outb, tid3, tgpig, sgid, slid);
+}
+
+kernel void moe_gu_grouped5_iq4_work(device const block_iq4_xs* gwE [[buffer(0)]],
+                                      device const block_iq4_xs* uwE [[buffer(1)]],
+                                      device const block_q8_0* gwS [[buffer(2)]],
+                                      device const block_q8_0* uwS [[buffer(3)]],
+                                      device const float* x [[buffer(4)]],
+                                      device const uint* start [[buffer(5)]],
+                                      device const uint* aTok [[buffer(6)]],
+                                      device const uint* aSlot [[buffer(7)]],
+                                      device float* h [[buffer(8)]],
+                                      device const uint* work [[buffer(9)]],
+                                      constant MoePC& pc [[buffer(10)]],
+                                      uint3 tid3 [[thread_position_in_threadgroup]],
+                                      uint3 tgpig [[threadgroup_position_in_grid]],
+                                      uint sgid [[simdgroup_index_in_threadgroup]],
+                                      uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup half WgSh[G4M * 64u];
+    threadgroup half WuSh[G4M * 64u];
+    threadgroup half Xsh[64u * G4N];
+    threadgroup float outb[4u * 144u];
+    moe_gu_grouped5_iq4_body<2>(gwE, uwE, gwS, uwS, x, start, aTok, aSlot, h,
+        work, pc, WgSh, WuSh, Xsh, outb, tid3, tgpig, sgid, slid);
 }
