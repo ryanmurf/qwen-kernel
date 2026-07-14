@@ -382,6 +382,21 @@ static id<MTLBuffer> createBuf(MtlCtx& c, size_t size, const void* init = nullpt
     return b;
 }
 
+// Loud command-buffer failure check for engine hot paths. Under memory
+// pressure (e.g. the working set exceeding recommendedMaxWorkingSetSize)
+// Metal ABORTS command buffers; the host then reads stale/zero logits and
+// argmax emits a constant token. Silence here once masqueraded as an engine
+// correctness bug on the standalone 80B — never swallow these.
+static void ckCb(id<MTLCommandBuffer> cb, const char* where) {
+    if (cb.status == MTLCommandBufferStatusCompleted) return;
+    static uint32_t nErr = 0;
+    if (nErr++ < 32)
+        fprintf(stderr, "qk: METAL COMMAND BUFFER FAILED in %s: %s "
+                "(output this step is garbage; check memory pressure)\n",
+                where,
+                cb.error ? cb.error.localizedDescription.UTF8String : "(no error)");
+}
+
 // ---------- generic GEMV run: upload, verify, benchmark ----------
 
 // fixedNr0 != 0: llama.cpp-style kernel owning its work shape — NSG
@@ -4900,6 +4915,7 @@ int qk_engine::stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin) {
             auto he1 = std::chrono::steady_clock::now();
             [cb commit];
             [cb waitUntilCompleted];
+            ckCb(cb, "stepChunk");
             auto he2 = std::chrono::steady_clock::now();
             if (getenv("QK_STEP_STATS")) {
                 static double gpuSum = 0, encSum = 0, waitSum = 0; static uint32_t nStep = 0;
@@ -5405,6 +5421,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         auto tw0 = std::chrono::steady_clock::now();
         [cb commit];
         [cb waitUntilCompleted];
+        ckCb(cb, "prefillBatchLast");
         lastCbGpu = cb.GPUEndTime - cb.GPUStartTime;
         lastCbWall = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
         counter.report(lastCbGpu);
@@ -5488,6 +5505,7 @@ uint32_t qk_engine::serialPrefillLogits(const uint32_t* toks, uint32_t n, uint32
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
+            ckCb(cb, "serialPrefillLogits");
         }
     }
     memcpy(logits.data(), (uint8_t*)bLogits.contents + (size_t)slot * vocab * 4,
