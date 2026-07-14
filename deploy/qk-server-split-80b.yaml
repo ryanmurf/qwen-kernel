@@ -67,12 +67,17 @@ spec:
         - --split-next
         - REDACTED-LAN-IP:18200
         env:
-        # Pin the head to the 7900 XTX (24 GB). Since 2026-07-13 the XT
-        # (03:00.0) is the AUDIO card (kokoro TTS + whisper STT, coord-2's
-        # domain) — LLM backends live on the XTX, one at a time, and the
-        # 35B (also XTX-pinned) is a switched alternative to this backend.
+        # Head pinned to the 7900 XT (03:00.0) since 2026-07-14: the XTX's SMU
+        # went unresponsive (power_dpm_* and hwmon read EBUSY, PSP resume
+        # failures in dmesg). With the SMU dead the card still ENUMERATES with
+        # 24 GB, so the engine happily opens on it — and every allocation lands
+        # in GTT instead (symptom: mem_info_vram_used ~26 MB, gtt ~15.4 GB,
+        # decode ~5 tok/s at /health 200). amdgpu_gpu_recover does NOT clear it;
+        # only a host reboot re-inits the PSP. Move back to 1a:00.0 once the XTX
+        # reads a DPM level again — until then the XT is the only LLM card, so
+        # the 35B (also pinned here) stays a switched alternative, not a co-tenant.
         - name: QK_DEVICE_PCI
-          value: "1a:00.0"
+          value: "03:00.0"
         - name: QK_LAYERS
           value: "0:12"
         # Snapshot ENTRY COUNT for split cross-turn reuse (qk_state_n). Each

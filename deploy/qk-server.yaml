@@ -60,11 +60,14 @@ spec:
         - --chunk
         - "8"
         env:
-        # Pin to the 7900 XTX — with two identical Navi31s, first-discrete
-        # enumeration order is a boot-flip away from landing on the 80B
-        # head's card. BDF suffix match; needs image >= 2026-07-12 (6135b97).
+        # Pinned to the 7900 XT (03:00.0) since 2026-07-14 — the XTX's SMU is
+        # wedged (EBUSY on power_dpm_*/hwmon; allocations silently land in GTT
+        # at ~5 tok/s; only a reboot re-inits it — see qk-server-split-80b.yaml).
+        # With one usable LLM card the 35B is a SWITCHED alternative to the 80B
+        # again, never a co-tenant: two backends on one card = GTT fallback.
+        # BDF suffix match; needs image >= 2026-07-12 (6135b97).
         - name: QK_DEVICE_PCI
-          value: "1a:00.0"
+          value: "03:00.0"
         - name: QK_FORK           # same-prompt requests share one prefill (fork mode)
           value: "1"
         - name: QK_SPEC           # prompt-lookup speculative decoding (exact-output;
@@ -110,6 +113,17 @@ spec:
         - name: QK_MOE_DOWN_128
           value: "1"
         - name: QK_MOE_SHARED_DOWN_32
+          value: "1"
+        # Phase-2 additions (32709a2). GROUP_PREFILL counting-sorts routed
+        # assignments expert-major so each expert row is dequantized ONCE and
+        # reused across every token that picked it — prefill 593->850 tok/s (XT)
+        # and 848->1153 (XTX). GU_ROWTILE is the 4-row IQ3 gate/up decode kernel
+        # (8 rows was measured and rejected: register pressure). Both greedy
+        # byte-exact on this model. NOT set on the 80B head: the grouped path is
+        # shape-guarded to n_ff=512 and its IQ4 down twin changes hidden hashes.
+        - name: QK_MOE_GROUP_PREFILL
+          value: "1"
+        - name: QK_MOE_GU_ROWTILE
           value: "1"
         # Batched prefill flushes its command buffer every QK_SUBMIT_LAYERS layers
         # (engine default 8) so no single vkQueueSubmit can outlive amdgpu's ~10 s
