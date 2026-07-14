@@ -306,3 +306,44 @@ Every GPU command in this log is explicitly pinned with `QK_DEVICE_PCI`.
 
 - After the final GPU command, XTX VRAM/GTT had drained to 27,947,008/15,970,304 bytes. Scaled only `gemma/deployment/qk-server-split-80b` from zero back to its original one replica and waited for rollout.
 - Final deployment spec/updated/ready/available is **1/1/1/1**; pod `qk-server-split-80b-cfd797b74-ldrhl` is `1/1 Running` with zero restarts. Final DPM readbacks are XTX **`auto`** and XT **`manual`**. No GPU benchmark ran after restoration.
+
+## 2026-07-14
+
+### 00:01 — Architectural follow-on intake and checkpoint discipline
+
+- Re-read this log and `REPORT.md` before source work and treated every recorded roof and negative result as closed. The live worktree contained the complete, documented 17:01–18:58 residual-stage patch plus its three retained shaders; provenance audit found no unrelated edits. Preserved it in checkpoint `793a76a` before the first test, then used small commits between every implementation/test boundary as requested.
+- The mission levers were narrowed exactly to the report's remaining opportunity: counting-sorted grouped prefill MoE, plus a decode quant-kernel/fusion change. No DeltaNet layout/tile variants, old IQ3 dword repack, dense half-TPR, or short-context GQA dead ends were repeated.
+- Stable inputs remained `/tmp/amd-opt-big_a.ids` (1,213 tokens, SHA-256 `79f318...a251`) and `/tmp/amd-opt-big4.ids` (4,852, `5c7e18...64e8`). Every GPU invocation below explicitly set `QK_DEVICE_PCI`; `qk token` was never used.
+
+### 00:05 — Grouped prefill MoE implementation and XT isolation
+
+- Added `QK_MOE_GROUP_PREFILL_GU`, `QK_MOE_GROUP_PREFILL_DOWN`, and umbrella `QK_MOE_GROUP_PREFILL`. One GPU counting-sort workgroup builds expert ranges over packed `(token,slot)` pairs. Expert-major IQ3 gate/up and IQ4/Q6 down workgroups dequantize each row once and loop all matching pairs; grouped down writes token/slot contributions and a grouped add/RMS tail folds them deterministically.
+- Correctness audit before GPU use fixed three avoidable association changes: restored IQ3's alternating lower/upper term order, applied routed weights before subgroup reduction, and formed the routed slot sum before `residual + routed + shared`. Q6 retains `w*d*scale*dot`. Small speculative batches retain token-major dispatch when `n*n_used < n_expert`; empty buckets return before dequant; the grouped path is guarded to `n_ff=512`.
+- First XT matched smoke, all with identical first-16 greedy tokens:
+  - token-major **595.31 tok/s**;
+  - grouped GU only **767.69** (+29.0%);
+  - grouped GU+down **858.33** (+44.2%).
+- Final XT `big_a` composed samples were prefill 849.61 / 854.38 / 848.62 (median **849.61 tok/s**) and decode 126.83 / 128.33 / 128.55 (median **128.33**). `big4` single was **645.72 prefill / 135.14 decode**.
+
+### 00:11 — Decode IQ3 row-stationary trial
+
+- Added decode-only `QK_MOE_GU_ROWTILE`: one workgroup computes consecutive IQ3 gate/up rows while reusing each lane's eight input values. This is not the old 25-u32 repack; weight layout is unchanged and each row preserves the original lane, term, subgroup, and serial-wave reduction order.
+- Eight rows lost to register pressure: XT `moe.gu` was **918.4 us** and wall decode regressed. The four-row checkpoint reduced `moe.gu` from the recorded 791.9 to **726.2 us** (-8.3%) and stayed exact.
+- Direct wall pairs: XT **127.41→128.05 tok/s**; XTX **180.18→181.52**. Later composed medians/singles are reported below. The gain is retained but small because routed GU is only one part of the serialized decode stream.
+
+### 00:15 — Exclusive XTX campaign and final medians
+
+- Intake anomaly was the same as the earlier handoff: the live 80B pod was `1/1`, but card2 showed 27.9 MB VRAM, 16.2 GB GTT, and an `EBUSY` DPM read. Scaled only `gemma/deployment/qk-server-split-80b` to zero, waited for pod deletion, then required VRAM/GTT drain to 27,947,008/15,921,152 bytes and DPM **`auto`** before the first XTX benchmark.
+- XTX token-major short prefill samples were 863.23/863.16 tok/s. Composed grouped samples were 1,164.82 / 1,142.14 / 1,153.31, median **1,153.31 tok/s** (+33.6% matched; +35.97% over the prior report's 848.19). Composed decode samples were 181.16 / 181.44 / 180.96, median **181.16 tok/s**. `big4` reached **944.50 prefill / 166.72 decode**.
+- Optional grouped IQ4 down on the 80B XTX head moved prefill **1,928.75→1,966.41 stage-tok/s** (+1.95%). Its hidden hashes changed (`d85e.../c5ed...` baseline versus `21a8.../3847...`) because the old local-128 kernel mixes two slots per subgroup; this flag is not added to production. A grouped IQ4 gate/up shader remains the material 80B extension.
+- XTX remained `auto` throughout every readable benchmark-state check. No DPM control was written.
+
+### 00:21 — Mandatory gates and production restoration anomaly
+
+- Final composed flags add `QK_MOE_GROUP_PREFILL=1 QK_MOE_GU_ROWTILE=1` to the previous common set.
+- Final `serve-test` matrix, every command PCI-pinned:
+  - `big_a`, 256: XT and XTX both exactly **`201f416edb24cc1f5c630bdfe66471d0f12442b53503e1f88da627853c3f60a4`**.
+  - `big4`, 64: XT and XTX both exactly **`98b14c52ffa9f983059f81184b680b6a108a6ed84f3b1cb20bc314e33b4667ef`**.
+- Built-in five-format suite passed both cards. XT/XTX correctness-run rates: F16 769.2/913.1, Q8 1,343.6/1,331.7, Q6 677.1/626.0, IQ4 621.3/581.1, IQ3 431.9/410.3 GB/s.
+- Restored only `qk-server-split-80b` to one replica; deployment and new pod reached spec/updated/ready/available **1/1/1/1** with zero restarts. No XTX benchmark ran afterward.
+- The restored GPU state is not healthy: model load briefly reached 9.0 GB VRAM, then migrated about 16.2 GB to GTT; DPM remained unreadable. Kernel logs show repeated XTX PSP load/unload failures and suspend/resume cycles, and `fuser` identifies `ptyxis` PID 54767 holding `/dev/dri/renderD129`. This exactly reproduces the intake anomaly. The replica remains up; no unauthorized process kill, GPU reset, or second rollout was attempted.
