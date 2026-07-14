@@ -2899,6 +2899,7 @@ struct qk_engine {
     std::vector<id<MTLBuffer>> extraBufs;   // host-built weights (ssm_ba split)
     struct WeightWin { const uint8_t* base; size_t len; id<MTLBuffer> buf; };
     std::vector<WeightWin> gwin;            // no-copy windows when the file > maxBufferLength
+    id wRset = nil;                         // MTLResidencySet over the weight mapping (macOS 15+)
     uint32_t gemmThreads = 256;
     uint32_t gemmBM = 128, gemmBN = 64;
     bool prefillGemvBatch = false;
@@ -3457,6 +3458,34 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                     gwin.size(), g.size() / 1e9);
         }
         if (!gbuf && gwin.empty()) return fail("qk_open: newBufferWithBytesNoCopy failed");
+        // GPU residency for the weight mapping. Without this, no-copy mmap
+        // buffers rely on lazy per-submit page wiring: memory pressure evicts
+        // GPU mappings, submits degrade 2-6x rewiring them, and under hard
+        // pressure Metal aborts command buffers / the GPU takes BIF0 page
+        // faults (the standalone-80B garbage-token + 2026-07-13 panic chain).
+        // llama.cpp wraps every weight buffer in an MTLResidencySet; attaching
+        // ours to the queue keeps the windows resident for every submit.
+        // QK_NO_RSET=1 disables (A/B; matches GGML_METAL_NO_RESIDENCY).
+        if (!getenv("QK_NO_RSET")) {
+            if (@available(macOS 15.0, *)) {
+                MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
+                rd.label = @"qk weights";
+                rd.initialCapacity = gbuf ? 1 : gwin.size();
+                NSError* rerr = nil;
+                id<MTLResidencySet> rs = [c.dev newResidencySetWithDescriptor:rd error:&rerr];
+                if (!rs) {
+                    fprintf(stderr, "qk_open: residency set failed (%s) — continuing without\n",
+                            rerr ? rerr.localizedDescription.UTF8String : "?");
+                } else {
+                    if (gbuf) [rs addAllocation:gbuf];
+                    for (const auto& w : gwin) [rs addAllocation:w.buf];
+                    [rs commit];
+                    [rs requestResidency];
+                    [c.queue addResidencySet:rs];
+                    wRset = rs;
+                }
+            }
+        }
         // QK_MLOCK=1: wire the mapping. No-copy weights degrade 2-6x
         // after memory-pressure evictions (per-submit GPU rewiring of
         // faulted pages, sys-time bound) and do NOT self-heal; mlock
