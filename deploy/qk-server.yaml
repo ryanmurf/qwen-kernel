@@ -26,9 +26,11 @@ spec:
     metadata:
       labels:
         app: qk-server
-        # NB deliberately NOT gpu-llm: server since the 2026-07-12 both-live
-        # cutover — gemma-server routes to the switched backend (the 80B
-        # split); this pod is reached via the dedicated qk-35b Service.
+        # gpu-llm: server restored 2026-07-13 — the 80B moved onto the XTX, so
+        # the 35B is a SWITCHED alternative again (one at a time on that card).
+        # It therefore serves the main gemma-server endpoint when scaled up;
+        # the dedicated qk-35b Service still reaches it directly either way.
+        gpu-llm: server
     spec:
       containers:
       - name: qk-server
