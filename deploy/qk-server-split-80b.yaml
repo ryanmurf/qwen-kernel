@@ -98,6 +98,28 @@ spec:
           value: "0.7"
         - name: QK_TEMP_CAP
           value: "0.8"
+        # RDNA3 tuning (docs/amd-opt/REPORT.md, 2026-07-13). Head runs on the
+        # XTX, so this is the report's 80B XTX card-best set: live split-K
+        # dispatch + GQA-aware attention, fused MoE route, fast standalone
+        # selector, fused DN step+gate, 128-lane IQ4 down. Each is greedy
+        # byte-exact (hidden-row hashes matched the untouched build on both
+        # cards). Measured: head stage decode 640 tok/s, prefill 1904 tok/s.
+        - name: QK_MAXB
+          value: "256"
+        - name: QK_ATTN_CHUNK
+          value: "64"
+        - name: QK_ATTN_LIVE_DISPATCH
+          value: "1"
+        - name: QK_ATTN_GQA_AUTO
+          value: "1"
+        - name: QK_MOE_SELECT_FAST
+          value: "1"
+        - name: QK_MOE_ROUTE_FUSED
+          value: "1"
+        - name: QK_DN_STEP_GATE_FUSED
+          value: "1"
+        - name: QK_MOE_DOWN_128
+          value: "1"
         # NB: QK_FORK / QK_SPEC are unsupported in split mode v1 (the server
         # warns and they never engage) — deliberately unset here.
         ports:

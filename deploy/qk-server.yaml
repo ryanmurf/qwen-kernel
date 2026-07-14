@@ -82,6 +82,33 @@ spec:
           value: "4000"
         - name: QK_STATS_FILE     # [spec]/[pcache] lines append here and survive pod
           value: "/stats/qk-stats.log"  # restarts (kubectl logs reset on every bounce)
+        # RDNA3 tuning (docs/amd-opt/REPORT.md, 2026-07-13) — the 35B common
+        # set, all greedy byte-exact (GEN SHA-256 matched the untouched build
+        # on both cards). Measured on the XTX: decode 179 tok/s (was ~135),
+        # prefill 809 tok/s; deep context no longer decays (GQA-AUTO reuses
+        # KV reads across the 4 q-heads per kv-head past a ~2k crossover).
+        - name: QK_MAXB
+          value: "1024"
+        - name: QK_ATTN_CHUNK
+          value: "64"
+        - name: QK_ATTN_LIVE_DISPATCH
+          value: "1"
+        - name: QK_ATTN_GQA_AUTO
+          value: "1"
+        - name: QK_MOE_SELECT_FAST
+          value: "1"
+        - name: QK_MOE_ROUTE_FUSED
+          value: "1"
+        - name: QK_MOE_SELECT_HIER
+          value: "1"
+        - name: QK_MOE_SHARED_GU_64
+          value: "1"
+        - name: QK_DN_STEP_GATE_FUSED
+          value: "1"
+        - name: QK_MOE_DOWN_128
+          value: "1"
+        - name: QK_MOE_SHARED_DOWN_32
+          value: "1"
         # Batched prefill flushes its command buffer every QK_SUBMIT_LAYERS layers
         # (engine default 8) so no single vkQueueSubmit can outlive amdgpu's ~10 s
         # gfx-ring timeout (the 2026-07-06 VK_ERROR_DEVICE_LOST crash loop). Set
