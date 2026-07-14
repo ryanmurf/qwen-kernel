@@ -63,12 +63,12 @@ void main() {
                 a += qv[j] * h[ho + j];
                 b2 += qv[16u + j] * h[ho + 16u + j];
             }
-            acc = dl * (a + b2);
+            acc = sel[rq].w[s] * dl * (a + b2);
         }
         float sum = subgroupAdd(acc);
         if (tid == 0u) {
             uint yo = (rq * pc.n_used + s) * pc.n_embd + o;
-            y[yo] = sel[rq].w[s] * sum;
+            y[yo] = sum;
         }
     }
 }

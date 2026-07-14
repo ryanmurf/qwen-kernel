@@ -20,10 +20,10 @@ shared float red[256];
 shared float scale;
 
 float valueAt(uint rq, uint i) {
-    float v = a[rq * pc.n + i];
+    float v = 0.0;
     for (uint k = 0u; k < pc.n_used; ++k)
         v += routed[(rq * pc.n_used + k) * pc.n + i];
-    return v + c2[rq * pc.n + i];
+    return a[rq * pc.n + i] + v + c2[rq * pc.n + i];
 }
 
 void main() {

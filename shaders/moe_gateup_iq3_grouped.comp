@@ -87,10 +87,13 @@ void main() {
             uint l = g8 & 3u;
             uint xo = rq * pc.n_embd + b * 256u + ib32 * 32u + l * 8u;
             float sg = 0.0, su = 0.0;
-            for (uint j = 0u; j < 8u; ++j) {
-                float xv = x[xo + j];
-                sg += mg[j] * xv;
-                su += mu[j] * xv;
+            // Preserve moe_gateup_iq3.comp's alternating lower/upper-half
+            // accumulation order exactly.
+            for (uint j = 0u; j < 4u; ++j) {
+                sg += mg[j] * x[xo + j];
+                sg += mg[4u + j] * x[xo + 4u + j];
+                su += mu[j] * x[xo + j];
+                su += mu[4u + j] * x[xo + 4u + j];
             }
             ag = dg * sg;
             au = du * su;

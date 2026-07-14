@@ -62,12 +62,12 @@ void main() {
             uint ho = (rq * (pc.n_used + 1u) + s) * pc.n_ff + b * 256u + gg * 16u;
             float dot = 0.0;
             for (uint j = 0u; j < 16u; ++j) dot += qv[j] * h[ho + j];
-            acc = ds * dot;
+            acc = sel[rq].w[s] * ds * dot;
         }
         float sum = subgroupAdd(acc);
         if (tid == 0u) {
             uint yo = (rq * pc.n_used + s) * pc.n_embd + o;
-            y[yo] = sel[rq].w[s] * sum;
+            y[yo] = sum;
         }
     }
 }
