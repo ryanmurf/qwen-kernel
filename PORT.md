@@ -1107,3 +1107,74 @@ C4 final scorecard in README + PORT.md: decode, prefill, aggregate, TTFT,
 Rules of engagement (unchanged): every kernel lands with CPU-reference
 validation; every phase ends with the token-parity gate ×3 prompts; every
 result (positive or negative) recorded here; commit per green step.
+
+## 80B standalone arc (2026-07-13 night): residency root cause, grouped-MoE fix, llama.cpp beaten on decode
+
+Context: llama-bench (this box, worker stopped) runs the whole 80B at
+68.8-70.6 tok/s decode / ~1017 tok/s pp512 — beating the tron+midnight
+split (48.7 tok/s e2e, network exonerated by the ethernet A/B). Our
+standalone had emitted garbage (token 15 repeat, 7.6 tok/s), and the box
+kernel-panicked at 21:07 mid-investigation.
+
+Findings (each verified tonight, clean box, same repacked GGUF):
+1. The panic is watchdogd starvation — the 42.9GB standalone run paging
+   against the 32GB-wired worker — not a Metal driver bug. The garbage
+   runs left 8 GPU-restart reports (gpuEvent-qk-*-112552.ips, "BIF0 page
+   fault", read) hours before the panic.
+2. Window COUNT was a red herring: maxBufferLength is 38.88 GiB on this
+   M4 Max, so llama.cpp maps the same file as 2 overlapping views
+   (ggml_metal_buffer_map). The real difference is GPU residency:
+   llama.cpp wraps every buffer in an MTLResidencySet with
+   requestResidency + heartbeat; we relied on lazy per-submit wiring
+   (QK_MLOCK wires CPU pages only — the M0 warmup note foreshadowed
+   this). Under pressure: rewire degradation, then ABORTED command
+   buffers → stale logits → argmax constant token.
+3. Fix ed53ed1: MTLResidencySet over the weight mapping at qk_open
+   (commit + requestResidency + attach to queue; QK_NO_RSET=1 A/B).
+   5e1e0b8 scopes it to full-model engines — split stages keep
+   stage-scoped mlock + lazy wiring by design.
+4. Grouped-MoE batched prefill was CORRUPT on the 80B: moe_group wrote
+   the shared-expert aSlot bucket at hardcoded start[256] (n_expert=256
+   on the 35B masked it; 512 on the 80B put it mid-table). prefillcmp
+   exploded exactly at the moeGroupN=192 crossover (max|dlogit| to 26).
+   Fix cd119d2. The split-prod worker never saw it only because the
+   grouped gates (ids4/moegcmp) are 35B-shaped — harness hole below.
+
+Scorecard (this box, clean, identical GGUF):
+
+| axis | llama.cpp Metal | qk standalone |
+|---|---|---|
+| decode short-ctx | 70.62 tok/s (tg128, 14.16 ms) | **92.5 tok/s (10.81 ms wall / 10.6 GPU)** |
+| decode @ ctx~2100 | — | ~78 tok/s |
+| prefill N=512 | 1017 tok/s | 550 tok/s grouped-fixed (282 ungrouped) |
+| greedy parity | reference | 39-tok prompt ->128: 126/128 exact, 2 near-ties CERTIFIED (llama top-2 gaps 0.054/0.022, qk picks llama #2); 2103-tok prompt ->64: **64/64 EXACT** |
+
+Where llama.cpp's 14.16 ms/token goes: 2047 dispatched Metal ops per
+decode graph (GGML_METAL_GRAPH_DEBUG histogram: 389 MUL_MAT + 131
+MUL_MAT_ID doing the work; ~1500 small ops — 139 CONT/CPY data
+movement, 109 GET_ROWS, 64 L2_NORM, 64 REPEAT, 44 each
+SUM_ROWS/CLAMP/DIV — the ggml DeltaNet decomposition). Ours: one
+command buffer per token of fused chains; measured budget MoE 5.0 ms
+(48 x 104 µs, 232 GB/s over 23.1 MiB active/layer), attention 2.3 ms
+(12 x 191 µs at pos 0), DN ~2.3 ms (36 layers, by subtraction), head
+0.51 ms (503 GB/s) — reconciles with the 10.1 ms step GPU time.
+
+Open items:
+- Prefill gap 550 vs 1017 tok/s: grouped-MoE GEMM is the lever (B-phase
+  class work). A benign f16-class "mild regime" exists for N>32 in
+  prefillcmp (worst rel 0.044, one N=96 near-tie argmax flip;
+  insensitive to QK_GEMM=scalar / QK_DN_CHUNK=0 / QK_MOE_GROUPED=0 —
+  kernel-variant rounding, llama.cpp's own prefill precision class).
+- 80B batch harness hole: caseBlock needs split ssm_alpha/beta (80B
+  fuses ssm_ba), moegcmp is IQ3-shaped. Port both so the next grouped
+  bug cannot hide behind the 35B gates.
+- Serving decision (tron): standalone on this box beats llama.cpp
+  decode by 31% and the split by 90%, with the full server stack
+  (prefix reuse, snapshots, sampling, tool-retry) intact. Worker
+  relaunched on :18200 (fixed binary, same 12:48 config) so prod runs
+  the split meanwhile; the single-box switch is yours to call.
+
+Repro anchors: QK_GGUF=<80B-qk.gguf> ./build/qk serve-test /tmp/big_a.ids 128 1 2048
+(certify vs llama-server /completion temperature 0, n_probs 3, near-tie
+bar 0.15 logprob); prefillcmp 512 2048 with QK_MAXB=512; llama-bench
+reproduced 70.62/1017 same-night same-box.
