@@ -1178,3 +1178,60 @@ Repro anchors: QK_GGUF=<80B-qk.gguf> ./build/qk serve-test /tmp/big_a.ids 128 1 
 (certify vs llama-server /completion temperature 0, n_probs 3, near-tie
 bar 0.15 logprob); prefillcmp 512 2048 with QK_MAXB=512; llama-bench
 reproduced 70.62/1017 same-night same-box.
+
+### 80B prefill counterattack (2026-07-13 late): **1029 tok/s — llama.cpp beaten**
+
+Profile first: the repaired v4 default at N=512 was 939.3 ms / 545
+tok/s under the timestamp trace. `moe-gateup` was 542.4 ms and
+`moe-down` 197.8 ms: **79% of the whole pass was grouped MoE**. The
+existing packed-f16 v5 immediately cut those to ~202/107 ms, but the
+80B IQ4 path could not use `moe_group_work`; it still launched the dense
+513-expert x token-tile grid and returned from empty pairs.
+
+The landed path adds the IQ4_XS twin of the compact `(expert,t0)` work
+consumer and makes v5 the default only for 512-expert IQ4 models at the
+unchanged N>=192 crossover. The raw all-f16 form traced at 493.5 ms /
+1038 tok/s, but it GREW the prefillcmp envelope to rel 0.069 at N=256 —
+red, not promoted. The shared Q8_0 expert was the numerical amplifier:
+every token traverses it in every layer. Keeping only shared gate+up in
+the existing v4 f32 MMA class brought the exact same cell to rel 0.007
+and the full sweep back inside the prior envelope. Making shared down
+f32 too was rejected at 978 traced tok/s (down 99 -> 116 ms); packed-f16
+down stays.
+
+Final clean full-curve record (`f16` probe 515.7 GB/s immediately
+before it):
+
+| N | old/default control | new default | result |
+|---:|---:|---:|---|
+| 128 | same ungrouped path | **281 tok/s** | unchanged crossover regime |
+| 256 | 453 tok/s (forced v4) | **823 tok/s** | 1.82x |
+| 512 | 545-550 tok/s | **1029 tok/s** (497.49 ms) | **1.87x; beats llama.cpp 1017.5** |
+
+An isolated cool N=512 run reached 495.33 ms / 1034 tok/s. One full
+sweep immediately after the long decode gate sagged to 853 purely from
+soak (every size was ~22% down); it is excluded, per the established
+thermal rule. The final traced budget is ~203 ms gate+up, 99 ms down,
+80 ms recurrent projections, 27 ms output projections, 19 ms attention
+projections, and ~70 ms everything else. MoE remains 61% of the pass,
+but the absolute target is green.
+
+One pre-existing 35B harness hole surfaced while applying tonight's
+stated gates: the untouched 21:01 `build-perf/qk` baseline and the new
+binary both produced the same N=48 seed=42 flip (44/45, rel 0.10). N=48
+is the first tiled Q8 GEMM shape. Selecting its existing tiled f32 twin
+only below N=64 restores **45/45** with f32-level N=48 error (~2e-6),
+without touching N=128/256 or the 80B IQ4 projection path.
+
+Final gates, default config:
+
+- 35B `serve-test ids3 44`: reference prefix exact; prefillcmp **45/45**.
+- 80B short certified stream: **128/128 file-exact**.
+- 80B 2103-token grouped prompt: **64/64 file-exact**.
+- 80B prefillcmp: accepted **44/45**, only N=96 seed=1234; every N>=192
+  MATCH; worst rel **0.042** (was ~0.044).
+- Decode guard: 512-step average GPU **10.55 ms** (10.76 ms submit+wait),
+  no regression.
+
+Rollback/debug remains explicit: `QK_MOE_GROUPED=4` restores the old
+80B f32 grouped kernels; `QK_MOE_WORK=0` restores v5's dense z-grid.
