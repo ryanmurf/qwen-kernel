@@ -4519,8 +4519,8 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         // The grouped primitive is intentionally prefill-only and currently
         // targets the 35B IQ3 routed gate/up format.  Decode (n==1) and the
         // 80B IQ4 gate/up shape retain their measured card-best paths.
-        bool groupEligible = n * nUsed >= nExp && !guIq4 && !tapsDir;
-        bool groupGu = groupEligible && moeGroupPrefillGu;
+        bool groupEligible = n * nUsed >= nExp && ffE == 512 && !tapsDir;
+        bool groupGu = groupEligible && !guIq4 && moeGroupPrefillGu;
         bool groupDown = groupEligible && moeGroupPrefillDown;
         if (groupGu || groupDown) {
             struct { uint32_t nExpert, nUsed, nTokens; } pcPairs{nExp, nUsed, n};

@@ -32,6 +32,8 @@ void main() {
     uint eid = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
     if (r >= pc.n_ff || eid >= pc.n_expert) return;
+    uint begin = offsets[eid], end = offsets[eid + 1u];
+    if (begin == end) return;
 
     uint kb = pc.n_embd / 256u;
     uint nu = kb * 32u;
@@ -74,7 +76,6 @@ void main() {
         }
     }
 
-    uint begin = offsets[eid], end = offsets[eid + 1u];
     for (uint pi = begin; pi < end; ++pi) {
         uint pair = pairs[pi];
         uint rq = pair >> 4u;
