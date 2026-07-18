@@ -2,3 +2,4 @@ server/target/
 build/
 *.o
 *.spv
+tests/gemma4/__pycache__/

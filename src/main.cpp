@@ -334,6 +334,13 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     // covers 256/TPR rows and stays fully occupied
     uint32_t tpr = 256;
     while (tpr > 4 && tpr / 2 >= unitsPerRow) tpr /= 2;
+    // QK_TPR overrides the derived value so the geometry can be swept during
+    // format calibration; must divide 256 and stay within [4,256].
+    if (const char* e = getenv("QK_TPR")) {
+        uint32_t v = (uint32_t)atoi(e);
+        if (v >= 4 && v <= 256 && (256 % v) == 0) tpr = v;
+        else fprintf(stderr, "QK_TPR=%s ignored (need divisor of 256 in [4,256])\n", e);
+    }
     uint32_t rowsPerWg = 256 / tpr;
 
     Buf bW = createBuf(c, wSize,
@@ -587,6 +594,33 @@ static bool caseQ80(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
                    x, M, K, yref, iters, K / 32);
 }
 
+static bool caseQ40(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
+    printf("\n== q4_0 GEMV  M=%u K=%u (W %.1f MiB) ==\n", M, K,
+           (double)M * K / 32 * 18 / (1 << 20));
+    if (K % 32) {
+        fprintf(stderr, "K must be a multiple of 32\n");
+        return false;
+    }
+    size_t nb = (size_t)M * K / 32;
+    std::vector<block_q4_0> blocks(nb);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        b.d = qk_f32_to_f16(0.005f + 0.02f * (rng() & 0xFFFF) / 65536.0f);
+        for (auto& q : b.qs) q = (uint8_t)rng();
+    }
+    auto x = randomX(K);
+
+    std::vector<float> yref(M), tmp(K);
+    for (uint32_t m = 0; m < M; m++) {
+        dequant_row_q4_0(&blocks[(size_t)m * (K / 32)], tmp.data(), K);
+        double acc = 0;
+        for (uint32_t k = 0; k < K; k++) acc += (double)tmp[k] * x[k];
+        yref[m] = (float)acc;
+    }
+    return runGemv(c, "gemv_q4_0.spv", blocks.data(), nb * sizeof(block_q4_0),
+                   x, M, K, yref, iters, K / 32);
+}
+
 static bool caseQ6K(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
     printf("\n== q6_k GEMV  M=%u K=%u (W %.1f MiB) ==\n", M, K,
            (double)M * K / 256 * 210 / (1 << 20));
@@ -784,6 +818,7 @@ static bool caseGguf(VkCtx& c, const std::string& tensorName, uint32_t iters) {
     for (uint32_t m = 0; m < M; m++) {
         const uint8_t* row = t->data + (size_t)m * rowBytes;
         switch (t->type) {
+            case GGML_Q4_0: dequant_row_q4_0((const block_q4_0*)row, tmp.data(), K); break;
             case GGML_Q8_0: dequant_row_q8_0((const block_q8_0*)row, tmp.data(), K); break;
             case GGML_Q6_K: dequant_row_q6_K((const block_q6_K*)row, tmp.data(), K); break;
             case GGML_IQ4_XS: dequant_row_iq4_xs((const block_iq4_xs*)row, tmp.data(), K); break;
@@ -803,6 +838,7 @@ static bool caseGguf(VkCtx& c, const std::string& tensorName, uint32_t iters) {
     const char* spv = nullptr;
     uint32_t units = K;
     switch (t->type) {
+        case GGML_Q4_0:    spv = "gemv_q4_0.spv";    units = K / 32; break;
         case GGML_Q8_0:    spv = "gemv_q8_0.spv";    units = K / 32; break;
         case GGML_Q6_K:    spv = "gemv_q6_k.spv";    units = K / 16; break;
         case GGML_IQ4_XS:  spv = "gemv_iq4_xs.spv";  units = K / 32; break;
@@ -6208,6 +6244,7 @@ int main(int argc, char** argv) {
     bool ok = true;
     if (mode == "suite") {
         ok &= caseF16(c, 8192, 8192, 200);
+        ok &= caseQ40(c, 8192, 8192, 200);
         ok &= caseQ80(c, 8192, 8192, 200);
         ok &= caseQ6K(c, 8192, 8192, 200);
         ok &= caseIQ4XS(c, 8192, 8192, 200);
@@ -6217,6 +6254,8 @@ int main(int argc, char** argv) {
         ok = caseF16(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "q8_0") {
         ok = caseQ80(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+    } else if (mode == "q4_0") {
+        ok = caseQ40(c, argU(2, 32768), argU(3, 16384), argU(4, 100));
     } else if (mode == "q6_k") {
         ok = caseQ6K(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "iq4_xs") {

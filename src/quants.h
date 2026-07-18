@@ -49,6 +49,13 @@ static inline uint16_t qk_f32_to_f16(float f) {
 
 // ---- block layouts (must match ggml-common.h exactly) ----
 
+#define QK4_0 32
+struct block_q4_0 {
+    uint16_t d;          // fp16 delta
+    uint8_t  qs[QK4_0 / 2]; // low/high nibbles encode positions j/j+16
+};
+static_assert(sizeof(block_q4_0) == 18, "q4_0 block size");
+
 #define QK8_0 32
 struct block_q8_0 {
     uint16_t d;          // fp16 delta
@@ -66,6 +73,19 @@ struct block_q6_K {
 static_assert(sizeof(block_q6_K) == 210, "q6_K block size");
 
 // ---- CPU dequant (reference) ----
+
+static inline void dequant_row_q4_0(const block_q4_0* x, float* y, int64_t k) {
+    assert(k % QK4_0 == 0);
+    const int64_t nb = k / QK4_0;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = qk_f16_to_f32(x[i].d);
+        for (int j = 0; j < QK4_0 / 2; ++j) {
+            y[j] = d * ((int)(x[i].qs[j] & 0x0f) - 8);
+            y[j + QK4_0 / 2] = d * ((int)(x[i].qs[j] >> 4) - 8);
+        }
+        y += QK4_0;
+    }
+}
 
 static inline void dequant_row_q8_0(const block_q8_0* x, float* y, int64_t k) {
     assert(k % QK8_0 == 0);

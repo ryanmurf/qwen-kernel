@@ -70,3 +70,75 @@ authoritative and the plan's provisional baseline as superseded.
 | commit | stage | what landed |
 |---|---|---|
 | `0be6893` | — | design plan committed (planning only, no engine code) |
+
+### 2026-07-18 — Stage 0 partial: artifact ledger and Q4 measurement harness
+
+- Added `tests/gemma4/generate_manifest.py` and the generated `manifest.json`.
+  The generator passed the exact local/remote SHA-256
+  `3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d`,
+  14,439,363,584-byte size, 52 metadata KVs, 658 tensor ranges, F32/Q4_0/Q6_K
+  histogram 392/265/1, 25 sliding plus 5 global layers at 5/11/17/23/29,
+  global `attn_v` absence, and exactly 2,380,055,608 active bytes/token. The
+  Hugging Face 14.4 GB label is rounded decimal display; its SHA matches local.
+- Extended the standalone Vulkan format harness with a measurement-only Q4_0
+  block reader, CPU reference dequantizer, and shader. `/usr/bin/cmake` build,
+  `spirv-val --target-env vulkan1.2`, and a small llvmpipe CPU-reference check
+  passed (`max_rel_err=1.65e-05`). No Gemma graph, attention, MoE, or production
+  GEMV path was added.
+### 2026-07-18 — Q4_0 bandwidth measured on real hardware (unblocking the above)
+
+Run from a shell that does have `/dev/dri`. `QK_TPR` was added to `runGemv` so
+the geometry can be swept; the derived default pinned tpr=256 for this shape.
+288 MiB matrix (M=32768, K=16384), 2000 GPU-timestamped iterations, VRAM
+resident, correctness PASS against CPU dequant (max_rel_err <= 2.8e-4).
+
+| tpr | XTX GB/s | XT GB/s |
+|---:|---:|---:|
+| 32 | **801.5** | **558.3** |
+| 64 | 753.1 | 510.2 |
+| 128 | 790.6 | 517.1 |
+| 256 | 766.2 | 492.3 |
+
+tpr=32 wins on both cards, as the plan's lane-occupancy argument predicted.
+XTX tpr=32 repeats: 801.9 / 801.7 / 801.4 / 801.4 — reproducible to +/-0.3.
+
+Against the existing format anchors:
+
+| format | XTX GB/s | XT GB/s | Q4_0 relative |
+|---|---:|---:|---|
+| Q8_0 | 927.8 | 775.0 | — |
+| f16 | 917.8 | 778.8 | — |
+| Q6_K | 800.4 | — | — |
+| **Q4_0** | **801.5** | **558.3** | 87% of f16 on XTX, **72% on XT** |
+| IQ4_XS | 729.0 | — | — |
+
+Two findings:
+
+1. **Q4_0 lands at ~801 GB/s on XTX — essentially level with Q6_K, well above
+   IQ4_XS (729), but 14% below Q8_0.** The plan's idealized floors quote 900
+   GB/s and are therefore ~12% optimistic. The section-5 *budget* table is not:
+   its implied effective rates are 761 (attention), 717 (experts), 700 (shared
+   FFN) and 776 (head) GB/s, all at or below the measured large-shape 801.5, as
+   they should be for smaller real shapes. **The 270 tok/s XTX prediction
+   survives this measurement.**
+2. **Q4_0 scales worse than bandwidth across cards** (0.70 XT/XTX vs a 0.833
+   bandwidth ratio), while f16/Q8_0 scale at ~0.85. The nibble unpack has real
+   ALU cost that the 84-CU card feels more. The plan's XT prediction of 222
+   tok/s (range 210-235) assumed near-bandwidth scaling and should be revised
+   down pending Stage 1 measurement on real shapes.
+
+Caveat: this is one large, perfectly-shaped matrix. It is an upper bound, not
+evidence that the 1-3 MiB expert shapes will reach it. Stage 1 must re-measure
+on real Gemma shapes before any of this is treated as settled.
+
+### 2026-07-18 — Stage 0 sandbox limitation (superseded for bandwidth, still open for fixtures)
+
+- **Stage 0 gate blocked; stopped as required.** The codex sandbox has no
+  `/dev/dri`. qk enumerated only llvmpipe and rejected `QK_DEVICE_PCI=1a:00.0`;
+  llama.cpp reported `ggml_vulkan: No devices found.` Host sysfs showed both
+  target cards idle (0% busy), but device nodes were unavailable. Consequently
+  there is no honest Q4_0 GB/s result, no same-day llama.cpp baseline, and no
+  twice-reproduced parity fixture. Blocked machine-readable records and exact
+  host rerun commands are in `tests/gemma4/` and
+  `bench/results-gemma4-llamacpp.jsonl`; acceptance numbers were not lowered or
+  backfilled from earlier runs.
