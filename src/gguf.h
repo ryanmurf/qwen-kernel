@@ -92,6 +92,8 @@ class Gguf {
     }
 
     const std::map<std::string, GgufTensor>& tensors() const { return tensors_; }
+    const uint8_t* base() const { return base_; }
+    size_t size() const { return size_; }
 
     // Scalar-int and string KVs captured during parse (shard 1 holds them all).
     uint64_t kvInt(const std::string& key, uint64_t def) const {
