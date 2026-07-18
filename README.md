@@ -22,15 +22,22 @@ at a time — full methodology and raw data in [`bench/`](bench/README.md),
 | multi-turn resumed session, per turn | **2.3 s** | 14.3 s | **6.2×** |
 | warm decode through the CLI | **65 tok/s** | 12 tok/s | **5.4×** |
 
-**Engine-level**, measured on the 7900 XT (RADV), token-exact greedy parity
-with llama.cpp verified across the full stack:
+**Engine-level**, token-exact greedy parity with llama.cpp verified across the
+full stack. Decode re-measured 2026-07-18 against llama.cpp `571d0d5` (same
+day), same model file, f16 KV both sides — see [`bench/`](bench/README.md#refresh-2026-07-18):
 
-| metric | qk | llama.cpp Vulkan |
+| metric | qk | llama.cpp Vulkan `571d0d5` |
 |---|---|---|
-| single-stream decode | **172 tok/s** (5.82 ms/tok) | 72–86 tok/s |
-| aggregate decode, 16 streams | **384 tok/s** | — |
-| batched prefill (128-tok chunk) | **~450 tok/s** (4.2× own serial) | 37.5 tok/s |
+| single-stream decode, **7900 XTX** | **190.7 tok/s** (5.24 ms/tok) | 132.3 tok/s (**1.44×**) |
+| single-stream decode, **7900 XT** | **147.1 tok/s** (6.80 ms/tok) | 109.7 tok/s (**1.34×**) |
+| aggregate decode, 16 streams | **384 tok/s** † | — |
+| batched prefill (128-tok chunk) | **~450 tok/s** † (4.2× own serial) | not re-measured |
 | warm start from prefix cache | 0.3 ms restore (vs 341 ms/64-tok prefill) | — |
+
+† Not re-measured on 2026-07-18 and not backed by raw data in `bench/`; treat
+as provisional. The end-to-end CLI table above uses a llama.cpp build from
+2026-04-05 and overstates the current gap — see
+[`bench/README.md`](bench/README.md#refresh-2026-07-18).
 
 Correctness bar throughout: greedy output is **token-for-token identical** to
 llama.cpp on identical input ids, batched paths are validated bit-identical
