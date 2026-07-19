@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "gguf.h"
+#include "gemma4_loader.h"
 #include "quants.h"
 #include "../include/qk.h"
 
@@ -327,8 +328,18 @@ static std::vector<uint32_t> loadSpv(const char* argv0, const char* name) {
 static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
                     size_t wSize, const std::vector<float>& x, uint32_t M,
                     uint32_t K, const std::vector<float>& yref, uint32_t iters,
-                    uint32_t unitsPerRow, double tol = 1e-2) {
+                    uint32_t unitsPerRow, double tol = 1e-2,
+                    bool checkArgmax = false) {
     size_t sizeX = (size_t)K * 4, sizeY = (size_t)M * 4;
+    uint32_t weightCopies = 1;
+    if (const char* value = getenv("QK_COLD_MIB")) {
+        uint64_t mib = strtoull(value, nullptr, 10);
+        uint64_t target = mib << 20;
+        if (target > wSize)
+            weightCopies = (uint32_t)std::min<uint64_t>(
+                512, (target + wSize - 1) / wSize);
+    }
+    const size_t residentWSize = wSize * (size_t)weightCopies;
 
     // threads-per-row spec constant: shrink for skinny rows so a workgroup
     // covers 256/TPR rows and stays fully occupied
@@ -343,13 +354,13 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     }
     uint32_t rowsPerWg = 256 / tpr;
 
-    Buf bW = createBuf(c, wSize,
+    Buf bW = createBuf(c, residentWSize,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     Buf bX = createBuf(c, sizeX,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     Buf bY = createBuf(c, sizeY,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    Buf stage = createBuf(c, std::max(wSize, std::max(sizeX, sizeY)),
+    Buf stage = createBuf(c, std::max(residentWSize, std::max(sizeX, sizeY)),
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                           false);
 
@@ -376,7 +387,18 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
         vkCmdCopyBuffer(c.cb, stage.buf, dst.buf, 1, &cp);
         submitWait();
     };
-    upload(bW, wBytes, wSize);
+    if (weightCopies == 1) {
+        upload(bW, wBytes, wSize);
+    } else {
+        for (uint32_t copy = 0; copy < weightCopies; ++copy)
+            memcpy((uint8_t*)mapped + (size_t)copy * wSize, wBytes, wSize);
+        begin();
+        VkBufferCopy copy{0, 0, residentWSize};
+        vkCmdCopyBuffer(c.cb, stage.buf, bW.buf, 1, &copy);
+        submitWait();
+        printf("cache-cold weights: %u copies, %.1f MiB resident\n",
+               weightCopies, (double)residentWSize / (1 << 20));
+    }
     upload(bX, x.data(), sizeX);
 
     std::vector<uint32_t> code = loadSpv(c.argv0, spvName);
@@ -386,8 +408,20 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     VkShaderModule sm;
     VK_CHECK(vkCreateShaderModule(c.dev, &smci, nullptr, &sm));
 
-    VkSpecializationMapEntry sme{0, 0, 4};
-    VkSpecializationInfo spec{1, &sme, 4, &tpr};
+    uint32_t specializationData[2] = {tpr, K / 32};
+    VkSpecializationMapEntry specializationEntries[2] = {
+        {0, 0, 4}, {1, 4, 4},
+    };
+    bool q4Specialized = strcmp(spvName, "gemv_q4_0.spv") == 0;
+    bool q6Specialized = strcmp(spvName, "gemv_q6_k.spv") == 0;
+    specializationData[1] = q6Specialized ? K / 256 : K / 32;
+    bool shapeSpecialized = q4Specialized || q6Specialized;
+    VkSpecializationInfo spec{
+        shapeSpecialized ? 2u : 1u,
+        specializationEntries,
+        shapeSpecialized ? 8u : 4u,
+        specializationData,
+    };
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -398,33 +432,104 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     VkPipeline pipe;
     VK_CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipe));
 
-    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolSize dps{
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        3u * weightCopies + (checkArgmax ? 6u : 0u),
+    };
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpci.maxSets = 1;
+    dpci.maxSets = weightCopies + (checkArgmax ? 2u : 0u);
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &dps;
     VkDescriptorPool dpool;
     VK_CHECK(vkCreateDescriptorPool(c.dev, &dpci, nullptr, &dpool));
+    std::vector<VkDescriptorSetLayout> gemvLayouts(weightCopies, c.dsl);
+    std::vector<VkDescriptorSet> gemvSets(weightCopies);
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = dpool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &c.dsl;
-    VkDescriptorSet ds;
-    VK_CHECK(vkAllocateDescriptorSets(c.dev, &dsai, &ds));
+    dsai.descriptorSetCount = weightCopies;
+    dsai.pSetLayouts = gemvLayouts.data();
+    VK_CHECK(vkAllocateDescriptorSets(c.dev, &dsai, gemvSets.data()));
 
-    VkDescriptorBufferInfo dbi[3] = {{bW.buf, 0, VK_WHOLE_SIZE},
-                                     {bX.buf, 0, VK_WHOLE_SIZE},
-                                     {bY.buf, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet wr[3]{};
-    for (uint32_t i = 0; i < 3; i++) {
-        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = ds;
-        wr[i].dstBinding = i;
-        wr[i].descriptorCount = 1;
-        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        wr[i].pBufferInfo = &dbi[i];
+    std::vector<VkDescriptorBufferInfo> dbi((size_t)weightCopies * 3);
+    std::vector<VkWriteDescriptorSet> wr((size_t)weightCopies * 3);
+    for (uint32_t copy = 0; copy < weightCopies; ++copy) {
+        VkDeviceSize offset = (VkDeviceSize)copy * wSize;
+        dbi[(size_t)copy * 3 + 0] = {bW.buf, offset, wSize};
+        dbi[(size_t)copy * 3 + 1] = {bX.buf, 0, VK_WHOLE_SIZE};
+        dbi[(size_t)copy * 3 + 2] = {bY.buf, 0, VK_WHOLE_SIZE};
+        for (uint32_t binding = 0; binding < 3; ++binding) {
+            auto& write = wr[(size_t)copy * 3 + binding];
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = gemvSets[copy];
+            write.dstBinding = binding;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &dbi[(size_t)copy * 3 + binding];
+        }
     }
-    vkUpdateDescriptorSets(c.dev, 3, wr, 0, nullptr);
+    vkUpdateDescriptorSets(c.dev, (uint32_t)wr.size(), wr.data(), 0, nullptr);
+
+    Buf bArgVals{}, bArgIdx{}, bArgTok{};
+    VkShaderModule argSm1 = VK_NULL_HANDLE, argSm2 = VK_NULL_HANDLE;
+    VkPipeline argPipe1 = VK_NULL_HANDLE, argPipe2 = VK_NULL_HANDLE;
+    VkDescriptorSet argSet1 = VK_NULL_HANDLE, argSet2 = VK_NULL_HANDLE;
+    uint32_t argWgs = (M + 4095) / 4096;
+    if (checkArgmax) {
+        if (argWgs > 64) {
+            fprintf(stderr, "argmax1 supports at most 64 spans, got %u\n", argWgs);
+            return false;
+        }
+        bArgVals = createBuf(c, 64 * sizeof(float),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        bArgIdx = createBuf(c, 64 * sizeof(uint32_t),
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        bArgTok = createBuf(c, sizeof(uint32_t),
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+        auto rawPipeline = [&](const char* name, VkShaderModule& module,
+                               VkPipeline& pipeline) {
+            std::vector<uint32_t> argCode = loadSpv(c.argv0, name);
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = argCode.size() * sizeof(uint32_t);
+            moduleInfo.pCode = argCode.data();
+            VK_CHECK(vkCreateShaderModule(c.dev, &moduleInfo, nullptr, &module));
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = module;
+            pipelineInfo.stage.pName = "main";
+            pipelineInfo.layout = c.pl;
+            VK_CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1,
+                                               &pipelineInfo, nullptr, &pipeline));
+        };
+        rawPipeline("argmax1.spv", argSm1, argPipe1);
+        rawPipeline("argmax2.spv", argSm2, argPipe2);
+        VkDescriptorSetLayout layouts[2] = {c.dsl, c.dsl};
+        VkDescriptorSet sets[2]{};
+        VkDescriptorSetAllocateInfo argAlloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        argAlloc.descriptorPool = dpool;
+        argAlloc.descriptorSetCount = 2;
+        argAlloc.pSetLayouts = layouts;
+        VK_CHECK(vkAllocateDescriptorSets(c.dev, &argAlloc, sets));
+        argSet1 = sets[0];
+        argSet2 = sets[1];
+        VkBuffer argBuffers[6] = {
+            bY.buf, bArgVals.buf, bArgIdx.buf,
+            bArgVals.buf, bArgIdx.buf, bArgTok.buf,
+        };
+        VkDescriptorBufferInfo argInfos[6];
+        VkWriteDescriptorSet argWrites[6]{};
+        for (uint32_t i = 0; i < 6; ++i) {
+            argInfos[i] = {argBuffers[i], 0, VK_WHOLE_SIZE};
+            argWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            argWrites[i].dstSet = i < 3 ? argSet1 : argSet2;
+            argWrites[i].dstBinding = i % 3;
+            argWrites[i].descriptorCount = 1;
+            argWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            argWrites[i].pBufferInfo = &argInfos[i];
+        }
+        vkUpdateDescriptorSets(c.dev, 6, argWrites, 0, nullptr);
+    }
 
     // 2D grid so the workgroup count can exceed maxComputeWorkGroupCount[0]
     uint32_t wgs = (M + rowsPerWg - 1) / rowsPerWg;
@@ -432,9 +537,10 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     uint32_t gy = (wgs + gx - 1) / gx;
 
     struct { uint32_t M, K; } pc{M, K};
-    auto bindAll = [&]() {
+    auto bindAll = [&](uint32_t copy = 0) {
         vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &ds, 0, nullptr);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl,
+                                0, 1, &gemvSets[copy], 0, nullptr);
         vkCmdPushConstants(c.cb, c.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &pc);
     };
 
@@ -477,6 +583,52 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     bool pass = bad == 0;
     printf("correctness: max_rel_err = %.3g  ->  %s\n", maxRel, pass ? "PASS" : "FAIL");
 
+    VkMemoryBarrier argBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    argBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    argBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                               VK_ACCESS_SHADER_WRITE_BIT;
+    auto bindArgmax = [&]() {
+        struct { uint32_t n, span; } pc1{M, 4096};
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, argPipe1);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl,
+                                0, 1, &argSet1, 0, nullptr);
+        vkCmdPushConstants(c.cb, c.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &pc1);
+        vkCmdDispatch(c.cb, argWgs, 1, 1);
+        vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             1, &argBarrier, 0, nullptr, 0, nullptr);
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, argPipe2);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl,
+                                0, 1, &argSet2, 0, nullptr);
+        vkCmdPushConstants(c.cb, c.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &argWgs);
+        vkCmdDispatch(c.cb, 1, 1, 1);
+    };
+    if (checkArgmax) {
+        begin();
+        bindArgmax();
+        VkBufferMemoryBarrier tokenBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        tokenBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        tokenBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        tokenBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        tokenBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        tokenBarrier.buffer = bArgTok.buf;
+        tokenBarrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                             1, &tokenBarrier, 0, nullptr);
+        VkBufferCopy tokenCopy{0, 0, sizeof(uint32_t)};
+        vkCmdCopyBuffer(c.cb, bArgTok.buf, stage.buf, 1, &tokenCopy);
+        submitWait();
+        uint32_t gpuBest = *(const uint32_t*)mapped;
+        uint32_t cpuBest = 0;
+        for (uint32_t i = 1; i < M; ++i)
+            if (yref[i] > yref[cpuBest]) cpuBest = i;
+        bool argOk = gpuBest == cpuBest;
+        printf("argmax: gpu=%u cpu=%u (lower-index tie order) -> %s\n",
+               gpuBest, cpuBest, argOk ? "PASS" : "FAIL");
+        pass &= argOk;
+    }
+
     if (pass && c.hasTimestamps && iters > 0) {
         VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -490,9 +642,9 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
         auto runBench = [&]() {
             begin();
             vkCmdResetQueryPool(c.cb, qp, 0, 2);
-            bindAll();
             vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
             for (uint32_t i = 0; i < iters; i++) {
+                bindAll(i % weightCopies);
                 vkCmdDispatch(c.cb, gx, gy, 1);
                 vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
@@ -501,18 +653,55 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
             vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
             submitWait();
         };
-        runBench();  // warm-up
-        runBench();
-
+        runBench();  // cold/warm-up sample
         uint64_t ts[2];
         VK_CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 2, sizeof(ts), ts, 8,
                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+        double coldNs = (double)(ts[1] - ts[0]) *
+                        c.props.limits.timestampPeriod / iters;
+        runBench();
+        VK_CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 2, sizeof(ts), ts, 8,
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
         double ns = (double)(ts[1] - ts[0]) * c.props.limits.timestampPeriod / iters;
-        double bytes = (double)wSize + sizeX + sizeY;
+        double totalBytes = (double)wSize + sizeX + sizeY;
         double flops = 2.0 * M * K;
-        printf("gpu: %8.1f µs/iter | %7.1f GB/s | %8.1f GFLOP/s | %.1f MiB/iter (%s, tpr %u)\n",
-               ns / 1e3, bytes / ns, flops / ns, bytes / (1 << 20),
-               bW.deviceLocal ? "VRAM" : "GTT", tpr);
+        printf("gpu: %8.1f us/iter | %7.1f GB/s W | %7.1f GB/s total | "
+               "%8.1f GFLOP/s | %.2f MiB W | groups=(%u,%u,1) "
+               "(%s, tpr %u, cold/hot %.3fx)\n",
+               ns / 1e3, (double)wSize / ns, totalBytes / ns, flops / ns,
+               (double)wSize / (1 << 20), gx, gy,
+               bW.deviceLocal ? "VRAM" : "GTT", tpr, coldNs / ns);
+        vkDestroyQueryPool(c.dev, qp, nullptr);
+    }
+
+    if (pass && checkArgmax && c.hasTimestamps && iters > 0) {
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 2;
+        VkQueryPool qp = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateQueryPool(c.dev, &qpci, nullptr, &qp));
+        auto runArgmaxBench = [&]() {
+            begin();
+            vkCmdResetQueryPool(c.cb, qp, 0, 2);
+            vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+            for (uint32_t i = 0; i < iters; ++i) {
+                bindArgmax();
+                vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                     1, &argBarrier, 0, nullptr, 0, nullptr);
+            }
+            vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+            submitWait();
+        };
+        runArgmaxBench();
+        runArgmaxBench();
+        uint64_t ts[2]{};
+        VK_CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 2, sizeof(ts), ts, 8,
+                                       VK_QUERY_RESULT_64_BIT |
+                                       VK_QUERY_RESULT_WAIT_BIT));
+        double ns = (double)(ts[1] - ts[0]) *
+                    c.props.limits.timestampPeriod / iters;
+        printf("argmax gpu: %.1f us/iter | pass1_wgs=%u\n", ns / 1e3, argWgs);
         vkDestroyQueryPool(c.dev, qp, nullptr);
     }
 
@@ -520,6 +709,15 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     vkDestroyDescriptorPool(c.dev, dpool, nullptr);
     vkDestroyPipeline(c.dev, pipe, nullptr);
     vkDestroyShaderModule(c.dev, sm, nullptr);
+    if (checkArgmax) {
+        vkDestroyPipeline(c.dev, argPipe1, nullptr);
+        vkDestroyPipeline(c.dev, argPipe2, nullptr);
+        vkDestroyShaderModule(c.dev, argSm1, nullptr);
+        vkDestroyShaderModule(c.dev, argSm2, nullptr);
+        destroyBuf(c, bArgVals);
+        destroyBuf(c, bArgIdx);
+        destroyBuf(c, bArgTok);
+    }
     destroyBuf(c, bW);
     destroyBuf(c, bX);
     destroyBuf(c, bY);
@@ -790,14 +988,10 @@ static const char* ggufPath() {
     return p ? p : kDefaultGguf;
 }
 
-static bool caseGguf(VkCtx& c, const std::string& tensorName, uint32_t iters) {
-    Gguf g;
-    if (!g.open(ggufPath())) return false;
-    const GgufTensor* t = g.find(tensorName);
-    if (!t) {
-        fprintf(stderr, "tensor '%s' not found (try: qk list)\n", tensorName.c_str());
-        return false;
-    }
+static bool caseGgufTensor(VkCtx& c, const GgufTensor* t,
+                           const std::string& tensorName, uint32_t iters,
+                           bool checkArgmax = false) {
+    if (!t) return false;
     uint32_t K = (uint32_t)t->ne[0];
     uint32_t M = (uint32_t)t->ne[1];
     size_t rowBytes = ggmlRowBytes(t->type, K);
@@ -848,7 +1042,58 @@ static bool caseGguf(VkCtx& c, const std::string& tensorName, uint32_t iters) {
             fprintf(stderr, "no kernel for %s\n", ggmlTypeName(t->type));
             return false;
     }
-    return runGemv(c, spv, t->data, (size_t)M * rowBytes, x, M, K, yref, iters, units);
+    return runGemv(c, spv, t->data, (size_t)M * rowBytes, x, M, K, yref, iters,
+                   units, 1e-2, checkArgmax);
+}
+
+static bool caseGguf(VkCtx& c, const std::string& tensorName, uint32_t iters) {
+    Gguf g;
+    if (!g.open(ggufPath())) return false;
+    const GgufTensor* t = g.find(tensorName);
+    if (!t) {
+        fprintf(stderr, "tensor '%s' not found (try: qk list)\n", tensorName.c_str());
+        return false;
+    }
+    return caseGgufTensor(c, t, tensorName, iters);
+}
+
+static bool loadGemma4Stage1(Gemma4Stage1Weights& model) {
+    std::string error;
+    if (!model.open(ggufPath(), error)) {
+        fprintf(stderr, "gemma4 loader: %s\n", error.c_str());
+        return false;
+    }
+    printf("gemma4 loader: PASS mapped=%zu vision_skipped=%zu "
+           "Q4_0=%llu Q6_K=%llu other=%llu bytes\n",
+           model.mappedTextTensors, model.skippedVisionTensors,
+           (unsigned long long)model.q4Bytes, (unsigned long long)model.q6Bytes,
+           (unsigned long long)model.otherBytes);
+    printf("gemma4 loader: text-only; no vision projector is opened or mapped\n");
+    return true;
+}
+
+static bool caseGemma4Q4Gemv(VkCtx& c, uint32_t iters) {
+    Gemma4Stage1Weights model;
+    if (!loadGemma4Stage1(model)) return false;
+    struct Case { const char* name; const GgufTensor* tensor; } cases[] = {
+        {"sliding_q_4096x2816", model.layers[0].attnQ},
+        {"global_q_8192x2816", model.layers[5].attnQ},
+        {"shared_ffn_2112x2816", model.layers[0].ffnGate},
+        {"shared_ffn_down_2816x2112", model.layers[0].ffnDown},
+        {"expert_gate_up_1408x2816", model.layers[0].expertGateUp},
+        {"expert_down_2816x704", model.layers[0].expertDown},
+    };
+    bool ok = true;
+    for (const auto& one : cases)
+        ok &= caseGgufTensor(c, one.tensor, one.name, iters);
+    return ok;
+}
+
+static bool caseGemma4Head(VkCtx& c, uint32_t iters) {
+    Gemma4Stage1Weights model;
+    if (!loadGemma4Stage1(model)) return false;
+    return caseGgufTensor(c, model.tokenEmbedding, "q6_k_head_262144x2816",
+                          iters, /*checkArgmax=*/true);
 }
 
 // Fused MoE decode step for one layer: logits -> select -> gate/up (routed
@@ -5029,6 +5274,243 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t ite
     return ok;
 }
 
+static bool caseQ40GemmTensor(VkCtx& c, const GgufTensor* tensor,
+                              const char* name, uint32_t N, uint32_t iters) {
+    if (!tensor || tensor->type != GGML_Q4_0 || tensor->ne[0] % 32 ||
+        tensor->ne[0] > UINT32_MAX || tensor->ne[1] > UINT32_MAX || N == 0) {
+        fprintf(stderr, "gemma4 Q4_0 GEMM: invalid tensor/shape for %s\n", name);
+        return false;
+    }
+    const uint32_t K = (uint32_t)tensor->ne[0];
+    const uint32_t M = (uint32_t)tensor->ne[1];
+    const uint32_t BN = N <= 32 ? 32 : 64;
+    if (N > BN) {
+        fprintf(stderr, "gemma4 Q4_0 GEMM: N=%u exceeds the Stage-1 BN64 harness\n", N);
+        return false;
+    }
+    const size_t rowBytes = ggmlRowBytes(GGML_Q4_0, K);
+    const size_t weightBytes = (size_t)M * rowBytes;  // expert slice 0 for 3-D tensors
+    uint32_t weightCopies = 1;
+    if (const char* value = getenv("QK_COLD_MIB")) {
+        uint64_t target = strtoull(value, nullptr, 10) << 20;
+        if (target > weightBytes)
+            weightCopies = (uint32_t)std::min<uint64_t>(
+                512, (target + weightBytes - 1) / weightBytes);
+    }
+    const size_t residentWeightBytes = weightBytes * (size_t)weightCopies;
+    printf("\n== gemma4 Q4_0 GEMM %s  Y[%u,%u] X[%u,%u] W[%u,%u] "
+           "BN=%u (W %.2f MiB) ==\n",
+           name, N, M, N, K, M, K, BN, (double)weightBytes / (1 << 20));
+    if (tensor->ne[2] > 1) printf("3D tensor: using slice [:,:,0] (expert 0)\n");
+
+    std::vector<float> X((size_t)N * K);
+    std::mt19937 rng(71);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    for (float& value : X) value = normal(rng);
+    std::vector<float> Yref((size_t)N * M), row(K);
+    printf("cpu reference...\n");
+    for (uint32_t m = 0; m < M; ++m) {
+        dequant_row_q4_0((const block_q4_0*)(tensor->data + (size_t)m * rowBytes),
+                         row.data(), K);
+        for (uint32_t n = 0; n < N; ++n) {
+            const float* xr = X.data() + (size_t)n * K;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < K; ++k) sum += (double)row[k] * xr[k];
+            Yref[(size_t)n * M + m] = (float)sum;
+        }
+    }
+
+    Pipe pipe = makePipe(c, BN == 32 ? "gemm_q4_0_bn32.spv" : "gemm_q4_0.spv",
+                         3, 12, K / 32);
+    const VkBufferUsageFlags stor =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const size_t xBytes = X.size() * sizeof(float);
+    const size_t yBytes = Yref.size() * sizeof(float);
+    Buf bW = createBuf(c, residentWeightBytes, stor, true);
+    Buf bX = createBuf(c, xBytes, stor, true);
+    Buf bY = createBuf(c, yBytes, stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    Buf stage = createBuf(c, std::max({residentWeightBytes, xBytes, yBytes}),
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    void* mapped = nullptr;
+    VK_CHECK(vkMapMemory(c.dev, stage.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
+
+    auto begin = [&]() {
+        VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(c.cb, &info));
+    };
+    auto submit = [&]() {
+        VK_CHECK(vkEndCommandBuffer(c.cb));
+        VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        info.commandBufferCount = 1;
+        info.pCommandBuffers = &c.cb;
+        VK_CHECK(vkQueueSubmit(c.queue, 1, &info, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(c.queue));
+    };
+    auto upload = [&](Buf& destination, const void* source, size_t bytes) {
+        memcpy(mapped, source, bytes);
+        begin();
+        VkBufferCopy copy{0, 0, bytes};
+        vkCmdCopyBuffer(c.cb, stage.buf, destination.buf, 1, &copy);
+        submit();
+    };
+    if (weightCopies == 1) {
+        upload(bW, tensor->data, weightBytes);
+    } else {
+        for (uint32_t copy = 0; copy < weightCopies; ++copy)
+            memcpy((uint8_t*)mapped + (size_t)copy * weightBytes,
+                   tensor->data, weightBytes);
+        begin();
+        VkBufferCopy copy{0, 0, residentWeightBytes};
+        vkCmdCopyBuffer(c.cb, stage.buf, bW.buf, 1, &copy);
+        submit();
+        printf("cache-cold weights: %u copies, %.1f MiB resident\n",
+               weightCopies, (double)residentWeightBytes / (1 << 20));
+    }
+    upload(bX, X.data(), xBytes);
+
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                  3u * weightCopies};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = weightCopies;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorPool(c.dev, &poolInfo, nullptr, &pool));
+    VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    alloc.descriptorPool = pool;
+    std::vector<VkDescriptorSetLayout> layouts(weightCopies, pipe.dsl);
+    std::vector<VkDescriptorSet> sets(weightCopies);
+    alloc.descriptorSetCount = weightCopies;
+    alloc.pSetLayouts = layouts.data();
+    VK_CHECK(vkAllocateDescriptorSets(c.dev, &alloc, sets.data()));
+    std::vector<VkDescriptorBufferInfo> infos((size_t)weightCopies * 3);
+    std::vector<VkWriteDescriptorSet> writes((size_t)weightCopies * 3);
+    for (uint32_t copy = 0; copy < weightCopies; ++copy) {
+        infos[(size_t)copy * 3 + 0] = {
+            bW.buf, (VkDeviceSize)copy * weightBytes, weightBytes};
+        infos[(size_t)copy * 3 + 1] = {bX.buf, 0, VK_WHOLE_SIZE};
+        infos[(size_t)copy * 3 + 2] = {bY.buf, 0, VK_WHOLE_SIZE};
+        for (uint32_t binding = 0; binding < 3; ++binding) {
+            auto& write = writes[(size_t)copy * 3 + binding];
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = sets[copy];
+            write.dstBinding = binding;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &infos[(size_t)copy * 3 + binding];
+        }
+    }
+    vkUpdateDescriptorSets(c.dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+    struct { uint32_t M, K, N; } pc{M, K, N};
+    const uint32_t gx = (M + 127) / 128;
+    const uint32_t gz = (N + BN - 1) / BN;
+    auto bindDispatch = [&](uint32_t copy = 0) {
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.p);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pl,
+                                0, 1, &sets[copy], 0, nullptr);
+        vkCmdPushConstants(c.cb, pipe.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pc);
+        vkCmdDispatch(c.cb, gx, 1, gz);
+    };
+    VkMemoryBarrier memoryBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                  VK_ACCESS_SHADER_WRITE_BIT;
+
+    begin();
+    bindDispatch();
+    VkBufferMemoryBarrier outputBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    outputBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    outputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.buffer = bY.buf;
+    outputBarrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                         1, &outputBarrier, 0, nullptr);
+    VkBufferCopy outputCopy{0, 0, yBytes};
+    vkCmdCopyBuffer(c.cb, bY.buf, stage.buf, 1, &outputCopy);
+    submit();
+
+    const float* gpu = (const float*)mapped;
+    double squareSum = 0.0, maxAbs = 0.0;
+    for (size_t i = 0; i < Yref.size(); ++i) {
+        squareSum += (double)Yref[i] * Yref[i];
+        maxAbs = std::max(maxAbs, std::fabs((double)gpu[i] - Yref[i]));
+    }
+    const double rms = std::sqrt(squareSum / Yref.size());
+    const double relative = maxAbs / std::max(1e-8, rms);
+    bool ok = relative < 2e-3;
+    printf("correctness: max_abs/rms = %.3g -> %s\n", relative,
+           ok ? "PASS" : "FAIL");
+
+    if (ok && c.hasTimestamps && iters > 0) {
+        VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryInfo.queryCount = 2;
+        VkQueryPool queryPool = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateQueryPool(c.dev, &queryInfo, nullptr, &queryPool));
+        auto run = [&]() {
+            begin();
+            vkCmdResetQueryPool(c.cb, queryPool, 0, 2);
+            vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
+            for (uint32_t i = 0; i < iters; ++i) {
+                bindDispatch(i % weightCopies);
+                vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                     1, &memoryBarrier, 0, nullptr, 0, nullptr);
+            }
+            vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 1);
+            submit();
+        };
+        uint64_t stamps[2]{};
+        run();
+        VK_CHECK(vkGetQueryPoolResults(c.dev, queryPool, 0, 2, sizeof(stamps),
+                                       stamps, 8, VK_QUERY_RESULT_64_BIT |
+                                       VK_QUERY_RESULT_WAIT_BIT));
+        double coldNs = (double)(stamps[1] - stamps[0]) *
+                        c.props.limits.timestampPeriod / iters;
+        run();
+        VK_CHECK(vkGetQueryPoolResults(c.dev, queryPool, 0, 2, sizeof(stamps),
+                                       stamps, 8, VK_QUERY_RESULT_64_BIT |
+                                       VK_QUERY_RESULT_WAIT_BIT));
+        double ns = (double)(stamps[1] - stamps[0]) *
+                    c.props.limits.timestampPeriod / iters;
+        double payload = weightBytes * gz + xBytes + yBytes;
+        double tflops = 2.0 * M * N * K / ns / 1000.0;
+        printf("gpu: %8.1f us/iter | %7.1f GB/s payload | %6.2f TFLOP/s | "
+               "groups=(%u,1,%u) (%s, cold/hot %.3fx)\n",
+               ns / 1e3, payload / ns, tflops, gx, gz,
+               bW.deviceLocal ? "VRAM" : "GTT", coldNs / ns);
+        vkDestroyQueryPool(c.dev, queryPool, nullptr);
+    }
+
+    vkUnmapMemory(c.dev, stage.mem);
+    vkDestroyDescriptorPool(c.dev, pool, nullptr);
+    destroyPipe(c, pipe);
+    for (Buf* buffer : {&bW, &bX, &bY, &stage}) destroyBuf(c, *buffer);
+    return ok;
+}
+
+static bool caseGemma4Q4Gemm(VkCtx& c, uint32_t N, uint32_t iters) {
+    Gemma4Stage1Weights model;
+    if (!loadGemma4Stage1(model)) return false;
+    struct Case { const char* name; const GgufTensor* tensor; } cases[] = {
+        {"sliding_q_4096x2816", model.layers[0].attnQ},
+        {"global_q_8192x2816", model.layers[5].attnQ},
+        {"shared_ffn_2112x2816", model.layers[0].ffnGate},
+        {"shared_ffn_down_2816x2112", model.layers[0].ffnDown},
+        {"expert_gate_up_1408x2816", model.layers[0].expertGateUp},
+        {"expert_down_2816x704", model.layers[0].expertDown},
+    };
+    bool ok = true;
+    for (const auto& one : cases)
+        ok &= caseQ40GemmTensor(c, one.tensor, one.name, N, iters);
+    return ok;
+}
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -5093,6 +5575,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (mode == "gemma4-load") {
+        Gemma4Stage1Weights model;
+        return loadGemma4Stage1(model) ? 0 : 1;
+    }
+
     if (mode == "serve-bench") {
         // Serving-shaped timing without the completion snapshot: slot_start
         // batch-prefills prompt[0:n-1], then every measured step is the normal
@@ -5134,16 +5621,35 @@ int main(int argc, char** argv) {
         uint32_t finMask = 0;
         auto drive = [&](uint32_t want, std::vector<uint32_t>& dst,
                          const char* phase, bool traceChunks) -> bool {
+            // slot_start intentionally leaves a <16-token prompt tail for the
+            // serial path.  A stepChunk call can therefore make valid prefill
+            // progress while emitting zero tokens (ids2 leaves 13; ids4 leaves
+            // 15 after its 1024-token batch).  Do not mistake that for a stop,
+            // but retain a finite guard so a broken engine cannot spin forever.
+            uint32_t emptyCalls = 0;
+            const uint32_t maxEmptyCalls =
+                (uint32_t)((prompt.size() + chunk - 1) / chunk) + 2;
             while (dst.size() < want) {
                 auto c0 = std::chrono::steady_clock::now();
                 int active = qk_step_chunk(e, outTok.data(), outCnt.data(), &finMask);
                 auto c1 = std::chrono::steady_clock::now();
-                if (active <= 0 || finMask || outCnt[0] == 0) {
+                if (active <= 0 || finMask) {
                     fprintf(stderr,
                             "serve-bench: %s early stop active=%d fin=%u produced=%zu\n",
                             phase, active, finMask, dst.size());
                     return false;
                 }
+                if (outCnt[0] == 0) {
+                    if (++emptyCalls > maxEmptyCalls) {
+                        fprintf(stderr,
+                                "serve-bench: %s stalled after %u zero-output calls "
+                                "(produced=%zu)\n",
+                                phase, emptyCalls, dst.size());
+                        return false;
+                    }
+                    continue;
+                }
+                emptyCalls = 0;
                 dst.insert(dst.end(), outTok.begin(), outTok.begin() + outCnt[0]);
                 if (traceChunks) {
                     double cms = std::chrono::duration<double, std::milli>(c1 - c0).count();
@@ -6258,6 +6764,12 @@ int main(int argc, char** argv) {
         ok = caseQ40(c, argU(2, 32768), argU(3, 16384), argU(4, 100));
     } else if (mode == "q6_k") {
         ok = caseQ6K(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+    } else if (mode == "gemma4-q4-gemv") {
+        ok = caseGemma4Q4Gemv(c, argU(2, 2000));
+    } else if (mode == "gemma4-q4-gemm") {
+        ok = caseGemma4Q4Gemm(c, argU(2, 32), argU(3, 100));
+    } else if (mode == "gemma4-head") {
+        ok = caseGemma4Head(c, argU(2, 2000));
     } else if (mode == "iq4_xs") {
         ok = caseIQ4XS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "iq3_xxs") {

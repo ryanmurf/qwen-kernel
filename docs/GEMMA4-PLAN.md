@@ -300,8 +300,8 @@ Prefer target-shaped synthetic tensors before downloading a sibling. The existin
 4. Freeze raw numeric input-ID fixtures: ordinary chat/coding, window positions 1023/1024/1025, full-attention contexts, and near-tie hidden states.
 
 Gate: artifact ledger reconciles, both cards have repeatable bandwidth data,
-the supplied 3505.04 pp512 and 139.36 tg128 baseline reproduces within thermal
-variance, and llama.cpp produces stable reference IDs on two clean runs.
+the frozen llama.cpp comparator is recorded, and llama.cpp produces stable
+reference IDs on two clean runs.
 
 ### Stage 1 — loader and standalone quant kernels
 
@@ -354,7 +354,7 @@ Gate: all rejection patterns reproduce target-only IDs; acceptance exceeds 75%; 
 ## 4. Exact llama.cpp baseline and parity harness
 
 Reference: `/mnt/data/llama.cpp-master`, commit
-`a935fbffe1a3d31509c325c116454ab5d56b2eb8`. The exact supplied baseline
+`571d0d540df04f25298d0e159e520d9fc62ed121`. The exact supplied baseline
 reproduction is:
 
 ```bash
@@ -364,13 +364,18 @@ GGML_VK_VISIBLE_DEVICES=2 \
   -ngl 99 -p 512 -n 128
 ```
 
-It produced independent tests (the context is cleared between them):
+The current decode reference (the context is cleared between depths) is:
 
 ```text
-pp512 = 3505.04 +/- 103.25 tok/s
-tg128 =  139.36 +/-   1.20 tok/s
+tg128 d0     = 137.73 +/- 0.92 tok/s
+tg128 d4096  = 127.77 +/- 0.17 tok/s
+tg128 d16384 = 120.76 +/- 0.20 tok/s
 model  = 13.43 GiB / 25.23 B parameters
 ```
+
+The 3505.04 tok/s pp512 result remains the historical prefill bar until a clean
+current-revision prefill run replaces it; the recorded 571d0d5 pp samples were
+started at 10% GPU busy and are not accepted as clean measurements.
 
 For the expanded campaign, pin by PCI and verify that `Vulkan0` is the XTX:
 
@@ -426,9 +431,10 @@ Text output is not authoritative because tokenizer/template differences can hide
 
 ## 5. Performance prediction and residual roofline gap
 
-The measured comparator is llama.cpp a935fbf on this XTX: **139.36 +/- 1.20
-tok/s for tg128** and **3505.04 +/- 103.25 tok/s for pp512**. The decode result
-is 7.176 ms/token and only 331.7 GB/s of unique active-weight traffic.
+The measured comparator is llama.cpp 571d0d5 on this XTX: **137.73 +/- 0.92
+tok/s for tg128 at depth zero**. The historical prefill bar is **3505.04
+tok/s for pp512**. The decode result is 7.261 ms/token and only 327.8 GB/s of
+unique active-weight traffic.
 
 The XTX B=1 budget matches standalone tg128 (average depth 64.5):
 
@@ -445,8 +451,8 @@ The XTX B=1 budget matches standalone tg128 (average depth 64.5):
 | **Total** | | **3.70 ms** | **270 tok/s** |
 
 Prediction: **270 tok/s on XTX**, plausible range **250–290**; **222 tok/s on
-XT**, range **210–235**. Against measured llama.cpp, the XTX point is +130.64
-tok/s and **1.94x**; the range is **1.79-2.08x**. The acceptance target is at
+XT**, range **210–235**. Against measured llama.cpp, the XTX point is +132.27
+tok/s and **1.96x**; the range is **1.82-2.11x**. The acceptance target is at
 least 1.3x the same-day llama median after exact parity. At 32K, KV traffic and
 split reduction move XTX to roughly **200–225 tok/s**.
 
@@ -480,8 +486,8 @@ from the 270 base claim; its speed is reported only after acceptance/union logs.
 7. **Router/top-k exactness.** Small f32 ordering differences can change an expert ID and amplify immediately. IDs/order are hard checks, not tolerance checks.
 8. **Greedy near ties.** Vulkan and CPU reductions can flip top-1 despite small tensor error. Preserve a slow diagnostic order and exact ID gate.
 9. **Q6 head bottleneck.** The delivered head is 46% larger than the prompt assumed. Its measured 800 GB/s may vary at the exact 262K-row geometry.
-10. **Prefill estimate.** Native Q4 GEMM and grouped-expert balance are unmeasured; use the 3505.04 llama result as the gate, not a guessed TFLOP/s.
-11. **llama.cpp drift.** The measured 139.36 result is pinned to a935fbf; rerun same-day before comparisons to current master.
+10. **Prefill estimate.** Standalone native Q4 GEMM is measured, but grouped-expert balance is not; use the 3505.04 llama result as the gate, not a guessed TFLOP/s.
+11. **llama.cpp drift.** The measured 137.73 result is pinned to 571d0d5; rerun same-day before comparisons after future reference updates.
 12. **Assistant economics.** Assistant traffic and acceptance are provisional. MTP is optional and abandoned if its explicit gates fail.
 13. **Maximum-context memory.** Model plus KV leaves ~5.37 GiB before Vulkan overhead. Scratch, batching, duplicated tied weights, or an assistant can exhaust it.
 14. **Sibling mismatch.** E4B/12B/31B passing does not validate sparse routing or the exact A4B attention mix.

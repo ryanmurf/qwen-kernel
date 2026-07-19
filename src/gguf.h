@@ -49,7 +49,10 @@ static inline size_t ggmlRowBytes(uint32_t type, uint64_t ne0) {
 
 struct GgufTensor {
     uint32_t type = 0;
+    uint32_t nDims = 0;
     uint64_t ne[4] = {1, 1, 1, 1};
+    uint64_t dataOffset = 0;       // absolute byte offset in the owning GGUF shard
+    size_t nbytes = 0;             // exact encoded payload size when the type is recognized
     const uint8_t* data = nullptr;  // points into the mmap
 };
 
@@ -186,13 +189,43 @@ class Gguf {
         for (auto& inf : infos) {
             inf.name = rdStr();
             uint32_t nd = rd<uint32_t>();
-            for (uint32_t d = 0; d < nd && d < 4; d++) inf.t.ne[d] = rd<uint64_t>();
+            inf.t.nDims = nd;
+            for (uint32_t d = 0; d < nd; d++) {
+                uint64_t ne = rd<uint64_t>();
+                if (d < 4) inf.t.ne[d] = ne;
+            }
             inf.t.type = rd<uint32_t>();
             inf.off = rd<uint64_t>();
         }
         uint64_t dataStart = (pos_ + alignment_ - 1) / alignment_ * alignment_;
         for (auto& inf : infos) {
-            inf.t.data = base_ + dataStart + inf.off;
+            uint64_t absolute = dataStart + inf.off;
+            if (absolute < dataStart || absolute > size_) {
+                fprintf(stderr, "gguf: tensor %s offset is outside the file\n", inf.name.c_str());
+                return false;
+            }
+            // Only publish an exact encoded range when every dimension is
+            // represented in GgufTensor::ne.  Higher-dimensional tensors are
+            // still parsed, but callers must reject them before range use.
+            size_t rowBytes = inf.t.nDims <= 4
+                            ? ggmlRowBytes(inf.t.type, inf.t.ne[0]) : 0;
+            if (rowBytes) {
+                uint64_t total = rowBytes;
+                for (uint32_t d = 1; d < inf.t.nDims && d < 4; d++) {
+                    if (inf.t.ne[d] && total > UINT64_MAX / inf.t.ne[d]) {
+                        fprintf(stderr, "gguf: tensor %s byte size overflows\n", inf.name.c_str());
+                        return false;
+                    }
+                    total *= inf.t.ne[d];
+                }
+                if (total > size_ - absolute) {
+                    fprintf(stderr, "gguf: tensor %s payload extends past EOF\n", inf.name.c_str());
+                    return false;
+                }
+                inf.t.nbytes = (size_t)total;
+            }
+            inf.t.dataOffset = absolute;
+            inf.t.data = base_ + absolute;
             tensors_[inf.name] = inf.t;
         }
         return true;

@@ -1,6 +1,9 @@
-# Frozen fixture status
+# Frozen numeric parity fixtures
 
-No fixture is frozen yet. The 2026-07-18 execution sandbox exposed no Vulkan
-GPU (`/dev/dri` was absent), so the required pair of independent llama.cpp
-reference runs could not be completed. See `../README.md` for the exact gate.
+These six fixtures were generated with llama.cpp
+`571d0d540df04f25298d0e159e520d9fc62ed121` on the RX 7900 XTX. Every input is
+a numeric token-ID array, and every greedy continuation was generated twice
+with `cache_prompt=false`; files were written only after exact ID agreement.
 
+See [`../README.md`](../README.md) for commands, sampler settings, model SHA,
+and the boundary-position construction.

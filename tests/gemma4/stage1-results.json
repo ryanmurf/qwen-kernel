@@ -1,0 +1,148 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-18",
+  "device": {
+    "name": "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+    "pci": "1a:00.0",
+    "mesa_vulkan_driver_package": "26.0.3-1ubuntu1"
+  },
+  "model": {
+    "path": "/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf",
+    "sha256": "3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d"
+  },
+  "method": {
+    "iterations": 2000,
+    "q4_cache_cold_mib_minimum": 128,
+    "timing": "Vulkan GPU timestamps; first batch reported as cold/hot ratio, second as result",
+    "gpu_busy_scope": "Each gpu_busy_percent_before value applies to every timing number in its enclosing sweep/campaign; all were checked immediately before launch",
+    "bandwidth_numerator": "encoded weight bytes only",
+    "command": "QK_DEVICE_PCI=1a:00.0 QK_GGUF=<model> QK_COLD_MIB=128 QK_TPR=<tpr> ./build/qk gemma4-q4-gemv 2000"
+  },
+  "loader": {
+    "status": "PASS",
+    "mapped_text_tensors": 658,
+    "vision_tensors_skipped": 0,
+    "full_file_encoded_bytes": {
+      "Q4_0": 13771929600,
+      "Q6_K": 605552640,
+      "other": 46056568
+    }
+  },
+  "q4_gemv": [
+    {
+      "shape": "sliding_q_4096x2816",
+      "weight_bytes": 6488064,
+      "gpu_busy_percent_before": 0,
+      "sweep_gbps": {"8": 466.6, "16": 648.7, "32": 665.2, "64": 650.2, "128": 685.8, "256": 627.9},
+      "best_tpr": 128,
+      "best_gbps": 685.8,
+      "best_us": 9.5,
+      "workgroups": [2048, 1, 1],
+      "cold_hot_ratio": 1.242,
+      "correctness": "PASS"
+    },
+    {
+      "shape": "global_q_8192x2816",
+      "weight_bytes": 12976128,
+      "gpu_busy_percent_before": 0,
+      "sweep_gbps": {"8": 698.8, "16": 714.2, "32": 747.7, "64": 735.5, "128": 755.7, "256": 709.7},
+      "best_tpr": 128,
+      "best_gbps": 755.7,
+      "best_us": 17.2,
+      "workgroups": [4096, 1, 1],
+      "cold_hot_ratio": 1.179,
+      "correctness": "PASS"
+    },
+    {
+      "shape": "shared_ffn_2112x2816",
+      "weight_bytes": 3345408,
+      "gpu_busy_percent_before": 0,
+      "sweep_gbps": {"8": 330.6, "16": 398.2, "32": 465.9, "64": 503.1, "128": 497.5, "256": 513.6},
+      "best_tpr": 256,
+      "best_gbps": 513.6,
+      "best_us": 6.5,
+      "workgroups": [2112, 1, 1],
+      "cold_hot_ratio": 1.087,
+      "correctness": "PASS"
+    },
+    {
+      "shape": "shared_ffn_down_2816x2112",
+      "weight_bytes": 3345408,
+      "gpu_busy_percent_before": 0,
+      "sweep_gbps": {"8": 349.5, "16": 416.8, "32": 400.8, "64": 409.5, "128": 411.5, "256": 365.4},
+      "best_tpr": 16,
+      "best_gbps": 416.8,
+      "best_us": 8.0,
+      "workgroups": [176, 1, 1],
+      "cold_hot_ratio": 1.158,
+      "correctness": "PASS"
+    },
+    {
+      "shape": "expert_gate_up_1408x2816",
+      "weight_bytes": 2230272,
+      "gpu_busy_percent_before": 0,
+      "sweep_gbps": {"8": 228.8, "16": 318.8, "32": 374.7, "64": 402.2, "128": 392.1, "256": 416.4},
+      "best_tpr": 256,
+      "best_gbps": 416.4,
+      "best_us": 5.4,
+      "workgroups": [1408, 1, 1],
+      "cold_hot_ratio": 1.112,
+      "correctness": "PASS"
+    },
+    {
+      "shape": "expert_down_2816x704",
+      "weight_bytes": 1115136,
+      "gpu_busy_percent_before": 0,
+      "sweep_gbps": {"8": 229.6, "16": 225.2, "32": 249.8, "64": 259.5, "128": 180.8, "256": 161.3},
+      "best_tpr": 64,
+      "best_gbps": 259.5,
+      "best_us": 4.3,
+      "workgroups": [704, 1, 1],
+      "cold_hot_ratio": 1.145,
+      "correctness": "PASS"
+    }
+  ],
+  "q4_gemm": {
+    "gpu_busy_percent_before": 0,
+    "iterations": 1000,
+    "cache_cold_mib_minimum": 128,
+    "bn32_n32_tflops": {
+      "sliding_q_4096x2816": 2.83,
+      "global_q_8192x2816": 5.76,
+      "shared_ffn_2112x2816": 1.59,
+      "shared_ffn_down_2816x2112": 2.07,
+      "expert_gate_up_1408x2816": 1.01,
+      "expert_down_2816x704": 1.97
+    },
+    "bn64_n64_tflops": {
+      "sliding_q_4096x2816": 3.22,
+      "global_q_8192x2816": 6.24,
+      "shared_ffn_2112x2816": 1.76,
+      "shared_ffn_down_2816x2112": 2.32,
+      "expert_gate_up_1408x2816": 1.18,
+      "expert_down_2816x704": 2.22
+    },
+    "correctness": "PASS on every output for every shape in both BN variants"
+  },
+  "q6_k_head": {
+    "shape": "262144x2816",
+    "weight_bytes": 605552640,
+    "gpu_busy_percent_before": 0,
+    "iterations": 2000,
+    "sweep_gbps": {"8": 734.7, "16": 805.3, "32": 793.4, "64": 783.2, "128": 642.5, "256": 611.7},
+    "best_tpr": 16,
+    "best_gbps": 805.3,
+    "best_us": 752.0,
+    "workgroups": [16384, 1, 1],
+    "argmax_us": 5.4,
+    "argmax_pass1_workgroups": 64,
+    "argmax_id_gpu": 78183,
+    "argmax_id_cpu": 78183,
+    "correctness": "PASS"
+  },
+  "spirv_validation": {
+    "target_env": "vulkan1.2",
+    "modules": ["gemv_q4_0", "gemm_q4_0", "gemm_q4_0_bn32", "gemv_q6_k", "argmax1", "argmax2"],
+    "status": "PASS"
+  }
+}

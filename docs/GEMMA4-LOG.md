@@ -30,7 +30,7 @@ Target: `/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf`
 Dead for this model: every `dn_*.comp` (DeltaNet) shader and all recurrent
 state/carry/snapshot code.
 
-## Baseline — llama.cpp master `a935fbf`, Vulkan, measured 2026-07-18
+## Historical baseline — superseded by current 571d0d5 results below
 
 Command shape: `llama-bench -m <model> -ngl 99`, card selected with
 `GGML_VK_VISIBLE_DEVICES` (2 = XTX, 1 = XT).
@@ -51,9 +51,10 @@ across these two cards and the test cannot separate the two hypotheses.
 At 2.380 GB/token, 139.36 tok/s implies only ~331.7 GB/s effective — about 36%
 of the 920 GB/s measured simple-stream rate. That gap is the opportunity.
 
-Note: `GEMMA4-PLAN.md` section 5 predates this measurement and guesses 130 tok/s
-(range 100-160). The guess brackets the real number; treat 139.36/3505 as
-authoritative and the plan's provisional baseline as superseded.
+These values remain useful historical context. The current decode comparator is
+the 571d0d5 depth sweep recorded in the latest entry below; 3505.04 tok/s
+remains the historical prefill bar until a clean current-revision run replaces
+it.
 
 ## Process notes
 
@@ -131,7 +132,7 @@ Caveat: this is one large, perfectly-shaped matrix. It is an upper bound, not
 evidence that the 1-3 MiB expert shapes will reach it. Stage 1 must re-measure
 on real Gemma shapes before any of this is treated as settled.
 
-### 2026-07-18 — Stage 0 sandbox limitation (superseded for bandwidth, still open for fixtures)
+### 2026-07-18 — Stage 0 sandbox limitation (fully superseded)
 
 - **Stage 0 gate blocked; stopped as required.** The codex sandbox has no
   `/dev/dri`. qk enumerated only llvmpipe and rejected `QK_DEVICE_PCI=1a:00.0`;
@@ -142,3 +143,71 @@ on real Gemma shapes before any of this is treated as settled.
   host rerun commands are in `tests/gemma4/` and
   `bench/results-gemma4-llamacpp.jsonl`; acceptance numbers were not lowered or
   backfilled from earlier runs.
+
+### 2026-07-18 — Stage 0 complete; Stage 1 standalone loader and quant kernels
+
+- Updated the reference to llama.cpp
+  `571d0d540df04f25298d0e159e520d9fc62ed121`. The already-measured XTX
+  comparator is tg128 137.73 tok/s at d0, 127.77 at d4096, and 120.76 at
+  d16384; it was not rerun here. The local `common/debug.cpp`
+  `QK_DUMP_DIR`/`QK_DUMP_FILTER` patch remains available for later graph parity.
+- Froze six numeric-ID fixtures: ordinary chat, coding, first-continuation
+  positions 1023/1024/1025, and an exact 8192-ID context. Each stores the exact
+  server/generator commands, sampler settings, reference commit, model SHA-256,
+  inputs, continuations, and two matching continuation hashes. All used
+  temperature zero, penalties off, `cache_prompt=false`, and `ignore_eos=true`.
+- Fixed the Qwen `serve-bench` `produced=0` issue. `qk_slot_start` legitimately
+  leaves a short serial prefill tail; the benchmark had treated a zero-output
+  prefill-progress call as a stop. A bounded-progress guard now permits it.
+  Verification at XTX `gpu_busy=0%`: ids2 emitted its reference first token
+  198 and ids4 emitted reference token 13 with `QK_CHUNK=1`.
+- Added a Stage-1-only Gemma loader with explicit roles for all 658 tensors,
+  exact shape/type/range checks, native 18-byte Q4_0 recognition, global-layer
+  V-projection absence checks, and explicit vision-name skipping. The target
+  passed with 658 mapped text tensors and zero vision tensors. Full-file encoded
+  payload is 13,771,929,600 Q4_0 + 605,552,640 Q6_K + 46,056,568 other bytes;
+  this is distinct from the 1,728,460,800 active Q4_0 bytes per token because
+  the file stores all 128 experts.
+- Promoted Q4_0 GEMV from a measurement-only shader to the standalone native
+  decode primitive and added BM128/BK64/local256 Q4_0 GEMMs for BN32 and BN64.
+  GEMV/GEMM share `q4_0_dequant_pair`; K=704/2112/2816 block counts are pipeline
+  specializations. No Gemma graph, attention, MoE scheduling, or layer assembly
+  was added.
+- All real Q4 shapes passed CPU-dequant versus GPU correctness. GEMM passed
+  every output at both N=32/BN32 and N=64/BN64 (worst max-abs/RMS
+  `2.86e-6`). `spirv-val --target-env vulkan1.2` passed for `gemv_q4_0`, both
+  Q4 GEMMs, `gemv_q6_k`, and both argmax passes.
+
+Q4_0 GEMV was swept over TPR 8/16/32/64/128/256 using real model weights,
+2,000 GPU-timestamped iterations, and descriptor-cycled copies spanning at
+least 128 MiB so the 1-13 MiB tensors could not remain hot in Infinity Cache.
+Every timing run below started at XTX `gpu_busy=0%`; rates count encoded weight
+bytes only.
+
+| shape | best TPR | shader us | GB/s | gpu_busy | workgroups | cold/hot |
+|---|---:|---:|---:|---:|---:|---:|
+| sliding Q 4096x2816 | 128 | 9.5 | **685.8** | 0% | 2048 | 1.242x |
+| global Q 8192x2816 | 128 | 17.2 | **755.7** | 0% | 4096 | 1.179x |
+| shared FFN 2112x2816 | 256 | 6.5 | **513.6** | 0% | 2112 | 1.087x |
+| shared down 2816x2112 | 16 | 8.0 | **416.8** | 0% | 176 | 1.158x |
+| one expert gate/up 1408x2816 | 256 | 5.4 | **416.4** | 0% | 1408 | 1.112x |
+| one expert down 2816x704 | 64 | 4.3 | **259.5** | 0% | 704 | 1.145x |
+
+The small-expert result is the important finding: gate/up reaches only 52% of
+the 801.5-GB/s large-stream upper bound and down only 32%. A hot repeated-tensor
+run misleadingly exceeded 1 TB/s on the 12.4-MiB global-Q tensor, which is why
+cache-cold cycling is now part of the harness. TPR32 is not a general winner;
+the real-shape optima span TPR16 through TPR256.
+
+The standalone Q4 GEMM is correct but clearly under-occupied at these small
+output counts. At XTX `gpu_busy=0%`, N=32/BN32 delivered 2.83/5.76/1.59/2.07/
+1.01/1.97 TFLOP/s for sliding Q, global Q, shared gate, shared down, expert
+gate/up, and expert down. N=64/BN64 delivered 3.22/6.24/1.76/2.32/1.18/2.22
+TFLOP/s. The dispatch has only 11-64 workgroups for most of these cases; this is
+a Stage-6 retiling target, not a waived correctness gate.
+
+The exact 262144x2816 Q6_K head also passed CPU dequant and GPU two-pass argmax
+(ID 78183 on both, lower-index tie order). A TPR 8/16/32/64/128/256 sweep at
+XTX `gpu_busy=0%` selected TPR16: **805.3 GB/s**, 752.0 us for GEMV plus 5.4 us
+for the 64-workgroup argmax reduction. Full machine-readable sweeps are in
+`tests/gemma4/stage1-results.json`.

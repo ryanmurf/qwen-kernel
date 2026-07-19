@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "name": "ordinary_chat",
+  "purpose": "ordinary chat-template decode",
+  "created_utc": "2026-07-19T00:36:01+00:00",
+  "reference": {
+    "implementation": "llama.cpp llama-server /completion numeric-token API",
+    "llama_cpp_commit": "571d0d540df04f25298d0e159e520d9fc62ed121",
+    "llama_cpp_worktree_note": "local common/debug.cpp patch adds QK_DUMP_DIR/QK_DUMP_FILTER; it does not alter model arithmetic unless those variables are set",
+    "binary": "/mnt/data/llama.cpp-master/build/bin/llama-server",
+    "model": "/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf",
+    "model_sha256": "3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d",
+    "server_command": "GGML_VK_VISIBLE_DEVICES=2 rtk proxy /mnt/data/llama.cpp-master/build/bin/llama-server -m /mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf -dev Vulkan0 -sm none -mg 0 -ngl 99 -fa on -ctk f16 -ctv f16 -fit off -c 16384 -b 8192 -ub 512 --parallel 1 --host 127.0.0.1 --port 18271",
+    "fixture_command": "rtk proxy tests/gemma4/generate_fixtures.py --server http://127.0.0.1:18271",
+    "request": "POST /completion twice with prompt=input_ids and sampler_settings below"
+  },
+  "sampler_settings": {
+    "temperature": 0.0,
+    "top_k": 0,
+    "top_p": 1.0,
+    "min_p": 0.0,
+    "typical_p": 1.0,
+    "repeat_penalty": 1.0,
+    "repeat_last_n": 0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "dry_multiplier": 0.0,
+    "xtc_probability": 0.0,
+    "samplers": [
+      "temperature"
+    ],
+    "seed": 1,
+    "cache_prompt": false,
+    "ignore_eos": true,
+    "return_tokens": true,
+    "stream": false,
+    "n_predict": 32
+  },
+  "input_construction": {
+    "method": "llama-server /apply-template followed by /tokenize once",
+    "messages": [
+      {
+        "role": "user",
+        "content": "In one sentence, explain why leaves change color in autumn."
+      }
+    ],
+    "first_continuation_position": 28
+  },
+  "input_ids": [
+    2,
+    105,
+    9731,
+    107,
+    98,
+    107,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    902,
+    886,
+    13315,
+    236764,
+    8082,
+    3217,
+    6895,
+    2352,
+    2258,
+    528,
+    16273,
+    236761,
+    106,
+    107,
+    105,
+    4368,
+    107
+  ],
+  "greedy_continuation_ids": [
+    100,
+    45518,
+    107,
+    236829,
+    139,
+    47589,
+    236787,
+    8922,
+    6895,
+    2352,
+    2258,
+    528,
+    16273,
+    236761,
+    107,
+    140,
+    236829,
+    139,
+    52240,
+    236787,
+    3656,
+    13315,
+    236761,
+    107,
+    140,
+    236829,
+    139,
+    35559,
+    236787,
+    42085,
+    506,
+    20284
+  ],
+  "reproducibility": {
+    "independent_runs": 2,
+    "cache_prompt": false,
+    "exact_match": true,
+    "run_continuation_sha256": [
+      "8ac21a419bff2eaf75a72c2c50b7b096b2c2af2e05da48c4515ee108310888ed",
+      "8ac21a419bff2eaf75a72c2c50b7b096b2c2af2e05da48c4515ee108310888ed"
+    ]
+  }
+}

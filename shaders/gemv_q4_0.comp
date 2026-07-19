@@ -1,19 +1,18 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Measurement-only y[M] = W[M,K] * x[K], raw ggml Q4_0 (18 B/32 weights).
-// This is intentionally a minimal read/dequant GEMV, not the Stage 1 kernel.
+// Native decode GEMV: y[M] = W[M,K] * x[K], raw ggml Q4_0
+// (18 B/32 weights). The block decode is shared with both prefill GEMMs.
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint TPR = 256u;
+layout(constant_id = 1) const uint Q4_BLOCKS_PER_ROW = 88u;
 
-struct block_q4_0 {
-    float16_t d;
-    uint8_t qs[16];
-};
+#include "q4_0.glsl"
 
 layout(std430, binding = 0) readonly  buffer BufW { block_q4_0 wb[]; };
 layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
@@ -29,18 +28,18 @@ void main() {
     uint row = wg * (256u / TPR) + tid / TPR;
     float acc = 0.0;
     if (row < pc.M) {
-        uint blocks_per_row = pc.K / 32u;
+        uint blocks_per_row = Q4_BLOCKS_PER_ROW;
         uint base = row * blocks_per_row;
         for (uint block = lane; block < blocks_per_row; block += TPR) {
-            float d = float(wb[base + block].d);
             uint xoff = block * 32u;
             float sum = 0.0;
             for (uint j = 0u; j < 16u; ++j) {
-                uint packed = uint(wb[base + block].qs[j]);
-                sum += float(int(packed & 15u) - 8) * x[xoff + j];
-                sum += float(int(packed >> 4u) - 8) * x[xoff + j + 16u];
+                float lo, hi;
+                q4_0_dequant_pair(wb[base + block], j, lo, hi);
+                sum += lo * x[xoff + j];
+                sum += hi * x[xoff + j + 16u];
             }
-            acc += d * sum;
+            acc += sum;
         }
     }
 
