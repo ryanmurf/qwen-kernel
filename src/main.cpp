@@ -6862,7 +6862,8 @@ int main(int argc, char** argv) {
         ok = caseGemma4Stage3(c);
     } else if (mode == "gemma4-stage4") {
         ok = caseGemma4Stage4(c, argU(2, 2000));
-    } else if (mode == "gemma4-stage5-fixtures") {
+    } else if (mode == "gemma4-stage5-fixtures" ||
+               mode == "gemma4-stage6-fixtures") {
         ok = caseGemma4Fixtures(c);
     } else if (mode == "gemma4-generate") {
         if (argc < 3) {

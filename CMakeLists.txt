@@ -42,9 +42,12 @@ set(SHADERS gemv_f16 gemv_q4_0 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs
     gemma4_router gemma4_router_batch gemma4_select gemma4_select_batch
     gemma4_quant_q8 gemma4_gemv_q4_q8 gemma4_gemv_q4_f32
     gemma4_moe_gateup gemma4_moe_gateup_f32 gemma4_moe_gateup_batch
-    gemma4_moe_down gemma4_moe_down_batch gemma4_moe_geglu_batch gemma4_moe_reduce_batch
+    gemma4_moe_gateup_grouped gemma4_moe_group
+    gemma4_moe_down gemma4_moe_down_batch gemma4_moe_down_grouped
+    gemma4_moe_reduce_grouped gemma4_moe_geglu_batch gemma4_moe_reduce_batch
     gemma4_attn_prep gemma4_attn gemma4_attn_prep_f16 gemma4_attn_f16
-    gemma4_attn_prep_batch_f16 gemma4_attn_batch_f16 gemma4_mask_f16
+    gemma4_attn_prep_batch_f16 gemma4_attn_batch_f16
+    gemma4_attn_split_f16 gemma4_attn_split_reduce gemma4_mask_f16
     gemma4_cache_scatter_f16 gemma4_argmax
     moe_logits moe_route_select moe_route_select_hier moe_select moe_select_256 moe_group_pairs
     moe_gateup_iq3 moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_q8 moe_gateup_q8_64
@@ -73,54 +76,9 @@ foreach(s ${SHADERS})
 endforeach()
 add_custom_target(shaders ALL DEPENDS ${SPV_FILES})
 
-# Stage-5 parity uses the frozen llama.cpp 571d0d5 cooperative-matrix FA
-# module.  Keeping this exact binary avoids compiler-version drift in the
-# numerical oracle while the surrounding cache/layout code remains qk-owned.
-set(LLAMA_FA_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/flash_attn_f32_f16_f16acc_cm1.spv)
-set(QK_LLAMA_FA_SPV ${CMAKE_BINARY_DIR}/shaders/llama_flash_attn_f16acc_cm1.spv)
-set(LLAMA_MM_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/matmul_q4_0_f32_f16acc_cm1.spv)
-set(QK_LLAMA_MM_SPV ${CMAKE_BINARY_DIR}/shaders/llama_matmul_q4_f32_f16acc_cm1.spv)
-set(LLAMA_MM_ID_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/matmul_id_subgroup_q4_0_f32_f16acc_cm1.spv)
-set(QK_LLAMA_MM_ID_SPV ${CMAKE_BINARY_DIR}/shaders/llama_matmul_id_q4_f32_f16acc_cm1.spv)
-set(LLAMA_COUNT_EXPERTS_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/count_experts.spv)
-set(QK_LLAMA_COUNT_EXPERTS_SPV ${CMAKE_BINARY_DIR}/shaders/llama_count_experts.spv)
-set(LLAMA_MV_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/mul_mat_vec_q4_0_f32_f32_subgroup.spv)
-set(QK_LLAMA_MV_SPV ${CMAKE_BINARY_DIR}/shaders/llama_mul_mat_vec_q4_f32.spv)
-set(LLAMA_MV_ID_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/mul_mat_vec_id_q4_0_f32_f32_subgroup.spv)
-set(QK_LLAMA_MV_ID_SPV ${CMAKE_BINARY_DIR}/shaders/llama_mul_mat_vec_id_q4_f32.spv)
-set(LLAMA_FA_SPLIT_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/fa_split_k_reduce.spv)
-set(QK_LLAMA_FA_SPLIT_SPV ${CMAKE_BINARY_DIR}/shaders/llama_fa_split_k_reduce.spv)
-set(LLAMA_RMS_ROPE_F32_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/rms_norm_mul_rope_f32_f32.spv)
-set(QK_LLAMA_RMS_ROPE_F32_SPV ${CMAKE_BINARY_DIR}/shaders/llama_rms_norm_mul_rope_f32_f32.spv)
-set(LLAMA_RMS_ROPE_F16_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/rms_norm_mul_rope_f32_f16.spv)
-set(QK_LLAMA_RMS_ROPE_F16_SPV ${CMAKE_BINARY_DIR}/shaders/llama_rms_norm_mul_rope_f32_f16.spv)
-set(LLAMA_RMS_SPV /mnt/data/llama.cpp-master/build/ggml/src/ggml-vulkan/vulkan-shaders.spv/rms_norm_f32.spv)
-set(QK_LLAMA_RMS_SPV ${CMAKE_BINARY_DIR}/shaders/llama_rms_norm_f32.spv)
-add_custom_command(
-    OUTPUT ${QK_LLAMA_FA_SPV} ${QK_LLAMA_MM_SPV} ${QK_LLAMA_MM_ID_SPV} ${QK_LLAMA_COUNT_EXPERTS_SPV} ${QK_LLAMA_MV_SPV} ${QK_LLAMA_MV_ID_SPV} ${QK_LLAMA_FA_SPLIT_SPV} ${QK_LLAMA_RMS_ROPE_F32_SPV} ${QK_LLAMA_RMS_ROPE_F16_SPV} ${QK_LLAMA_RMS_SPV}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_FA_SPV} ${QK_LLAMA_FA_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_MM_SPV} ${QK_LLAMA_MM_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_MM_ID_SPV} ${QK_LLAMA_MM_ID_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_COUNT_EXPERTS_SPV} ${QK_LLAMA_COUNT_EXPERTS_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_MV_SPV} ${QK_LLAMA_MV_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_MV_ID_SPV} ${QK_LLAMA_MV_ID_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_FA_SPLIT_SPV} ${QK_LLAMA_FA_SPLIT_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_RMS_ROPE_F32_SPV} ${QK_LLAMA_RMS_ROPE_F32_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_RMS_ROPE_F16_SPV} ${QK_LLAMA_RMS_ROPE_F16_SPV}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LLAMA_RMS_SPV} ${QK_LLAMA_RMS_SPV}
-    DEPENDS ${LLAMA_FA_SPV} ${LLAMA_MM_SPV} ${LLAMA_MM_ID_SPV} ${LLAMA_COUNT_EXPERTS_SPV} ${LLAMA_MV_SPV} ${LLAMA_MV_ID_SPV} ${LLAMA_FA_SPLIT_SPV} ${LLAMA_RMS_ROPE_F32_SPV} ${LLAMA_RMS_ROPE_F16_SPV} ${LLAMA_RMS_SPV}
-    COMMENT "copy frozen llama.cpp cooperative Gemma-4 SPIR-V")
-add_custom_target(gemma4_llama_fa ALL DEPENDS ${QK_LLAMA_FA_SPV} ${QK_LLAMA_MM_SPV}
-    ${QK_LLAMA_MM_ID_SPV} ${QK_LLAMA_COUNT_EXPERTS_SPV} ${QK_LLAMA_MV_SPV}
-    ${QK_LLAMA_MV_ID_SPV} ${QK_LLAMA_FA_SPLIT_SPV}
-    ${QK_LLAMA_RMS_ROPE_F32_SPV} ${QK_LLAMA_RMS_ROPE_F16_SPV}
-    ${QK_LLAMA_RMS_SPV})
-
 add_executable(qk src/main.cpp)
 target_link_libraries(qk PRIVATE Vulkan::Vulkan)
 add_dependencies(qk shaders)
-add_dependencies(qk gemma4_llama_fa)
 
 # Shared library exposing the qk.h C ABI (server links this via dlopen).
 # Same TU as the CLI, compiled with QK_LIBRARY to drop main(); OUTPUT_NAME qk -> libqk.so.
@@ -129,4 +87,3 @@ set_target_properties(qklib PROPERTIES OUTPUT_NAME qk)
 target_compile_definitions(qklib PRIVATE QK_LIBRARY)
 target_link_libraries(qklib PRIVATE Vulkan::Vulkan)
 add_dependencies(qklib shaders)
-add_dependencies(qklib gemma4_llama_fa)

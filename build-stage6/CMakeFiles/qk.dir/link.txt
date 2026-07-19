@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/qk.dir/link.d CMakeFiles/qk.dir/src/main.cpp.o -o qk  /usr/lib/x86_64-linux-gnu/libvulkan.so

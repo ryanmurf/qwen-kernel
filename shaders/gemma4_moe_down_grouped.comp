@@ -1,0 +1,91 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+#include "q4_0.glsl"
+layout(std430, binding = 0) readonly buffer BufW { block_q4_0 weights[]; };
+layout(std430, binding = 1) readonly buffer BufH { float hidden[]; };
+layout(std430, binding = 2) readonly buffer BufM { uint meta[]; };
+layout(std430, binding = 3) readonly buffer BufA { uint assignments[]; };
+layout(std430, binding = 4) readonly buffer BufS { float downScale[]; };
+layout(std430, binding = 5) writeonly buffer BufD { float16_t downAll[]; };
+
+const uint BM = 64u, BN = 32u, RM = 4u, RN = 2u;
+const uint BK_BLOCKS = 2u, BK = 64u, SK = 65u;
+shared float Wsh[BM*SK];
+shared float Xsh[BN*SK];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tr = tid >> 4u, tc = tid & 15u;
+    uint expert = gl_WorkGroupID.z;
+    uint rowBase = gl_WorkGroupID.x*BM;
+    uint begin = meta[128u + expert];
+    uint end = meta[129u + expert];
+    uint assignmentBase = begin + gl_WorkGroupID.y*BN;
+    if (assignmentBase >= end) return;
+
+    float acc[RM][RN];
+    [[unroll]] for (uint mi = 0u; mi < RM; ++mi)
+        [[unroll]] for (uint ni = 0u; ni < RN; ++ni) acc[mi][ni] = 0.0;
+
+    const uint blocksPerRow = 22u;
+    const uint expertBase = expert*2816u*blocksPerRow;
+    for (uint b0 = 0u; b0 < blocksPerRow; b0 += BK_BLOCKS) {
+        if (tid < BM*BK_BLOCKS) {
+            uint rowLocal = tid & (BM - 1u);
+            uint blockLocal = tid >> 6u;
+            uint row = rowBase + rowLocal;
+            uint block = b0 + blockLocal;
+            uint offset = rowLocal*SK + blockLocal*32u;
+            if (row < 2816u && block < blocksPerRow) {
+                block_q4_0 q = weights[expertBase + row*blocksPerRow + block];
+                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                    float lo, hi;
+                    q4_0_dequant_pair(q, j, lo, hi);
+                    Wsh[offset + j] = lo; Wsh[offset + 16u + j] = hi;
+                }
+            } else {
+                [[unroll]] for (uint j = 0u; j < 32u; ++j)
+                    Wsh[offset + j] = 0.0;
+            }
+        }
+        for (uint idx = tid; idx < BN*BK; idx += 256u) {
+            uint localAssignment = idx/BK;
+            uint k = idx - localAssignment*BK;
+            uint listIndex = assignmentBase + localAssignment;
+            uint assignment = listIndex < end ? assignments[listIndex] : 0u;
+            Xsh[localAssignment*SK + k] = listIndex < end &&
+                (b0 << 5u) + k < 704u
+                ? hidden[assignment*704u + (b0 << 5u) + k] : 0.0;
+        }
+        barrier();
+        [[unroll]] for (uint bb = 0u; bb < BK_BLOCKS; ++bb)
+            [[unroll]] for (uint mi = 0u; mi < RM; ++mi) {
+                uint wo = (tr*RM + mi)*SK + bb*32u;
+                [[unroll]] for (uint ni = 0u; ni < RN; ++ni) {
+                    uint xo = (tc*RN + ni)*SK + bb*32u;
+                    float sum = 0.0;
+                    [[unroll]] for (uint k = 0u; k < 32u; ++k)
+                        sum += Wsh[wo + k]*Xsh[xo + k];
+                    acc[mi][ni] += sum;
+                }
+            }
+        barrier();
+    }
+    [[unroll]] for (uint mi = 0u; mi < RM; ++mi) {
+        uint row = rowBase + tr*RM + mi;
+        [[unroll]] for (uint ni = 0u; ni < RN; ++ni) {
+            uint listIndex = assignmentBase + tc*RN + ni;
+            if (row < 2816u && listIndex < end) {
+                uint assignment = assignments[listIndex];
+                downAll[assignment*2816u + row] =
+                    float16_t(acc[mi][ni]*downScale[expert]);
+            }
+        }
+    }
+}

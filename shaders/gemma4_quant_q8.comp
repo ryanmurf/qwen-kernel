@@ -3,6 +3,8 @@
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 32) in;
 #include "q8_1.glsl"
@@ -17,24 +19,14 @@ void main() {
     uint block = gl_WorkGroupID.x;
     uint index = block*32u + lane;
     float value = index < pc.n ? x[index] : 0.0;
-    scratchFloat[lane] = abs(value);
-    barrier();
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) scratchFloat[lane] = max(scratchFloat[lane], scratchFloat[lane + stride]);
-        barrier();
-    }
-    float d = scratchFloat[0]/127.0;
+    float maximum = subgroupMax(abs(value));
+    float d = maximum/127.0;
     float inverse = d != 0.0 ? 1.0/d : 0.0;
     int q = int(round(value*inverse));
-    scratchInt[lane] = q;
     blocks[block].qs[lane] = int8_t(q);
-    barrier();
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) scratchInt[lane] += scratchInt[lane + stride];
-        barrier();
-    }
+    int sum = subgroupAdd(q);
     if (lane == 0u) {
         blocks[block].d = float16_t(d);
-        blocks[block].s = float16_t(float(scratchInt[0])*d);
+        blocks[block].s = float16_t(float(sum)*d);
     }
 }

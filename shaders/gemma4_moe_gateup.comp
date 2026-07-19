@@ -44,7 +44,7 @@ void main() {
     sharedGate[tid] = gate;
     sharedUp[tid] = up;
     barrier();
-    for (uint stride = TPR / 2u; stride > 0u; stride >>= 1u) {
+    for (uint stride = TPR/2u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
             sharedGate[tid] += sharedGate[tid + stride];
             sharedUp[tid] += sharedUp[tid + stride];

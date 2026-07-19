@@ -1,0 +1,71 @@
+#version 450
+
+// Stable F32 merge of split-K online-softmax states. The 64-lane max/sum
+// tree and linear O merge follow llama.cpp's published Vulkan reduction
+// algorithm, reimplemented against qk's own partial-state layout.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer BufS { float states[]; };
+layout(std430, binding = 1) writeonly buffer BufO { float outputValue[]; };
+layout(push_constant) uniform PC {
+    uint headDim;
+    uint queryHeads;
+    uint splitK;
+} pc;
+
+shared float reduction[64];
+shared float globalMaximum;
+shared float globalInverseSum;
+
+void main() {
+    uint qHead = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint stateStride = pc.headDim + 2u;
+    float maximum = -3.402823466e38;
+    for (uint split = lane; split < pc.splitK; split += 64u) {
+        uint base = (split*pc.queryHeads + qHead)*stateStride;
+        if (states[base + 1u] > 0.0) maximum = max(maximum, states[base]);
+    }
+    reduction[lane] = maximum;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            maximum = max(maximum, reduction[lane + stride]);
+            reduction[lane] = maximum;
+        }
+        barrier();
+    }
+    maximum = reduction[0];
+
+    float sum = 0.0;
+    for (uint split = lane; split < pc.splitK; split += 64u) {
+        uint base = (split*pc.queryHeads + qHead)*stateStride;
+        if (states[base + 1u] > 0.0)
+            sum += states[base + 1u]*exp(states[base] - maximum);
+    }
+    reduction[lane] = sum;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sum += reduction[lane + stride];
+            reduction[lane] = sum;
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        globalMaximum = maximum;
+        globalInverseSum = reduction[0] == 0.0 ? 0.0 : 1.0/reduction[0];
+    }
+    barrier();
+
+    uint dim = lane + gl_WorkGroupID.y*64u;
+    if (dim < pc.headDim) {
+        float total = 0.0;
+        for (uint split = 0u; split < pc.splitK; ++split) {
+            uint base = (split*pc.queryHeads + qHead)*stateStride;
+            if (states[base + 1u] > 0.0)
+                total += states[base + 2u + dim]*
+                         exp(states[base] - globalMaximum);
+        }
+        outputValue[qHead*pc.headDim + dim] = total*globalInverseSum;
+    }
+}

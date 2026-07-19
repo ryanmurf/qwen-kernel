@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 256) in;
+struct SelT { uint ids[8]; float routeWeights[8]; };
+layout(std430, binding = 0) readonly buffer BufS { SelT selections[]; };
+// meta[0..127] is scratch; meta[128..256] holds expert offsets.
+layout(std430, binding = 1) buffer BufM { uint meta[]; };
+layout(std430, binding = 2) writeonly buffer BufA { uint assignments[]; };
+layout(push_constant) uniform PC { uint tokens; } pc;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    if (lane < 128u) meta[lane] = 0u;
+    memoryBarrierBuffer(); barrier();
+    uint count = pc.tokens*8u;
+    for (uint assignment = lane; assignment < count; assignment += 256u) {
+        uint expert = selections[assignment >> 3u].ids[assignment & 7u];
+        atomicAdd(meta[expert], 1u);
+    }
+    memoryBarrierBuffer(); barrier();
+    if (lane == 0u) {
+        uint offset = 0u;
+        for (uint expert = 0u; expert < 128u; ++expert) {
+            meta[128u + expert] = offset;
+            offset += meta[expert];
+            meta[expert] = 0u;
+        }
+        meta[256] = offset;
+    }
+    memoryBarrierBuffer(); barrier();
+    for (uint assignment = lane; assignment < count; assignment += 256u) {
+        uint expert = selections[assignment >> 3u].ids[assignment & 7u];
+        uint slot = atomicAdd(meta[expert], 1u);
+        assignments[meta[128u + expert] + slot] = assignment;
+    }
+}

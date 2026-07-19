@@ -1,6 +1,6 @@
 #pragma once
 
-// Persistent Stage-5 Gemma 4 text engine. This file is included from main.cpp
+// Persistent Gemma 4 text engine. This file is included from main.cpp
 // after the shared Vulkan helpers and the Stage 2--4 primitive gates.
 
 #include <array>
@@ -53,6 +53,10 @@ class Gemma4Engine {
                              probabilityStride*4);
         bAttentionValue = dev(gemma4::kGlobalAttention.queryHeads*
                               gemma4::kGlobalAttention.headDim*4);
+        // Global decode attention uses at most one split state per target
+        // workgroup. Leave headroom above the current 96-workgroup heuristic.
+        bAttnSplit = dev((size_t)256*gemma4::kGlobalAttention.queryHeads*
+                         (gemma4::kGlobalAttention.headDim + 2)*4);
         bAttnProjected = dev(gemma4::kEmbedding*4);
         bAttnPost = dev(gemma4::kEmbedding*4);
         bAttnOut = dev(gemma4::kEmbedding*4);
@@ -90,19 +94,12 @@ class Gemma4Engine {
                      gemma4::kSlidingAttention.headDim*4);
         bbRawV = dev((size_t)kBatch*gemma4::kSlidingAttention.kvHeads*
                      gemma4::kSlidingAttention.headDim*4);
-        bbVNorm = dev((size_t)kBatch*gemma4::kSlidingAttention.kvHeads*
-                      gemma4::kSlidingAttention.headDim*4);
         bbQuery = dev((size_t)kBatch*gemma4::kGlobalAttention.queryHeads*
                       gemma4::kGlobalAttention.headDim*4);
         bbProbabilities = dev((size_t)kBatch*gemma4::kGlobalAttention.queryHeads*
                               probabilityStride*4);
         bbAttentionValue = dev((size_t)kBatch*gemma4::kGlobalAttention.queryHeads*
                                gemma4::kGlobalAttention.headDim*4);
-        // llama.cpp's low-row FA path fans KV across at most roughly 2x the
-        // XTX CU count, then performs a separate stable softmax reduction.
-        bFaSplit = dev((size_t)256*(gemma4::kGlobalAttention.queryHeads*
-                       gemma4::kGlobalAttention.headDim +
-                       2*gemma4::kGlobalAttention.queryHeads)*4);
         bbAttnProjected = dev(batchEmbedding);
         bbAttnPost = dev(batchEmbedding);
         bbAttnOut = dev(batchEmbedding);
@@ -116,13 +113,12 @@ class Gemma4Engine {
         bbRouterLogits = dev((size_t)kBatch*gemma4::kExperts*4);
         bbSelection = dev((size_t)kBatch*sizeof(gemma4::Selection));
         bbRoutedIn = dev(batchEmbedding);
-        bbExpertGateUp = dev((size_t)kBatch*gemma4::kExpertsUsed*
-                             (2*gemma4::kExpertFf)*4);
         bbExpertHidden = dev((size_t)kBatch*gemma4::kExpertsUsed*
                              gemma4::kExpertFf*4);
-        bbExpertDown = dev((size_t)kBatch*gemma4::kExpertsUsed*
-                           gemma4::kEmbedding*4);
-        bbExpertCounts = dev(gemma4::kExperts*4);
+        bbExpertMeta = dev(257u*4);
+        bbExpertAssignments = dev((size_t)kBatch*gemma4::kExpertsUsed*4);
+        bbExpertDownAll = dev((size_t)kBatch*gemma4::kExpertsUsed*
+                              gemma4::kEmbedding*2);
         bbRoutedDown = dev(batchEmbedding);
         bbRoutedBranch = dev(batchEmbedding);
         bbBranchSum = dev(batchEmbedding);
@@ -131,7 +127,9 @@ class Gemma4Engine {
         bbMask = dev((size_t)kBatch*kvCapacity*sizeof(uint16_t));
         bLayerDumps = dev((size_t)gemma4::kLayers*gemma4::kEmbedding*4);
         bOpDumps = dev((size_t)5*gemma4::kEmbedding*4);
-        bAttnOpDumps = dev((size_t)7*4096*4);
+        bAttnOpDumps = dev((size_t)7*8192*4);
+        bRouterSnapshot = dev((size_t)gemma4::kExperts*4 +
+                              sizeof(gemma4::Selection));
 
         if (!uploadModel(error)) return false;
         makePipelines();
@@ -188,7 +186,7 @@ class Gemma4Engine {
         if (position >= nCtx) throw std::runtime_error("Gemma 4 context exhausted");
         (void)prefillArithmetic;
         batchIdsMap[0] = token;
-        recordBatch(position, 1, true);
+        recordBatch(position, 1, true, false);
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &c.cb;
@@ -270,33 +268,6 @@ class Gemma4Engine {
     }
 
   private:
-    struct G4BinaryPush {
-        uint32_t ne;
-        uint32_t ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03;
-        uint32_t ne10, ne11, ne12, ne13, nb10, nb11, nb12, nb13;
-        uint32_t ne20, ne21, ne22, ne23, nb20, nb21, nb22, nb23;
-        uint32_t misalignOffsets;
-        float param1, param2;
-        int32_t param3;
-    };
-    struct G4RopePush {
-        uint32_t ropeMode, nrows, nDims;
-        float freqScale, freqBase, extFactor, attnFactor;
-        float corrDims[2];
-        float thetaScale;
-        uint32_t hasFactors;
-        int32_t sections[4];
-        uint32_t isImrope, isBack, setRowsStride;
-        uint32_t ne00, ne01, ne02;
-        uint32_t nb01, nb02, nb03;
-        uint32_t nb11, nb12, nb13;
-        uint32_t aOffset, dOffset;
-    };
-    struct G4RmsRopePush { G4BinaryPush binary; G4RopePush rope; };
-    static_assert(sizeof(G4BinaryPush) == 116);
-    static_assert(sizeof(G4RopePush) == 116);
-    static_assert(sizeof(G4RmsRopePush) == 232);
-
     struct LayerGpu {
         gemma4::AttentionConfig cfg{};
         VkBuffer attnK = VK_NULL_HANDLE, attnKNorm = VK_NULL_HANDLE;
@@ -334,25 +305,21 @@ class Gemma4Engine {
         VkDescriptorSet bAttnRms = VK_NULL_HANDLE, bQ = VK_NULL_HANDLE;
         VkDescriptorSet bK = VK_NULL_HANDLE, bV = VK_NULL_HANDLE;
         VkDescriptorSet bPrep = VK_NULL_HANDLE, bAttention = VK_NULL_HANDLE;
-        VkDescriptorSet bAttentionSplit = VK_NULL_HANDLE;
-        VkDescriptorSet bQRmsRope = VK_NULL_HANDLE;
-        VkDescriptorSet bKRmsRope = VK_NULL_HANDLE;
-        VkDescriptorSet bVRms = VK_NULL_HANDLE;
-        VkDescriptorSet bCacheScatter = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionSplit = VK_NULL_HANDLE;
         VkDescriptorSet bAttnOutput = VK_NULL_HANDLE, bPostAttention = VK_NULL_HANDLE;
         VkDescriptorSet bSharedRms = VK_NULL_HANDLE, bSharedGate = VK_NULL_HANDLE;
         VkDescriptorSet bSharedUp = VK_NULL_HANDLE, bSharedDown = VK_NULL_HANDLE;
         VkDescriptorSet bSharedPost = VK_NULL_HANDLE, bRouter = VK_NULL_HANDLE;
         VkDescriptorSet bRoutedRms = VK_NULL_HANDLE, bExpertGateUp = VK_NULL_HANDLE;
-        VkDescriptorSet bExpertDown = VK_NULL_HANDLE, bExpertReduce = VK_NULL_HANDLE;
+        VkDescriptorSet bExpertDown = VK_NULL_HANDLE;
         VkDescriptorSet bRoutedPost = VK_NULL_HANDLE;
         VkDescriptorSet bPostFfw = VK_NULL_HANDLE;
         VkDescriptorSet dQ = VK_NULL_HANDLE, dK = VK_NULL_HANDLE, dV = VK_NULL_HANDLE;
+        VkDescriptorSet dKF32 = VK_NULL_HANDLE, dVF32 = VK_NULL_HANDLE;
         VkDescriptorSet dAttnOutput = VK_NULL_HANDLE;
         VkDescriptorSet dSharedGate = VK_NULL_HANDLE, dSharedUp = VK_NULL_HANDLE;
         VkDescriptorSet dSharedDown = VK_NULL_HANDLE;
-        VkDescriptorSet dExpertGateUp = VK_NULL_HANDLE;
-        VkDescriptorSet dExpertDown = VK_NULL_HANDLE;
+        VkDescriptorSet dExpertGateUp = VK_NULL_HANDLE, dExpertDown = VK_NULL_HANDLE;
     };
 
     VkCtx& c;
@@ -381,20 +348,10 @@ class Gemma4Engine {
     Pipe pHead{}, pArgmax{};
     Pipe pBatchEmbed{}, pBatchGemm88{}, pBatchGemm66{};
     Pipe pBatchGemm128{}, pBatchGemm256{}, pBatchPrep{}, pBatchAttention{};
-    Pipe pBatchMask{}, pBatchFa256Aligned{}, pBatchFa256Clamp{};
-    Pipe pBatchFa512Aligned{}, pBatchFa512Clamp{};
-    Pipe pFaSplitReduce{};
-    Pipe pRmsRopeF32{}, pRmsRopeF16{}, pExactHeadRms{};
-    Pipe pCacheScatter{};
-    Pipe pBatchMmLargeAligned{}, pBatchMmLargeClamp{};
-    Pipe pBatchMmMediumAligned{}, pBatchMmMediumClamp{};
-    Pipe pBatchMmSmallAligned{}, pBatchMmSmallClamp{};
-    Pipe pBatchCountExperts{}, pBatchMoeGeglu{}, pBatchMoeReduce{};
-    Pipe pDecodeMatVec{}, pDecodeMatVecId{};
-    Pipe pBatchMmIdLargeAligned{}, pBatchMmIdLargeClamp{};
-    Pipe pBatchMmIdMediumAligned{}, pBatchMmIdMediumClamp{};
-    Pipe pBatchMmIdSmallAligned{}, pBatchMmIdSmallClamp{};
+    Pipe pDecodeAttentionSplit{}, pDecodeAttentionReduce{};
+    Pipe pBatchMask{};
     Pipe pBatchRouter{}, pBatchSelect{}, pBatchExpertGateUp{}, pBatchExpertDown{};
+    Pipe pBatchExpertGroup{}, pBatchExpertReduce{};
 
     static constexpr uint32_t kBatch = 512;
     uint32_t* batchIdsMap = nullptr;
@@ -407,7 +364,8 @@ class Gemma4Engine {
     VkBuffer bX = VK_NULL_HANDLE, bAttnNorm = VK_NULL_HANDLE, bQ8 = VK_NULL_HANDLE;
     VkBuffer bRawQ = VK_NULL_HANDLE, bRawK = VK_NULL_HANDLE, bRawV = VK_NULL_HANDLE;
     VkBuffer bQuery = VK_NULL_HANDLE, bProbabilities = VK_NULL_HANDLE;
-    VkBuffer bAttentionValue = VK_NULL_HANDLE, bAttnProjected = VK_NULL_HANDLE;
+    VkBuffer bAttentionValue = VK_NULL_HANDLE, bAttnSplit = VK_NULL_HANDLE;
+    VkBuffer bAttnProjected = VK_NULL_HANDLE;
     VkBuffer bAttnPost = VK_NULL_HANDLE, bAttnOut = VK_NULL_HANDLE;
     VkBuffer bSharedIn = VK_NULL_HANDLE, bSharedGate = VK_NULL_HANDLE;
     VkBuffer bSharedUp = VK_NULL_HANDLE, bSharedHidden = VK_NULL_HANDLE;
@@ -422,24 +380,24 @@ class Gemma4Engine {
     VkBuffer bBatchCacheIndices = VK_NULL_HANDLE, bbX = VK_NULL_HANDLE;
     VkBuffer bbAttnNorm = VK_NULL_HANDLE, bbRawQ = VK_NULL_HANDLE;
     VkBuffer bbRawK = VK_NULL_HANDLE, bbRawV = VK_NULL_HANDLE;
-    VkBuffer bbVNorm = VK_NULL_HANDLE;
     VkBuffer bbQuery = VK_NULL_HANDLE, bbProbabilities = VK_NULL_HANDLE;
     VkBuffer bbAttentionValue = VK_NULL_HANDLE, bbAttnProjected = VK_NULL_HANDLE;
-    VkBuffer bFaSplit = VK_NULL_HANDLE;
     VkBuffer bbAttnPost = VK_NULL_HANDLE, bbAttnOut = VK_NULL_HANDLE;
     VkBuffer bbSharedIn = VK_NULL_HANDLE, bbSharedGate = VK_NULL_HANDLE;
     VkBuffer bbSharedUp = VK_NULL_HANDLE, bbSharedHidden = VK_NULL_HANDLE;
     VkBuffer bbSharedDown = VK_NULL_HANDLE, bbSharedBranch = VK_NULL_HANDLE;
     VkBuffer bbRouterNorm = VK_NULL_HANDLE, bbRouterLogits = VK_NULL_HANDLE;
     VkBuffer bbSelection = VK_NULL_HANDLE, bbRoutedIn = VK_NULL_HANDLE;
-    VkBuffer bbExpertGateUp = VK_NULL_HANDLE, bbExpertHidden = VK_NULL_HANDLE;
-    VkBuffer bbExpertDown = VK_NULL_HANDLE, bbExpertCounts = VK_NULL_HANDLE;
+    VkBuffer bbExpertHidden = VK_NULL_HANDLE;
+    VkBuffer bbExpertMeta = VK_NULL_HANDLE, bbExpertAssignments = VK_NULL_HANDLE;
+    VkBuffer bbExpertDownAll = VK_NULL_HANDLE;
     VkBuffer bbRoutedDown = VK_NULL_HANDLE;
     VkBuffer bbRoutedBranch = VK_NULL_HANDLE, bbBranchSum = VK_NULL_HANDLE;
     VkBuffer bbPostFfw = VK_NULL_HANDLE, bbFinalNorm = VK_NULL_HANDLE;
     VkBuffer bbMask = VK_NULL_HANDLE, bLayerDumps = VK_NULL_HANDLE;
     VkBuffer bOpDumps = VK_NULL_HANDLE;
     VkBuffer bAttnOpDumps = VK_NULL_HANDLE;
+    VkBuffer bRouterSnapshot = VK_NULL_HANDLE;
 
     VkDescriptorSet sEmbed = VK_NULL_HANDLE, sQuantAttn = VK_NULL_HANDLE;
     VkDescriptorSet sQuantAttentionValue = VK_NULL_HANDLE;
@@ -450,12 +408,18 @@ class Gemma4Engine {
     VkDescriptorSet sFinalNorm = VK_NULL_HANDLE, sHead = VK_NULL_HANDLE;
     VkDescriptorSet sArgmax = VK_NULL_HANDLE;
     VkDescriptorSet sbEmbed = VK_NULL_HANDLE, sbAttnResidual = VK_NULL_HANDLE;
+    VkDescriptorSet sbQuantAttn = VK_NULL_HANDLE;
+    VkDescriptorSet sbQuantAttentionValue = VK_NULL_HANDLE;
+    VkDescriptorSet sbQuantShared = VK_NULL_HANDLE;
+    VkDescriptorSet sbQuantSharedHidden = VK_NULL_HANDLE;
+    VkDescriptorSet sbQuantRouted = VK_NULL_HANDLE;
     VkDescriptorSet sbSharedGelu = VK_NULL_HANDLE, sbRouterNorm = VK_NULL_HANDLE;
     VkDescriptorSet sbSelect = VK_NULL_HANDLE, sbBranchAdd = VK_NULL_HANDLE;
     VkDescriptorSet sbLayerOutput = VK_NULL_HANDLE, sbFinalNorm = VK_NULL_HANDLE;
-    VkDescriptorSet sbMask = VK_NULL_HANDLE, sbCountExperts = VK_NULL_HANDLE;
-    VkDescriptorSet sbMoeGeglu = VK_NULL_HANDLE;
-    VkDescriptorSet sbFaSplitReduce = VK_NULL_HANDLE;
+    VkDescriptorSet sbMask = VK_NULL_HANDLE;
+    VkDescriptorSet sbExpertGroup = VK_NULL_HANDLE;
+    VkDescriptorSet sbExpertReduce = VK_NULL_HANDLE;
+    VkDescriptorSet sdAttentionReduce = VK_NULL_HANDLE;
 
     VkBuffer allocDevice(size_t bytes) {
         owned.push_back(createBuf(c, std::max<size_t>(bytes, 4),
@@ -521,6 +485,10 @@ class Gemma4Engine {
     void dumpLayerOutputs() {
         const char* dir = getenv("QK_G4_DUMP_DIR");
         if (!dir || !*dir) return;
+        uint32_t diagnosticLayer = 0;
+        if (const char* value = getenv("QK_G4_DUMP_LAYER"))
+            diagnosticLayer = std::min<uint32_t>(
+                (uint32_t)strtoul(value, nullptr, 10), gemma4::kLayers - 1);
         std::vector<float> values((size_t)gemma4::kLayers*gemma4::kEmbedding);
         download(bLayerDumps, values.data(), values.size()*sizeof(float));
         for (uint32_t il = 0; il < gemma4::kLayers; ++il) {
@@ -534,27 +502,49 @@ class Gemma4Engine {
         std::vector<float> ops((size_t)5*gemma4::kEmbedding);
         download(bOpDumps, ops.data(), ops.size()*sizeof(float));
         static const char* names[] = {
-            "attn_out-0", "ffn_mlp-0", "ffn_moe-0",
-            "ffn_moe_combined-0", "ffn_post_norm-0"};
+            "attn_out-", "ffn_mlp-", "ffn_moe-",
+            "ffn_moe_combined-", "ffn_post_norm-"};
         for (uint32_t i = 0; i < 5; ++i) {
-            std::string path = std::string(dir) + "/" + names[i] + ".bin";
+            std::string path = std::string(dir) + "/" + names[i] +
+                               std::to_string(diagnosticLayer) + ".bin";
             std::ofstream output(path, std::ios::binary);
             output.write((const char*)(ops.data() +
                          (size_t)i*gemma4::kEmbedding),
                          gemma4::kEmbedding*sizeof(float));
         }
-        std::vector<float> attnOps((size_t)7*4096);
+        std::vector<float> attnOps((size_t)7*8192);
         download(bAttnOpDumps, attnOps.data(), attnOps.size()*sizeof(float));
         static const char* attnNames[] = {
-            "attn_norm-0", "Qcur-0", "Kcur-0", "Vcur-0",
-            "Qcur_pos-0", "kqv_out-0", "attn_post_norm-0"};
-        static const uint32_t attnWidths[] = {
-            2816, 4096, 2048, 2048, 4096, 4096, 2816};
+            "attn_norm-", "Qcur-", "Kcur-", "Vcur-",
+            "Qcur_pos-", "kqv_out-", "attn_post_norm-"};
+        const auto cfg = gemma4::attentionConfig(diagnosticLayer);
+        const uint32_t qWidth = cfg.queryHeads*cfg.headDim;
+        const uint32_t kvWidth = cfg.kvHeads*cfg.headDim;
+        const uint32_t attnWidths[] = {
+            gemma4::kEmbedding, qWidth, kvWidth, kvWidth,
+            qWidth, qWidth, gemma4::kEmbedding};
         for (uint32_t i = 0; i < 7; ++i) {
-            std::string path = std::string(dir) + "/" + attnNames[i] + ".bin";
+            std::string path = std::string(dir) + "/" + attnNames[i] +
+                               std::to_string(diagnosticLayer) + ".bin";
             std::ofstream output(path, std::ios::binary);
-            output.write((const char*)(attnOps.data() + (size_t)i*4096),
+            output.write((const char*)(attnOps.data() + (size_t)i*8192),
                          attnWidths[i]*sizeof(float));
+        }
+        std::array<uint8_t, gemma4::kExperts*4 +
+                            sizeof(gemma4::Selection)> router{};
+        download(bRouterSnapshot, router.data(), router.size());
+        {
+            std::string path = std::string(dir) + "/router_logits-" +
+                               std::to_string(diagnosticLayer) + ".bin";
+            std::ofstream output(path, std::ios::binary);
+            output.write((const char*)router.data(), gemma4::kExperts*4);
+        }
+        {
+            std::string path = std::string(dir) + "/router_selection-" +
+                               std::to_string(diagnosticLayer) + ".bin";
+            std::ofstream output(path, std::ios::binary);
+            output.write((const char*)router.data() + gemma4::kExperts*4,
+                         sizeof(gemma4::Selection));
         }
     }
 
@@ -585,8 +575,29 @@ class Gemma4Engine {
         vkCmdPipelineBarrier(recordingCb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                              1, &toCopy, 0, nullptr, 0, nullptr);
-        VkBufferCopy copy{sourceOffset, (VkDeviceSize)slot*4096*4, bytes};
+        VkBufferCopy copy{sourceOffset, (VkDeviceSize)slot*8192*4, bytes};
         vkCmdCopyBuffer(recordingCb, source, bAttnOpDumps, 1, &copy);
+        VkMemoryBarrier fromCopy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        fromCopy.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        fromCopy.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(recordingCb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             1, &fromCopy, 0, nullptr, 0, nullptr);
+    }
+
+    void recordRouterDump(VkBuffer logits, VkDeviceSize logitsOffset,
+                          VkBuffer selection, VkDeviceSize selectionOffset) {
+        VkMemoryBarrier toCopy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        toCopy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        toCopy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(recordingCb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             1, &toCopy, 0, nullptr, 0, nullptr);
+        VkBufferCopy copies[2]{{logitsOffset, 0, gemma4::kExperts*4},
+                               {selectionOffset, gemma4::kExperts*4,
+                                sizeof(gemma4::Selection)}};
+        vkCmdCopyBuffer(recordingCb, logits, bRouterSnapshot, 1, &copies[0]);
+        vkCmdCopyBuffer(recordingCb, selection, bRouterSnapshot, 1, &copies[1]);
         VkMemoryBarrier fromCopy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         fromCopy.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         fromCopy.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -656,8 +667,6 @@ class Gemma4Engine {
     }
 
     void makePipelines() {
-        if (!c.cooperativeMatrix)
-            throw std::runtime_error("Gemma 4 parity requires VK_KHR_cooperative_matrix");
         pEmbed = makePipe(c, "gemma4_embed.spv", 3, 8);
         pRms = makePipe(c, "gemma4_rms.spv", 3, 16);
         pQuant = makePipe(c, "gemma4_quant_q8.spv", 2, 4);
@@ -680,74 +689,18 @@ class Gemma4Engine {
         pBatchGemm256 = makePipe(c, "gemm_q4_0.spv", 3, 12, 256);
         pBatchPrep = makePipe(c, "gemma4_attn_prep_batch_f16.spv", 11, 44);
         pBatchAttention = makePipe(c, "gemma4_attn_batch_f16.spv", 5, 32);
+        pDecodeAttentionSplit = makePipe(c, "gemma4_attn_split_f16.spv", 5, 40);
+        pDecodeAttentionReduce = makePipe(c, "gemma4_attn_split_reduce.spv", 2, 12);
         pBatchMask = makePipe(c, "gemma4_mask_f16.spv", 1, 16);
-        auto faSpecs = [](uint32_t headDim, bool clamp) {
-            return std::vector<uint32_t>{
-                256, 16, 64, headDim, headDim, clamp ? 1u : 0u,
-                8, 4, 64, 0, 2, 0, 1, 1, 2, 2};
-        };
-        pBatchFa256Aligned = makePipeSpecs(c, "llama_flash_attn_f16acc_cm1.spv",
-                                           7, 128, faSpecs(256, false));
-        pBatchFa256Clamp = makePipeSpecs(c, "llama_flash_attn_f16acc_cm1.spv",
-                                         7, 128, faSpecs(256, true));
-        pBatchFa512Aligned = makePipeSpecs(c, "llama_flash_attn_f16acc_cm1.spv",
-                                           7, 128, faSpecs(512, false));
-        pBatchFa512Clamp = makePipeSpecs(c, "llama_flash_attn_f16acc_cm1.spv",
-                                         7, 128, faSpecs(512, true));
-        pFaSplitReduce = makePipe(c, "llama_fa_split_k_reduce.spv",
-                                  3, 24, 64);
-        pRmsRopeF32 = makePipeSpecs(c,
-            "llama_rms_norm_mul_rope_f32_f32.spv", 7, 232, {0, 1});
-        pRmsRopeF16 = makePipeSpecs(c,
-            "llama_rms_norm_mul_rope_f32_f16.spv", 7, 232, {0, 1});
-        pExactHeadRms = makePipeSpecs(c, "llama_rms_norm_f32.spv",
-                                      4, 116, {0, 0});
-        pCacheScatter = makePipe(c, "gemma4_cache_scatter_f16.spv",
-                                 6, 16);
-        auto mmSpecs = [](std::initializer_list<uint32_t> tile, bool aligned) {
-            std::vector<uint32_t> result(tile);
-            result.push_back(aligned ? 1u : 0u);
-            return result;
-        };
-        pBatchMmLargeAligned = makePipeSpecs(c, "llama_matmul_q4_f32_f16acc_cm1.spv",
-            3, 68, mmSpecs({256,128,128,32,64,64,2,16,16,16,64}, true));
-        pBatchMmLargeClamp = makePipeSpecs(c, "llama_matmul_q4_f32_f16acc_cm1.spv",
-            3, 68, mmSpecs({256,128,128,32,64,64,2,16,16,16,64}, false));
-        pBatchMmMediumAligned = makePipeSpecs(c, "llama_matmul_q4_f32_f16acc_cm1.spv",
-            3, 68, mmSpecs({128,64,64,32,64,32,2,16,16,16,64}, true));
-        pBatchMmMediumClamp = makePipeSpecs(c, "llama_matmul_q4_f32_f16acc_cm1.spv",
-            3, 68, mmSpecs({128,64,64,32,64,32,2,16,16,16,64}, false));
-        pBatchMmSmallAligned = makePipeSpecs(c, "llama_matmul_q4_f32_f16acc_cm1.spv",
-            3, 68, mmSpecs({64,32,32,32,32,32,2,16,16,16,64}, true));
-        pBatchMmSmallClamp = makePipeSpecs(c, "llama_matmul_q4_f32_f16acc_cm1.spv",
-            3, 68, mmSpecs({64,32,32,32,32,32,2,16,16,16,64}, false));
-        pBatchCountExperts = makePipe(c, "llama_count_experts.spv", 2, 20);
-        pBatchMoeGeglu = makePipe(c, "gemma4_moe_geglu_batch.spv", 2, 4);
-        pBatchMoeReduce = makePipe(c, "gemma4_moe_reduce_batch.spv", 4, 4);
-        pDecodeMatVec = makePipeSpecs(c, "llama_mul_mat_vec_q4_f32.spv",
-                                      5, 52, {64, 2, 1});
-        pDecodeMatVecId = makePipeSpecs(c,
-            "llama_mul_mat_vec_id_q4_f32.spv", 6, 48, {64, 2});
-        pBatchMmIdLargeAligned = makePipeSpecs(c,
-            "llama_matmul_id_q4_f32_f16acc_cm1.spv", 5, 56,
-            mmSpecs({128,128,128,32,128,64,2,16,16,16,64}, true));
-        pBatchMmIdLargeClamp = makePipeSpecs(c,
-            "llama_matmul_id_q4_f32_f16acc_cm1.spv", 5, 56,
-            mmSpecs({128,128,128,32,128,64,2,16,16,16,64}, false));
-        pBatchMmIdMediumAligned = makePipeSpecs(c,
-            "llama_matmul_id_q4_f32_f16acc_cm1.spv", 5, 56,
-            mmSpecs({128,64,64,32,64,32,2,16,16,16,64}, true));
-        pBatchMmIdMediumClamp = makePipeSpecs(c,
-            "llama_matmul_id_q4_f32_f16acc_cm1.spv", 5, 56,
-            mmSpecs({128,64,64,32,64,32,2,16,16,16,64}, false));
-        pBatchMmIdSmallAligned = makePipeSpecs(c,
-            "llama_matmul_id_q4_f32_f16acc_cm1.spv", 5, 56,
-            mmSpecs({64,32,32,32,32,32,2,16,16,16,64}, true));
-        pBatchMmIdSmallClamp = makePipeSpecs(c,
-            "llama_matmul_id_q4_f32_f16acc_cm1.spv", 5, 56,
-            mmSpecs({64,32,32,32,32,32,2,16,16,16,64}, false));
         pBatchRouter = makePipe(c, "gemma4_router_batch.spv", 4, 12);
         pBatchSelect = makePipe(c, "gemma4_select_batch.spv", 2, 0);
+        pBatchExpertGroup = makePipe(c, "gemma4_moe_group.spv", 3, 4);
+        pBatchExpertGateUp = makePipe(c, "gemma4_moe_gateup_grouped.spv",
+                                      5, 0);
+        pBatchExpertDown = makePipe(c, "gemma4_moe_down_grouped.spv",
+                                    6, 0);
+        pBatchExpertReduce = makePipe(c, "gemma4_moe_reduce_grouped.spv",
+                                      3, 4);
     }
 
     void makeDescriptorPool() {
@@ -799,6 +752,8 @@ class Gemma4Engine {
         sFinalNorm = set(pRms, {bX, bOutputNorm, bFinalNorm});
         sHead = set(pHead, {bTokenEmbedding, bFinalNorm, bLogits});
         sArgmax = set(pArgmax, {bLogits, bTokenOut});
+        sdAttentionReduce = set(pDecodeAttentionReduce,
+                                {bAttnSplit, bbAttentionValue});
     }
 
     void makeLayerSets(std::string& error) {
@@ -858,50 +813,13 @@ class Gemma4Engine {
         throw std::runtime_error("unsupported Gemma batch GEMM K");
     }
 
-    Pipe& batchFaPipe(uint32_t headDim, bool aligned) {
-        if (headDim == 256)
-            return aligned ? pBatchFa256Aligned : pBatchFa256Clamp;
-        if (headDim == 512)
-            return aligned ? pBatchFa512Aligned : pBatchFa512Clamp;
-        throw std::runtime_error("unsupported Gemma FA head size");
-    }
-
-    Pipe& batchMmPipe(uint32_t K, uint32_t tokens, uint32_t& bm,
-                      uint32_t& bn) {
-        if (tokens <= 32) {
-            bm = bn = 32;
-            const bool aligned = K%32 == 0 && tokens > 8;
-            return aligned ? pBatchMmSmallAligned : pBatchMmSmallClamp;
-        }
-        if (tokens <= 64) {
-            bm = bn = 64;
-            const bool aligned = K%64 == 0;
-            return aligned ? pBatchMmMediumAligned : pBatchMmMediumClamp;
-        }
-        bm = bn = 128;
-        const bool aligned = K%128 == 0;
-        return aligned ? pBatchMmLargeAligned : pBatchMmLargeClamp;
-    }
-
-    Pipe& batchMmIdPipe(uint32_t K, uint32_t M, uint32_t tokens,
-                        uint32_t& bm, uint32_t& bn) {
-        if (M <= 32 || tokens <= 32) {
-            bm = bn = 32;
-            const bool aligned = K%32 == 0 && M > 8 && tokens > 8;
-            return aligned ? pBatchMmIdSmallAligned : pBatchMmIdSmallClamp;
-        }
-        if (M <= 64 || tokens <= 64) {
-            bm = bn = 64;
-            const bool aligned = K%64 == 0;
-            return aligned ? pBatchMmIdMediumAligned : pBatchMmIdMediumClamp;
-        }
-        bm = bn = 128;
-        const bool aligned = K%128 == 0;
-        return aligned ? pBatchMmIdLargeAligned : pBatchMmIdLargeClamp;
-    }
-
     void makeBatchSharedSets() {
         sbEmbed = set(pBatchEmbed, {bTokenEmbedding, bBatchIds, bbX});
+        sbQuantAttn = set(pQuant, {bbAttnNorm, bQ8});
+        sbQuantAttentionValue = set(pQuant, {bbAttentionValue, bQ8});
+        sbQuantShared = set(pQuant, {bbSharedIn, bQ8});
+        sbQuantSharedHidden = set(pQuant, {bbSharedHidden, bQ8});
+        sbQuantRouted = set(pQuant, {bbRoutedIn, bQ8});
         sbAttnResidual = set(pElement, {bbAttnPost, bbX, bbAttnOut});
         sbSharedGelu = set(pElement, {bbSharedGate, bbSharedUp, bbSharedHidden});
         sbRouterNorm = set(pRms, {bbAttnOut, bOutputNorm, bbRouterNorm});
@@ -910,10 +828,10 @@ class Gemma4Engine {
         sbLayerOutput = set(pElement, {bbPostFfw, bbAttnOut, bbX});
         sbFinalNorm = set(pRms, {bbX, bOutputNorm, bbFinalNorm});
         sbMask = set(pBatchMask, {bbMask});
-        sbCountExperts = set(pBatchCountExperts, {bbSelection, bbExpertCounts});
-        sbMoeGeglu = set(pBatchMoeGeglu, {bbExpertGateUp, bbExpertHidden});
-        sbFaSplitReduce = set(pFaSplitReduce,
-                              {bFaSplit, bbQuery, bbAttentionValue});
+        sbExpertGroup = set(pBatchExpertGroup,
+                            {bbSelection, bbExpertMeta, bbExpertAssignments});
+        sbExpertReduce = set(pBatchExpertReduce,
+                             {bbExpertDownAll, bbSelection, bbRoutedDown});
     }
 
     void makeBatchLayerSets(std::string& error) {
@@ -934,24 +852,16 @@ class Gemma4Engine {
                      l.attnQNorm, l.attnKNorm, bRopeFactors, bbQuery,
                      l.linearKeyCache, l.linearValueCache,
                      l.keyCache, l.valueCache});
-                l.bQRmsRope = set(pRmsRopeF32,
-                    {bbRawQ, l.attnQNorm, bbQuery, bBatchPositions,
-                     bRopeFactors, bbQuery, bBatchCacheIndices});
-                l.bKRmsRope = set(pRmsRopeF16,
-                    {bbRawK, l.attnKNorm, bbQuery, bBatchPositions,
-                     bRopeFactors, l.linearKeyCache, bBatchCacheIndices});
-                VkBuffer vSource = l.cfg.sliding ? bbRawV : bbRawK;
-                l.bVRms = set(pExactHeadRms,
-                    {vSource, vSource, bbVNorm, vSource});
-                l.bCacheScatter = set(pCacheScatter,
-                    {bbVNorm, l.linearKeyCache, l.linearValueCache,
-                     l.keyCache, l.valueCache, bBatchPositions});
-                l.bAttention = set(batchFaPipe(l.cfg.headDim, true),
-                    {bbQuery, l.linearKeyCache, l.linearValueCache, bbMask,
-                     bbQuery, bbAttentionValue, bbQuery});
-                l.bAttentionSplit = set(batchFaPipe(l.cfg.headDim, true),
-                    {bbQuery, l.linearKeyCache, l.linearValueCache, bbMask,
-                     bbQuery, bFaSplit, bbQuery});
+                l.bAttention = set(pBatchAttention,
+                    {bbQuery,
+                     l.cfg.sliding ? l.keyCache : l.linearKeyCache,
+                     l.cfg.sliding ? l.valueCache : l.linearValueCache,
+                     bbProbabilities, bbAttentionValue});
+                l.dAttentionSplit = set(pDecodeAttentionSplit,
+                    {bbQuery,
+                     l.cfg.sliding ? l.keyCache : l.linearKeyCache,
+                     l.cfg.sliding ? l.valueCache : l.linearValueCache,
+                     bbProbabilities, bAttnSplit});
                 l.bAttnOutput = set(batchGemmPipe(qWidth),
                     {l.attnOut, bbAttentionValue, bbAttnProjected});
                 l.bPostAttention = set(pRms,
@@ -968,42 +878,37 @@ class Gemma4Engine {
                 l.bRouter = set(pBatchRouter,
                     {bbRouterNorm, l.routerScale, l.router, bbRouterLogits});
                 l.bRoutedRms = set(pRms, {bbAttnOut, l.preFfwNorm2, bbRoutedIn});
-                l.bExpertGateUp = set(pBatchMmIdLargeAligned,
-                    {l.expertGateUp, bbRoutedIn, bbExpertGateUp,
-                     bbSelection, bbExpertCounts});
-                l.bExpertDown = set(pBatchMmIdLargeAligned,
-                    {l.expertDown, bbExpertHidden, bbExpertDown,
-                     bbSelection, bbExpertCounts});
-                l.bExpertReduce = set(pBatchMoeReduce,
-                    {bbExpertDown, bbSelection, l.expertDownScale, bbRoutedDown});
+                l.bExpertGateUp = set(pBatchExpertGateUp,
+                    {l.expertGateUp, bbRoutedIn, bbExpertMeta,
+                     bbExpertAssignments, bbExpertHidden});
+                l.bExpertDown = set(pBatchExpertDown,
+                    {l.expertDown, bbExpertHidden, bbExpertMeta,
+                     bbExpertAssignments, l.expertDownScale,
+                     bbExpertDownAll});
                 l.bRoutedPost = set(pRms,
                     {bbRoutedDown, l.postFfwNorm2, bbRoutedBranch});
                 l.bPostFfw = set(pRms, {bbBranchSum, l.postFfwNorm, bbPostFfw});
-                l.dQ = set(pDecodeMatVec,
-                    {l.attnQ, bbAttnNorm, bbRawQ, bbRawQ, bbRawQ});
-                l.dK = set(pDecodeMatVec,
-                    {l.attnK, bbAttnNorm, bbRawK, bbRawK, bbRawK});
+                l.dQ = set(pGemv, {l.attnQ, bQ8, bbRawQ});
+                l.dK = set(pGemv, {l.attnK, bQ8, bbRawK});
+                l.dKF32 = set(pGemvF32, {l.attnK, bbAttnNorm, bbRawK});
                 if (l.cfg.sliding)
-                    l.dV = set(pDecodeMatVec,
-                        {l.attnV, bbAttnNorm, bbRawV, bbRawV, bbRawV});
-                l.dAttnOutput = set(pDecodeMatVec,
-                    {l.attnOut, bbAttentionValue, bbAttnProjected,
-                     bbAttnProjected, bbAttnProjected});
-                l.dSharedGate = set(pDecodeMatVec,
-                    {l.ffnGate, bbSharedIn, bbSharedGate,
-                     bbSharedGate, bbSharedGate});
-                l.dSharedUp = set(pDecodeMatVec,
-                    {l.ffnUp, bbSharedIn, bbSharedUp,
-                     bbSharedUp, bbSharedUp});
-                l.dSharedDown = set(pDecodeMatVec,
-                    {l.ffnDown, bbSharedHidden, bbSharedDown,
-                     bbSharedDown, bbSharedDown});
-                l.dExpertGateUp = set(pDecodeMatVecId,
-                    {l.expertGateUp, bbRoutedIn, bbExpertGateUp,
-                     bbExpertGateUp, bbExpertGateUp, bbSelection});
-                l.dExpertDown = set(pDecodeMatVecId,
-                    {l.expertDown, bbExpertHidden, bbExpertDown,
-                     bbExpertDown, bbExpertDown, bbSelection});
+                    l.dV = set(pGemv, {l.attnV, bQ8, bbRawV});
+                if (l.cfg.sliding)
+                    l.dVF32 = set(pGemvF32,
+                                  {l.attnV, bbAttnNorm, bbRawV});
+                l.dAttnOutput = set(pGemvF32,
+                    {l.attnOut, bbAttentionValue, bbAttnProjected});
+                l.dSharedGate = set(pGemv,
+                    {l.ffnGate, bQ8, bbSharedGate});
+                l.dSharedUp = set(pGemv,
+                    {l.ffnUp, bQ8, bbSharedUp});
+                l.dSharedDown = set(pGemv,
+                    {l.ffnDown, bQ8, bbSharedDown});
+                l.dExpertGateUp = set(pExpertGateUp,
+                    {l.expertGateUp, bQ8, bbSelection, bbExpertHidden});
+                l.dExpertDown = set(pExpertDown,
+                    {l.expertDown, bbExpertHidden, bbSelection,
+                     l.expertDownScale, bbRoutedDown});
                 (void)kvWidth;
             }
         } catch (const std::exception& ex) {
@@ -1076,130 +981,61 @@ class Gemma4Engine {
 
     void batchGemm(VkDescriptorSet descriptor, uint32_t M, uint32_t K,
                    uint32_t tokens) {
-        struct MmPush {
-            uint32_t M, N, K, strideA, strideB, strideD;
-            uint32_t batchStrideA, batchStrideB, batchStrideD;
-            uint32_t baseWorkgroupZ, batches, kSplit;
-            uint32_t ne02, ne12, broadcast2, broadcast3, paddedN;
-        } push{M, tokens, K, K, K, M, M*K, K*tokens, M*tokens,
-               0, 1, K, 1, 1, 1, 1, tokens};
-        uint32_t bm, bn;
-        Pipe& pipe = batchMmPipe(K, tokens, bm, bn);
+        struct { uint32_t M, K, N; } push{M, K, tokens};
+        Pipe& pipe = batchGemmPipe(K);
         bindDispatch(pipe, descriptor, &push, sizeof(push),
-                     (M + bm - 1)/bm, (tokens + bn - 1)/bn);
+                     (M + 127)/128, 1, (tokens + 63)/64);
     }
 
     void decodeMatVec(VkDescriptorSet descriptor, uint32_t M, uint32_t K) {
-        struct MvPush {
-            uint32_t ncols, strideA, strideB, strideD;
-            uint32_t batchStrideA, batchStrideB, batchStrideD;
-            uint32_t fusionFlags, baseWorkgroupY;
-            uint32_t ne02, ne12, broadcast2, broadcast3;
-        } push{K, K, K, M, K*M, K, M, 0, 0, 1, 1, 1, 1};
-        bindDispatch(pDecodeMatVec, descriptor, &push, sizeof(push), M);
+        struct { uint32_t M, K; } push{M, K};
+        bindDispatch(pGemvF32, descriptor, &push, sizeof(push), (M + 3)/4);
     }
 
-    void decodeMatVecId(VkDescriptorSet descriptor, uint32_t M, uint32_t K,
-                        uint32_t inputRanks) {
-        struct MvIdPush {
-            uint32_t ncols, strideA, strideB, strideD;
-            uint32_t batchStrideA, batchStrideB, batchStrideD;
-            uint32_t fusionFlags, nei0, ne11, expertI1, nbi1;
-        } push{K, K, K, M, K*M, K*inputRanks,
-               M*gemma4::kExpertsUsed, 0,
-               gemma4::kExpertsUsed, inputRanks, 0,
-               sizeof(gemma4::Selection)/sizeof(uint32_t)};
-        bindDispatch(pDecodeMatVecId, descriptor, &push, sizeof(push),
-                     M, gemma4::kExpertsUsed);
+    void decodeMatVecQ8(VkDescriptorSet descriptor, uint32_t M, uint32_t K) {
+        struct { uint32_t M, K; } push{M, K};
+        bindDispatch(pGemv, descriptor, &push, sizeof(push), (M + 3)/4);
     }
 
-    G4BinaryPush headBinary(uint32_t width, uint32_t heads,
-                            uint32_t tokens, bool weighted) {
-        G4BinaryPush p{};
-        p.ne = width*heads*tokens;
-        p.ne00 = width; p.ne01 = heads; p.ne02 = tokens; p.ne03 = 1;
-        p.nb00 = 1; p.nb01 = width; p.nb02 = width*heads;
-        p.nb03 = width*heads*tokens;
-        if (weighted) {
-            p.ne10 = width; p.ne11 = p.ne12 = p.ne13 = 1;
-            p.nb10 = 1; p.nb11 = p.nb12 = p.nb13 = width;
-        } else {
-            p.ne10 = width; p.ne11 = heads; p.ne12 = tokens; p.ne13 = 1;
-            p.nb10 = 1; p.nb11 = width; p.nb12 = width*heads;
-            p.nb13 = width*heads*tokens;
-        }
-        p.ne20 = width; p.ne21 = heads; p.ne22 = tokens; p.ne23 = 1;
-        p.nb20 = 1; p.nb21 = width; p.nb22 = width*heads;
-        p.nb23 = width*heads*tokens;
-        p.param1 = gemma4::kRmsEpsilon;
-        return p;
+    void batchExpertGateUp(VkDescriptorSet descriptor, uint32_t tokens) {
+        bindDispatch(pBatchExpertGateUp, descriptor, nullptr, 0,
+                     (gemma4::kExpertFf + 63)/64,
+                     (tokens + 31)/32, gemma4::kExperts);
     }
 
-    void exactRmsRope(VkDescriptorSet descriptor,
-                      const gemma4::AttentionConfig& cfg, uint32_t heads,
-                      uint32_t tokens, bool factors, bool cacheF16) {
-        G4RmsRopePush p{};
-        p.binary = headBinary(cfg.headDim, heads, tokens, true);
-        p.rope.ropeMode = 2; // GGML_ROPE_TYPE_NEOX
-        p.rope.nrows = heads*tokens;
-        p.rope.nDims = cfg.ropeDim;
-        p.rope.freqScale = 1.0f;
-        p.rope.freqBase = cfg.ropeBase;
-        p.rope.extFactor = 0.0f;
-        p.rope.attnFactor = 1.0f;
-        p.rope.thetaScale = std::pow(cfg.ropeBase,
-                                     -2.0f/(float)cfg.ropeDim);
-        p.rope.hasFactors = factors ? 1u : 0u;
-        p.rope.setRowsStride = cacheF16 ? cfg.headDim*heads : 0u;
-        p.rope.ne00 = cfg.headDim;
-        p.rope.ne01 = heads;
-        p.rope.ne02 = tokens;
-        p.rope.nb01 = cfg.headDim;
-        p.rope.nb02 = cfg.headDim*heads;
-        p.rope.nb03 = cfg.headDim*heads*tokens;
-        p.rope.nb11 = cfg.headDim;
-        p.rope.nb12 = cfg.headDim*heads;
-        p.rope.nb13 = cfg.headDim*heads*tokens;
-        Pipe& pipe = cacheF16 ? pRmsRopeF16 : pRmsRopeF32;
-        bindDispatch(pipe, descriptor, &p, sizeof(p), heads, tokens);
+    void batchExpertDown(VkDescriptorSet descriptor, uint32_t tokens) {
+        bindDispatch(pBatchExpertDown, descriptor, nullptr, 0,
+                     (gemma4::kEmbedding + 63)/64,
+                     (tokens + 31)/32, gemma4::kExperts);
+        struct { uint32_t tokens; } push{tokens};
+        bindDispatch(pBatchExpertReduce, sbExpertReduce,
+                     &push, sizeof(push),
+                     (gemma4::kEmbedding + 255)/256, tokens);
     }
 
-    void exactHeadRms(VkDescriptorSet descriptor, uint32_t width,
-                      uint32_t heads, uint32_t tokens) {
-        G4BinaryPush p = headBinary(width, heads, tokens, false);
-        bindDispatch(pExactHeadRms, descriptor, &p, sizeof(p), heads, tokens);
+    void decodeExpertGateUp(VkDescriptorSet descriptor) {
+        bindDispatch(pExpertGateUp, descriptor, nullptr, 0,
+                     gemma4::kExpertFf, 2);
     }
 
-    void batchCountExperts(uint32_t tokens) {
-        struct CountPush {
-            uint32_t ne00, ne01, nb00, nb01, offset;
-        } push{gemma4::kExpertsUsed, tokens, 1,
-               sizeof(gemma4::Selection)/sizeof(uint32_t), 0};
-        bindDispatch(pBatchCountExperts, sbCountExperts, &push, sizeof(push),
-                     gemma4::kExperts);
+    void decodeExpertDown(VkDescriptorSet descriptor) {
+        bindDispatch(pExpertDown, descriptor, nullptr, 0,
+                     (gemma4::kEmbedding + 3)/4);
     }
 
-    void batchMatmulId(VkDescriptorSet descriptor, uint32_t M, uint32_t K,
-                       uint32_t tokens, uint32_t inputRanks) {
-        struct MmIdPush {
-            uint32_t M, N, K, strideA, strideB, strideD;
-            uint32_t batchStrideA, batchStrideB, batchStrideD;
-            uint32_t nei0, nei1, nbi1, ne11, paddedN;
-        } push{M, gemma4::kExpertsUsed, K, K, K, M,
-               M*K, K*inputRanks, M*gemma4::kExpertsUsed,
-               gemma4::kExpertsUsed, tokens,
-               sizeof(gemma4::Selection)/sizeof(uint32_t), inputRanks,
-               inputRanks};
-        uint32_t bm, bn;
-        Pipe& pipe = batchMmIdPipe(K, M, tokens, bm, bn);
-        bindDispatch(pipe, descriptor, &push, sizeof(push),
-                     (M + bm - 1)/bm, (tokens + bn - 1)/bn,
-                     gemma4::kExperts);
-    }
-
-    void recordBatch(uint32_t basePosition, uint32_t tokens, bool finalChunk) {
+    void recordBatch(uint32_t basePosition, uint32_t tokens, bool finalChunk,
+                     bool promptCache) {
         const char* dumpDir = getenv("QK_G4_DUMP_DIR");
         const bool diagnostics = dumpDir && *dumpDir;
+        const char* f32KvFromValue = getenv("QK_G4_PREFILL_F32_KV_FROM");
+        const uint32_t f32KvFrom = f32KvFromValue
+            ? (uint32_t)strtoul(f32KvFromValue, nullptr, 10) : UINT32_MAX;
+        const bool prefillF32Kv = promptCache && tokens == 1 &&
+                                  basePosition >= f32KvFrom;
+        uint32_t diagnosticLayer = 0;
+        if (const char* value = getenv("QK_G4_DUMP_LAYER"))
+            diagnosticLayer = std::min<uint32_t>(
+                (uint32_t)strtoul(value, nullptr, 10), gemma4::kLayers - 1);
         for (uint32_t i = 0; i < tokens; ++i) {
             batchPositionsMap[i] = basePosition + i;
             batchCacheIndicesMap[2*i + 0] = basePosition + i;
@@ -1227,11 +1063,6 @@ class Gemma4Engine {
                              1, &host, 0, nullptr, 0, nullptr);
         struct { uint32_t kdim, tokens; } embedPush{gemma4::kEmbedding, tokens};
         bindDispatch(pBatchEmbed, sbEmbed, &embedPush, sizeof(embedPush), tokens);
-        const uint32_t actualLength = basePosition + tokens;
-        // llama.cpp grows KV views in 256-cell buckets.  FA sees the padded
-        // view (unused cells are masked), which selects its aligned kernel and
-        // fixes both the block traversal and split-K reduction order.
-        const uint32_t kvLength = (actualLength + 255u) & ~255u;
 
         const uint32_t probabilityStride = std::max(kvCapacity, gemma4::kSlidingWindow);
         for (uint32_t il = 0; il < layers.size(); ++il) {
@@ -1241,114 +1072,97 @@ class Gemma4Engine {
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                     profileQueries, 1);
             batchRms(l.bAttnRms, tokens);
-            if (diagnostics && il == 0) recordAttnOpDump(
+            if (diagnostics && il == diagnosticLayer) recordAttnOpDump(
                 bbAttnNorm, (VkDeviceSize)(tokens - 1)*gemma4::kEmbedding*4,
                 0, gemma4::kEmbedding*4);
             const uint32_t qWidth = l.cfg.queryHeads*l.cfg.headDim;
             const uint32_t kvWidth = l.cfg.kvHeads*l.cfg.headDim;
-            if (tokens == 1) decodeMatVec(l.dQ, qWidth, gemma4::kEmbedding);
+            if (tokens == 1) {
+                quant(sbQuantAttn, gemma4::kEmbedding);
+                decodeMatVecQ8(l.dQ, qWidth, gemma4::kEmbedding);
+            }
             else batchGemm(l.bQ, qWidth, gemma4::kEmbedding, tokens);
-            if (diagnostics && il == 0) recordAttnOpDump(
+            if (diagnostics && il == diagnosticLayer) recordAttnOpDump(
                 bbRawQ, (VkDeviceSize)(tokens - 1)*qWidth*4, 1, qWidth*4);
-            if (tokens == 1) decodeMatVec(l.dK, kvWidth, gemma4::kEmbedding);
+            if (tokens == 1 && prefillF32Kv)
+                decodeMatVec(l.dKF32, kvWidth, gemma4::kEmbedding);
+            else if (tokens == 1)
+                decodeMatVecQ8(l.dK, kvWidth, gemma4::kEmbedding);
             else batchGemm(l.bK, kvWidth, gemma4::kEmbedding, tokens);
-            if (diagnostics && il == 0) recordAttnOpDump(
+            if (diagnostics && il == diagnosticLayer) recordAttnOpDump(
                 bbRawK, (VkDeviceSize)(tokens - 1)*kvWidth*4, 2, kvWidth*4);
             if (l.cfg.sliding) {
-                if (tokens == 1) decodeMatVec(l.dV, kvWidth, gemma4::kEmbedding);
+                if (tokens == 1 && prefillF32Kv)
+                    decodeMatVec(l.dVF32, kvWidth, gemma4::kEmbedding);
+                else if (tokens == 1)
+                    decodeMatVecQ8(l.dV, kvWidth, gemma4::kEmbedding);
                 else batchGemm(l.bV, kvWidth, gemma4::kEmbedding, tokens);
             }
-            if (diagnostics && il == 0) recordAttnOpDump(
+            if (diagnostics && il == diagnosticLayer) recordAttnOpDump(
                 bbRawV, (VkDeviceSize)(tokens - 1)*kvWidth*4, 3, kvWidth*4);
 
-            const uint32_t cacheLength = kvCapacity;
-            exactRmsRope(l.bQRmsRope, l.cfg, l.cfg.queryHeads, tokens,
-                         !l.cfg.sliding, false);
-            exactRmsRope(l.bKRmsRope, l.cfg, l.cfg.kvHeads, tokens,
-                         !l.cfg.sliding, true);
-            exactHeadRms(l.bVRms, l.cfg.headDim, l.cfg.kvHeads, tokens);
-            struct { uint32_t tokens, headDim, kvHeads, sliding; } scatterPush{
-                tokens, l.cfg.headDim, l.cfg.kvHeads,
-                l.cfg.sliding ? 1u : 0u};
-            bindDispatch(pCacheScatter, l.bCacheScatter, &scatterPush,
-                         sizeof(scatterPush), tokens*l.cfg.kvHeads);
-            if (diagnostics && il == 0 && tokens == 1)
+            struct PrepPush {
+                uint32_t basePosition, tokens, headDim, queryHeads, kvHeads;
+                uint32_t ropeDim, cacheLength, sliding, useFactors;
+                float eps, ropeBase;
+            } prepPush{basePosition, tokens, l.cfg.headDim,
+                       l.cfg.queryHeads, l.cfg.kvHeads, l.cfg.ropeDim,
+                       kvCapacity, l.cfg.sliding ? 1u : 0u,
+                       l.cfg.sliding ? 0u : 1u, gemma4::kRmsEpsilon,
+                       l.cfg.ropeBase};
+            bindDispatch(pBatchPrep, l.bPrep, &prepPush, sizeof(prepPush),
+                         tokens*(l.cfg.queryHeads + 2*l.cfg.kvHeads));
+            if (diagnostics && il == diagnosticLayer && tokens == 1)
                 recordAttnOpDump(bbQuery,
                     (VkDeviceSize)(tokens - 1)*qWidth*4, 4, qWidth*4);
-            struct { uint32_t basePosition, tokens, kvLength, window; } maskPush{
-                basePosition, tokens, kvLength,
-                l.cfg.sliding ? gemma4::kSlidingWindow : 0u};
-            bindDispatch(pBatchMask, sbMask, &maskPush, sizeof(maskPush),
-                         (tokens*kvLength + 255)/256);
-
-            const uint32_t ratio = l.cfg.queryHeads/l.cfg.kvHeads;
-            const bool grouped = tokens <= 8 && ratio <= 16;
-            const uint32_t faN = grouped ? ratio : tokens;
-            const uint32_t gqa = grouped ? ratio : 1u;
-            const uint32_t workgroupsX = grouped ? tokens : (tokens + 15)/16;
-            const uint32_t workgroupsY = grouped ? l.cfg.kvHeads : l.cfg.queryHeads;
-            // Match the frozen oracle's split-K heuristic on the dedicated
-            // 96-CU XTX.  This is numerically significant because FA combines
-            // partial softmax states in a fixed second-stage reduction.
-            uint32_t splitKv = kvLength;
-            uint32_t splitK = 1;
-            uint32_t desiredSplits = 1;
-            if (grouped && workgroupsX <= 16) {
-                desiredSplits = 192/(workgroupsX*workgroupsY);
-            } else if (!grouped) {
-                const uint32_t total = workgroupsX*workgroupsY;
-                if (total < 192) desiredSplits = 192/total;
-            }
-            if (desiredSplits > 1) {
-                splitKv = std::max(1u, kvLength/desiredSplits);
+            if (tokens == 1) {
+                const uint32_t actualLength = basePosition + 1;
+                const uint32_t kvLength = std::min(
+                    kvCapacity, (actualLength + 255u) & ~255u);
+                const uint32_t desiredGroups = std::max(
+                    1u, 192u/l.cfg.kvHeads);
+                uint32_t splitKv = std::max(
+                    1u, (kvLength + desiredGroups - 1)/desiredGroups);
                 splitKv = (splitKv + 63u) & ~63u;
-                splitK = (kvLength + splitKv - 1)/splitKv;
-            }
-            struct FaPush {
-                uint32_t N, KV, ne1, ne2, ne3;
-                uint32_t neq2, neq3, nek2, nek3, nev2, nev3;
-                uint32_t nem1, nem2, nem3;
-                uint32_t nb01, nb02, nb03, nb11, nb12, nb13;
-                uint32_t nb21, nb22, nb23;
-                float scale, maxBias, logitSoftcap;
-                uint32_t maskHeadLog2;
-                float m0, m1;
-                uint32_t gqaRatio, splitKv, kNum;
-            } faPush{
-                faN, kvLength, l.cfg.queryHeads, tokens, 1,
-                l.cfg.queryHeads, 1, l.cfg.kvHeads, 1, l.cfg.kvHeads, 1,
-                tokens, 1, 1,
-                qWidth, l.cfg.headDim*4,
-                qWidth*tokens*4,
-                l.cfg.headDim*l.cfg.kvHeads, l.cfg.headDim*2,
-                l.cfg.headDim*cacheLength*l.cfg.kvHeads*2,
-                l.cfg.headDim*l.cfg.kvHeads, l.cfg.headDim*2,
-                l.cfg.headDim*cacheLength*l.cfg.kvHeads*2,
-                1.0f, 0.0f, 0.0f, 16, 1.0f, 1.0f,
-                gqa, splitKv, splitK};
-            const bool alignedFa = kvLength%64 == 0;
-            Pipe& fa = batchFaPipe(l.cfg.headDim, alignedFa);
-            bindDispatch(fa, splitK > 1 ? l.bAttentionSplit : l.bAttention,
-                         &faPush, sizeof(faPush), workgroupsX*splitK,
-                         workgroupsY);
-            if (splitK > 1) {
-                struct SplitPush {
-                    uint32_t D, ne1, ne2, ne3, kNum, sinks;
-                } splitPush{l.cfg.headDim, l.cfg.queryHeads, tokens, 1,
-                            splitK, 0};
-                bindDispatch(pFaSplitReduce, sbFaSplitReduce,
+                const uint32_t splitK = (kvLength + splitKv - 1)/splitKv;
+                struct SplitAttentionPush {
+                    uint32_t position, headDim, queryHeads, kvHeads;
+                    uint32_t cacheLength, sliding, probabilityStride;
+                    uint32_t kvLength, splitKv, splitK;
+                } splitPush{basePosition, l.cfg.headDim, l.cfg.queryHeads,
+                            l.cfg.kvHeads,
+                            l.cfg.sliding ? gemma4::kSlidingWindow : kvCapacity,
+                            l.cfg.sliding ? 1u : 0u, probabilityStride,
+                            kvLength, splitKv, splitK};
+                bindDispatch(pDecodeAttentionSplit, l.dAttentionSplit,
                              &splitPush, sizeof(splitPush),
-                             l.cfg.queryHeads, (l.cfg.headDim + 63)/64,
-                             tokens);
+                             l.cfg.kvHeads, splitK);
+                struct ReducePush { uint32_t headDim, queryHeads, splitK; };
+                ReducePush reducePush{l.cfg.headDim, l.cfg.queryHeads, splitK};
+                bindDispatch(pDecodeAttentionReduce, sdAttentionReduce,
+                             &reducePush, sizeof(reducePush),
+                             l.cfg.queryHeads,
+                             (l.cfg.headDim + 63u)/64u);
+            } else {
+                struct AttentionPush {
+                    uint32_t basePosition, tokens, headDim, queryHeads, kvHeads;
+                    uint32_t cacheLength, sliding, probabilityStride;
+                } attentionPush{
+                    basePosition, tokens, l.cfg.headDim, l.cfg.queryHeads,
+                    l.cfg.kvHeads,
+                    l.cfg.sliding ? gemma4::kSlidingWindow : kvCapacity,
+                    l.cfg.sliding ? 1u : 0u, probabilityStride};
+                bindDispatch(pBatchAttention, l.bAttention, &attentionPush,
+                             sizeof(attentionPush), l.cfg.kvHeads, tokens);
             }
-            if (diagnostics && il == 0 && tokens == 1)
+            if (diagnostics && il == diagnosticLayer && tokens == 1)
                 recordAttnOpDump(bbAttentionValue, 0, 5, qWidth*4);
 
             if (tokens == 1)
                 decodeMatVec(l.dAttnOutput, gemma4::kEmbedding, qWidth);
             else batchGemm(l.bAttnOutput, gemma4::kEmbedding, qWidth, tokens);
             batchRms(l.bPostAttention, tokens);
-            if (diagnostics && il == 0) recordAttnOpDump(
+            if (diagnostics && il == diagnosticLayer) recordAttnOpDump(
                 bbAttnPost, (VkDeviceSize)(tokens - 1)*gemma4::kEmbedding*4,
                 6, gemma4::kEmbedding*4);
             batchElement(sbAttnResidual, tokens, gemma4::kEmbedding, 2);
@@ -1356,15 +1170,16 @@ class Gemma4Engine {
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                     profileQueries, 2);
-            if (diagnostics && il == 0)
+            if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbAttnOut, tokens - 1, 0);
 
             batchRms(l.bSharedRms, tokens);
             if (tokens == 1) {
-                decodeMatVec(l.dSharedGate, gemma4::kSharedFf,
-                             gemma4::kEmbedding);
-                decodeMatVec(l.dSharedUp, gemma4::kSharedFf,
-                             gemma4::kEmbedding);
+                quant(sbQuantShared, gemma4::kEmbedding);
+                decodeMatVecQ8(l.dSharedGate, gemma4::kSharedFf,
+                               gemma4::kEmbedding);
+                decodeMatVecQ8(l.dSharedUp, gemma4::kSharedFf,
+                               gemma4::kEmbedding);
             } else {
                 batchGemm(l.bSharedGate, gemma4::kSharedFf,
                           gemma4::kEmbedding, tokens);
@@ -1372,9 +1187,11 @@ class Gemma4Engine {
                           gemma4::kEmbedding, tokens);
             }
             batchElement(sbSharedGelu, tokens, gemma4::kSharedFf, 0);
-            if (tokens == 1)
-                decodeMatVec(l.dSharedDown, gemma4::kEmbedding,
-                             gemma4::kSharedFf);
+            if (tokens == 1) {
+                quant(sbQuantSharedHidden, gemma4::kSharedFf);
+                decodeMatVecQ8(l.dSharedDown, gemma4::kEmbedding,
+                               gemma4::kSharedFf);
+            }
             else batchGemm(l.bSharedDown, gemma4::kEmbedding,
                            gemma4::kSharedFf, tokens);
             batchRms(l.bSharedPost, tokens);
@@ -1382,7 +1199,7 @@ class Gemma4Engine {
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                     profileQueries, 3);
-            if (diagnostics && il == 0)
+            if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbSharedBranch, tokens - 1, 1);
 
             batchRms(l.bRoutedRms, tokens);
@@ -1393,39 +1210,36 @@ class Gemma4Engine {
             bindDispatch(pBatchRouter, l.bRouter, &routerPush,
                          sizeof(routerPush), gemma4::kExperts, tokens);
             bindDispatch(pBatchSelect, sbSelect, nullptr, 0, tokens);
-            batchCountExperts(tokens);
-            if (tokens == 1)
-                decodeMatVecId(l.dExpertGateUp, 2*gemma4::kExpertFf,
-                               gemma4::kEmbedding, 1);
-            else
-                batchMatmulId(l.bExpertGateUp, 2*gemma4::kExpertFf,
-                              gemma4::kEmbedding, tokens, 1);
-            const uint32_t hiddenElements = tokens*gemma4::kExpertsUsed*
-                                            gemma4::kExpertFf;
-            bindDispatch(pBatchMoeGeglu, sbMoeGeglu, &hiddenElements,
-                         sizeof(hiddenElements), (hiddenElements + 255)/256);
-            if (tokens == 1)
-                decodeMatVecId(l.dExpertDown, gemma4::kEmbedding,
-                               gemma4::kExpertFf, gemma4::kExpertsUsed);
-            else
-                batchMatmulId(l.bExpertDown, gemma4::kEmbedding,
-                              gemma4::kExpertFf, tokens,
-                              gemma4::kExpertsUsed);
-            bindDispatch(pBatchMoeReduce, l.bExpertReduce, &tokens,
-                         sizeof(tokens), (gemma4::kEmbedding + 255)/256, tokens);
+            if (diagnostics && il == diagnosticLayer)
+                recordRouterDump(
+                    bbRouterLogits,
+                    (VkDeviceSize)(tokens - 1)*gemma4::kExperts*4,
+                    bbSelection,
+                    (VkDeviceSize)(tokens - 1)*sizeof(gemma4::Selection));
+            if (tokens == 1) {
+                quant(sbQuantRouted, gemma4::kEmbedding);
+                decodeExpertGateUp(l.dExpertGateUp);
+                decodeExpertDown(l.dExpertDown);
+            } else {
+                struct { uint32_t tokens; } groupPush{tokens};
+                bindDispatch(pBatchExpertGroup, sbExpertGroup,
+                             &groupPush, sizeof(groupPush), 1);
+                batchExpertGateUp(l.bExpertGateUp, tokens);
+                batchExpertDown(l.bExpertDown, tokens);
+            }
             batchRms(l.bRoutedPost, tokens);
             if (profile && il == profileLayer)
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                     profileQueries, 4);
-            if (diagnostics && il == 0)
+            if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbRoutedBranch, tokens - 1, 2);
 
             batchElement(sbBranchAdd, tokens, gemma4::kEmbedding, 2);
-            if (diagnostics && il == 0)
+            if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbBranchSum, tokens - 1, 3);
             batchRms(l.bPostFfw, tokens);
-            if (diagnostics && il == 0)
+            if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbPostFfw, tokens - 1, 4);
             batchElement(sbLayerOutput, tokens, gemma4::kEmbedding, 1,
                          l.outputScale);
@@ -1507,13 +1321,17 @@ class Gemma4Engine {
         for (uint32_t token : prompt)
             if (token >= Gemma4Stage1Weights::kVocabulary) return false;
         if (clearCaches) reset();
+        uint32_t batchLimit = kBatch;
+        if (const char* value = getenv("QK_G4_CHUNK"))
+            batchLimit = std::clamp<uint32_t>(
+                (uint32_t)strtoul(value, nullptr, 10), 1u, kBatch);
         uint32_t base = 0;
         while (base < prompt.size()) {
-            uint32_t tokens = std::min<uint32_t>(kBatch,
+            uint32_t tokens = std::min<uint32_t>(batchLimit,
                 (uint32_t)prompt.size() - base);
             memcpy(batchIdsMap, prompt.data() + base, (size_t)tokens*4);
             bool finalChunk = base + tokens == prompt.size();
-            recordBatch(base, tokens, finalChunk);
+            recordBatch(base, tokens, finalChunk, true);
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &c.cb;
@@ -1676,21 +1494,11 @@ class Gemma4Engine {
                         &pExpertGateUpF32, &pExpertDown, &pHead, &pArgmax,
                         &pBatchEmbed, &pBatchGemm88, &pBatchGemm66,
                         &pBatchGemm128, &pBatchGemm256, &pBatchPrep,
-                        &pBatchAttention, &pBatchMask,
-                        &pBatchFa256Aligned, &pBatchFa256Clamp,
-                        &pBatchFa512Aligned, &pBatchFa512Clamp,
-                        &pFaSplitReduce, &pRmsRopeF32, &pRmsRopeF16,
-                        &pExactHeadRms, &pCacheScatter,
-                        &pBatchMmLargeAligned, &pBatchMmLargeClamp,
-                        &pBatchMmMediumAligned, &pBatchMmMediumClamp,
-                        &pBatchMmSmallAligned, &pBatchMmSmallClamp,
-                        &pBatchCountExperts, &pBatchMoeGeglu, &pBatchMoeReduce,
-                        &pDecodeMatVec, &pDecodeMatVecId,
-                        &pBatchMmIdLargeAligned, &pBatchMmIdLargeClamp,
-                        &pBatchMmIdMediumAligned, &pBatchMmIdMediumClamp,
-                        &pBatchMmIdSmallAligned, &pBatchMmIdSmallClamp,
+                        &pBatchAttention, &pDecodeAttentionSplit,
+                        &pDecodeAttentionReduce, &pBatchMask,
                         &pBatchRouter, &pBatchSelect,
-                        &pBatchExpertGateUp, &pBatchExpertDown}) {
+                        &pBatchExpertGroup, &pBatchExpertGateUp,
+                        &pBatchExpertDown, &pBatchExpertReduce}) {
             if (p->p) destroyPipe(c, *p);
         }
         for (VkDeviceMemory memory : mappedMemories) vkUnmapMemory(c.dev, memory);
@@ -1730,6 +1538,10 @@ static bool g4ReadJsonArray(const char* path, const char* key,
 }
 
 static bool caseGemma4Fixtures(VkCtx& c) {
+    // The parity gate deliberately uses the numerically robust serial prompt
+    // path. Performance modes select the batched path independently.
+    setenv("QK_G4_CHUNK", "1", 1);
+    setenv("QK_G4_PREFILL_F32_KV_FROM", "2048", 1);
     static const char* names[] = {
         "ordinary_chat", "coding_prompt", "swa_position_1023",
         "swa_position_1024", "swa_position_1025", "global_context_8192"};
@@ -1752,28 +1564,34 @@ static bool caseGemma4Fixtures(VkCtx& c) {
     std::string error;
     Gemma4Engine engine(c);
     if (!engine.open(ggufPath(), maxContext, error)) {
-        fprintf(stderr, "gemma4-stage5: %s\n", error.c_str());
+        fprintf(stderr, "gemma4-stage6: %s\n", error.c_str());
         return false;
     }
-    printf("Gemma 4 Stage 5: persistent 30-layer engine, context=%u, KV=f16\n",
+    printf("Gemma 4 Stage 6: persistent 30-layer engine, context=%u, KV=f16\n",
            maxContext);
     uint32_t validated = 0;
     auto run = [&](const Fixture& fixture, uint32_t repetition) {
         std::vector<uint32_t> actual;
-        if (!engine.generate(fixture.input, (uint32_t)fixture.expected.size(), actual)) {
-            fprintf(stderr, "%s: generation failed\n", fixture.name.c_str());
+        uint32_t next = 0;
+        if (!engine.ingest(fixture.input, next)) {
+            fprintf(stderr, "%s: prefill failed\n", fixture.name.c_str());
             return false;
         }
         size_t match = 0;
-        while (match < actual.size() && match < fixture.expected.size() &&
-               actual[match] == fixture.expected[match]) ++match;
-        bool ok = actual == fixture.expected;
+        for (; match < fixture.expected.size(); ++match) {
+            actual.push_back(next);
+            if (next != fixture.expected[match]) break;
+            if (match + 1 < fixture.expected.size())
+                next = engine.step(next,
+                    (uint32_t)fixture.input.size() + (uint32_t)match);
+        }
+        bool ok = match == fixture.expected.size();
         printf("  %-20s rep=%u input=%zu continuation=%zu matched=%zu -> %s\n",
                fixture.name.c_str(), repetition, fixture.input.size(), actual.size(),
                match, ok ? "PASS" : "DIVERGE");
         if (!ok) {
-            uint32_t got = match < actual.size() ? actual[match] : UINT32_MAX;
-            uint32_t want = match < fixture.expected.size() ? fixture.expected[match] : UINT32_MAX;
+            uint32_t got = actual[match];
+            uint32_t want = fixture.expected[match];
             auto top = engine.top2();
             fprintf(stderr,
                 "first divergence fixture=%s continuation_index=%zu absolute_position=%zu "
@@ -1800,7 +1618,7 @@ static bool caseGemma4Fixtures(VkCtx& c) {
         }
         ++repetition;
     }
-    printf("Gemma 4 Stage 5 parity: PASS fixtures=6 validated_generated_tokens=%u\n",
+    printf("Gemma 4 Stage 6 parity: PASS fixtures=6 validated_generated_tokens=%u\n",
            validated);
     return true;
 }

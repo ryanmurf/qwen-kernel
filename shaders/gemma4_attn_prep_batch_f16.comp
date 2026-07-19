@@ -83,7 +83,8 @@ void main() {
             float first = normalized[pair], second = normalized[pair + halfDim];
             outValue = dim < halfDim ? first*cc - second*ss : first*ss + second*cc;
         }
-        if (isQ) query[(head*pc.tokens + token)*pc.headDim + dim] = outValue;
+        if (isQ)
+            query[(token*pc.queryHeads + head)*pc.headDim + dim] = outValue;
         else if (isK) {
             keyCache[cacheBase + dim] = float16_t(outValue);
             if (pc.sliding != 0u) keyRing[ringBase + dim] = float16_t(outValue);

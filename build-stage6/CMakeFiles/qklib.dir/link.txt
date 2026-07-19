@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,--dependency-file=CMakeFiles/qklib.dir/link.d -Wl,-soname,libqk.so -o libqk.so CMakeFiles/qklib.dir/src/main.cpp.o  /usr/lib/x86_64-linux-gnu/libvulkan.so

@@ -1,0 +1,5 @@
+/home/ryan/IdeaProjects/qwen-kernel/build-stage6/CMakeFiles/shaders.dir
+/home/ryan/IdeaProjects/qwen-kernel/build-stage6/CMakeFiles/qk.dir
+/home/ryan/IdeaProjects/qwen-kernel/build-stage6/CMakeFiles/qklib.dir
+/home/ryan/IdeaProjects/qwen-kernel/build-stage6/CMakeFiles/edit_cache.dir
+/home/ryan/IdeaProjects/qwen-kernel/build-stage6/CMakeFiles/rebuild_cache.dir

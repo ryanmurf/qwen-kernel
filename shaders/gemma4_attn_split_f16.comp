@@ -1,0 +1,147 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Decode split-K attention. Each workgroup owns one KV head and one contiguous
+// KV chunk, producing an F32 online-softmax state for every GQA query head.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufQ { float query[]; };
+layout(std430, binding = 1) readonly buffer BufK { float16_t keyCache[]; };
+layout(std430, binding = 2) readonly buffer BufV { float16_t valueCache[]; };
+layout(std430, binding = 3) buffer BufP { float scores[]; };
+layout(std430, binding = 4) writeonly buffer BufS { float states[]; };
+layout(push_constant) uniform PC {
+    uint position;
+    uint headDim;
+    uint queryHeads;
+    uint kvHeads;
+    uint cacheLength;
+    uint sliding;
+    uint probabilityStride;
+    uint kvLength;
+    uint splitKv;
+    uint splitK;
+} pc;
+
+shared float reduction[8][256];
+shared float maxima[8];
+shared float sums[8];
+
+void main() {
+    uint kvHead = gl_WorkGroupID.x;
+    uint split = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint groupSize = pc.queryHeads/pc.kvHeads;
+    uint chunkBegin = split*pc.splitKv;
+    uint chunkEnd = min(chunkBegin + pc.splitKv, pc.kvLength);
+    uint validBegin = pc.sliding != 0u && pc.position + 1u > 1024u
+                    ? pc.position + 1u - 1024u : 0u;
+    uint validEnd = pc.position + 1u;
+    uint activeBegin = max(chunkBegin, validBegin);
+    uint activeEnd = min(chunkEnd, validEnd);
+    uint stateStride = pc.headDim + 2u;
+    if (activeBegin >= activeEnd) {
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead*groupSize + rank;
+            uint stateBase = (split*pc.queryHeads + qHead)*stateStride;
+            if (lane == 0u) {
+                states[stateBase] = -3.402823466e38;
+                states[stateBase + 1u] = 0.0;
+            }
+            for (uint dim = lane; dim < pc.headDim; dim += 256u)
+                states[stateBase + 2u + dim] = 0.0;
+        }
+        return;
+    }
+
+    // Masked chunks still emit an empty state, but do no dot-product work.
+    // This retains llama.cpp's absolute padded-view split boundaries without
+    // making sliding layers scale beyond their 1024-token ring.
+    for (uint absolutePos = activeBegin; absolutePos < activeEnd; ++absolutePos) {
+        uint slot = pc.sliding != 0u ? absolutePos%1024u : absolutePos;
+        uint keyBase = (kvHead*pc.cacheLength + slot)*pc.headDim;
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead*groupSize + rank;
+            float dot = 0.0;
+            for (uint dim = lane; dim < pc.headDim; dim += 256u)
+                dot += query[qHead*pc.headDim + dim]*float(keyCache[keyBase + dim]);
+            reduction[rank][lane] = dot;
+        }
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lane < stride)
+                for (uint rank = 0u; rank < groupSize; ++rank)
+                    reduction[rank][lane] += reduction[rank][lane + stride];
+            barrier();
+        }
+        if (lane == 0u)
+            for (uint rank = 0u; rank < groupSize; ++rank) {
+                uint qHead = kvHead*groupSize + rank;
+                scores[qHead*pc.probabilityStride + absolutePos] =
+                    reduction[rank][0];
+            }
+        barrier();
+    }
+
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead*groupSize + rank;
+        float maximum = -3.402823466e38;
+        for (uint p = activeBegin + lane; p < activeEnd; p += 256u)
+            maximum = max(maximum, scores[qHead*pc.probabilityStride + p]);
+        reduction[rank][lane] = maximum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                reduction[rank][lane] = max(reduction[rank][lane],
+                                            reduction[rank][lane + stride]);
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank)
+            maxima[rank] = reduction[rank][0];
+    barrier();
+
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead*groupSize + rank;
+        float sum = 0.0;
+        for (uint p = activeBegin + lane; p < activeEnd; p += 256u) {
+            uint index = qHead*pc.probabilityStride + p;
+            float probability = exp(scores[index] - maxima[rank]);
+            scores[index] = probability;
+            sum += probability;
+        }
+        reduction[rank][lane] = sum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                reduction[rank][lane] += reduction[rank][lane + stride];
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank)
+            sums[rank] = reduction[rank][0];
+    barrier();
+
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead*groupSize + rank;
+        uint stateBase = (split*pc.queryHeads + qHead)*stateStride;
+        if (lane == 0u) {
+            states[stateBase] = maxima[rank];
+            states[stateBase + 1u] = sums[rank];
+        }
+        for (uint dim = lane; dim < pc.headDim; dim += 256u) {
+            float total = 0.0;
+            for (uint absolutePos = activeBegin; absolutePos < activeEnd; ++absolutePos) {
+                float probability = scores[qHead*pc.probabilityStride + absolutePos];
+                uint slot = pc.sliding != 0u ? absolutePos%1024u : absolutePos;
+                uint valueBase = (kvHead*pc.cacheLength + slot)*pc.headDim;
+                total += probability*float(valueCache[valueBase + dim]);
+            }
+            states[stateBase + 2u + dim] = total;
+        }
+    }
+}

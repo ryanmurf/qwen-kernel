@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/ryan/IdeaProjects/qwen-kernel/build-stage6/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
