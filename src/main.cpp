@@ -87,6 +87,7 @@ struct VkCtx {
     uint32_t              cooperativeMatrixM = 0;
     uint32_t              cooperativeMatrixN = 0;
     uint32_t              cooperativeMatrixK = 0;
+    uint32_t              subgroupSize = 64;
 };
 
 static uint32_t findMemType(const VkPhysicalDeviceMemoryProperties& mp,
@@ -214,6 +215,15 @@ static void initVk(VkCtx& c, const char* argv0) {
     }
     c.phys = devs[pick];
     vkGetPhysicalDeviceProperties(c.phys, &c.props);
+    {
+        VkPhysicalDeviceSubgroupProperties subgroupProps{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 props2{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props2.pNext = &subgroupProps;
+        vkGetPhysicalDeviceProperties2(c.phys, &props2);
+        c.subgroupSize = subgroupProps.subgroupSize;
+    }
     vkGetPhysicalDeviceMemoryProperties(c.phys, &c.mp);
     pickBdf = pciBdf(c.phys);
     printf("device: %s [%s]\n", c.props.deviceName,
