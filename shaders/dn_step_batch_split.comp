@@ -1,0 +1,73 @@
+#version 450
+
+// Batched gated delta rule with one state head split across independent row
+// panels. State rows have no cross-row dependency: each panel repeats the
+// tiny q/k staging, then preserves the shipping kernel's per-row dot/update
+// order exactly. local_size_x is specialized to 64 (two panels/head) or 32
+// (four panels/head), spreading the long Tn scan beyond the original 32 WGs.
+
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly  buffer BufC  { float conv[]; };
+layout(std430, binding = 1) readonly  buffer BufGB { float gb[]; };
+layout(std430, binding = 2) writeonly buffer BufO  { float o[]; };
+layout(std430, binding = 3)          buffer BufS  { vec4 s4[]; };
+
+layout(push_constant) uniform PC { uint dState; uint hK; uint hV; uint Tn; uint kDiv; } pc;
+
+shared vec4 qs4[32];
+shared vec4 ks4[32];
+
+void main() {
+    uint rowsPerPanel = gl_WorkGroupSize.x;
+    uint panels = pc.dState / rowsPerPanel;
+    uint w = gl_WorkGroupID.x;
+    uint h = w / panels;
+    uint j = (w - h * panels) * rowsPerPanel + gl_LocalInvocationID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint dS = pc.dState;
+    uint nv = dS / 4u;
+
+    uint kh = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
+    float qScale = inversesqrt(float(dS));
+
+    uint srowBase = (h * dS + j) * nv;
+    vec4 srow[32];
+    for (uint i = 0u; i < nv; ++i) srow[i] = s4[srowBase + i];
+
+    for (uint t = 0u; t < pc.Tn; ++t) {
+        uint co = t * (2u * pc.hK + pc.hV) * dS;
+        uint qBase = co + kh * dS;
+        uint kBase = co + pc.hK * dS + kh * dS;
+        uint vBase = co + 2u * pc.hK * dS + h * dS;
+
+        for (uint i = lane; i < nv; i += rowsPerPanel) {
+            qs4[i] = vec4(conv[qBase + 4u*i], conv[qBase + 4u*i + 1u],
+                          conv[qBase + 4u*i + 2u], conv[qBase + 4u*i + 3u]) * qScale;
+            ks4[i] = vec4(conv[kBase + 4u*i], conv[kBase + 4u*i + 1u],
+                          conv[kBase + 4u*i + 2u], conv[kBase + 4u*i + 3u]);
+        }
+        barrier();
+
+        float decay = exp(gb[t * 2u * pc.hV + h]);
+        float beta  = gb[t * 2u * pc.hV + pc.hV + h];
+        float vj    = conv[vBase + j];
+
+        float sk = 0.0;
+        for (uint i = 0u; i < nv; ++i) sk += dot(srow[i], ks4[i]);
+        sk *= decay;
+
+        float dj = beta * (vj - sk);
+
+        float oj = 0.0;
+        for (uint i = 0u; i < nv; ++i) {
+            vec4 sn = srow[i] * decay + ks4[i] * dj;
+            srow[i] = sn;
+            oj += dot(sn, qs4[i]);
+        }
+        o[t * pc.hV * dS + h * dS + j] = oj;
+        barrier();
+    }
+
+    for (uint i = 0u; i < nv; ++i) s4[srowBase + i] = srow[i];
+}

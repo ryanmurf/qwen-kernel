@@ -73,6 +73,7 @@ struct VkCtx {
     VkQueue               queue = VK_NULL_HANDLE;
     uint32_t              qfi = 0;
     bool                  hasTimestamps = false;
+    uint32_t              timestampValidBits = 0;
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceMemoryProperties mp{};
     VkCommandPool         pool = VK_NULL_HANDLE;
@@ -249,7 +250,8 @@ static void initVk(VkCtx& c, const char* argv0) {
         fprintf(stderr, "no compute queue\n");
         exit(1);
     }
-    c.hasTimestamps = qf[c.qfi].timestampValidBits > 0;
+    c.timestampValidBits = qf[c.qfi].timestampValidBits;
+    c.hasTimestamps = c.timestampValidBits > 0;
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -2186,6 +2188,221 @@ static bool caseABlock(VkCtx& c, uint32_t layer, uint32_t nTok, uint32_t iters) 
     return pass;
 }
 
+// Batched DeltaNet step gate: shipping 128-row workgroups versus the exact
+// 64/32-row panel candidates. Compare raw output and final state bits from a
+// nonzero seed over both supported k-head mappings and boundary chunk widths.
+static bool caseDnBatchCmp(VkCtx& c, uint32_t TnMain, uint32_t iters) {
+    const uint32_t dS = 128, hK = 16, hV = 32;
+    const uint32_t chQkv = (2 * hK + hV) * dS;
+    const uint32_t TnCap = std::max(512u, TnMain);
+    const size_t convBytes = (size_t)TnCap * chQkv * 4;
+    const size_t gbBytes = (size_t)TnCap * 2 * hV * 4;
+    const size_t stateBytes = (size_t)hV * dS * dS * 4;
+    const size_t outBytes = (size_t)TnCap * hV * dS * 4;
+    const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> conv(convBytes / 4), gb(gbBytes / 4), state0(stateBytes / 4);
+    for (float& v : conv) v = nd(rng);
+    for (uint32_t t = 0; t < TnCap; ++t) {
+        for (uint32_t hh = 0; hh < 2 * hK; ++hh) {
+            float* row = conv.data() + ((size_t)t * chQkv + hh * dS);
+            float ss = 0.f;
+            for (uint32_t i = 0; i < dS; ++i) ss += row[i] * row[i];
+            float sc = 1.f / std::sqrt(std::max(ss, 1e-12f));
+            for (uint32_t i = 0; i < dS; ++i) row[i] *= sc;
+        }
+        for (uint32_t h = 0; h < hV; ++h) {
+            gb[(size_t)t * 2 * hV + h] = -std::fabs(nd(rng)) * 1.5f;
+            float z = nd(rng);
+            gb[(size_t)t * 2 * hV + hV + h] = 1.f / (1.f + std::exp(-z));
+        }
+    }
+    for (float& v : state0) v = 0.3f * nd(rng);
+
+    Buf bConv = createBuf(c, convBytes, stor, true);
+    Buf bGb = createBuf(c, gbBytes, stor, true);
+    Buf bState = createBuf(c, stateBytes, stor, true);
+    Buf bOut = createBuf(c, outBytes, stor, true);
+    Buf stage = createBuf(c, std::max({convBytes, gbBytes, stateBytes, outBytes}),
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          false);
+    void* mapped = nullptr;
+    VK_CHECK(vkMapMemory(c.dev, stage.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
+
+    auto begin = [&]() {
+        VK_CHECK(vkResetCommandBuffer(c.cb, 0));
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
+    };
+    auto submit = [&]() {
+        VK_CHECK(vkEndCommandBuffer(c.cb));
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &c.cb;
+        VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(c.queue));
+    };
+    auto upload = [&](Buf& dst, const void* src, size_t bytes) {
+        memcpy(mapped, src, bytes);
+        begin();
+        VkBufferCopy cp{0, 0, bytes};
+        vkCmdCopyBuffer(c.cb, stage.buf, dst.buf, 1, &cp);
+        submit();
+    };
+    auto download = [&](Buf& src, void* dst, size_t bytes) {
+        begin();
+        VkBufferMemoryBarrier mb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        mb.buffer = src.buf;
+        mb.size = bytes;
+        vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &mb,
+                             0, nullptr);
+        VkBufferCopy cp{0, 0, bytes};
+        vkCmdCopyBuffer(c.cb, src.buf, stage.buf, 1, &cp);
+        submit();
+        memcpy(dst, mapped, bytes);
+    };
+    upload(bConv, conv.data(), convBytes);
+    upload(bGb, gb.data(), gbBytes);
+
+    Pipe pRef = makePipe(c, "dn_step_batch.spv", 4, 20);
+    Pipe p2 = makePipe(c, "dn_step_batch_split.spv", 4, 20, 64);
+    Pipe p4 = makePipe(c, "dn_step_batch_split.spv", 4, 20, 32);
+    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 3;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &dps;
+    VkDescriptorPool pool;
+    VK_CHECK(vkCreateDescriptorPool(c.dev, &dpci, nullptr, &pool));
+    auto makeSet = [&](Pipe& p) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &p.dsl;
+        VkDescriptorSet ds;
+        VK_CHECK(vkAllocateDescriptorSets(c.dev, &ai, &ds));
+        VkDescriptorBufferInfo dbi[4] = {{bConv.buf, 0, VK_WHOLE_SIZE},
+                                         {bGb.buf, 0, VK_WHOLE_SIZE},
+                                         {bOut.buf, 0, VK_WHOLE_SIZE},
+                                         {bState.buf, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet wr[4]{};
+        for (uint32_t i = 0; i < 4; ++i) {
+            wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[i].dstSet = ds;
+            wr[i].dstBinding = i;
+            wr[i].descriptorCount = 1;
+            wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr[i].pBufferInfo = &dbi[i];
+        }
+        vkUpdateDescriptorSets(c.dev, 4, wr, 0, nullptr);
+        return ds;
+    };
+    VkDescriptorSet sRef = makeSet(pRef), s2 = makeSet(p2), s4 = makeSet(p4);
+    struct Pc { uint32_t dState, hK_, hV_, Tn, kDiv; } pc{dS, hK, hV, 0, 0};
+    auto run = [&](Pipe& p, VkDescriptorSet ds, uint32_t panels) {
+        begin();
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.p);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pl,
+                                0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(c.cb, p.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &pc);
+        vkCmdDispatch(c.cb, hV * panels, 1, 1);
+        submit();
+    };
+
+    std::vector<uint32_t> refO(outBytes / 4), gotO(outBytes / 4);
+    std::vector<uint32_t> refS(stateBytes / 4), gotS(stateBytes / 4);
+    bool pass = true;
+    printf("\n== dncmp shipping vs row-panel batched DeltaNet step ==\n");
+    for (uint32_t kd : {0u, hV / hK}) {
+        pc.kDiv = kd;
+        for (uint32_t Tn : {1u, 5u, 64u, 65u, 128u, 200u, TnMain}) {
+            if (Tn > TnCap) continue;
+            pc.Tn = Tn;
+            upload(bState, state0.data(), stateBytes);
+            run(pRef, sRef, 1);
+            download(bOut, refO.data(), (size_t)Tn * hV * dS * 4);
+            download(bState, refS.data(), stateBytes);
+            for (auto candidate : {std::pair<Pipe*, VkDescriptorSet>{&p2, s2},
+                                   std::pair<Pipe*, VkDescriptorSet>{&p4, s4}}) {
+                uint32_t panels = candidate.first == &p2 ? 2u : 4u;
+                upload(bState, state0.data(), stateBytes);
+                run(*candidate.first, candidate.second, panels);
+                download(bOut, gotO.data(), (size_t)Tn * hV * dS * 4);
+                download(bState, gotS.data(), stateBytes);
+                size_t diffO = 0, diffS = 0;
+                for (size_t i = 0; i < (size_t)Tn * hV * dS; ++i)
+                    diffO += gotO[i] != refO[i];
+                for (size_t i = 0; i < refS.size(); ++i) diffS += gotS[i] != refS[i];
+                bool ok = diffO == 0 && diffS == 0;
+                pass &= ok;
+                printf("  kDiv=%u Tn=%-4u split=%u output_diff=%zu state_diff=%zu -> %s\n",
+                       kd, Tn, panels, diffO, diffS, ok ? "PASS" : "FAIL");
+            }
+        }
+    }
+
+    if (iters && c.hasTimestamps) {
+        pc.kDiv = 0;
+        pc.Tn = TnMain;
+        auto timeRun = [&](Pipe& p, VkDescriptorSet ds, uint32_t panels) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 2;
+            VkQueryPool qp;
+            VK_CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &qp));
+            upload(bState, state0.data(), stateBytes);
+            begin();
+            vkCmdResetQueryPool(c.cb, qp, 0, 2);
+            vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            for (uint32_t i = 0; i < iters; ++i) {
+                vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.p);
+                vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pl,
+                                        0, 1, &ds, 0, nullptr);
+                vkCmdPushConstants(c.cb, p.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, &pc);
+                vkCmdDispatch(c.cb, hV * panels, 1, 1);
+                vkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
+                                     0, nullptr, 0, nullptr);
+            }
+            vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+            submit();
+            uint64_t ts[2];
+            VK_CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 2, sizeof ts, ts, sizeof(uint64_t),
+                                           VK_QUERY_RESULT_64_BIT |
+                                               VK_QUERY_RESULT_WAIT_BIT));
+            vkDestroyQueryPool(c.dev, qp, nullptr);
+            return (double)(ts[1] - ts[0]) * c.props.limits.timestampPeriod * 1e-3 /
+                   iters;
+        };
+        double t1 = timeRun(pRef, sRef, 1);
+        double t2 = timeRun(p2, s2, 2);
+        double t4 = timeRun(p4, s4, 4);
+        printf("  gpu @Tn=%u: split1 %.1f us | split2 %.1f us | split4 %.1f us\n",
+               TnMain, t1, t2, t4);
+    }
+
+    vkUnmapMemory(c.dev, stage.mem);
+    vkDestroyDescriptorPool(c.dev, pool, nullptr);
+    destroyPipe(c, pRef); destroyPipe(c, p2); destroyPipe(c, p4);
+    for (Buf* b : {&bConv, &bGb, &bState, &bOut, &stage}) destroyBuf(c, *b);
+    printf("dncmp: %s\n", pass ? "all PASS" : "FAIL");
+    return pass;
+}
+
 // M6b: end-to-end greedy decode over all 40 layers + embeddings + LM head.
 // Requires the whole model in VRAM (~16.5 GB) — quiesce llama-server first.
 // usage: qk token <ids-file> <nGen> [tmax]
@@ -2803,9 +3020,11 @@ struct qk_engine {
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pStepReg, pStepGate, pGate, pGemvO,
         pAddN, pAddNRoute,
         pPrep, pAttn, pMoeL, pMoeRS, pMoeRSHier, pMoeS, pMoeS256, pMoeGroupPairs,
-        pMoeGU, pMoeGURow3, pMoeGUGroup3,
+        pMoeGU, pMoeGURow3, pMoeGUGroup3, pMoeGUGroup3Row2,
         pMoeGUs, pMoeGUs64, pMoeDn4, pMoeDn4_128, pMoeDn6, pMoeDnsB,
-        pMoeDnsB32, pMoeDnGroup4, pMoeDnGroup6, pAdd3, pAdd3Group, pHead,
+        pMoeDnsB32, pMoeDnGroup4, pMoeDnGroup6,
+        pMoeDnGroup4Row2, pMoeDnGroup6Row2,
+        pAdd3, pAdd3Group, pHead,
         pAm1, pAm2, pEmb;
     Pipe pAttnS, pAttnSG2, pAttnSG4, pAttnSG8, pAttnR;
     // split-K decode attention (QK_NO_SPLITK=1 -> legacy pAttn); SG variants
@@ -2857,6 +3076,8 @@ struct qk_engine {
     bool moeSharedDown32 = false; // QK_MOE_SHARED_DOWN_32 uses one useful wave
     bool moeGroupPrefillGu = false;   // expert-major routed gate/up in batch prefill
     bool moeGroupPrefillDown = false; // expert-major routed down in batch prefill
+    uint32_t moeGroupPrefillRows = 2; // QK_MOE_GROUP_PREFILL_ROWS={1,2}
+    uint32_t moeGroupPrefillDownRows = 2; // QK_MOE_GROUP_PREFILL_DOWN_ROWS={1,2}
     bool dnStepReg = false; // QK_DN_STEP_REG caches each state row across both passes
     bool dnStepGate = false; // QK_DN_STEP_GATE_FUSED removes the o[] round trip
     Buf bbPos;                 // 1-entry position buffer: the batch n==1 split-K
@@ -2948,6 +3169,14 @@ struct qk_engine {
     bool profPrinted = false;
     bool profArmed = true;  // QK_STEP_PROF_DEFER lets a harness arm after warmup/idle
 
+    // QK_COUNTERS: one-shot batched-prefill timestamps. Markers are placed only
+    // after barriers that already exist in the shipping command stream, then
+    // aggregated by stage name after the queue has completed. QK_COUNTER_RAW=1
+    // additionally prints every per-layer delta.
+    VkQueryPool prefillProfQ = VK_NULL_HANDLE;
+    bool prefillProfPrinted = false;
+    bool prefillProfArmed = true;
+
     bool open(const char* path, const qk_config& cfg, char* err, size_t errLen);
     int stepChunk(uint32_t* outTok, uint32_t* outCnt, uint32_t* outFin);
     // base=0: from-empty (resets slot, zero conv carry). base>0: CONTINUE an existing
@@ -3019,6 +3248,7 @@ qk_engine::~qk_engine() {
                    &bbLogits, &bbIds, &bbCarry, &bbPos, &bvAV, &bvAI, &bvTok, &bvSamp})
         destroyBuf(c, *b);
     if (profQ) vkDestroyQueryPool(c.dev, profQ, nullptr);
+    if (prefillProfQ) vkDestroyQueryPool(c.dev, prefillProfQ, nullptr);
     if (dpool) vkDestroyDescriptorPool(c.dev, dpool, nullptr);
     for (Pipe* pp : {&pRms, &pGemvA, &pGemvA4,
                      &pAb, &pConvN, &pStep, &pStepReg, &pStepGate,
@@ -3026,9 +3256,10 @@ qk_engine::~qk_engine() {
                      &pGemvO4, &pAddN, &pAddNRoute, &pPrep,
                      &pAttn, &pAttnS, &pAttnSG2, &pAttnSG4, &pAttnSG8, &pAttnR,
                      &pMoeL, &pMoeRS, &pMoeRSHier, &pMoeS, &pMoeS256, &pMoeGroupPairs,
-                     &pMoeGU, &pMoeGURow3, &pMoeGUGroup3,
+                     &pMoeGU, &pMoeGURow3, &pMoeGUGroup3, &pMoeGUGroup3Row2,
                      &pMoeGUs, &pMoeGUs64, &pMoeDn4, &pMoeDn4_128, &pMoeDn6,
                      &pMoeDnsB, &pMoeDnsB32, &pMoeDnGroup4, &pMoeDnGroup6,
+                     &pMoeDnGroup4Row2, &pMoeDnGroup6Row2,
                      &pMoeGU4, &pAdd3, &pAdd3Group, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB,
                      &pAbB, &pConvB, &pStepB, &pGateB, &pGemmB, &pGemmB4})
         destroyPipe(c, *pp);
@@ -3285,6 +3516,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeGU = makePipe(c, "moe_gateup_iq3.spv", 5, 16);
     pMoeGURow3 = makePipe(c, "moe_gateup_iq3_rowtile.spv", 5, 16, 4);
     pMoeGUGroup3 = makePipe(c, "moe_gateup_iq3_grouped.spv", 6, 16);
+    pMoeGUGroup3Row2 = makePipe(c, "moe_gateup_iq3_grouped_rowtile.spv", 6, 16, 2);
     pMoeGU4 = makePipe(c, "moe_gateup_iq4.spv", 5, 16);
     pMoeGUs = makePipe(c, "moe_gateup_q8.spv", 4, 16);
     pMoeGUs64 = makePipe(c, "moe_gateup_q8_64.spv", 4, 16);
@@ -3295,6 +3527,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pMoeDnsB32 = makePipe(c, "moe_down_q8b_32.spv", 4, 16);
     pMoeDnGroup4 = makePipe(c, "moe_down_iq4_grouped.spv", 6, 16);
     pMoeDnGroup6 = makePipe(c, "moe_down_q6k_grouped.spv", 6, 16);
+    pMoeDnGroup4Row2 = makePipe(c, "moe_down_iq4_grouped_rowtile.spv", 6, 16, 2);
+    pMoeDnGroup6Row2 = makePipe(c, "moe_down_q6k_grouped_rowtile.spv", 6, 16, 2);
     pAdd3 = makePipe(c, "add_rms3.spv", 6, 8);
     pAdd3Group = makePipe(c, "add_rms3_grouped.spv", 6, 12);
     pHead = makePipe(c, "gemv_q6_k.spv", 3, 8, 128);
@@ -3747,6 +3981,18 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     specToks.resize(maxB);
     specAm.resize(maxB);
 
+    if (getenv("QK_COUNTERS")) {
+        prefillProfArmed = getenv("QK_COUNTERS_DEFER") == nullptr;
+        if (!c.hasTimestamps) {
+            fprintf(stderr, "QK_COUNTERS requested, but the selected Vulkan queue has no timestamps\n");
+        } else {
+            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = 1024;
+            VK_CHECK(vkCreateQueryPool(c.dev, &qci, nullptr, &prefillProfQ));
+        }
+    }
+
     stepCBs.resize(nSlots);
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -3815,6 +4061,14 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bool groupAll = getenv("QK_MOE_GROUP_PREFILL") != nullptr;
     moeGroupPrefillGu = groupAll || getenv("QK_MOE_GROUP_PREFILL_GU") != nullptr;
     moeGroupPrefillDown = groupAll || getenv("QK_MOE_GROUP_PREFILL_DOWN") != nullptr;
+    if (const char* v = getenv("QK_MOE_GROUP_PREFILL_ROWS")) {
+        long x = atol(v);
+        if (x == 1 || x == 2) moeGroupPrefillRows = (uint32_t)x;
+    }
+    if (const char* v = getenv("QK_MOE_GROUP_PREFILL_DOWN_ROWS")) {
+        long x = atol(v);
+        if (x == 1 || x == 2) moeGroupPrefillDownRows = (uint32_t)x;
+    }
     dnStepReg = getenv("QK_DN_STEP_REG") != nullptr;
     dnStepGate = getenv("QK_DN_STEP_GATE_FUSED") != nullptr;
     const uint32_t amWgs = (vocab + 4095) / 4096;
@@ -4265,6 +4519,16 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
 
+    const bool tracePrefill = prefillProfQ && prefillProfArmed && !prefillProfPrinted && n > 1;
+    std::vector<const char*> traceLbl;
+    if (tracePrefill) vkCmdResetQueryPool(c.cb, prefillProfQ, 0, 1024);
+    auto stamp = [&](const char* lbl) {
+        if (!tracePrefill || traceLbl.size() >= 1024) return;
+        vkCmdWriteTimestamp(c.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, prefillProfQ,
+                            (uint32_t)traceLbl.size());
+        traceLbl.push_back(lbl);
+    };
+
     uint32_t zdim = n;
     // Atomic last-router selection is a decode optimization. At batch widths
     // above one, the standalone selector is already amortized and avoids one
@@ -4312,6 +4576,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         VK_CHECK(vkResetCommandBuffer(c.cb, 0));
         VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
         barrier();
+        stamp("submit.gap");
     };
     auto disp = [&](Pipe& pp, VkDescriptorSet ds, uint32_t wgs, const void* pc, uint32_t pcSize) {
         vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pp.p);
@@ -4380,10 +4645,13 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         VkBufferCopy ch{hidInOff, 0, (VkDeviceSize)n * nEmbd * 4};
         vkCmdCopyBuffer(c.cb, stage.buf, bbXin.buf, 1, &ch);
         barrier();
+        stamp("t0");
     } else {
         barrier();
+        stamp("t0");
         disp(pEmb, sbEmb, 1, &pcE, 12);
         barrier();
+        stamp("embed");
         // QK_DUMP_X=<file>: read back the embedded residual rows (port-bisect
         // tooling; compare against a reference dequant of token_embd rows).
         if (const char* xf = getenv("QK_DUMP_X")) {
@@ -4404,6 +4672,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     }
     disp(pRms, blayers[lFirst].sRms, 1, &pcRms, 8);
     barrier();
+    stamp("rms0");
     // QK_DUMP_TAPS=<dir>: per-op readbacks for the FIRST layer of this stage
     // (port-bisect tooling; diff against llama.cpp eval-callback dumps).
     const char* tapsDir = getenv("QK_DUMP_TAPS");
@@ -4435,35 +4704,43 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             proj(BL.sP2, dIn, nEmbd, false, L.iq4P2);
             disp(pAbB, BL.sAb, 2 * hV, &pcAbB, 12);
             barrier();
+            stamp("dn.proj");
             tap(il, "qkv", bbBig.buf, (size_t)n * chQkv * 4);
             tap(il, "z", bbMid.buf, (size_t)n * dIn * 4);
             tap(il, "gb", bbGb.buf, (size_t)n * 2 * hV * 4);
             disp(pConvB, BL.sConv, chQkv / dS, &pcConvB, 20);
             barrier();
+            stamp("dn.conv");
             tap(il, "conv", bbConvOut.buf, (size_t)n * chQkv * 4);
             if (n == 1 && dnStepGate && !tapsDir) {
                 disp(pStepGate, BL.sStepGate, hV, &pcStepGate, 20);
                 barrier();
+                stamp("dn.step+gate");
             } else {
                 zdim = 1;
                 disp(pStepB, BL.sStep, hV, &pcStepB, 20);
                 zdim = n;
                 barrier();
+                stamp("dn.step");
                 tap(il, "step", bbO.buf, (size_t)n * hV * dS * 4);
                 disp(pGateB, BL.sGate, hV, &pcGateB, 16);
                 barrier();
+                stamp("dn.gate");
             }
             tap(il, "gate", bbAtt.buf, (size_t)n * dIn * 4);
             proj(BL.sWo, nEmbd, dIn, true, L.iq4Wo);
             barrier();
+            stamp("dn.out");
             tap(il, "wo", bbAttnOut.buf, (size_t)n * nEmbd * 4);
         } else {
             proj(BL.sP1, chQkv, nEmbd, false, L.iq4P1);
             proj(BL.sP2, hKV * dh, nEmbd, false, L.iq4P2);
             proj(BL.sP3, hKV * dh, nEmbd, false, L.iq4P3);
             barrier();
+            stamp("at.proj");
             disp(pPrepB, BL.sPrep, hQ + 2 * hKV, &pcFaB, 40);
             barrier();
+            stamp("at.prep");
             // Attention over the full [0, base+n) key range, but tiled along the
             // independent query axis so no single dispatch exceeds attnBudget.
             // Each tile flushes (submit + waitIdle) to bound its ring occupancy;
@@ -4513,21 +4790,26 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 zdim = n;
             }
             barrier();
+            stamp("at.core");
             proj(BL.sWo, nEmbd, dIn, true, L.iq4Wo);
         }
         barrier();
+        if (!L.rec) stamp("at.out");
         disp(fuseRoute ? pAddNRoute : pAddN,
              fuseRoute ? BL.sAddNRoute : BL.sAddN, 1, &pcRms, 8);
         barrier();
+        stamp("addN");
         disp(fuseRoute ? (moeSelectHier ? pMoeRSHier : pMoeRS) : pMoeL,
              fuseRoute ? BL.sMoeRS : BL.sMoeL, nExp, &pcv, 16);
         disp(moeSharedGu64 ? pMoeGUs64 : pMoeGUs, BL.sMoeGUs, ffE, &pcv, 16);
         barrier();
+        stamp("moe.route+shared_gu");
         if (!fuseRoute) {
             bool fastSelect = moeSelect256 || moeRouteFused;
             disp(fastSelect ? pMoeS256 : pMoeS,
                  fastSelect ? BL.sMoeS256 : BL.sMoeS, 1, &pcv, 16);
             barrier();
+            stamp("moe.select");
         }
         // The grouped primitive is intentionally prefill-only and currently
         // targets the 35B IQ3 routed gate/up format.  Decode (n==1) and the
@@ -4540,30 +4822,43 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             zdim = 1;
             disp(pMoeGroupPairs, sbMoeGroupPairs, 1, &pcPairs, 12);
             barrier();
+            stamp("moe.pairs");
         }
         if (groupGu) {
-            vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pMoeGUGroup3.p);
+            Pipe& pgg = moeGroupPrefillRows == 2 ? pMoeGUGroup3Row2 : pMoeGUGroup3;
+            vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pgg.p);
             vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    pMoeGUGroup3.pl, 0, 1, &BL.sMoeGUGroup, 0, nullptr);
-            vkCmdPushConstants(c.cb, pMoeGUGroup3.pl, VK_SHADER_STAGE_COMPUTE_BIT,
+                                    pgg.pl, 0, 1, &BL.sMoeGUGroup, 0, nullptr);
+            vkCmdPushConstants(c.cb, pgg.pl, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, 16, &pcv);
-            vkCmdDispatch(c.cb, ffE, nExp, 1);
+            vkCmdDispatch(c.cb, (ffE + moeGroupPrefillRows - 1) / moeGroupPrefillRows,
+                          nExp, 1);
         } else {
             zdim = n;
             disp(guIq4 ? pMoeGU4 : pMoeGU, BL.sMoeGU, nUsed * ffE, &pcv, 16);
         }
         barrier();
+        stamp("moe.gate+up");
         if (groupDown) {
-            Pipe& pgd = L.downQ6 ? pMoeDnGroup6 : pMoeDnGroup4;
+            // The row-paired schedule is tuned for the 35B IQ3 gate/up family.
+            // Keep the 80B IQ4 graph on its independently measured grouped-down
+            // path even though the descriptor ABI and down formats also fit.
+            uint32_t downRows = guIq4 ? 1u : moeGroupPrefillDownRows;
+            Pipe& pgd = L.downQ6
+                ? (downRows == 2 ? pMoeDnGroup6Row2 : pMoeDnGroup6)
+                : (downRows == 2 ? pMoeDnGroup4Row2 : pMoeDnGroup4);
             vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pgd.p);
             vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pgd.pl, 0, 1, &BL.sMoeDnGroup, 0, nullptr);
             vkCmdPushConstants(c.cb, pgd.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pcv);
-            vkCmdDispatch(c.cb, nEmbd, nExp, 1);
+            vkCmdDispatch(c.cb,
+                          (nEmbd + downRows - 1) / downRows,
+                          nExp, 1);
             zdim = n;
             disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
                  BL.sMoeDns, nEmbd, &pcv, 16);
             barrier();
+            stamp("moe.down");
             struct { uint32_t n; float e; uint32_t nUsed; }
                 pcGroupTail{nEmbd, eps, nUsed};
             disp(pAdd3Group, BL.sAdd3Group, 1, &pcGroupTail, 12);
@@ -4574,9 +4869,11 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
                  BL.sMoeDns, nEmbd, &pcv, 16);
             barrier();
+            stamp("moe.down");
             disp(pAdd3, BL.sAdd3, 1, &pcRms, 8);
         }
         barrier();
+        stamp("add3");
         if ((il + 1 - lFirst) % flushEvery == 0 && il + 1 < lEnd) flushCB();
     }
     if (hiddenOut) {
@@ -4619,6 +4916,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             VkBufferCopy cv{0, 0, (VkDeviceSize)n * 4};
             vkCmdCopyBuffer(c.cb, bvTok.buf, bvSamp.buf, 1, &cv);
         }
+        stamp(argmaxOut ? "head+argmax+copy" : "head+copy");
     }
 
     VK_CHECK(vkEndCommandBuffer(c.cb));
@@ -4627,6 +4925,43 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     si.pCommandBuffers = &c.cb;
     VK_CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE));
     VK_CHECK(vkQueueWaitIdle(c.queue));
+    if (tracePrefill) {
+        std::vector<uint64_t> ts(traceLbl.size());
+        VK_CHECK(vkGetQueryPoolResults(c.dev, prefillProfQ, 0, (uint32_t)ts.size(),
+                                       ts.size() * sizeof(uint64_t), ts.data(), sizeof(uint64_t),
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+        struct Agg { std::string name; double ms = 0.0; uint32_t count = 0; };
+        std::vector<Agg> agg;
+        const uint32_t bits = c.timestampValidBits;
+        const uint64_t mask = bits >= 64 ? UINT64_MAX : ((uint64_t{1} << bits) - 1u);
+        double totalMs = 0.0;
+        for (size_t i = 1; i < ts.size(); ++i) {
+            uint64_t dt = (ts[i] - ts[i - 1]) & mask;
+            double ms = (double)dt * c.props.limits.timestampPeriod * 1e-6;
+            totalMs += ms;
+            auto it = std::find_if(agg.begin(), agg.end(), [&](const Agg& a) {
+                return a.name == traceLbl[i];
+            });
+            if (it == agg.end()) {
+                agg.push_back(Agg{traceLbl[i], ms, 1});
+            } else {
+                it->ms += ms;
+                it->count++;
+            }
+            if (getenv("QK_COUNTER_RAW"))
+                fprintf(stderr, "[qk counter raw] %03zu %-22s %9.3f ms\n",
+                        i, traceLbl[i], ms);
+        }
+        fprintf(stderr,
+                "[qk counters] Vulkan batched prefill N=%u base=%u span=%.3f ms "
+                "markers=%zu period=%.3f ns valid_bits=%u\n",
+                n, base, totalMs, traceLbl.size(), c.props.limits.timestampPeriod, bits);
+        for (const auto& a : agg)
+            fprintf(stderr, "[qk counters] %-22s %9.3f ms %6.2f%%  (%u passes)\n",
+                    a.name.c_str(), a.ms, totalMs > 0.0 ? 100.0 * a.ms / totalMs : 0.0,
+                    a.count);
+        prefillProfPrinted = true;
+    }
     if (wantLogits) memcpy(logits.data(), stageMap, (size_t)vocab * 4);
     if (argmaxOut) memcpy(argmaxOut, bvSampMap, (size_t)n * 4);
     if (hiddenOut) memcpy(hiddenOut, (uint8_t*)stageMap + hidOutOff, (size_t)n * nEmbd * 4);
@@ -6118,6 +6453,60 @@ int main(int argc, char** argv) {
         std::vector<float> lS, lB;
         printf("prefillbench: serial (N per-token forwards) vs batched (1 forward), ctx=%u\n", ctx);
         printf("  %-6s %10s %10s %8s %10s\n", "N", "serial_ms", "batch_ms", "speedup", "tok/s_bat");
+        if (const char* only = getenv("QK_PB_ONLY")) {
+            uint32_t N = (uint32_t)atoi(only);
+            uint32_t reps = 1;
+            if (const char* v = getenv("QK_PB_REPS")) reps = std::max(1u, (uint32_t)atoi(v));
+            if (N < 1 || N + 1 > ctx) {
+                fprintf(stderr, "QK_PB_ONLY=%u requires 1 <= N < ctx=%u\n", N, ctx);
+                qk_close(e);
+                return 1;
+            }
+            std::mt19937 rng(1234);
+            std::vector<uint32_t> toks(N);
+            for (uint32_t i = 0; i < N; i++) toks[i] = rng() % (e->vocab - 16) + 4;
+            auto admission = [&]() {
+                std::vector<float> unused;
+                for (uint32_t off = 0; off < N; off += e->maxB) {
+                    uint32_t cn = std::min(e->maxB, N - off);
+                    e->prefillBatchLast(toks.data() + off, cn, 0, unused,
+                                        /*wantLogits=*/false, /*base=*/off);
+                }
+            };
+            admission();  // warm shaders, weights, and allocations
+            if (getenv("QK_COUNTERS_DEFER")) e->prefillProfArmed = true;
+            const char* busyPath = getenv("QK_PB_BUSY_PATH");
+            for (uint32_t rep = 0; rep < reps; ++rep) {
+                int busyBefore = -1;
+                if (busyPath) {
+                    for (uint32_t attempt = 0; attempt < 20; ++attempt) {
+                        if (FILE* f = fopen(busyPath, "r")) {
+                            if (fscanf(f, "%d", &busyBefore) != 1) busyBefore = -1;
+                            fclose(f);
+                        }
+                        if (busyBefore >= 0 && busyBefore <= 2) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                    if (busyBefore < 0 || busyBefore > 2) {
+                        fprintf(stderr,
+                                "prefillbench: refusing contaminated rep %u: gpu_busy_percent=%d\n",
+                                rep + 1, busyBefore);
+                        qk_close(e);
+                        return 3;
+                    }
+                }
+                auto t0 = std::chrono::steady_clock::now();
+                admission();
+                auto t1 = std::chrono::steady_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                printf("prefillbench sample: N=%u rep=%u batch_ms=%.3f tok/s=%.3f "
+                       "maxB=%u gpu_busy_before=%d\n",
+                       N, rep + 1, ms, N * 1000.0 / ms, e->maxB, busyBefore);
+                fflush(stdout);
+            }
+            qk_close(e);
+            return 0;
+        }
         for (uint32_t N : {8u, 16u, 32u, 64u, 96u, 128u, 192u, 256u}) {
             if (N > cap) continue;
             std::mt19937 rng(1234);
@@ -6212,7 +6601,12 @@ int main(int argc, char** argv) {
     };
 
     bool ok = true;
-    if (mode == "suite") {
+    if (mode == "counters") {
+        printf("vulkan timestamps: %s\n", c.hasTimestamps ? "supported" : "unsupported");
+        printf("queue_family: %u\n", c.qfi);
+        printf("timestamp_valid_bits: %u\n", c.timestampValidBits);
+        printf("timestamp_period_ns: %.6f\n", c.props.limits.timestampPeriod);
+    } else if (mode == "suite") {
         ok &= caseF16(c, 8192, 8192, 200);
         ok &= caseQ80(c, 8192, 8192, 200);
         ok &= caseQ6K(c, 8192, 8192, 200);
@@ -6243,6 +6637,8 @@ int main(int argc, char** argv) {
         ok = caseBlock(c, argU(2, 0), argU(3, 3), argU(4, 200));
     } else if (mode == "ablock") {
         ok = caseABlock(c, argU(2, 3), argU(3, 3), argU(4, 200));
+    } else if (mode == "dncmp") {
+        ok = caseDnBatchCmp(c, argU(2, 512), argU(3, 30));
     } else if (mode == "token") {
         if (argc < 4) {
             fprintf(stderr, "usage: qk token <ids-file> <nGen> [tmax] [batch]\n");

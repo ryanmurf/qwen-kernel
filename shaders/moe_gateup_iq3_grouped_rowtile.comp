@@ -1,0 +1,137 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Expert-major prefill gate/up with adjacent-row ILP. A workgroup owns
+// ROW_TILE rows for one expert, retaining each selected token's eight input
+// values across all rows. Every row keeps the shipping grouped kernel's lane
+// assignment, alternating lower/upper accumulation order, subgroupAdd tree,
+// and serial subgroup-leader fold.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint ROW_TILE = 2u;
+
+#include "iq_tables.glsl"
+
+struct block_iq3_xxs { float16_t d; uint8_t qs[96]; };
+layout(std430, binding = 0) readonly buffer BufG { block_iq3_xxs gw[]; };
+layout(std430, binding = 1) readonly buffer BufU { block_iq3_xxs uw[]; };
+layout(std430, binding = 2) readonly buffer BufX { float x[]; };
+layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 4) readonly buffer Pairs { uint pairs[]; };
+layout(std430, binding = 5) writeonly buffer BufH { float h[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float pg[2u * 8u];
+shared float pu[2u * 8u];
+
+void main() {
+    uint r0 = gl_WorkGroupID.x * ROW_TILE;
+    uint eid = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (r0 >= pc.n_ff || eid >= pc.n_expert) return;
+    uint begin = offsets[eid], end = offsets[eid + 1u];
+    if (begin == end) return;
+
+    uint kb = pc.n_embd / 256u;
+    uint nu = kb * 32u;
+    float mg[2][8], mu[2][8], dg[2], du[2];
+    for (uint rr = 0u; rr < 2u; ++rr) {
+        dg[rr] = 0.0; du[rr] = 0.0;
+        for (uint j = 0u; j < 8u; ++j) { mg[rr][j] = 0.0; mu[rr][j] = 0.0; }
+    }
+
+    if (tid < nu) {
+        uint b = tid >> 5u;
+        uint g8 = tid & 31u;
+        uint ib32 = g8 >> 2u;
+        uint l = g8 & 3u;
+        uint ao = 64u + 4u * ib32;
+        uint qo = ib32 * 8u + 2u * l;
+        for (uint rr = 0u; rr < ROW_TILE; ++rr) {
+            uint r = r0 + rr;
+            if (r >= pc.n_ff) continue;
+            uint bi = (eid * pc.n_ff + r) * kb + b;
+            uint ag = uint(gw[bi].qs[ao]) | (uint(gw[bi].qs[ao + 1u]) << 8u) |
+                      (uint(gw[bi].qs[ao + 2u]) << 16u) | (uint(gw[bi].qs[ao + 3u]) << 24u);
+            uint sg = iq_signbyte((ag >> (7u * l)) & 127u);
+            uint gg1 = iq3xxs_grid[uint(gw[bi].qs[qo])];
+            uint gg2 = iq3xxs_grid[uint(gw[bi].qs[qo + 1u])];
+            dg[rr] = float(gw[bi].d) * (0.5 + float(ag >> 28u)) * 0.5;
+
+            uint au = uint(uw[bi].qs[ao]) | (uint(uw[bi].qs[ao + 1u]) << 8u) |
+                      (uint(uw[bi].qs[ao + 2u]) << 16u) | (uint(uw[bi].qs[ao + 3u]) << 24u);
+            uint su = iq_signbyte((au >> (7u * l)) & 127u);
+            uint ug1 = iq3xxs_grid[uint(uw[bi].qs[qo])];
+            uint ug2 = iq3xxs_grid[uint(uw[bi].qs[qo + 1u])];
+            du[rr] = float(uw[bi].d) * (0.5 + float(au >> 28u)) * 0.5;
+
+            for (uint j = 0u; j < 4u; ++j) {
+                float a = float((gg1 >> (8u * j)) & 255u);
+                float b2 = float((gg2 >> (8u * j)) & 255u);
+                mg[rr][j] = (sg & (1u << j)) != 0u ? -a : a;
+                mg[rr][4u + j] = (sg & (1u << (4u + j))) != 0u ? -b2 : b2;
+                a = float((ug1 >> (8u * j)) & 255u);
+                b2 = float((ug2 >> (8u * j)) & 255u);
+                mu[rr][j] = (su & (1u << j)) != 0u ? -a : a;
+                mu[rr][4u + j] = (su & (1u << (4u + j))) != 0u ? -b2 : b2;
+            }
+        }
+    }
+
+    for (uint pi = begin; pi < end; ++pi) {
+        uint pair = pairs[pi];
+        uint rq = pair >> 4u;
+        uint s = pair & 15u;
+        float ag[2], au[2];
+        for (uint rr = 0u; rr < 2u; ++rr) { ag[rr] = 0.0; au[rr] = 0.0; }
+        if (tid < nu) {
+            uint b = tid >> 5u;
+            uint g8 = tid & 31u;
+            uint ib32 = g8 >> 2u;
+            uint l = g8 & 3u;
+            uint xo = rq * pc.n_embd + b * 256u + ib32 * 32u + l * 8u;
+            float xv[8];
+            for (uint j = 0u; j < 8u; ++j) xv[j] = x[xo + j];
+            for (uint rr = 0u; rr < ROW_TILE; ++rr) {
+                float sg = 0.0, su = 0.0;
+                for (uint j = 0u; j < 4u; ++j) {
+                    sg += mg[rr][j] * xv[j];
+                    sg += mg[rr][4u + j] * xv[4u + j];
+                    su += mu[rr][j] * xv[j];
+                    su += mu[rr][4u + j] * xv[4u + j];
+                }
+                ag[rr] = dg[rr] * sg;
+                au[rr] = du[rr] * su;
+            }
+        }
+        for (uint rr = 0u; rr < ROW_TILE; ++rr) {
+            float gs = subgroupAdd(ag[rr]);
+            float us = subgroupAdd(au[rr]);
+            if (gl_SubgroupInvocationID == 0u) {
+                pg[rr * 8u + gl_SubgroupID] = gs;
+                pu[rr * 8u + gl_SubgroupID] = us;
+            }
+        }
+        barrier();
+        if (tid == 0u) {
+            for (uint rr = 0u; rr < ROW_TILE; ++rr) {
+                uint r = r0 + rr;
+                if (r >= pc.n_ff) continue;
+                float g = 0.0, u = 0.0;
+                for (uint w = 0u; w < gl_NumSubgroups; ++w) {
+                    g += pg[rr * 8u + w];
+                    u += pu[rr * 8u + w];
+                }
+                uint ho = (rq * (pc.n_used + 1u) + s) * pc.n_ff + r;
+                h[ho] = (g / (1.0 + exp(-g))) * u;
+            }
+        }
+        barrier();
+    }
+}
