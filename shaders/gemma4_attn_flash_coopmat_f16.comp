@@ -12,6 +12,9 @@
 #ifndef G4_PROFILE_PHASE
 #define G4_PROFILE_PHASE 3
 #endif
+#ifndef G4_QUERY_HALF
+#define G4_QUERY_HALF 0
+#endif
 
 #if G4_COOPMAT_F32
 #define G4_ACCUMULATOR_TYPE float
@@ -35,7 +38,11 @@
 // accumulation in chronological tiles. This keeps the cooperative score/value
 // win without crossing the frozen boundary-fixture logits.
 layout(local_size_x = 256) in;
+#if G4_QUERY_HALF
+layout(std430, binding = 0) readonly buffer BufQ { float16_t query[]; };
+#else
 layout(std430, binding = 0) readonly buffer BufQ { float query[]; };
+#endif
 layout(std430, binding = 1) readonly buffer BufK { float16_t keyCache[]; };
 layout(std430, binding = 2) readonly buffer BufV { float16_t valueCache[]; };
 layout(std430, binding = 3) writeonly buffer BufS { float states[]; };
@@ -57,7 +64,9 @@ layout(constant_id = 0) const uint MAX_HEAD_DIM = 512u;
 layout(constant_id = 1) const uint MAX_GROUP_SIZE = 8u;
 const float NEG_MAX = -3.402823466e38;
 
+#if !G4_QUERY_HALF
 shared float16_t queryTile[TILE * MAX_HEAD_DIM];
+#endif
 shared G4_ACCUMULATOR_TYPE scoreTile[TILE * TILE]; // [key][q-head]
 shared G4_PROBABILITY_TYPE probabilityTile[TILE * TILE]; // [q-head][key]
 #if !G4_COOPMAT_F32
@@ -106,6 +115,7 @@ void main() {
         return;
     }
 
+#if !G4_QUERY_HALF
     for (uint index = lane; index < TILE * pc.headDim; index += 256u) {
         uint rank = index / pc.headDim;
         uint dim = index % pc.headDim;
@@ -113,6 +123,7 @@ void main() {
             ? query[(kvHead * groupSize + rank) * pc.headDim + dim] : 0.0;
         queryTile[index] = float16_t(value);
     }
+#endif
     for (uint index = lane; index < TILE * TILE; index += 256u)
         probabilityTile[index] = G4_PROBABILITY_TYPE(0.0);
     for (uint index = lane; index < groupSize * pc.headDim; index += 256u)
@@ -135,6 +146,9 @@ void main() {
          absoluteBlock < blockEnd; absoluteBlock += TILE) {
         uint physicalBlock = cache_slot(absoluteBlock);
         uint keyBase = (kvHead * pc.cacheLength + physicalBlock) * pc.headDim;
+#if G4_QUERY_HALF
+        uint queryBase = kvHead * TILE * pc.headDim;
+#endif
         if (gl_SubgroupID == 0u) {
             coopmat<float, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseAccumulator> scoreMatrix =
@@ -147,7 +161,11 @@ void main() {
             for (uint dim = 0u; dim < pc.headDim; dim += TILE) {
                 coopMatLoad(keyMatrix, keyCache, keyBase + dim, pc.headDim,
                             gl_CooperativeMatrixLayoutRowMajor);
+#if G4_QUERY_HALF
+                coopMatLoad(queryMatrix, query, queryBase + dim, pc.headDim,
+#else
                 coopMatLoad(queryMatrix, queryTile, dim, pc.headDim,
+#endif
                             gl_CooperativeMatrixLayoutColumnMajor);
                 scoreMatrix = coopMatMulAdd(
                     keyMatrix, queryMatrix, scoreMatrix);
@@ -294,6 +312,9 @@ void main() {
         uint physicalBlock = cache_slot(absoluteBlock);
         uint keyBase = (kvHead * pc.cacheLength + physicalBlock) * pc.headDim;
         uint valueBase0 = keyBase;
+#if G4_QUERY_HALF
+        uint queryBase = kvHead * TILE * pc.headDim;
+#endif
 
         // K[16 keys, dh] * Q^T[dh, 16 heads] -> S^T[16 keys, 16 heads].
         if (gl_SubgroupID == 0u) {
@@ -308,7 +329,11 @@ void main() {
             for (uint dim = 0u; dim < pc.headDim; dim += TILE) {
                 coopMatLoad(keyMatrix, keyCache, keyBase + dim, pc.headDim,
                             gl_CooperativeMatrixLayoutRowMajor);
+#if G4_QUERY_HALF
+                coopMatLoad(queryMatrix, query, queryBase + dim, pc.headDim,
+#else
                 coopMatLoad(queryMatrix, queryTile, dim, pc.headDim,
+#endif
                             gl_CooperativeMatrixLayoutColumnMajor);
                 scoreMatrix = coopMatMulAdd(
                     keyMatrix, queryMatrix, scoreMatrix);

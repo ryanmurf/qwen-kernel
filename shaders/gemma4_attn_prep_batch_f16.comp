@@ -4,6 +4,10 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
+#ifndef G4_QUERY_HALF
+#define G4_QUERY_HALF 0
+#endif
+
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufQ { float rawQ[]; };
 layout(std430, binding = 1) readonly buffer BufK { float rawK[]; };
@@ -16,6 +20,9 @@ layout(std430, binding = 7) buffer BufKC { float16_t keyCache[]; };
 layout(std430, binding = 8) buffer BufVC { float16_t valueCache[]; };
 layout(std430, binding = 9) buffer BufKR { float16_t keyRing[]; };
 layout(std430, binding = 10) buffer BufVR { float16_t valueRing[]; };
+#if G4_QUERY_HALF
+layout(std430, binding = 11) writeonly buffer BufQH { float16_t queryHalf[]; };
+#endif
 layout(push_constant) uniform PC {
     uint basePosition;
     uint tokens;
@@ -28,6 +35,9 @@ layout(push_constant) uniform PC {
     uint useFactors;
     float eps;
     float ropeBase;
+#if G4_QUERY_HALF
+    uint writeQueryHalf;
+#endif
 } pc;
 shared float waveSums[8];
 shared float normScale;
@@ -83,9 +93,16 @@ void main() {
             float first = normalized[pair], second = normalized[pair + halfDim];
             outValue = dim < halfDim ? first*cc - second*ss : first*ss + second*cc;
         }
-        if (isQ)
+        if (isQ) {
             query[(token*pc.queryHeads + head)*pc.headDim + dim] = outValue;
-        else if (isK) {
+#if G4_QUERY_HALF
+            if (pc.writeQueryHalf != 0u) {
+                uint groupSize = pc.queryHeads / pc.kvHeads;
+                uint paddedHead = (head / groupSize)*16u + head % groupSize;
+                queryHalf[paddedHead*pc.headDim + dim] = float16_t(outValue);
+            }
+#endif
+        } else if (isK) {
             keyCache[cacheBase + dim] = float16_t(outValue);
             if (pc.sliding != 0u) keyRing[ringBase + dim] = float16_t(outValue);
         } else {

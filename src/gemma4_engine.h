@@ -96,6 +96,8 @@ class Gemma4Engine {
                      gemma4::kSlidingAttention.headDim*4);
         bbQuery = dev((size_t)kBatch*gemma4::kGlobalAttention.queryHeads*
                       gemma4::kGlobalAttention.headDim*4);
+        bDecodeQueryHalf = dev((size_t)gemma4::kSlidingAttention.kvHeads*
+                               16u*gemma4::kSlidingAttention.headDim*2);
         bbProbabilities = dev((size_t)kBatch*gemma4::kGlobalAttention.queryHeads*
                               probabilityStride*4);
         bbAttentionValue = dev((size_t)kBatch*gemma4::kGlobalAttention.queryHeads*
@@ -140,6 +142,13 @@ class Gemma4Engine {
                              c.cooperativeMatrixK == 16;
         useCoopAttention = coopF16;
         useCoopSliding = coopF16 && c.cooperativeMatrixF32Acc;
+        useDecodeQueryHalf = coopF16 &&
+            getenv("QK_G4_NO_COOPMAT_QUERY_HALF") == nullptr;
+        if (const char* value = getenv("QK_G4_PREFILL_QUERY_TOKENS")) {
+            const uint32_t parsed = (uint32_t)strtoul(value, nullptr, 10);
+            if (parsed == 1u || parsed == 2u || parsed == 4u || parsed == 8u)
+                prefillSlidingQueryTokens = parsed;
+        }
         if (getenv("QK_G4_COOPMAT_EARLY"))
             firstCoopSlidingLayer = 0;
         useNormFusion = !getenv("QK_G4_NO_NORM_FUSION");
@@ -185,6 +194,7 @@ class Gemma4Engine {
                 vkCmdFillBuffer(c.cb, layer.linearValueCache, 0, VK_WHOLE_SIZE, 0);
             }
         }
+        vkCmdFillBuffer(c.cb, bDecodeQueryHalf, 0, VK_WHOLE_SIZE, 0);
         VK_CHECK(vkEndCommandBuffer(c.cb));
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
@@ -386,9 +396,11 @@ class Gemma4Engine {
     VkQueryPool profileQueries = VK_NULL_HANDLE;
     bool profileEnabled = false, profilePhaseEnabled = false;
     bool useCoopAttention = false, useCoopSliding = false;
+    bool useDecodeQueryHalf = false;
     uint32_t firstCoopSlidingLayer = 3;
     bool useNormFusion = false;
     bool useCoopBatch = false, useCoopBatchSliding = false;
+    uint32_t prefillSlidingQueryTokens = 8;
     bool profileReady = false;
     uint32_t lastProfilePosition = 0, profileLayer = 0;
     VkCommandBuffer stepCb = VK_NULL_HANDLE, prefillCb = VK_NULL_HANDLE;
@@ -425,6 +437,7 @@ class Gemma4Engine {
     VkBuffer bX = VK_NULL_HANDLE, bAttnNorm = VK_NULL_HANDLE, bQ8 = VK_NULL_HANDLE;
     VkBuffer bRawQ = VK_NULL_HANDLE, bRawK = VK_NULL_HANDLE, bRawV = VK_NULL_HANDLE;
     VkBuffer bQuery = VK_NULL_HANDLE, bProbabilities = VK_NULL_HANDLE;
+    VkBuffer bDecodeQueryHalf = VK_NULL_HANDLE;
     VkBuffer bAttentionValue = VK_NULL_HANDLE, bAttnSplit = VK_NULL_HANDLE;
     VkBuffer bAttnProjected = VK_NULL_HANDLE;
     VkBuffer bAttnPost = VK_NULL_HANDLE, bAttnOut = VK_NULL_HANDLE;
@@ -750,25 +763,34 @@ class Gemma4Engine {
         pBatchGemm66 = makePipe(c, "gemm_q4_0.spv", 3, 12, 66);
         pBatchGemm128 = makePipe(c, "gemm_q4_0.spv", 3, 12, 128);
         pBatchGemm256 = makePipe(c, "gemm_q4_0.spv", 3, 12, 256);
-        pBatchPrep = makePipe(c, "gemma4_attn_prep_batch_f16.spv", 11, 44);
+        pBatchPrep = makePipe(c,
+            useDecodeQueryHalf
+                ? "gemma4_attn_prep_batch_query_half.spv"
+                : "gemma4_attn_prep_batch_f16.spv",
+            useDecodeQueryHalf ? 12u : 11u,
+            useDecodeQueryHalf ? 48u : 44u);
         pBatchAttention = makePipe(c, "gemma4_attn_batch_f16.spv", 5, 32);
         if (useCoopBatch)
             pBatchAttentionCoop = makePipeSpecs(
                 c, "gemma4_attn_batch_flash_coopmat_f16.spv", 4, 32,
-                {512u, 8u});
+                {512u, 8u, 1u});
         if (useCoopBatchSliding)
             pBatchAttentionCoopSliding = makePipeSpecs(
                 c, "gemma4_attn_batch_flash_coopmat_f16.spv", 4, 32,
-                {256u, 2u});
+                {256u, 2u, prefillSlidingQueryTokens});
         pDecodeAttentionSplit = makePipe(c, "gemma4_attn_split_f16.spv", 5, 40);
         pDecodeAttentionReduce = makePipe(c, "gemma4_attn_split_reduce.spv", 2, 12);
         if (useCoopAttention)
             pDecodeAttentionCoop = makePipeSpecs(
-                c, "gemma4_attn_flash_coopmat_f16.spv", 4, 40,
+                c, useDecodeQueryHalf
+                    ? "gemma4_attn_flash_coopmat_query_half_f16.spv"
+                    : "gemma4_attn_flash_coopmat_f16.spv", 4, 40,
                 {512u, 8u});
         if (useCoopSliding)
             pDecodeAttentionCoopSliding = makePipeSpecs(
-                c, "gemma4_attn_flash_coopmat_f32.spv", 4, 40,
+                c, useDecodeQueryHalf
+                    ? "gemma4_attn_flash_coopmat_query_half_f32.spv"
+                    : "gemma4_attn_flash_coopmat_f32.spv", 4, 40,
                 {256u, 2u});
         if (profilePhaseEnabled) {
             pBatchAttentionScore = makePipe(
@@ -956,11 +978,18 @@ class Gemma4Engine {
                 if (l.cfg.sliding)
                     l.bV = set(batchGemmPipe(gemma4::kEmbedding),
                                {l.attnV, bbAttnNorm, bbRawV});
-                l.bPrep = set(pBatchPrep,
-                    {bbRawQ, bbRawK, l.cfg.sliding ? bbRawV : bbRawK,
-                     l.attnQNorm, l.attnKNorm, bRopeFactors, bbQuery,
-                     l.linearKeyCache, l.linearValueCache,
-                     l.keyCache, l.valueCache});
+                if (useDecodeQueryHalf)
+                    l.bPrep = set(pBatchPrep,
+                        {bbRawQ, bbRawK, l.cfg.sliding ? bbRawV : bbRawK,
+                         l.attnQNorm, l.attnKNorm, bRopeFactors, bbQuery,
+                         l.linearKeyCache, l.linearValueCache,
+                         l.keyCache, l.valueCache, bDecodeQueryHalf});
+                else
+                    l.bPrep = set(pBatchPrep,
+                        {bbRawQ, bbRawK, l.cfg.sliding ? bbRawV : bbRawK,
+                         l.attnQNorm, l.attnKNorm, bRopeFactors, bbQuery,
+                         l.linearKeyCache, l.linearValueCache,
+                         l.keyCache, l.valueCache});
                 l.bAttention = set(pBatchAttention,
                     {bbQuery,
                      l.cfg.sliding ? l.keyCache : l.linearKeyCache,
@@ -983,12 +1012,13 @@ class Gemma4Engine {
                      bbProbabilities, bAttnSplit});
                 if (useCoopAttention && !l.cfg.sliding)
                     l.dAttentionCoop = set(pDecodeAttentionCoop,
-                        {bbQuery,
+                        {useDecodeQueryHalf ? bDecodeQueryHalf : bbQuery,
                          l.linearKeyCache, l.linearValueCache,
                          bAttnSplit});
                 if (useCoopSliding && l.cfg.sliding)
                     l.dAttentionCoopSliding = set(pDecodeAttentionCoopSliding,
-                        {bbQuery, l.keyCache, l.valueCache, bAttnSplit});
+                        {useDecodeQueryHalf ? bDecodeQueryHalf : bbQuery,
+                         l.keyCache, l.valueCache, bAttnSplit});
                 if (profilePhaseEnabled) {
                     const std::initializer_list<VkBuffer> attentionBuffers{
                         bbQuery,
@@ -1277,12 +1307,18 @@ class Gemma4Engine {
                 uint32_t basePosition, tokens, headDim, queryHeads, kvHeads;
                 uint32_t ropeDim, cacheLength, sliding, useFactors;
                 float eps, ropeBase;
+                uint32_t writeQueryHalf;
             } prepPush{basePosition, tokens, l.cfg.headDim,
                        l.cfg.queryHeads, l.cfg.kvHeads, l.cfg.ropeDim,
                        kvCapacity, l.cfg.sliding ? 1u : 0u,
                        l.cfg.sliding ? 0u : 1u, gemma4::kRmsEpsilon,
-                       l.cfg.ropeBase};
-            bindDispatch(pBatchPrep, l.bPrep, &prepPush, sizeof(prepPush),
+                       l.cfg.ropeBase,
+                       useDecodeQueryHalf && tokens == 1u &&
+                       ((l.cfg.sliding && useCoopSliding &&
+                         il >= firstCoopSlidingLayer) ||
+                        (!l.cfg.sliding && useCoopAttention)) ? 1u : 0u};
+            bindDispatch(pBatchPrep, l.bPrep, &prepPush,
+                         useDecodeQueryHalf ? sizeof(prepPush) : 44u,
                          tokens*(l.cfg.queryHeads + 2*l.cfg.kvHeads));
             if (diagnostics && il == diagnosticLayer && tokens == 1)
                 recordAttnOpDump(bbQuery,
@@ -1422,9 +1458,12 @@ class Gemma4Engine {
                     !profilePhaseEnabled) {
                     Pipe& batchAttentionPipe = l.cfg.sliding
                         ? pBatchAttentionCoopSliding : pBatchAttentionCoop;
+                    const uint32_t queryTokens = l.cfg.sliding
+                        ? prefillSlidingQueryTokens : 1u;
                     bindDispatch(batchAttentionPipe, l.bAttentionCoop,
                                  &attentionPush, sizeof(attentionPush),
-                                 l.cfg.kvHeads, tokens);
+                                 l.cfg.kvHeads,
+                                 (tokens + queryTokens - 1u)/queryTokens);
                 } else if (profilePhaseEnabled) {
                     bindDispatch(pBatchAttentionScore, l.bAttentionScore,
                                  &attentionPush, sizeof(attentionPush),

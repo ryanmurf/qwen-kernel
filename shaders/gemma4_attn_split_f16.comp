@@ -1,6 +1,8 @@
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
 
 // Decode split-K attention. Each workgroup owns one KV head and one contiguous
 // KV chunk, producing an F32 online-softmax state for every GQA query head.
@@ -88,20 +90,56 @@ void main() {
         for (uint rank = 0u; rank < groupSize; ++rank)
             reduction[rank][lane] = dots[rank];
         barrier();
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (lane < stride)
-                for (uint rank = 0u; rank < groupSize; ++rank)
-                    reduction[rank][lane] += reduction[rank][lane + stride];
+        // Preserve the 256->128->...->1 tree exactly. Shared memory carries
+        // cross-subgroup levels; once the live half-tree fits in subgroup 0,
+        // register shuffles remove barriers without changing any operand pair.
+        if (gl_SubgroupSize >= 32u && gl_SubgroupSize <= 128u) {
+            uint stride = 128u;
+            for (; stride > gl_SubgroupSize; stride >>= 1u) {
+                if (lane < stride)
+                    for (uint rank = 0u; rank < groupSize; ++rank) {
+                        dots[rank] += reduction[rank][lane + stride];
+                        reduction[rank][lane] = dots[rank];
+                    }
+                barrier();
+            }
+            if (stride == gl_SubgroupSize) {
+                if (lane < stride)
+                    for (uint rank = 0u; rank < groupSize; ++rank)
+                        dots[rank] += reduction[rank][lane + stride];
+                stride >>= 1u;
+            }
+            for (; stride > 0u; stride >>= 1u) {
+                for (uint rank = 0u; rank < groupSize; ++rank) {
+                    float other = subgroupShuffleDown(dots[rank], stride);
+                    if (lane < stride) dots[rank] += other;
+                }
+            }
+            if (lane == 0u)
+                for (uint rank = 0u; rank < groupSize; ++rank) {
+                    uint qHead = kvHead*groupSize + rank;
+                    scores[qHead*pc.probabilityStride + absolutePos] =
+                        dots[rank];
+                }
+        } else {
+            for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+                if (lane < stride)
+                    for (uint rank = 0u; rank < groupSize; ++rank)
+                        reduction[rank][lane] +=
+                            reduction[rank][lane + stride];
+                barrier();
+            }
+            if (lane == 0u)
+                for (uint rank = 0u; rank < groupSize; ++rank) {
+                    uint qHead = kvHead*groupSize + rank;
+                    scores[qHead*pc.probabilityStride + absolutePos] =
+                        reduction[rank][0];
+                }
             barrier();
         }
-        if (lane == 0u)
-            for (uint rank = 0u; rank < groupSize; ++rank) {
-                uint qHead = kvHead*groupSize + rank;
-                scores[qHead*pc.probabilityStride + absolutePos] =
-                    reduction[rank][0];
-            }
-        barrier();
     }
+    memoryBarrierBuffer();
+    barrier();
     if (PROFILE_PHASE == 1u) return;
 
     if (PROFILE_PHASE == 0u || PROFILE_PHASE == 2u) {

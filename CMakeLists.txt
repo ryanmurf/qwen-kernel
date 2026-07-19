@@ -93,6 +93,31 @@ add_custom_command(
     COMMENT "glslc gemma4_attn_flash_coopmat_f32")
 list(APPEND SPV_FILES ${GEMMA4_COOPMAT_F32_SPV})
 
+# Decode prep writes a padded f16 query tile and cooperative attention loads it
+# directly, removing the per-workgroup LDS conversion tile. Separate modules
+# leave the non-cooperative fallback unchanged.
+set(GEMMA4_QUERY_HALF_SPV
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_prep_batch_query_half.spv
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_query_half_f16.spv
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_query_half_f32.spv)
+add_custom_command(
+    OUTPUT ${GEMMA4_QUERY_HALF_SPV}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_QUERY_HALF=1
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_prep_batch_f16.comp
+            -o ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_prep_batch_query_half.spv
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_QUERY_HALF=1
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+            -o ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_query_half_f16.spv
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_QUERY_HALF=1
+            -DG4_COOPMAT_F32=1
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+            -o ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_query_half_f32.spv
+    DEPENDS ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_prep_batch_f16.comp
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+    COMMENT "glslc Gemma 4 half-query decode variants")
+list(APPEND SPV_FILES ${GEMMA4_QUERY_HALF_SPV})
+
 # Profiling-only cumulative cooperative variants. Phase 1 runs QK, phase 2
 # runs QK+softmax, and the normal module runs the full QK+softmax+PV path.
 set(GEMMA4_COOPMAT_PROFILE_SPV

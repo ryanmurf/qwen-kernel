@@ -11,10 +11,10 @@
 // an independent implementation against qk's batch cache/output ABI. No
 // external SPIR-V or generated binary is used.
 //
-// One workgroup owns one prompt token and one KV head. Rows are the two sliding
-// or eight global GQA query heads served by that KV head, zero-padded to the
-// 16-row cooperative tile. The complete online output state lives in shared
-// F32 memory, not registers; only one 16-column PV tile is live at a time.
+// One workgroup owns one query-token tile and one KV head. Sliding attention
+// packs eight adjacent tokens x two GQA heads into all 16 cooperative rows;
+// global attention retains one token x eight heads. Each row keeps its own
+// original online-softmax order while the packed rows reuse every K/V tile.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufQ { float query[]; };
 layout(std430, binding = 1) readonly buffer BufK { float16_t keyCache[]; };
@@ -34,16 +34,18 @@ layout(push_constant) uniform PC {
 const uint TILE = 16u;
 layout(constant_id = 0) const uint MAX_HEAD_DIM = 512u;
 layout(constant_id = 1) const uint MAX_GROUP_SIZE = 8u;
+layout(constant_id = 2) const uint QUERY_TOKENS = 1u;
 const float NEG_MAX = -3.402823466e38;
 
 shared float16_t queryTile[TILE * MAX_HEAD_DIM];
 shared float16_t scoreTile[TILE * TILE];       // [key][q-head]
 shared float16_t probabilityTile[TILE * TILE]; // [q-head][key]
 shared float16_t pvTile[TILE * MAX_HEAD_DIM];
-shared float outputState[MAX_GROUP_SIZE * MAX_HEAD_DIM];
-shared float maxima[8];
-shared float sums[8];
-shared float corrections[8];
+shared float outputState[MAX_GROUP_SIZE * QUERY_TOKENS * MAX_HEAD_DIM];
+shared float maxima[TILE];
+shared float sums[TILE];
+shared float corrections[TILE];
+shared uint rowActive[TILE];
 
 uint cache_slot(uint absolutePosition) {
     return pc.sliding != 0u ? absolutePosition % pc.cacheLength
@@ -52,37 +54,43 @@ uint cache_slot(uint absolutePosition) {
 
 void main() {
     uint kvHead = gl_WorkGroupID.x;
-    uint token = gl_WorkGroupID.y;
-    if (token >= pc.tokens) return;
+    uint tokenBase = gl_WorkGroupID.y * QUERY_TOKENS;
+    if (tokenBase >= pc.tokens) return;
     uint lane = gl_LocalInvocationID.x;
-    uint position = pc.basePosition + token;
     uint groupSize = pc.queryHeads / pc.kvHeads;
+    uint tileTokens = min(QUERY_TOKENS, pc.tokens - tokenBase);
+    uint activeRows = tileTokens * groupSize;
     uint qWidth = pc.queryHeads * pc.headDim;
-    uint activeBegin = pc.sliding != 0u && position + 1u > pc.cacheLength
-                     ? position + 1u - pc.cacheLength : 0u;
-    uint activeEnd = position + 1u;
 
     for (uint index = lane; index < TILE * pc.headDim; index += 256u) {
-        uint rank = index / pc.headDim;
+        uint row = index / pc.headDim;
         uint dim = index % pc.headDim;
-        queryTile[index] = rank < groupSize
+        uint localToken = row / groupSize;
+        uint rank = row % groupSize;
+        uint token = tokenBase + localToken;
+        queryTile[index] = row < activeRows
             ? float16_t(query[token * qWidth +
                               (kvHead * groupSize + rank) * pc.headDim + dim])
             : float16_t(0.0);
     }
     for (uint index = lane; index < TILE * TILE; index += 256u)
         probabilityTile[index] = float16_t(0.0);
-    for (uint index = lane; index < groupSize * pc.headDim; index += 256u)
+    for (uint index = lane; index < activeRows * pc.headDim; index += 256u)
         outputState[index] = 0.0;
-    if (lane < groupSize) {
+    if (lane < activeRows) {
         maxima[lane] = NEG_MAX;
         sums[lane] = 0.0;
         corrections[lane] = 0.0;
     }
     barrier();
 
-    uint blockBegin = activeBegin & ~(TILE - 1u);
-    uint blockEnd = (activeEnd + TILE - 1u) & ~(TILE - 1u);
+    uint firstPosition = pc.basePosition + tokenBase;
+    uint lastPosition = firstPosition + tileTokens - 1u;
+    uint firstActiveBegin = pc.sliding != 0u &&
+                            firstPosition + 1u > pc.cacheLength
+                          ? firstPosition + 1u - pc.cacheLength : 0u;
+    uint blockBegin = firstActiveBegin & ~(TILE - 1u);
+    uint blockEnd = (lastPosition + 1u + TILE - 1u) & ~(TILE - 1u);
     for (uint absoluteBlock = blockBegin;
          absoluteBlock < blockEnd; absoluteBlock += TILE) {
         if (gl_SubgroupID == 0u) {
@@ -109,35 +117,47 @@ void main() {
         }
         barrier();
 
-        if (lane < groupSize) {
-            uint rank = lane;
+        if (lane < activeRows) {
+            uint row = lane;
+            uint localToken = row / groupSize;
+            uint position = firstPosition + localToken;
+            uint activeBegin = pc.sliding != 0u &&
+                               position + 1u > pc.cacheLength
+                             ? position + 1u - pc.cacheLength : 0u;
+            uint activeEnd = position + 1u;
+            bool activeBlock = absoluteBlock < activeEnd &&
+                               absoluteBlock + TILE > activeBegin;
             float blockMaximum = NEG_MAX;
-            for (uint key = 0u; key < TILE; ++key) {
+            for (uint key = 0u; key < TILE && activeBlock; ++key) {
                 uint absolutePosition = absoluteBlock + key;
                 if (absolutePosition >= activeBegin &&
                     absolutePosition < activeEnd)
                     blockMaximum = max(
-                        blockMaximum, float(scoreTile[key * TILE + rank]));
+                        blockMaximum, float(scoreTile[key * TILE + row]));
             }
-            float oldMaximum = maxima[rank];
+            float oldMaximum = maxima[row];
             float newMaximum = max(oldMaximum, blockMaximum);
-            float correction = oldMaximum == NEG_MAX
-                ? 0.0 : exp(oldMaximum - newMaximum);
+            float correction = activeBlock
+                ? (oldMaximum == NEG_MAX ? 0.0 : exp(oldMaximum - newMaximum))
+                : 1.0;
             float blockSum = 0.0;
             for (uint key = 0u; key < TILE; ++key) {
                 uint absolutePosition = absoluteBlock + key;
                 float16_t probability = float16_t(0.0);
-                if (absolutePosition >= activeBegin &&
+                if (activeBlock && absolutePosition >= activeBegin &&
                     absolutePosition < activeEnd) {
                     probability = float16_t(exp(
-                        float(scoreTile[key * TILE + rank]) - newMaximum));
+                        float(scoreTile[key * TILE + row]) - newMaximum));
                     blockSum += float(probability);
                 }
-                probabilityTile[rank * TILE + key] = probability;
+                probabilityTile[row * TILE + key] = probability;
             }
-            maxima[rank] = newMaximum;
-            sums[rank] = correction * sums[rank] + blockSum;
-            corrections[rank] = correction;
+            if (activeBlock) {
+                maxima[row] = newMaximum;
+                sums[row] = correction * sums[row] + blockSum;
+            }
+            corrections[row] = correction;
+            rowActive[row] = activeBlock ? 1u : 0u;
         }
         barrier();
 
@@ -167,20 +187,24 @@ void main() {
         barrier();
 
         for (uint index = lane;
-             index < groupSize * pc.headDim; index += 256u) {
-            uint rank = index / pc.headDim;
-            outputState[index] = corrections[rank] * outputState[index] +
-                                 float(pvTile[index]);
+            index < activeRows * pc.headDim; index += 256u) {
+            uint row = index / pc.headDim;
+            if (rowActive[row] != 0u)
+                outputState[index] = corrections[row] * outputState[index] +
+                                     float(pvTile[index]);
         }
         barrier();
     }
 
     for (uint index = lane;
-         index < groupSize * pc.headDim; index += 256u) {
-        uint rank = index / pc.headDim;
+         index < activeRows * pc.headDim; index += 256u) {
+        uint row = index / pc.headDim;
         uint dim = index % pc.headDim;
+        uint localToken = row / groupSize;
+        uint rank = row % groupSize;
+        uint token = tokenBase + localToken;
         uint qHead = kvHead * groupSize + rank;
         outputValue[token * qWidth + qHead * pc.headDim + dim] =
-            outputState[index] / sums[rank];
+            outputState[index] / sums[row];
     }
 }

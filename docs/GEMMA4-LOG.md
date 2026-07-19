@@ -753,3 +753,106 @@ passes. Raw accepted and rejected measurements, phase samples, busy readings,
 commands, parity disposition, and validation results are appended to
 `bench/results-gemma4-qk.jsonl`. The tree is intentionally dirty and no commit
 was created.
+
+### 2026-07-19 — Stage 10: deeper decode and prefill, without a second unsafe win
+
+Stage 10 improves every requested workload while retaining the Stage 9 d0 win
+and the complete parity gate. It does not manufacture a claim that the data do
+not support: qk still trails llama.cpp at pp512, d4096, and d16384.
+
+The first target was the apparent deep-context softmax/reduction inversion.
+Direct phase measurements at d4096 put the Stage 9-style cooperative path near
+637 us QK, 924 us softmax/reduction, and 615 us PV for sliding attention. The
+following exact-order or resource-only formulations were tested and rejected
+end to end:
+
+- a parallel rank mapping for the scalar F32 tree: 112.792 tok/s
+  (112.670--112.869, busy 0%--94%);
+- subgroup shuffles with the same reduction tree: 112.832 tok/s
+  (112.648--112.898, busy 0%--94%);
+- specialization-sized reduction scratch with the unused probability tile
+  removed: 112.911 tok/s (112.784--113.029, busy 0%--94%);
+- compact cooperative PV scratch: 111.828 tok/s (111.559--111.947, busy
+  0%--94%); and
+- a split-state shuffle reduction: 112.721 tok/s (112.625--112.754, busy
+  0%--93%).
+
+A distributed exponential pass retained the block max/sum ordering but failed
+the formal boundary fixture at continuation 14 (expected token 1638, actual
+13315), so it was removed. No waiver was used. The one retained score-tree
+change replaces LDS exchange with same-tree subgroup shuffles in the actual
+F16 split shader. A paired five-repetition d4096 campaign measured 113.111
+tok/s (112.959--113.146) versus 112.785 (112.732--112.862) for the restored
+control, both busy 0%--94%: a small but repeatable +0.29% assembled win.
+
+More importantly, decode now has a separate source-built half-query path. The
+batch-preparation shader writes the padded F16 query only for cooperative
+decode layers, and the cooperative shader loads it directly instead of
+converting the same query into an LDS tile in every workgroup. Separate SPIR-V
+modules leave the original fallback untouched; `QK_G4_NO_COOPMAT_QUERY_HALF`
+is the opt-out. This is now the parity-safe default. Final phase medians show
+why it helps rather than attributing the gain to softmax:
+
+| depth/path | QK us | softmax/reduction us | PV us |
+|---|---:|---:|---:|
+| d4096 sliding | 639.56 | 927.00 | 521.12 |
+| d4096 global | 19.60 | 336.12 | 145.00 |
+| d16384 sliding | 2249.28 | 3193.20 | 1648.92 |
+| d16384 global | 22.16 | 886.08 | 389.20 |
+
+Against the Stage 9 d16384 profile, sliding PV drops 14.4% and global PV drops
+24.4%, while sliding softmax changes by only -0.4%. Thus the unusual softmax
+share is real for this exact-order implementation; the safe reduction rewrites
+tried here could not turn it into an end-to-end win.
+
+For prefill, the Qwen counting-sort and adjacent-row work was reviewed before
+new shader work. The counting-sort idea already transfers: Gemma already sorts
+its top-8 assignments into expert-major order. The adjacent-row Qwen GEMV
+shader itself does not transfer directly to Gemma's fused
+`ffn_gate_up_exps (2816,1408,128)` and 128-expert layout. Its useful scheduling
+principle does transfer, and Gemma already applies it inside the grouped
+BM64xBN32 Q4_0 kernels, with each lane producing RM4xRN2 outputs.
+
+Two parity-preserving prefill changes were retained:
+
+- sliding prefill attention now packs eight adjacent query tokens and both GQA
+  heads into all 16 cooperative-matrix rows. `QK_G4_PREFILL_QUERY_TOKENS`
+  keeps 1/2/4/8 available for measurement; eight is the default. Five-rep tile
+  medians were 1095.117 tok/s for four, 1076.419 for two, and 1043.122 for one;
+  four tied eight, so the full-row schedule remains selected.
+- the grouped gate/up and down kernels reduce the K tile from two Q4_0 blocks
+  (64 values) to one block (32 values), preserving Q4 block accumulation order
+  while roughly halving their LDS footprint. With only gate/up at K32, pp512
+  reached 1184.274 tok/s (1107.447--1188.173, busy 0%--70%); with only down at
+  K32 it reached 1111.569 (1036.468--1112.834, busy 0%--71%). Both together
+  reached 1202.949 (1127.115--1203.926, busy 0%--70%). BM32 plus K32 regressed
+  to 1147.871 (1077.633--1149.416, busy 0%--70%) and was reverted.
+
+The final prefill phase medians are 183.359 ms routed experts, 168.977 ms
+attention, 71.019 ms shared experts, 1.122 ms residual/norm, and 1.100 ms head
+(425.584 ms accounted). Routed experts fall 20.4% and attention 8.4% from
+Stage 9. Their new shares are 43.1%, 39.7%, and 16.7% for routed, attention,
+and shared respectively.
+
+The default path passes all six fixtures without a waiver: ordinary chat,
+coding, the three SWA boundary fixtures, and global context, for **1,024
+token-exact generated tokens**. The gate began at XTX busy 0% and ended at
+96%. A separate batched coding check was also exact for 32/32 tokens.
+
+Final default performance follows. Each campaign has five repetitions, starts
+at `gpu_busy_percent=0`, and reports min--max spread and the immediate post-run
+busy reading. llama.cpp remains revision `571d0d5` on the same XTX.
+
+| test | Stage 10 qk tok/s | vs Stage 9 | llama.cpp tok/s | qk / llama | post busy |
+|---|---:|---:|---:|---:|---:|
+| pp512 | 1195.750 (1117.464--1197.440) | **+13.7%** | 3405.88 | 0.351x | 70% |
+| tg128 d0 | **146.191 (142.437--146.271)** | **+1.0%** | 139.943 | **1.045x, qk wins** | 76% |
+| tg128 d4096 | 115.314 (115.107--115.368) | **+2.3%** | 125.734 | 0.917x | 94% |
+| tg128 d16384 | 68.035 (68.027--68.095) | **+3.9%** | 120.224 | 0.566x | 99% |
+
+The remaining gaps are 8.3% at d4096, 43.4% at d16384, and 64.9% at pp512.
+All retained changes win end to end; isolation-only or parity-failing changes
+remain rejected. Fourteen generated modules pass `spirv-val --target-env
+vulkan1.2`, the forbidden binary/path scan is empty, `git diff --check` passes,
+and no compiled artifact from another project was copied, linked, loaded, or
+executed. The source tree is intentionally dirty and no commit was created.
