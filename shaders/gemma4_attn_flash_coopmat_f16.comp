@@ -5,6 +5,18 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_cooperative_matrix : require
 
+#ifndef G4_COOPMAT_F32
+#define G4_COOPMAT_F32 0
+#endif
+
+#if G4_COOPMAT_F32
+#define G4_ACCUMULATOR_TYPE float
+#define G4_PROBABILITY_TYPE float
+#else
+#define G4_ACCUMULATOR_TYPE float16_t
+#define G4_PROBABILITY_TYPE float16_t
+#endif
+
 // qk-native cooperative-matrix flash decoding for Gemma 4. The 16x16 QK and
 // PV tiling and online-softmax structure were designed after studying
 // llama.cpp's source-level flash_attn_cm1.comp implementation (571d0d5), but
@@ -13,9 +25,11 @@
 //
 // One workgroup owns one KV head and one split. Rows are the 2 or 8 GQA query
 // heads served by that KV head (zero-padded to the hardware's 16-row tile).
-// Scores and P*V use native 16x16x16 f16 cooperative matrices. Online m/l are
-// F32; probabilities and the running output numerator round through f16, as on
-// the RDNA3 f16-accumulate path.
+// The default global specialization uses native 16x16x16 f16 QK/PV with an
+// online F32 m/l state. The separately compiled sliding specialization uses
+// F32 QK accumulation, the scalar path's F32 max/sum tree, and F32 PV
+// accumulation in chronological tiles. This keeps the cooperative score/value
+// win without crossing the frozen boundary-fixture logits.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufQ { float query[]; };
 layout(std430, binding = 1) readonly buffer BufK { float16_t keyCache[]; };
@@ -40,9 +54,16 @@ layout(constant_id = 1) const uint MAX_GROUP_SIZE = 8u;
 const float NEG_MAX = -3.402823466e38;
 
 shared float16_t queryTile[TILE * MAX_HEAD_DIM];
-shared float16_t scoreTile[TILE * TILE];       // [key][q-head]
-shared float16_t probabilityTile[TILE * TILE]; // [q-head][key]
-shared float16_t pvTile[TILE * MAX_HEAD_DIM];  // one 16 x headDim block
+shared G4_ACCUMULATOR_TYPE scoreTile[TILE * TILE]; // [key][q-head]
+shared G4_PROBABILITY_TYPE probabilityTile[TILE * TILE]; // [q-head][key]
+#if !G4_COOPMAT_F32
+shared G4_ACCUMULATOR_TYPE pvTile[TILE * MAX_HEAD_DIM];
+#else
+shared float chunkScores[MAX_GROUP_SIZE * 1024];
+shared float scoreReduction[8][256];
+shared float16_t probabilityHighTile[TILE * TILE];
+shared float pvTileF32[TILE * MAX_HEAD_DIM];
+#endif
 shared float outputState[MAX_GROUP_SIZE * MAX_HEAD_DIM];
 shared float maxima[8];
 shared float sums[8];
@@ -84,12 +105,12 @@ void main() {
     for (uint index = lane; index < TILE * pc.headDim; index += 256u) {
         uint rank = index / pc.headDim;
         uint dim = index % pc.headDim;
-        queryTile[index] = rank < groupSize
-            ? float16_t(query[(kvHead * groupSize + rank) * pc.headDim + dim])
-            : float16_t(0.0);
+        float value = rank < groupSize
+            ? query[(kvHead * groupSize + rank) * pc.headDim + dim] : 0.0;
+        queryTile[index] = float16_t(value);
     }
     for (uint index = lane; index < TILE * TILE; index += 256u)
-        probabilityTile[index] = float16_t(0.0);
+        probabilityTile[index] = G4_PROBABILITY_TYPE(0.0);
     for (uint index = lane; index < groupSize * pc.headDim; index += 256u)
         outputState[index] = 0.0;
     if (lane < groupSize) {
@@ -99,24 +120,177 @@ void main() {
     }
     barrier();
 
+#if G4_COOPMAT_F32
+    // Keep the cooperative QK win, reproduce the scalar path's F32 max/sum
+    // tree, then accumulate cooperative PV tiles in chronological order. This
+    // is the arithmetic contract needed by the frozen boundary fixtures.
+    uint blockBegin = activeBegin & ~(TILE - 1u);
+    uint blockEnd = (activeEnd + TILE - 1u) & ~(TILE - 1u);
+    uint activeCount = activeEnd - activeBegin;
+    for (uint absoluteBlock = blockBegin;
+         absoluteBlock < blockEnd; absoluteBlock += TILE) {
+        uint physicalBlock = cache_slot(absoluteBlock);
+        uint keyBase = (kvHead * pc.cacheLength + physicalBlock) * pc.headDim;
+        if (gl_SubgroupID == 0u) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseAccumulator> scoreMatrix =
+                coopmat<float, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseAccumulator>(0.0);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseA> keyMatrix;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseB> queryMatrix;
+            for (uint dim = 0u; dim < pc.headDim; dim += TILE) {
+                coopMatLoad(keyMatrix, keyCache, keyBase + dim, pc.headDim,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(queryMatrix, queryTile, dim, pc.headDim,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                scoreMatrix = coopMatMulAdd(
+                    keyMatrix, queryMatrix, scoreMatrix);
+            }
+            coopMatStore(scoreMatrix, scoreTile, 0u, TILE,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        if (lane < groupSize) {
+            for (uint key = 0u; key < TILE; ++key) {
+                uint absolutePosition = absoluteBlock + key;
+                if (absolutePosition >= activeBegin &&
+                    absolutePosition < activeEnd)
+                    chunkScores[lane * 1024u +
+                                absolutePosition - activeBegin] =
+                        float(scoreTile[key * TILE + lane]);
+            }
+        }
+        barrier();
+    }
+
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        float maximum = NEG_MAX;
+        for (uint offset = lane; offset < activeCount; offset += 256u)
+            maximum = max(maximum, chunkScores[rank * 1024u + offset]);
+        scoreReduction[rank][lane] = maximum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                scoreReduction[rank][lane] = max(
+                    scoreReduction[rank][lane],
+                    scoreReduction[rank][lane + stride]);
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank)
+            maxima[rank] = scoreReduction[rank][0];
+    barrier();
+
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        float sum = 0.0;
+        for (uint offset = lane; offset < activeCount; offset += 256u) {
+            uint index = rank * 1024u + offset;
+            float probability = exp(chunkScores[index] - maxima[rank]);
+            chunkScores[index] = probability;
+            sum += probability;
+        }
+        scoreReduction[rank][lane] = sum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                scoreReduction[rank][lane] +=
+                    scoreReduction[rank][lane + stride];
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank)
+            sums[rank] = scoreReduction[rank][0];
+    barrier();
+
+    for (uint index = lane;
+         index < groupSize * pc.headDim; index += 256u)
+        outputState[index] = 0.0;
+    barrier();
+    for (uint absoluteBlock = blockBegin;
+         absoluteBlock < blockEnd; absoluteBlock += TILE) {
+        for (uint index = lane; index < TILE * TILE; index += 256u) {
+            uint rank = index / TILE;
+            uint key = index % TILE;
+            uint absolutePosition = absoluteBlock + key;
+            float probability = 0.0;
+            if (rank < groupSize && absolutePosition >= activeBegin &&
+                absolutePosition < activeEnd)
+                probability = chunkScores[
+                    rank * 1024u + absolutePosition - activeBegin];
+            probabilityHighTile[index] = float16_t(probability);
+        }
+        barrier();
+        uint physicalBlock = cache_slot(absoluteBlock);
+        uint valueBase = (kvHead * pc.cacheLength + physicalBlock) * pc.headDim;
+        for (uint dimTile = gl_SubgroupID;
+             dimTile < pc.headDim / TILE;
+             dimTile += gl_NumSubgroups) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseA> probabilityMatrix;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseB> valueMatrix;
+            coopmat<float, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseAccumulator> pvMatrix =
+                coopmat<float, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseAccumulator>(0.0);
+            coopMatLoad(probabilityMatrix, probabilityHighTile, 0u, TILE,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(valueMatrix, valueCache,
+                        valueBase + dimTile * TILE, pc.headDim,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            pvMatrix = coopMatMulAdd(
+                probabilityMatrix, valueMatrix, pvMatrix);
+            coopMatStore(pvMatrix, pvTileF32, dimTile * TILE, pc.headDim,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        for (uint index = lane;
+             index < groupSize * pc.headDim; index += 256u) {
+            outputState[index] += pvTileF32[index];
+        }
+        barrier();
+    }
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead * groupSize + rank;
+        uint stateBase = (split * pc.queryHeads + qHead) * stateStride;
+        for (uint dim = lane; dim < pc.headDim; dim += 256u)
+            states[stateBase + 2u + dim] =
+                outputState[rank * pc.headDim + dim];
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead * groupSize + rank;
+            uint stateBase = (split * pc.queryHeads + qHead) * stateStride;
+            states[stateBase] = maxima[rank];
+            states[stateBase + 1u] = sums[rank];
+        }
+#else
     // Align blocks to 16 absolute positions. Since the 1024-token ring is a
     // multiple of 16, a sliding tile never straddles the physical wrap.
     uint blockBegin = activeBegin & ~(TILE - 1u);
     uint blockEnd = (activeEnd + TILE - 1u) & ~(TILE - 1u);
     for (uint absoluteBlock = blockBegin;
          absoluteBlock < blockEnd; absoluteBlock += TILE) {
+        uint physicalBlock = cache_slot(absoluteBlock);
+        uint keyBase = (kvHead * pc.cacheLength + physicalBlock) * pc.headDim;
+        uint valueBase0 = keyBase;
+
         // K[16 keys, dh] * Q^T[dh, 16 heads] -> S^T[16 keys, 16 heads].
         if (gl_SubgroupID == 0u) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+            coopmat<G4_ACCUMULATOR_TYPE, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseAccumulator> scoreMatrix =
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                coopmat<G4_ACCUMULATOR_TYPE, gl_ScopeSubgroup, 16, 16,
                         gl_MatrixUseAccumulator>(0.0);
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseA> keyMatrix;
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseB> queryMatrix;
-            uint keyBase = (kvHead * pc.cacheLength +
-                            cache_slot(absoluteBlock)) * pc.headDim;
             for (uint dim = 0u; dim < pc.headDim; dim += TILE) {
                 coopMatLoad(keyMatrix, keyCache, keyBase + dim, pc.headDim,
                             gl_CooperativeMatrixLayoutRowMajor);
@@ -149,10 +323,10 @@ void main() {
             float blockSum = 0.0;
             for (uint key = 0u; key < TILE; ++key) {
                 uint absolutePosition = absoluteBlock + key;
-                float16_t probability = float16_t(0.0);
+                G4_PROBABILITY_TYPE probability = G4_PROBABILITY_TYPE(0.0);
                 if (absolutePosition >= activeBegin &&
                     absolutePosition < activeEnd) {
-                    probability = float16_t(exp(
+                    probability = G4_PROBABILITY_TYPE(exp(
                         float(scoreTile[key * TILE + rank]) - newMaximum));
                     blockSum += float(probability);
                 }
@@ -174,15 +348,13 @@ void main() {
                     gl_MatrixUseA> probabilityMatrix;
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseB> valueMatrix;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+            coopmat<G4_ACCUMULATOR_TYPE, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseAccumulator> pvMatrix =
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                coopmat<G4_ACCUMULATOR_TYPE, gl_ScopeSubgroup, 16, 16,
                         gl_MatrixUseAccumulator>(0.0);
             coopMatLoad(probabilityMatrix, probabilityTile, 0u, TILE,
                         gl_CooperativeMatrixLayoutRowMajor);
-            uint valueBase = (kvHead * pc.cacheLength +
-                              cache_slot(absoluteBlock)) * pc.headDim +
-                             dimTile * TILE;
+            uint valueBase = valueBase0 + dimTile * TILE;
             coopMatLoad(valueMatrix, valueCache, valueBase, pc.headDim,
                         gl_CooperativeMatrixLayoutRowMajor);
             pvMatrix = coopMatMulAdd(
@@ -214,4 +386,5 @@ void main() {
             states[stateBase + 2u + dim] =
                 outputState[rank * pc.headDim + dim];
     }
+#endif
 }

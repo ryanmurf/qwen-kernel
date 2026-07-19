@@ -76,6 +76,21 @@ foreach(s ${SHADERS})
         COMMENT "glslc ${s}.comp")
     list(APPEND SPV_FILES ${CMAKE_BINARY_DIR}/shaders/${s}.spv)
 endforeach()
+
+# Sliding decode needs F32 cooperative accumulation for parity. Compile the
+# same source separately so the global F16 path keeps its smaller LDS tile and
+# original throughput.
+set(GEMMA4_COOPMAT_F32_SPV
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f32.spv)
+add_custom_command(
+    OUTPUT ${GEMMA4_COOPMAT_F32_SPV}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_COOPMAT_F32=1
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+            -o ${GEMMA4_COOPMAT_F32_SPV}
+    DEPENDS ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+    COMMENT "glslc gemma4_attn_flash_coopmat_f32")
+list(APPEND SPV_FILES ${GEMMA4_COOPMAT_F32_SPV})
 add_custom_target(shaders ALL DEPENDS ${SPV_FILES})
 
 add_executable(qk src/main.cpp)

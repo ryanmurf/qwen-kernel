@@ -575,3 +575,76 @@ Raw profile launches, benchmark samples, commands, busy readings, ratios,
 parity disposition, and validation results are appended to
 `bench/results-gemma4-qk.jsonl`. The tree is intentionally dirty and no commit
 was created.
+
+### 2026-07-19 — Stage 8 parity-safe sliding cooperative attention
+
+Stage 8 began by tracing the failure that Stage 7 had attributed to the
+1024-cell circular ring. For the prediction at absolute position 1037 (the
+kernel evaluation is position 1036), temporary instrumentation copied every K
+and V element actually addressed by KV head 0 in layer 0, plus the absolute and
+physical row indices. Scalar and cooperative traces were byte-identical across
+1024 rows and 256 dimensions for both K and V: absolute rows 13--1036 mapped to
+physical slots 13--1023 followed by 0--12. Both 2,105,344-byte trace payloads
+had SHA-256 `f47eca36f2fbc145692ff99c5c425e5783ea565d4455ef2dd80c62f26fa571cf`.
+The Q/K/V inputs at that layer were also byte-identical. The suspected ring
+mapping defect was therefore disproved rather than guessed around.
+
+The actual defect was numerical amplification. Stage 7's f16 cooperative QK,
+f16 probability, and f16 PV path changed layer-0 attention output by up to
+0.031534 (relative L2 0.004238) despite identical cache reads. Small attention
+differences then crossed routed-expert boundaries in the early layers. Merely
+switching QK to F32 fixed `swa_position_1024` but still failed 1023/1025; F32
+softmax/value variants moved which boundary token failed. Those rejected
+variants were not shipped.
+
+The retained implementation compiles the same qk-native shader source a second
+time with `G4_COOPMAT_F32=1`. Its sliding specialization uses F32 cooperative
+QK, stores the active split's scores in shared memory, reproduces the scalar
+256-lane F32 max/sum tree, and processes PV tiles chronologically with an F32
+cooperative accumulator. The first three sliding layers retain scalar decode
+attention because layer-dump bisects showed that their score-rounding error is
+the parity boundary; the other **22 of 25 sliding layers** now use cooperative
+QK/PV by default. Global decode retains Stage 7's faster f16 specialization.
+`QK_G4_NO_COOPMAT` remains the device/path opt-out; the failing
+`QK_G4_COOPMAT_SLIDING=1` experiment is no longer required.
+
+The final default gate began at XTX `gpu_busy_percent=0` and passed all six
+fixtures with no waiver: ordinary chat 32/32, coding 32/32,
+`swa_position_1023`, `_1024`, and `_1025` 16/16 each, and
+`global_context_8192` 16/16. Repeats from empty caches raised the cumulative
+evidence to **1,024 exact generated tokens**. The immediate post-gate busy
+reading was 96%.
+
+Final default performance follows. Every campaign contains five repetitions,
+began at `gpu_busy_percent=0`, and records the immediate post-campaign busy
+reading; spreads are min--max. llama.cpp values remain the accepted same-XTX
+`571d0d5` measurements from Stage 6.
+
+| test | Stage 8 qk tok/s | vs Stage 7 default | llama.cpp tok/s | qk / llama | post busy |
+|---|---:|---:|---:|---:|---:|
+| pp512 | 1042.54 (961.87--1045.09) | -0.4% | 3405.88 | 0.306x | 71% |
+| tg128 d0 | 137.57 (137.13--137.77) | **+15.6%** | 139.94 | **0.983x** | 77% |
+| tg128 d4096 | 108.36 (108.32--108.49) | **+47.0%** | 125.73 | **0.862x** | 94% |
+| tg128 d16384 | 64.08 (64.04--64.15) | **+102.7% / 2.03x** | 120.22 | **0.533x** | 99% |
+
+The parity-safe result is 8.1% below Stage 7's rejected 69.709 tok/s path, but
+it more than doubles the accepted d16384 default without bending the token
+gate. Relative to the Stage 7 default, the five-launch d16384 attention median
+falls from 26.793 to **10.854 ms** (-59.5%): sliding falls from 24.938 to
+**9.032 ms** (-63.8%) and global remains effectively flat at 1.818 ms. The
+five-launch spreads are 10.818--10.968, 9.000--9.145, and 1.805--1.823 ms;
+every launch began at busy 0%.
+
+The next bottleneck was remeasured rather than inferred. At d16384, attention
+is still **10.854 ms / 71.1%** of the 15.267-ms accounted median; routed
+experts are 2.015 ms, shared experts 1.076 ms, and the head 1.057 ms. At d0,
+attention and routed experts are now nearly tied at **2.416 / 2.258 ms**
+(33.3% / 31.1%), followed by shared experts at 1.231 ms and the head at
+1.067 ms. Further decode work should first remove the three scalar sliding
+layers without changing their score arithmetic, then address routed experts;
+the head is no longer the sole d0 target.
+
+Both generated modules pass `spirv-val --target-env vulkan1.2`. The forbidden
+binary/path scan is empty. No compiled SPIR-V or binary was copied, linked,
+loaded, or executed from another project, the temporary trace instrumentation
+was removed, the tree is intentionally dirty, and no commit was created.

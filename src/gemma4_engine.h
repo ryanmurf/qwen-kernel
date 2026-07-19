@@ -139,8 +139,7 @@ class Gemma4Engine {
                              c.cooperativeMatrixN == 16 &&
                              c.cooperativeMatrixK == 16;
         useCoopAttention = coopF16;
-        useCoopSliding = getenv("QK_G4_COOPMAT_SLIDING") &&
-                         coopF16;
+        useCoopSliding = coopF16 && c.cooperativeMatrixF32Acc;
         useCoopBatch = coopF16;
         useCoopBatchSliding = coopF16;
         if (!uploadModel(error)) return false;
@@ -390,6 +389,10 @@ class Gemma4Engine {
     Pipe pBatchExpertGroup{}, pBatchExpertReduce{};
 
     static constexpr uint32_t kBatch = 512;
+    // The first three sliding layers retain scalar decode attention. Their tiny
+    // cooperative score-rounding differences cross frozen router boundaries;
+    // layers 3+ pass the complete serial parity gate with cooperative QK.
+    static constexpr uint32_t kFirstCoopSlidingLayer = 3;
     uint32_t* batchIdsMap = nullptr;
     uint32_t* batchPositionsMap = nullptr;
     uint32_t* batchCacheIndicesMap = nullptr;
@@ -741,7 +744,7 @@ class Gemma4Engine {
                 {512u, 8u});
         if (useCoopSliding)
             pDecodeAttentionCoopSliding = makePipeSpecs(
-                c, "gemma4_attn_flash_coopmat_f16.spv", 4, 40,
+                c, "gemma4_attn_flash_coopmat_f32.spv", 4, 40,
                 {256u, 2u});
         if (profilePhaseEnabled) {
             pBatchAttentionScore = makePipe(
@@ -1252,6 +1255,7 @@ class Gemma4Engine {
                                  &splitPush, sizeof(splitPush),
                                  l.cfg.kvHeads, splitK);
                 } else if (useCoopSliding && l.cfg.sliding &&
+                    il >= kFirstCoopSlidingLayer &&
                     !profilePhaseEnabled) {
                     bindDispatch(pDecodeAttentionCoopSliding,
                                  l.dAttentionCoopSliding,
