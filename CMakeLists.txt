@@ -42,10 +42,12 @@ set(SHADERS gemv_f16 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs
     moe_gateup_iq3 moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_iq3_grouped_rowtile moe_gateup_q8 moe_gateup_q8_64
     moe_down_iq4 moe_down_iq4_grouped moe_down_iq4_grouped_rowtile
     moe_down_q6k moe_down_q6k_grouped moe_down_q6k_grouped_rowtile moe_down_q8
+    moe_gateup_iq3_grouped_coopmat moe_down_iq4_grouped_coopmat moe_down_q6k_grouped_coopmat
+    moe_gateup_q8_coopmat moe_down_q8_coopmat
     rmsnorm dn_ab dn_conv dn_qknorm dn_step dn_step_reg dn_step_gate dn_gate add_rmsnorm add_rmsnorm_route vec_add
     fa_prep fa_attn argmax1 argmax2 embed_q6k add_rms3 add_rms3_grouped moe_down_q8b moe_down_q8b_32 dn_convn
     fa_prep_srv fa_attn_srv fa_attn_srv_split fa_attn_srv_split_gqa fa_attn_srv_reduce
-    gemm_q8_0 gemm_q8_0_coopmat fa_prep_batch fa_attn_batch
+    gemm_q8_0 gemm_q8_0_coopmat gemm_q8_0_coopmat2 fa_prep_batch fa_attn_batch
     dn_ab_batch dn_conv_batch dn_step_batch dn_step_batch_split dn_gate_batch
     moe_gateup_iq4 gemm_iq4_xs embed_q8_0)
 set(SPV_FILES "")

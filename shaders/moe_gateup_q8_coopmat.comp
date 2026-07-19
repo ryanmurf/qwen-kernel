@@ -1,0 +1,171 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// Cooperative-matrix shared-expert gate/up (Q8_0 both tensors) for wide
+// prefill chunks: h[rq*(n_used+1)*n_ff + n_used*n_ff + r] =
+// silu(gate[r].x_rq) * (up[r].x_rq). One 256-thread workgroup owns a 64-row
+// by 64-token tile (x = row group, z = token group); each wave64 subgroup
+// owns a 16-row strip and four adjacent 16-token tiles for both matrices.
+// F32 accumulation throughout; the SiLU pairing is elementwise on the F32
+// accumulators and staging stays F32. Bindings and push constants match
+// moe_gateup_q8.comp. Host requires n_ff%64 == 0, n_embd%32 == 0, N%64 == 0.
+layout(local_size_x = 256) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly buffer BufG { block_q8_0 gw[]; };
+layout(std430, binding = 1) readonly buffer BufU { block_q8_0 uw[]; };
+layout(std430, binding = 2) readonly buffer BufX { float x[]; };
+layout(std430, binding = 3) writeonly buffer BufH { float h[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+const uint SK = BK + 8u;
+const uint SN = BN + 1u;
+
+shared float16_t Wg[BM * SK];
+shared float16_t Wu[BM * SK];
+shared float16_t Xsh[BN * SK];
+shared float staging[BM * SN];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint rowBase = gl_WorkGroupID.x * BM;
+    uint tokBase = gl_WorkGroupID.z * BN;
+    uint kSteps = pc.n_embd / BK;
+    uint rt = gl_SubgroupID;
+
+    // Dequant role: matrix (gate/up), 64 rows x 2 sixteen-value halves.
+    uint matrix = tid >> 7u;
+    uint mu128 = tid & 127u;
+    uint rowLocal = mu128 >> 1u;
+    uint halfSel = mu128 & 1u;
+    uint wRow = (rowBase + rowLocal) * kSteps;
+
+    // Activation staging role: 64 tokens x 8 consecutive k values.
+    uint la = tid >> 2u;
+    uint k8 = (tid & 3u) * 8u;
+    uint xBase = (tokBase + la) * pc.n_embd + k8;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+        g0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0),
+        g1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0),
+        g2 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0),
+        g3 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0),
+        u0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0),
+        u1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0),
+        u2 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0),
+        u3 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    // Raw block bytes prefetched one K step ahead (16 of the 32 int8 values
+    // per thread, packed) so loads overlap the cooperative products.
+    float dN;
+    uint qN[4];
+    float xN[8];
+    {
+        uint qo = halfSel * 16u;
+        if (matrix == 0u) {
+            dN = float(gw[wRow].d);
+            [[unroll]] for (uint w = 0u; w < 4u; ++w)
+                qN[w] = (uint(uint8_t(gw[wRow].qs[qo + 4u * w]))) |
+                        (uint(uint8_t(gw[wRow].qs[qo + 4u * w + 1u])) << 8u) |
+                        (uint(uint8_t(gw[wRow].qs[qo + 4u * w + 2u])) << 16u) |
+                        (uint(uint8_t(gw[wRow].qs[qo + 4u * w + 3u])) << 24u);
+        } else {
+            dN = float(uw[wRow].d);
+            [[unroll]] for (uint w = 0u; w < 4u; ++w)
+                qN[w] = (uint(uint8_t(uw[wRow].qs[qo + 4u * w]))) |
+                        (uint(uint8_t(uw[wRow].qs[qo + 4u * w + 1u])) << 8u) |
+                        (uint(uint8_t(uw[wRow].qs[qo + 4u * w + 2u])) << 16u) |
+                        (uint(uint8_t(uw[wRow].qs[qo + 4u * w + 3u])) << 24u);
+        }
+        [[unroll]] for (uint j = 0u; j < 8u; ++j)
+            xN[j] = x[xBase + j];
+    }
+
+    for (uint ks = 0u; ks < kSteps; ++ks) {
+        {
+            uint dst = rowLocal * SK + halfSel * 16u;
+            [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                int q = int(int8_t(uint8_t((qN[j >> 2u] >> (8u * (j & 3u))) & 255u)));
+                if (matrix == 0u) Wg[dst + j] = float16_t(dN * float(q));
+                else              Wu[dst + j] = float16_t(dN * float(q));
+            }
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                Xsh[la * SK + k8 + j] = float16_t(xN[j]);
+        }
+        barrier();
+        if (ks + 1u < kSteps) {
+            uint bi = wRow + ks + 1u;
+            uint qo = halfSel * 16u;
+            if (matrix == 0u) {
+                dN = float(gw[bi].d);
+                [[unroll]] for (uint w = 0u; w < 4u; ++w)
+                    qN[w] = (uint(uint8_t(gw[bi].qs[qo + 4u * w]))) |
+                            (uint(uint8_t(gw[bi].qs[qo + 4u * w + 1u])) << 8u) |
+                            (uint(uint8_t(gw[bi].qs[qo + 4u * w + 2u])) << 16u) |
+                            (uint(uint8_t(gw[bi].qs[qo + 4u * w + 3u])) << 24u);
+            } else {
+                dN = float(uw[bi].d);
+                [[unroll]] for (uint w = 0u; w < 4u; ++w)
+                    qN[w] = (uint(uint8_t(uw[bi].qs[qo + 4u * w]))) |
+                            (uint(uint8_t(uw[bi].qs[qo + 4u * w + 1u])) << 8u) |
+                            (uint(uint8_t(uw[bi].qs[qo + 4u * w + 2u])) << 16u) |
+                            (uint(uint8_t(uw[bi].qs[qo + 4u * w + 3u])) << 24u);
+            }
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                xN[j] = x[xBase + (ks + 1u) * BK + j];
+        }
+        [[unroll]] for (uint kt = 0u; kt < BK; kt += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> x0, x1, x2, x3;
+            coopMatLoad(x0, Xsh, kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(x1, Xsh, 16u * SK + kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(x2, Xsh, 32u * SK + kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(x3, Xsh, 48u * SK + kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> wg, wu;
+            coopMatLoad(wg, Wg, rt * 16u * SK + kt, SK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(wu, Wu, rt * 16u * SK + kt, SK, gl_CooperativeMatrixLayoutRowMajor);
+            g0 = coopMatMulAdd(wg, x0, g0);
+            g1 = coopMatMulAdd(wg, x1, g1);
+            g2 = coopMatMulAdd(wg, x2, g2);
+            g3 = coopMatMulAdd(wg, x3, g3);
+            u0 = coopMatMulAdd(wu, x0, u0);
+            u1 = coopMatMulAdd(wu, x1, u1);
+            u2 = coopMatMulAdd(wu, x2, u2);
+            u3 = coopMatMulAdd(wu, x3, u3);
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < g0.length(); ++i) {
+        g0[i] = (g0[i] / (1.0 + exp(-g0[i]))) * u0[i];
+        g1[i] = (g1[i] / (1.0 + exp(-g1[i]))) * u1[i];
+        g2[i] = (g2[i] / (1.0 + exp(-g2[i]))) * u2[i];
+        g3[i] = (g3[i] / (1.0 + exp(-g3[i]))) * u3[i];
+    }
+    coopMatStore(g0, staging, rt * 16u * SN, SN, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(g1, staging, rt * 16u * SN + 16u, SN, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(g2, staging, rt * 16u * SN + 32u, SN, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(g3, staging, rt * 16u * SN + 48u, SN, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    uint hoBase = pc.n_used * pc.n_ff + rowBase;
+    for (uint idx = tid; idx < BM * BN; idx += 256u) {
+        uint r = idx >> 6u;
+        uint nn = idx & (BN - 1u);
+        h[(tokBase + nn) * (pc.n_used + 1u) * pc.n_ff + hoBase + r] =
+            staging[r * SN + nn];
+    }
+}

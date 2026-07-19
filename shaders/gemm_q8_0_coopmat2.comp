@@ -1,0 +1,148 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// Schedule-optimized twin of gemm_q8_0_coopmat.comp. The output is
+// BIT-IDENTICAL to that kernel by construction: every accumulator receives
+// the same ascending-k sequence of 16x16x16 cooperative products, and the
+// f16 staging expressions (float16_t(scale * q) for weights, float16_t(x)
+// for activations) are unchanged. Only the memory schedule differs: two Q8
+// blocks per K step with padded LDS strides, every thread dequantizing one
+// block, and raw block/activation bytes prefetched into registers one K
+// step ahead so the scattered loads overlap the cooperative products.
+// Same 128x64 tile, dispatch geometry, bindings, and push constants.
+layout(local_size_x = 256) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly  buffer BufW { block_q8_0 wb[]; };
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint M; uint K; uint N; } pc;
+
+const uint TILE = 16u;
+const uint BM = 128u;
+const uint BN = 64u;
+const uint BK = 64u;
+const uint SK = BK + 8u;
+
+shared float16_t Wsh[BM * SK];
+shared float16_t Xsh[BN * SK];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint subgroup = gl_SubgroupID;
+    uint rowBase = gl_WorkGroupID.x * BM;
+    uint tokBase = gl_WorkGroupID.z * BN;
+    uint blocks = pc.K / 32u;
+    uint kSteps = pc.K / BK;
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+        c0 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+        c1 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+        c2 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+        c3 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+        d0 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+        d1 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+        d2 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+        d3 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+
+    // Dequant role: one Q8 block (row, halfSel) per thread per K step.
+    uint rowLocal = tid >> 1u;
+    uint halfSel = tid & 1u;
+    uint wRowBase = (rowBase + rowLocal) * blocks;
+
+    // Activation staging role: 64 tokens x 16 consecutive k values.
+    uint la = tid >> 2u;
+    uint k16 = (tid & 3u) * 16u;
+    uint xBase = (tokBase + la) * pc.K + k16;
+
+    float scaleN;
+    uint qN[8];
+    float xN[16];
+    {
+        uint bi = wRowBase + halfSel;
+        scaleN = float(wb[bi].d);
+        [[unroll]] for (uint w = 0u; w < 8u; ++w)
+            qN[w] = (uint(uint8_t(wb[bi].qs[4u * w]))) |
+                    (uint(uint8_t(wb[bi].qs[4u * w + 1u])) << 8u) |
+                    (uint(uint8_t(wb[bi].qs[4u * w + 2u])) << 16u) |
+                    (uint(uint8_t(wb[bi].qs[4u * w + 3u])) << 24u);
+        [[unroll]] for (uint j = 0u; j < 16u; ++j)
+            xN[j] = x[xBase + j];
+    }
+
+    for (uint ks = 0u; ks < kSteps; ++ks) {
+        {
+            uint dst = rowLocal * SK + halfSel * 32u;
+            [[unroll]] for (uint j = 0u; j < 32u; ++j) {
+                int q = int(int8_t(uint8_t((qN[j >> 2u] >> (8u * (j & 3u))) & 255u)));
+                Wsh[dst + j] = float16_t(scaleN * float(q));
+            }
+            [[unroll]] for (uint j = 0u; j < 16u; ++j)
+                Xsh[la * SK + k16 + j] = float16_t(xN[j]);
+        }
+        barrier();
+        if (ks + 1u < kSteps) {
+            uint bi = wRowBase + 2u * (ks + 1u) + halfSel;
+            scaleN = float(wb[bi].d);
+            [[unroll]] for (uint w = 0u; w < 8u; ++w)
+                qN[w] = (uint(uint8_t(wb[bi].qs[4u * w]))) |
+                        (uint(uint8_t(wb[bi].qs[4u * w + 1u])) << 8u) |
+                        (uint(uint8_t(wb[bi].qs[4u * w + 2u])) << 16u) |
+                        (uint(uint8_t(wb[bi].qs[4u * w + 3u])) << 24u);
+            [[unroll]] for (uint j = 0u; j < 16u; ++j)
+                xN[j] = x[xBase + (ks + 1u) * BK + j];
+        }
+        [[unroll]] for (uint kt = 0u; kt < BK; kt += TILE) {
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> b0, b1, b2, b3;
+            coopMatLoad(b0, Xsh, kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, Xsh, 16u * SK + kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b2, Xsh, 32u * SK + kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b3, Xsh, 48u * SK + kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> a;
+            coopMatLoad(a, Wsh, subgroup * TILE * SK + kt, SK,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            c0 = coopMatMulAdd(a, b0, c0);
+            c1 = coopMatMulAdd(a, b1, c1);
+            c2 = coopMatMulAdd(a, b2, c2);
+            c3 = coopMatMulAdd(a, b3, c3);
+            coopMatLoad(a, Wsh, (subgroup + 4u) * TILE * SK + kt, SK,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            d0 = coopMatMulAdd(a, b0, d0);
+            d1 = coopMatMulAdd(a, b1, d1);
+            d2 = coopMatMulAdd(a, b2, d2);
+            d3 = coopMatMulAdd(a, b3, d3);
+        }
+        barrier();
+    }
+
+    uint row = rowBase + subgroup * TILE;
+    coopMatStore(c0, y, tokBase * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(c1, y, (tokBase + TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(c2, y, (tokBase + 2u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(c3, y, (tokBase + 3u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    row += 4u * TILE;
+    coopMatStore(d0, y, tokBase * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(d1, y, (tokBase + TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(d2, y, (tokBase + 2u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(d3, y, (tokBase + 3u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+}
