@@ -140,6 +140,9 @@ class Gemma4Engine {
                              c.cooperativeMatrixK == 16;
         useCoopAttention = coopF16;
         useCoopSliding = coopF16 && c.cooperativeMatrixF32Acc;
+        if (getenv("QK_G4_COOPMAT_EARLY"))
+            firstCoopSlidingLayer = 0;
+        useNormFusion = !getenv("QK_G4_NO_NORM_FUSION");
         useCoopBatch = coopF16;
         useCoopBatchSliding = coopF16;
         if (!uploadModel(error)) return false;
@@ -275,9 +278,19 @@ class Gemma4Engine {
         sample.gpuTotalUs = (stamps[11] - stamps[0])*usPerTick;
         sample.attentionUs = (stamps[6] - stamps[1])*usPerTick;
         sample.attentionPrepUs = (stamps[2] - stamps[1])*usPerTick;
-        sample.scoreUs = (stamps[3] - stamps[2])*usPerTick;
-        sample.softmaxUs = (stamps[4] - stamps[3])*usPerTick;
-        sample.valueUs = (stamps[5] - stamps[4])*usPerTick;
+        const double phase1 = (stamps[3] - stamps[2])*usPerTick;
+        const double phase2 = (stamps[4] - stamps[3])*usPerTick;
+        const double phase3 = (stamps[5] - stamps[4])*usPerTick;
+        const auto& cfg = layers[sample.layer].cfg;
+        const bool cumulativeCoop = profilePhaseEnabled &&
+            ((useCoopAttention && !cfg.sliding) ||
+             (useCoopSliding && cfg.sliding &&
+              sample.layer >= firstCoopSlidingLayer));
+        sample.scoreUs = phase1;
+        sample.softmaxUs = cumulativeCoop
+            ? std::max(0.0, phase2 - phase1) : phase2;
+        sample.valueUs = cumulativeCoop
+            ? std::max(0.0, phase3 - phase2) : phase3;
         sample.attentionFinalizeUs = (stamps[6] - stamps[5])*usPerTick;
         sample.sharedUs = (stamps[7] - stamps[6])*usPerTick;
         sample.routedUs = (stamps[8] - stamps[7])*usPerTick;
@@ -334,7 +347,12 @@ class Gemma4Engine {
         VkDescriptorSet dAttentionValue = VK_NULL_HANDLE;
         VkDescriptorSet dAttentionCoop = VK_NULL_HANDLE;
         VkDescriptorSet dAttentionCoopSliding = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionCoopScore = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionCoopSoftmax = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionCoopSlidingScore = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionCoopSlidingSoftmax = VK_NULL_HANDLE;
         VkDescriptorSet bAttnOutput = VK_NULL_HANDLE, bPostAttention = VK_NULL_HANDLE;
+        VkDescriptorSet bPostAttentionFused = VK_NULL_HANDLE;
         VkDescriptorSet bSharedRms = VK_NULL_HANDLE, bSharedGate = VK_NULL_HANDLE;
         VkDescriptorSet bSharedUp = VK_NULL_HANDLE, bSharedDown = VK_NULL_HANDLE;
         VkDescriptorSet bSharedPost = VK_NULL_HANDLE, bRouter = VK_NULL_HANDLE;
@@ -368,13 +386,16 @@ class Gemma4Engine {
     VkQueryPool profileQueries = VK_NULL_HANDLE;
     bool profileEnabled = false, profilePhaseEnabled = false;
     bool useCoopAttention = false, useCoopSliding = false;
+    uint32_t firstCoopSlidingLayer = 3;
+    bool useNormFusion = false;
     bool useCoopBatch = false, useCoopBatchSliding = false;
     bool profileReady = false;
     uint32_t lastProfilePosition = 0, profileLayer = 0;
     VkCommandBuffer stepCb = VK_NULL_HANDLE, prefillCb = VK_NULL_HANDLE;
     VkCommandBuffer recordingCb = VK_NULL_HANDLE;
 
-    Pipe pEmbed{}, pRms{}, pQuant{}, pGemv{}, pGemvF32{}, pElement{}, pPrep{}, pAttention{};
+    Pipe pEmbed{}, pRms{}, pQuant{}, pGemv{}, pGemvF32{}, pElement{};
+    Pipe pPostAttentionFused{}, pPrep{}, pAttention{};
     Pipe pRouter{}, pSelect{}, pExpertGateUp{}, pExpertGateUpF32{}, pExpertDown{};
     Pipe pHead{}, pArgmax{};
     Pipe pBatchEmbed{}, pBatchGemm88{}, pBatchGemm66{};
@@ -384,15 +405,16 @@ class Gemma4Engine {
     Pipe pBatchAttentionScore{}, pBatchAttentionSoftmax{}, pBatchAttentionValue{};
     Pipe pDecodeAttentionScore{}, pDecodeAttentionSoftmax{}, pDecodeAttentionValue{};
     Pipe pDecodeAttentionCoop{}, pDecodeAttentionCoopSliding{};
+    Pipe pDecodeAttentionCoopScore{}, pDecodeAttentionCoopSoftmax{};
+    Pipe pDecodeAttentionCoopSlidingScore{}, pDecodeAttentionCoopSlidingSoftmax{};
     Pipe pBatchMask{};
     Pipe pBatchRouter{}, pBatchSelect{}, pBatchExpertGateUp{}, pBatchExpertDown{};
     Pipe pBatchExpertGroup{}, pBatchExpertReduce{};
 
     static constexpr uint32_t kBatch = 512;
     // The first three sliding layers retain scalar decode attention. Their tiny
-    // cooperative score-rounding differences cross frozen router boundaries;
-    // layers 3+ pass the complete serial parity gate with cooperative QK.
-    static constexpr uint32_t kFirstCoopSlidingLayer = 3;
+    // cooperative score-rounding differences cross frozen router boundaries.
+    // QK_G4_COOPMAT_EARLY retains the faster, parity-failing experiment.
     uint32_t* batchIdsMap = nullptr;
     uint32_t* batchPositionsMap = nullptr;
     uint32_t* batchCacheIndicesMap = nullptr;
@@ -712,6 +734,8 @@ class Gemma4Engine {
         pGemv = makePipe(c, "gemma4_gemv_q4_q8.spv", 3, 8, 64);
         pGemvF32 = makePipe(c, "gemma4_gemv_q4_f32.spv", 3, 8, 64);
         pElement = makePipe(c, "gemma4_elementwise.spv", 3, 20);
+        pPostAttentionFused = makePipe(
+            c, "gemma4_post_attention_fused.spv", 9, 8);
         pPrep = makePipe(c, "gemma4_attn_prep_f16.spv", 10, 40);
         pAttention = makePipe(c, "gemma4_attn_f16.spv", 6, 32);
         pRouter = makePipe(c, "gemma4_router.spv", 4, 8);
@@ -759,6 +783,22 @@ class Gemma4Engine {
                 c, "gemma4_attn_split_f16.spv", 5, 40, 2);
             pDecodeAttentionValue = makePipe(
                 c, "gemma4_attn_split_f16.spv", 5, 40, 3);
+            if (useCoopAttention) {
+                pDecodeAttentionCoopScore = makePipeSpecs(
+                    c, "gemma4_attn_flash_coopmat_f16_p1.spv", 4, 40,
+                    {512u, 8u});
+                pDecodeAttentionCoopSoftmax = makePipeSpecs(
+                    c, "gemma4_attn_flash_coopmat_f16_p2.spv", 4, 40,
+                    {512u, 8u});
+            }
+            if (useCoopSliding) {
+                pDecodeAttentionCoopSlidingScore = makePipeSpecs(
+                    c, "gemma4_attn_flash_coopmat_f32_p1.spv", 4, 40,
+                    {256u, 2u});
+                pDecodeAttentionCoopSlidingSoftmax = makePipeSpecs(
+                    c, "gemma4_attn_flash_coopmat_f32_p2.spv", 4, 40,
+                    {256u, 2u});
+            }
         }
         pBatchMask = makePipe(c, "gemma4_mask_f16.spv", 1, 16);
         pBatchRouter = makePipe(c, "gemma4_router_batch.spv", 4, 12);
@@ -773,9 +813,9 @@ class Gemma4Engine {
     }
 
     void makeDescriptorPool() {
-        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192};
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12288};
         VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        info.maxSets = 2048;
+        info.maxSets = 3072;
         info.poolSizeCount = 1;
         info.pPoolSizes = &size;
         VK_CHECK(vkCreateDescriptorPool(c.dev, &info, nullptr, &descriptorPool));
@@ -972,11 +1012,32 @@ class Gemma4Engine {
                                               splitBuffers);
                     l.dAttentionValue = set(pDecodeAttentionValue,
                                             splitBuffers);
+                    if (useCoopAttention && !l.cfg.sliding) {
+                        const std::initializer_list<VkBuffer> coopBuffers{
+                            bbQuery, l.linearKeyCache, l.linearValueCache,
+                            bAttnSplit};
+                        l.dAttentionCoopScore = set(
+                            pDecodeAttentionCoopScore, coopBuffers);
+                        l.dAttentionCoopSoftmax = set(
+                            pDecodeAttentionCoopSoftmax, coopBuffers);
+                    }
+                    if (useCoopSliding && l.cfg.sliding) {
+                        const std::initializer_list<VkBuffer> coopBuffers{
+                            bbQuery, l.keyCache, l.valueCache, bAttnSplit};
+                        l.dAttentionCoopSlidingScore = set(
+                            pDecodeAttentionCoopSlidingScore, coopBuffers);
+                        l.dAttentionCoopSlidingSoftmax = set(
+                            pDecodeAttentionCoopSlidingSoftmax, coopBuffers);
+                    }
                 }
                 l.bAttnOutput = set(batchGemmPipe(qWidth),
                     {l.attnOut, bbAttentionValue, bbAttnProjected});
                 l.bPostAttention = set(pRms,
                     {bbAttnProjected, l.postAttentionNorm, bbAttnPost});
+                l.bPostAttentionFused = set(pPostAttentionFused,
+                    {bbAttnProjected, bbX, l.postAttentionNorm, l.ffnNorm,
+                     l.preFfwNorm2, bbAttnPost, bbAttnOut, bbSharedIn,
+                     bbRoutedIn});
                 l.bSharedRms = set(pRms, {bbAttnOut, l.ffnNorm, bbSharedIn});
                 l.bSharedGate = set(batchGemmPipe(gemma4::kEmbedding),
                     {l.ffnGate, bbSharedIn, bbSharedGate});
@@ -1255,8 +1316,52 @@ class Gemma4Engine {
                                  &splitPush, sizeof(splitPush),
                                  l.cfg.kvHeads, splitK);
                 } else if (useCoopSliding && l.cfg.sliding &&
-                    il >= kFirstCoopSlidingLayer &&
+                    il >= firstCoopSlidingLayer &&
                     !profilePhaseEnabled) {
+                    bindDispatch(pDecodeAttentionCoopSliding,
+                                 l.dAttentionCoopSliding,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                } else if (profilePhaseEnabled && useCoopAttention &&
+                           !l.cfg.sliding) {
+                    bindDispatch(pDecodeAttentionCoopScore,
+                                 l.dAttentionCoopScore,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 3);
+                    bindDispatch(pDecodeAttentionCoopSoftmax,
+                                 l.dAttentionCoopSoftmax,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 4);
+                    bindDispatch(pDecodeAttentionCoop, l.dAttentionCoop,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                } else if (profilePhaseEnabled && useCoopSliding &&
+                           l.cfg.sliding &&
+                           il >= firstCoopSlidingLayer) {
+                    bindDispatch(pDecodeAttentionCoopSlidingScore,
+                                 l.dAttentionCoopSlidingScore,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 3);
+                    bindDispatch(pDecodeAttentionCoopSlidingSoftmax,
+                                 l.dAttentionCoopSlidingSoftmax,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 4);
                     bindDispatch(pDecodeAttentionCoopSliding,
                                  l.dAttentionCoopSliding,
                                  &splitPush, sizeof(splitPush),
@@ -1362,11 +1467,18 @@ class Gemma4Engine {
             if (tokens == 1)
                 decodeMatVec(l.dAttnOutput, gemma4::kEmbedding, qWidth);
             else batchGemm(l.bAttnOutput, gemma4::kEmbedding, qWidth, tokens);
-            batchRms(l.bPostAttention, tokens);
+            if (useNormFusion) {
+                struct { uint32_t n; float eps; } fusedPush{
+                    gemma4::kEmbedding, gemma4::kRmsEpsilon};
+                bindDispatch(pPostAttentionFused, l.bPostAttentionFused,
+                             &fusedPush, sizeof(fusedPush), tokens);
+            } else {
+                batchRms(l.bPostAttention, tokens);
+                batchElement(sbAttnResidual, tokens, gemma4::kEmbedding, 2);
+            }
             if (diagnostics && il == diagnosticLayer) recordAttnOpDump(
                 bbAttnPost, (VkDeviceSize)(tokens - 1)*gemma4::kEmbedding*4,
                 6, gemma4::kEmbedding*4);
-            batchElement(sbAttnResidual, tokens, gemma4::kEmbedding, 2);
             if (profile && il == profileLayer)
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1374,7 +1486,7 @@ class Gemma4Engine {
             if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbAttnOut, tokens - 1, 0);
 
-            batchRms(l.bSharedRms, tokens);
+            if (!useNormFusion) batchRms(l.bSharedRms, tokens);
             if (tokens == 1) {
                 quant(sbQuantShared, gemma4::kEmbedding);
                 decodeMatVecQ8(l.dSharedGate, gemma4::kSharedFf,
@@ -1403,7 +1515,7 @@ class Gemma4Engine {
             if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbSharedBranch, tokens - 1, 1);
 
-            batchRms(l.bRoutedRms, tokens);
+            if (!useNormFusion) batchRms(l.bRoutedRms, tokens);
             batchRms(sbRouterNorm, tokens, false,
                      1.0f/std::sqrt((float)gemma4::kEmbedding));
             struct { uint32_t n, experts, tokens; } routerPush{
@@ -1690,7 +1802,8 @@ class Gemma4Engine {
         if (descriptorPool) vkDestroyDescriptorPool(c.dev, descriptorPool, nullptr);
         if (profileQueries)
             vkDestroyQueryPool(c.dev, profileQueries, nullptr);
-        for (Pipe* p : {&pEmbed, &pRms, &pQuant, &pGemv, &pGemvF32, &pElement, &pPrep,
+        for (Pipe* p : {&pEmbed, &pRms, &pQuant, &pGemv, &pGemvF32, &pElement,
+                        &pPostAttentionFused, &pPrep,
                         &pAttention, &pRouter, &pSelect, &pExpertGateUp,
                         &pExpertGateUpF32, &pExpertDown, &pHead, &pArgmax,
                         &pBatchEmbed, &pBatchGemm88, &pBatchGemm66,
@@ -1702,6 +1815,10 @@ class Gemma4Engine {
                         &pBatchAttentionValue, &pDecodeAttentionScore,
                         &pDecodeAttentionSoftmax, &pDecodeAttentionValue,
                         &pDecodeAttentionCoop, &pDecodeAttentionCoopSliding,
+                        &pDecodeAttentionCoopScore,
+                        &pDecodeAttentionCoopSoftmax,
+                        &pDecodeAttentionCoopSlidingScore,
+                        &pDecodeAttentionCoopSlidingSoftmax,
                         &pBatchRouter, &pBatchSelect,
                         &pBatchExpertGroup, &pBatchExpertGateUp,
                         &pBatchExpertDown, &pBatchExpertReduce}) {

@@ -648,3 +648,108 @@ Both generated modules pass `spirv-val --target-env vulkan1.2`. The forbidden
 binary/path scan is empty. No compiled SPIR-V or binary was copied, linked,
 loaded, or executed from another project, the temporary trace instrumentation
 was removed, the tree is intentionally dirty, and no commit was created.
+
+### 2026-07-19 — Stage 9: first own-kernel win, deep-context attribution, and prefill attack
+
+Stage 9 gets over the line at d0 without weakening the parity contract.
+**This is the project's first genuine Gemma 4 win on its own kernels:** the
+final default reaches **144.78 tok/s** at tg128 d0 versus llama.cpp's
+**139.94 tok/s**, a parity-safe **1.035x / +3.46%** result on the same XTX.
+
+The winning change fuses the post-attention chain that previously dispatched
+weighted RMS norm, residual add, shared-branch RMS norm, and routed-branch RMS
+norm separately. One qk-native shader preserves the post-norm and residual
+intermediates, performs the second RMS reduction once, and applies the two
+independent branch weights. The control flag is `QK_G4_NO_NORM_FUSION`.
+Measured in the assembled d0 graph, the fused path was **144.107 tok/s**
+(143.548--144.167) versus **137.861 tok/s** (136.864--138.016) unfused,
+**+4.53%** end to end. Both five-repetition campaigns began at busy 0%; their
+immediate post-campaign readings were 76% and 77% respectively.
+
+The cooperative F32 max/sum tree also now omits leading levels whose upper
+half contains only the neutral values `NEG_MAX` or zero. For the short sliding
+splits this removes exact no-op reductions and barriers while leaving the
+surviving arithmetic tree unchanged. The optimization passed the complete
+fixture gate and contributes at every depth.
+
+The tempting early-layer cooperative path was tested and rejected for the
+same reason Stage 8 warned about. On the final fused build, F32 cooperative
+attention on layers 0--2 reaches **148.566 tok/s** (147.411--148.763, five
+reps, busy 0%--69%) versus the accepted default's 144.782 tok/s, but
+`swa_position_1023` fails 13--14 generated tokens after the perturbation.
+Testing layers 1--2 and layer 2 alone also failed that fixture. The all-three
+experiment remains available only behind
+`QK_G4_COOPMAT_EARLY`; it is off by default and explicitly not an accepted
+result. A tied-head Q6_K blocks-per-row specialization also produced no
+assembled gain (**137.764 tok/s**, 136.358--137.968, busy 0%--76%) and was
+reverted.
+
+Deep-context attention was split into measured cooperative phases rather than
+inferred from the fused timestamp. The profiler builds qk-native cumulative
+QK, QK+softmax/reduction, and full QK+softmax/reduction+PV variants and reports
+their deltas. Across five d16384 launches, all beginning at busy 0% and ending
+at 95%, the medians are:
+
+| layer class | QK | softmax/reduction | PV | cooperative core |
+|---|---:|---:|---:|---:|
+| 25 sliding layers | 2.271 ms | **3.205 ms** | 1.927 ms | **7.403 ms** |
+| 5 global layers | 0.022 ms | **0.885 ms** | 0.515 ms | **1.422 ms** |
+
+The cumulative instrumentation dispatches three variants and intentionally
+inflates its own total wall time; the component deltas above are the useful
+result. Sliding attention still dominates, but the largest measured piece is
+now its F32 softmax/reduction, not QK or PV. The neutral-level elision improves
+the final d16384 benchmark by 2.23% over Stage 8, but d16384 remains only
+0.545x llama.cpp, so reduction/softmax is the next concrete deep-context
+target.
+
+Prefill was re-profiled after the attention and norm changes. The five-launch
+accounted median is 486.623 ms: routed experts are **230.279 ms / 47.3%**,
+attention **184.548 ms / 37.9%**, shared experts **69.593 ms / 14.3%**, and
+residual/head are 1.115/1.089 ms. Every launch began at busy 0%; immediate
+post-launch readings were 89--90%. Routed experts remain the largest term, but
+they no longer account for the old 86% share.
+
+`docs/amd-opt/REPORT.md` and the source diff of Qwen branch `prefill-opt`
+(`cf899c1`) were reviewed before changing the Gemma schedule. Gemma already
+counting-sorts top-8 assignments into expert-major order and runs tiled Q4_0
+grouped GEMMs, so Qwen's adjacent-row grouped GEMV is not a direct transfer to
+Gemma's 128-expert top-8 layout. No binary or compiled shader was copied,
+linked, loaded, or executed from that work.
+
+Two Gemma tile changes were measured and rejected:
+
+- BN64 fell to **890.331 tok/s** (818.279--891.652, busy 0%--72%), consistent
+  with added LDS/register pressure.
+- A corrected BM32 variant first measured 1062.335 tok/s, but its repeat was
+  **1054.864 tok/s** versus **1054.397 tok/s** for BM64, only +0.04% and inside
+  noise. BM32 exactly matched BM64 and all 64 frozen grouped ordinary/coding
+  tokens, but it was still reverted because it did not establish an
+  end-to-end win. An earlier 1778.85 tok/s BM32 number was discarded: the
+  loader still had a BM64 shift and skipped the second K block, so it was not
+  a valid performance result.
+
+The exact final BM64 tree then passed all six fixtures with no waiver:
+ordinary chat 32/32, coding 32/32, the three SWA boundary fixtures 16/16 each,
+and global-context 16/16. Empty-cache repeats bring the cumulative gate to
+**1,024 token-exact generated tokens**. The gate began at XTX busy 0% and the
+immediate post-gate reading was 95%.
+
+Final default performance follows. Every campaign has five repetitions,
+began at `gpu_busy_percent=0`, and records the immediate post-campaign reading;
+spreads are min--max. llama.cpp values are the accepted same-XTX `571d0d5`
+measurements from Stage 6.
+
+| test | Stage 9 qk tok/s | vs Stage 8 | llama.cpp tok/s | qk / llama | post busy |
+|---|---:|---:|---:|---:|---:|
+| pp512 | 1051.85 (973.59--1052.14) | +0.9% | 3405.88 | 0.309x | 66% |
+| tg128 d0 | **144.78 (144.01--145.05)** | **+5.2%** | 139.94 | **1.035x, qk wins** | 72% |
+| tg128 d4096 | 112.72 (112.60--112.83) | **+4.0%** | 125.73 | 0.896x | 93% |
+| tg128 d16384 | 65.51 (65.45--65.66) | **+2.2%** | 120.22 | 0.545x | 98% |
+
+All seven affected/generated modules pass `spirv-val` for Vulkan 1.2. The
+changed-source forbidden binary/path scan is empty and `git diff --check`
+passes. Raw accepted and rejected measurements, phase samples, busy readings,
+commands, parity disposition, and validation results are appended to
+`bench/results-gemma4-qk.jsonl`. The tree is intentionally dirty and no commit
+was created.

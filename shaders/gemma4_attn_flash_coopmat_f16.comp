@@ -9,6 +9,10 @@
 #define G4_COOPMAT_F32 0
 #endif
 
+#ifndef G4_PROFILE_PHASE
+#define G4_PROFILE_PHASE 3
+#endif
+
 #if G4_COOPMAT_F32
 #define G4_ACCUMULATOR_TYPE float
 #define G4_PROBABILITY_TYPE float
@@ -165,6 +169,7 @@ void main() {
         barrier();
     }
 
+#if G4_PROFILE_PHASE >= 2
     for (uint rank = 0u; rank < groupSize; ++rank) {
         float maximum = NEG_MAX;
         for (uint offset = lane; offset < activeCount; offset += 256u)
@@ -172,7 +177,13 @@ void main() {
         scoreReduction[rank][lane] = maximum;
     }
     barrier();
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    // Skip leading reduction levels whose upper half contains only neutral
+    // lanes. Sliding decode uses <=64 active keys per split, so the 128/64
+    // levels are exact no-ops (max(x, NEG_MAX), x + 0) plus barriers.
+    uint firstReductionStride = 128u;
+    while (firstReductionStride >= activeCount)
+        firstReductionStride >>= 1u;
+    for (uint stride = firstReductionStride; stride > 0u; stride >>= 1u) {
         if (lane < stride)
             for (uint rank = 0u; rank < groupSize; ++rank)
                 scoreReduction[rank][lane] = max(
@@ -196,7 +207,7 @@ void main() {
         scoreReduction[rank][lane] = sum;
     }
     barrier();
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    for (uint stride = firstReductionStride; stride > 0u; stride >>= 1u) {
         if (lane < stride)
             for (uint rank = 0u; rank < groupSize; ++rank)
                 scoreReduction[rank][lane] +=
@@ -207,7 +218,9 @@ void main() {
         for (uint rank = 0u; rank < groupSize; ++rank)
             sums[rank] = scoreReduction[rank][0];
     barrier();
+#endif
 
+#if G4_PROFILE_PHASE >= 3
     for (uint index = lane;
          index < groupSize * pc.headDim; index += 256u)
         outputState[index] = 0.0;
@@ -256,6 +269,7 @@ void main() {
         }
         barrier();
     }
+#endif
     for (uint rank = 0u; rank < groupSize; ++rank) {
         uint qHead = kvHead * groupSize + rank;
         uint stateBase = (split * pc.queryHeads + qHead) * stateStride;
@@ -306,6 +320,7 @@ void main() {
 
         // One lane owns each real GQA row. Preserve the 16-key order while
         // updating an F32 online-softmax state and an f16 probability tile.
+#if G4_PROFILE_PHASE >= 2
         if (lane < groupSize) {
             uint rank = lane;
             float blockMaximum = NEG_MAX;
@@ -337,10 +352,12 @@ void main() {
             corrections[rank] = correction;
         }
         barrier();
+#endif
 
         // P[16 heads, 16 keys] * V[16 keys, dh] -> block PV. Subgroups split
         // the unusually wide dh=512 output tiles without retaining dh in
         // registers. Full outputState remains in shared memory.
+#if G4_PROFILE_PHASE >= 3
         for (uint dimTile = gl_SubgroupID;
              dimTile < pc.headDim / TILE;
              dimTile += gl_NumSubgroups) {
@@ -373,6 +390,7 @@ void main() {
                                  float(pvTile[index]);
         }
         barrier();
+#endif
     }
 
     for (uint rank = 0u; rank < groupSize; ++rank) {

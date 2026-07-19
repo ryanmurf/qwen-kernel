@@ -39,6 +39,7 @@ find_program(GLSLC glslc REQUIRED)
 
 set(SHADERS gemv_f16 gemv_q4_0 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs
     gemma4_embed gemma4_embed_batch gemma4_rms gemma4_elementwise
+    gemma4_post_attention_fused
     gemma4_router gemma4_router_batch gemma4_select gemma4_select_batch
     gemma4_quant_q8 gemma4_gemv_q4_q8 gemma4_gemv_q4_f32
     gemma4_moe_gateup gemma4_moe_gateup_f32 gemma4_moe_gateup_batch
@@ -91,6 +92,35 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
     COMMENT "glslc gemma4_attn_flash_coopmat_f32")
 list(APPEND SPV_FILES ${GEMMA4_COOPMAT_F32_SPV})
+
+# Profiling-only cumulative cooperative variants. Phase 1 runs QK, phase 2
+# runs QK+softmax, and the normal module runs the full QK+softmax+PV path.
+set(GEMMA4_COOPMAT_PROFILE_SPV
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f16_p1.spv
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f16_p2.spv
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f32_p1.spv
+    ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f32_p2.spv)
+add_custom_command(
+    OUTPUT ${GEMMA4_COOPMAT_PROFILE_SPV}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_PROFILE_PHASE=1
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+            -o ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f16_p1.spv
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_PROFILE_PHASE=2
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+            -o ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f16_p2.spv
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_COOPMAT_F32=1
+            -DG4_PROFILE_PHASE=1
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+            -o ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f32_p1.spv
+    COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DG4_COOPMAT_F32=1
+            -DG4_PROFILE_PHASE=2
+            ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+            -o ${CMAKE_BINARY_DIR}/shaders/gemma4_attn_flash_coopmat_f32_p2.spv
+    DEPENDS ${CMAKE_SOURCE_DIR}/shaders/gemma4_attn_flash_coopmat_f16.comp
+    COMMENT "glslc Gemma 4 cooperative attention profiling variants")
+list(APPEND SPV_FILES ${GEMMA4_COOPMAT_PROFILE_SPV})
+
 add_custom_target(shaders ALL DEPENDS ${SPV_FILES})
 
 add_executable(qk src/main.cpp)

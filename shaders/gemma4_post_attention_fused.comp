@@ -1,0 +1,71 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Fused Gemma post-attention chain. The first reduction reproduces the
+// weighted post-attention RMS norm. The resulting residual is then reduced
+// once and multiplied by the two independent shared/routed branch weights.
+// Every pre-fusion intermediate remains materialized for diagnostics.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufProjected { float projected[]; };
+layout(std430, binding = 1) readonly buffer BufResidual { float residual[]; };
+layout(std430, binding = 2) readonly buffer BufPostWeight { float postWeight[]; };
+layout(std430, binding = 3) readonly buffer BufSharedWeight { float sharedWeight[]; };
+layout(std430, binding = 4) readonly buffer BufRoutedWeight { float routedWeight[]; };
+layout(std430, binding = 5) writeonly buffer BufPost { float post[]; };
+layout(std430, binding = 6) buffer BufAttentionOut { float attentionOut[]; };
+layout(std430, binding = 7) writeonly buffer BufSharedIn { float sharedIn[]; };
+layout(std430, binding = 8) writeonly buffer BufRoutedIn { float routedIn[]; };
+
+layout(push_constant) uniform PC { uint n; float eps; } pc;
+
+shared float waveSums[8];
+shared float normScale;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint base = gl_WorkGroupID.x * pc.n;
+
+    float sum = 0.0;
+    for (uint i = lane; i < pc.n; i += 256u) {
+        float value = projected[base + i];
+        sum += value * value;
+    }
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0u) waveSums[gl_SubgroupID] = sum;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint wave = 0u; wave < gl_NumSubgroups; ++wave)
+            total += waveSums[wave];
+        normScale = 1.0 / sqrt(total / float(pc.n) + pc.eps);
+    }
+    barrier();
+
+    float residualSum = 0.0;
+    for (uint i = lane; i < pc.n; i += 256u) {
+        float postValue = projected[base + i] * normScale * postWeight[i];
+        post[base + i] = postValue;
+        float value = postValue + residual[base + i];
+        attentionOut[base + i] = value;
+        residualSum += value * value;
+    }
+    residualSum = subgroupAdd(residualSum);
+    if (gl_SubgroupInvocationID == 0u)
+        waveSums[gl_SubgroupID] = residualSum;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint wave = 0u; wave < gl_NumSubgroups; ++wave)
+            total += waveSums[wave];
+        normScale = 1.0 / sqrt(total / float(pc.n) + pc.eps);
+    }
+    barrier();
+
+    for (uint i = lane; i < pc.n; i += 256u) {
+        float value = attentionOut[base + i];
+        sharedIn[base + i] = value * normScale * sharedWeight[i];
+        routedIn[base + i] = value * normScale * routedWeight[i];
+    }
+}
