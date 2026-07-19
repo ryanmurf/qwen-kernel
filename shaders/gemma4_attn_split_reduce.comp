@@ -10,6 +10,8 @@ layout(push_constant) uniform PC {
     uint headDim;
     uint queryHeads;
     uint splitK;
+    uint activeSplitBegin;
+    uint activeSplitEnd;
 } pc;
 
 shared float reduction[64];
@@ -22,8 +24,11 @@ void main() {
     uint stateStride = pc.headDim + 2u;
     float maximum = -3.402823466e38;
     for (uint split = lane; split < pc.splitK; split += 64u) {
-        uint base = (split*pc.queryHeads + qHead)*stateStride;
-        if (states[base + 1u] > 0.0) maximum = max(maximum, states[base]);
+        if (split >= pc.activeSplitBegin && split < pc.activeSplitEnd) {
+            uint base = (split*pc.queryHeads + qHead)*stateStride;
+            if (states[base + 1u] > 0.0)
+                maximum = max(maximum, states[base]);
+        }
     }
     reduction[lane] = maximum;
     barrier();
@@ -38,9 +43,11 @@ void main() {
 
     float sum = 0.0;
     for (uint split = lane; split < pc.splitK; split += 64u) {
-        uint base = (split*pc.queryHeads + qHead)*stateStride;
-        if (states[base + 1u] > 0.0)
-            sum += states[base + 1u]*exp(states[base] - maximum);
+        if (split >= pc.activeSplitBegin && split < pc.activeSplitEnd) {
+            uint base = (split*pc.queryHeads + qHead)*stateStride;
+            if (states[base + 1u] > 0.0)
+                sum += states[base + 1u]*exp(states[base] - maximum);
+        }
     }
     reduction[lane] = sum;
     barrier();
@@ -61,10 +68,12 @@ void main() {
     if (dim < pc.headDim) {
         float total = 0.0;
         for (uint split = 0u; split < pc.splitK; ++split) {
-            uint base = (split*pc.queryHeads + qHead)*stateStride;
-            if (states[base + 1u] > 0.0)
-                total += states[base + 2u + dim]*
-                         exp(states[base] - globalMaximum);
+            if (split >= pc.activeSplitBegin && split < pc.activeSplitEnd) {
+                uint base = (split*pc.queryHeads + qHead)*stateStride;
+                if (states[base + 1u] > 0.0)
+                    total += states[base + 2u + dim]*
+                             exp(states[base] - globalMaximum);
+            }
         }
         outputValue[qHead*pc.headDim + dim] = total*globalInverseSum;
     }

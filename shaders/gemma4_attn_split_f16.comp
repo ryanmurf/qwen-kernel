@@ -27,6 +27,7 @@ layout(push_constant) uniform PC {
     uint kvLength;
     uint splitKv;
     uint splitK;
+    uint splitBase;
 } pc;
 
 shared float reduction[8][256];
@@ -35,7 +36,7 @@ shared float sums[8];
 
 void main() {
     uint kvHead = gl_WorkGroupID.x;
-    uint split = gl_WorkGroupID.y;
+    uint split = pc.splitBase + gl_WorkGroupID.y;
     uint lane = gl_LocalInvocationID.x;
     uint groupSize = pc.queryHeads/pc.kvHeads;
     uint chunkBegin = split*pc.splitKv;

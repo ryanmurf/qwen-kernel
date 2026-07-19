@@ -856,3 +856,116 @@ remain rejected. Fourteen generated modules pass `spirv-val --target-env
 vulkan1.2`, the forbidden binary/path scan is empty, `git diff --check` passes,
 and no compiled artifact from another project was copied, linked, loaded, or
 executed. The source tree is intentionally dirty and no commit was created.
+
+### 2026-07-19 — Stage 11: medium-context decode win
+
+Stage 11 reaches the remaining realistic target without weakening parity. The
+final default measures **129.889 tok/s** at tg128 d4096 versus llama.cpp
+`571d0d5` at **125.734 tok/s**: **1.033x / +3.30%**, and +12.64% over the
+Stage 10 default. Together with d0 at 146.962 versus 139.943, qk now wins
+single-token decode at both short and medium context on the XTX.
+
+The stage began with a fresh control rather than relying on the Stage 10
+number. Five repetitions measured 115.394 tok/s (115.147--115.512, busy
+0%--93%). A five-launch production-path profile measured 8.309 ms median GPU
+time and attributed 4.389 ms to attention, 1.827 ms to routed experts, 1.064
+ms to the head, 0.902 ms to shared experts, and 0.263 ms to residual/norm
+(busy 0%--78%). Attention itself was 3.535 ms sliding and 0.855 ms global;
+1.082 ms was preparation, 2.660 ms the fused attention/reduce core, and 0.663
+ms finalization.
+
+The apparent sliding-depth growth was not an over-read of the ring. Every
+shader already bounds its useful positions to the final 1024 entries. The host
+did, however, derive split width from the full padded context. At d4096 that
+left only about six useful splits per KV head, so the three parity-sensitive
+scalar sliding layers serialized long score/value loops and the cooperative
+layers also had less useful parallelism than at d1024.
+
+Two related launch changes are retained:
+
+- At medium context (`kvLength` above 2048 and no more than 8192), every
+  sliding layer uses 32-token absolute-aligned splits. Short-context geometry
+  remains unchanged, and the upper bound guarantees that all partial states
+  fit the existing 256-slot allocation. Only the contiguous split interval
+  intersecting the 1024-token ring is dispatched. The reducer keeps the full
+  absolute split numbering and the same neutral values for undispatched
+  splits, so empty-state elision itself does not change the reduction tree.
+- Q/K/V and attention-output projections use the Stage-1-measured TPR128
+  geometry (two rows per workgroup) only from position 2048 onward and only
+  from layer 3 onward. Short context and layers 0--2 keep TPR64/four rows per
+  workgroup. Separate pipelines use the same qk-owned GLSL modules; no external
+  binary is involved.
+
+The scope guards are correctness requirements, not benchmark conveniences. A
+32-token split at all depths reached 120.779 tok/s (120.364--120.855, busy
+0%--93%) but failed `swa_position_1023` at continuation 14 (expected 1638,
+actual 13315; gate busy 0%--80%). Restoring the established split geometry
+through 2048 tokens passed the full gate (busy 0%--95%). Likewise, applying
+TPR128 at short context failed the same boundary/token; restricting it to
+positions at or beyond 2048 passed all fixtures, including the 8192-context
+case (busy 0%--96%). No waiver was used.
+
+The progression at d4096 was repeatable. Fixed 64-token sliding splits reached
+120.005 tok/s (119.904--120.157, busy 0%--93%). Scoped 32-token splits in the
+22 cooperative layers reached 120.779 (120.364--120.855, busy 0%--93%). The
+scoped TPR changes then reached 122.149 (121.884--122.240, busy 0%--93%).
+Extending 32-token splits to the three scalar early layers supplied the large
+remaining gain: 129.981 (129.576--130.012, busy 0%--93%). After removing a
+marginal argmax experiment and restoring the original softcap path, the final
+campaign measured 129.889 (129.613--130.115, busy 0%--93%).
+
+Final production and cumulative phase profiles show the mechanism. Each row is
+the median of five launches; the final campaigns began at busy 0% and ended at
+77% (production) or 80% (cumulative phases).
+
+| d4096 profile | fresh control | final | change |
+|---|---:|---:|---:|
+| production attention | 4.389 ms | 3.421 ms | -22.1% |
+| production sliding attention | 3.535 ms | 2.558 ms | -27.6% |
+| production global attention | 0.855 ms | 0.854 ms | flat |
+| production fused attention/reduce core | 2.660 ms | 1.718 ms | -35.4% |
+| sliding QK phase | 626.24 us | 152.72 us | -75.6% |
+| sliding softmax/reduction phase | 923.60 us | 492.28 us | -46.7% |
+| sliding PV phase | 501.28 us | 499.44 us | -0.4% |
+
+Thus Stage 10's PV work remains valuable, but PV is not where Stage 11's gain
+comes from. Finer useful splits restore CU occupancy for QK and the ordered
+reduction; PV was already essentially flat. Global phases also remain flat,
+confirming that each global K/V read already serves all eight query heads.
+
+Several ideas were measured and rejected end to end:
+
+- dispatching only non-empty splits with the old coarse geometry was just
+  115.545 tok/s (115.460--115.655, busy 0%--93%), +0.13% with overlapping
+  spreads; neutral elision is retained only as an enabling part of the finer
+  split schedule;
+- same-tree subgroup shuffles in the general Q4xQ8 GEMV regressed to 115.240
+  (115.166--115.369, busy 0%--93%), and in routed gate/up regressed to 120.152
+  (119.954--120.183, busy 0%--93%); both were reverted;
+- F16 cooperative PV accumulation in layers 3+ was flat at 115.347
+  (115.197--115.782, busy 0%--93%) and was reverted without spending a parity
+  campaign;
+- 32-token global splits added only +0.08% in the assembled candidate, and the
+  Stage-1 shared gate/down TPR256+16 pair regressed to 120.523
+  (120.478--120.752, busy 0%--92%); both were reverted;
+- direct-logit argmax reached 121.215 (120.622--121.640, busy 0%--93%) in
+  isolation but had overlapping spread and was unnecessary for the final win,
+  so the original softcap comparison was restored.
+
+Final default performance follows. Every campaign has five repetitions,
+began at `gpu_busy_percent=0`, and reports the immediate post-run reading.
+
+| test | Stage 11 qk tok/s | vs Stage 10 | llama.cpp tok/s | qk / llama | post busy |
+|---|---:|---:|---:|---:|---:|
+| pp512 | 1192.890 (1109.630--1194.142) | -0.2% | 3405.88 | 0.350x | 68% |
+| tg128 d0 | **146.962 (145.525--147.068)** | +0.5% | 139.943 | **1.050x, qk wins** | 74% |
+| tg128 d4096 | **129.889 (129.613--130.115)** | **+12.6%** | 125.734 | **1.033x, qk wins** | 93% |
+| tg128 d16384 | 68.479 (68.128--68.652) | +0.7% | 120.224 | 0.570x | 98% |
+
+The exact final binary passes ordinary chat, coding, all three SWA boundary
+fixtures, and global context for **1,024 token-exact generated tokens** (busy
+0%--95%). Fourteen relevant generated modules pass `spirv-val --target-env
+vulkan1.2`; the forbidden binary/path scan is empty; `git diff --check`
+passes. No compiled SPIR-V or binary from another project was copied, linked,
+loaded, or executed. The tree is intentionally dirty, no commit was created,
+and the d4096 stopping target is honestly met rather than relaxed.
