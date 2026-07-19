@@ -1,0 +1,164 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// Cooperative-matrix grouped expert gate/up. Same expert-major counting-sort
+// schedule and bindings as gemma4_moe_gateup_grouped.comp, but the fused
+// gate and up strips are dequantized to f16 shared tiles and multiplied with
+// 16x16x16 cooperative products under F32 accumulation. Because gate and up
+// accumulators for the same output tile live in the same subgroup, the GELU
+// pairing happens elementwise in registers before one staged scatter. The
+// 16x16 coopmat tiling follows the structure of llama.cpp 571d0d5's Vulkan
+// mul_mm shaders, reimplemented from scratch for qk's fused (2816,1408,128)
+// expert layout. Requires subgroup size 64 (four subgroups per workgroup);
+// the host falls back to the scalar grouped kernel otherwise.
+layout(local_size_x = 256) in;
+
+#include "q4_0.glsl"
+
+layout(std430, binding = 0) readonly buffer BufW { block_q4_0 weights[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) readonly buffer BufM { uint meta[]; };
+layout(std430, binding = 3) readonly buffer BufA { uint assignments[]; };
+layout(std430, binding = 4) writeonly buffer BufH { float hidden[]; };
+
+const uint BM = 64u, BN = 32u, BK = 64u, SK = BK + 8u, SN = BN + 8u;
+
+shared float16_t Wg[BM*SK];
+shared float16_t Wu[BM*SK];
+shared float16_t Xsh[BN*SK];
+// Staged hidden values round to f16 exactly once here; the grouped down
+// kernel converts its input to f16 anyway, so the values it consumes are
+// bit-identical to an F32 staging path.
+shared float16_t staging[BM*SN];
+
+float gelu(float value) {
+    const float v = 0.79788456080286535587989211986876*value*
+                    (1.0 + 0.044715*value*value);
+    return 0.5*value*(2.0 - 2.0/(exp(2.0*v) + 1.0));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint expert = gl_WorkGroupID.z;
+    uint rowBase = gl_WorkGroupID.x*BM;
+    uint begin = meta[128u + expert];
+    uint end = meta[129u + expert];
+    uint assignmentBase = begin + gl_WorkGroupID.y*BN;
+    if (assignmentBase >= end) return;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+        gate0 = coopmat<float, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseAccumulator>(0.0),
+        gate1 = coopmat<float, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseAccumulator>(0.0),
+        up0 = coopmat<float, gl_ScopeSubgroup, 16, 16,
+                      gl_MatrixUseAccumulator>(0.0),
+        up1 = coopmat<float, gl_ScopeSubgroup, 16, 16,
+                      gl_MatrixUseAccumulator>(0.0);
+
+    const uint blocksPerRow = 88u;
+    const uint expertBase = expert*1408u*blocksPerRow;
+    // Subgroup s owns 16-row strip s of the 64-row tile for both gate and up.
+    uint rt = gl_SubgroupID;
+
+    // Fixed per-lane roles: one lane dequantizes one of the 256 blocks per
+    // K step (64 rows x 2 blocks x {gate,up}); the same lane also loads 8
+    // consecutive activation values. Both are prefetched one K step ahead so
+    // the raw loads overlap the cooperative products.
+    const uint matrix = tid >> 7u;
+    const uint blockIndex = tid & 127u;
+    const uint rowLocal = blockIndex & (BM - 1u);
+    const uint blockLocal = blockIndex >> 6u;
+    const uint wRowBase =
+        expertBase + (rowBase + rowLocal + matrix*704u)*blocksPerRow;
+    const uint la = tid >> 3u;
+    const uint kk8 = (tid & 7u)*8u;
+    const uint listIndex = assignmentBase + la;
+    const bool xValid = listIndex < end;
+    const uint xBase = (xValid ? assignments[listIndex] >> 3u : 0u)*2816u + kk8;
+
+    block_q4_0 qNext = weights[wRowBase + blockLocal];
+    float xNext[8];
+    [[unroll]] for (uint j = 0u; j < 8u; ++j)
+        xNext[j] = xValid ? x[xBase + j] : 0.0;
+
+    for (uint b0 = 0u; b0 < blocksPerRow; b0 += 2u) {
+        {
+            block_q4_0 q = qNext;
+            uint offset = rowLocal*SK + blockLocal*32u;
+            if (matrix == 0u) {
+                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                    float lo, hi;
+                    q4_0_dequant_pair(q, j, lo, hi);
+                    Wg[offset + j] = float16_t(lo);
+                    Wg[offset + 16u + j] = float16_t(hi);
+                }
+            } else {
+                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                    float lo, hi;
+                    q4_0_dequant_pair(q, j, lo, hi);
+                    Wu[offset + j] = float16_t(lo);
+                    Wu[offset + 16u + j] = float16_t(hi);
+                }
+            }
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                Xsh[la*SK + kk8 + j] = float16_t(xNext[j]);
+        }
+        barrier();
+        if (b0 + 2u < blocksPerRow) {
+            qNext = weights[wRowBase + b0 + 2u + blockLocal];
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                xNext[j] = xValid ? x[xBase + (b0 + 2u)*32u + j] : 0.0;
+        }
+        [[unroll]] for (uint kt = 0u; kt < BK; kt += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> x0, x1;
+            coopMatLoad(x0, Xsh, kt, SK,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(x1, Xsh, 16u*SK + kt, SK,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> wg, wu;
+            coopMatLoad(wg, Wg, rt*16u*SK + kt, SK,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(wu, Wu, rt*16u*SK + kt, SK,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            gate0 = coopMatMulAdd(wg, x0, gate0);
+            gate1 = coopMatMulAdd(wg, x1, gate1);
+            up0 = coopMatMulAdd(wu, x0, up0);
+            up1 = coopMatMulAdd(wu, x1, up1);
+        }
+        barrier();
+    }
+
+    // Accumulators of the same shape share an element mapping inside one
+    // subgroup, so gate/up pairing is elementwise in registers.
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+            combined0, combined1;
+        for (uint i = 0u; i < gate0.length(); ++i) {
+            combined0[i] = float16_t(gelu(gate0[i])*up0[i]);
+            combined1[i] = float16_t(gelu(gate1[i])*up1[i]);
+        }
+        coopMatStore(combined0, staging, rt*16u*SN, SN,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(combined1, staging, rt*16u*SN + 16u, SN,
+                     gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+    for (uint idx = tid; idx < BM*BN; idx += 256u) {
+        uint rowLocal = idx >> 5u;
+        uint n = idx & (BN - 1u);
+        uint listIndex = assignmentBase + n;
+        if (listIndex < end) {
+            uint assignment = assignments[listIndex];
+            hidden[assignment*704u + rowBase + rowLocal] =
+                staging[rowLocal*SN + n];
+        }
+    }
+}

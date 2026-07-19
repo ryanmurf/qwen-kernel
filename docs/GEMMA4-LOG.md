@@ -1066,3 +1066,120 @@ vulkan1.2`; the forbidden binary/path scan is empty; `git diff --check`
 passes. No compiled SPIR-V or binary from another project was copied, linked,
 loaded, or executed. The tree is intentionally dirty and no commit was
 created.
+### 2026-07-19 — Stage 12: cooperative-matrix prefill — pp512 from 0.350x to 0.926x
+
+Stage 12 attacks the prefill gap with a structural thesis rather than more
+tuning: at pp512 the whole forward pass is roughly 3.2 TFLOP of GEMM work,
+llama.cpp executes it at about 21 TFLOP/s effective, and every qk prefill
+matmul — dense projections, shared FFN, and the expert-major grouped MoE —
+was a scalar-FMA loop running at 5-10 TFLOP/s. The counting-sorted
+expert-major schedule from the Qwen work was already present and was not the
+problem; the arithmetic engine under it was. The fix is 16x16x16
+`KHR_cooperative_matrix` tiles (f16 operands, F32 accumulation) everywhere
+the batch is wide, following the structure of llama.cpp `571d0d5`'s
+`mul_mm.comp` reimplemented from scratch against qk's Q4_0 ABI. No compiled
+SPIR-V or binary from any other project was copied, linked, loaded, or
+executed; the forbidden-path scan over the changed files is empty.
+
+Retained changes (all default-on behind `useCoopGemm` = KHR coopmat + F32
+accumulator + subgroup 64; `QK_G4_NO_COOPMAT_GEMM` restores the Stage 11
+path; every new kernel dispatches only for `tokens > 1`, so decode is
+structurally untouched):
+
+- `gemm_q4_0_coopmat.comp`: dense Q4_0 GEMM for all batched Q/K/V/O and
+  shared-FFN projections. BM128xBN64xBK64 f16 shared tiles, eight F32
+  accumulators per subgroup, and one-K-step register prefetch of raw blocks
+  and activations so memory latency overlaps the previous step's WMMAs.
+- `gemma4_moe_gateup_grouped_coopmat.comp`: the grouped expert-major gate/up
+  with BM64xBN32xBK64 cooperative tiles. Gate and up accumulators for the
+  same output tile live in the same subgroup, so the GELU pairing is
+  elementwise in registers; the staging tile is f16, which is bit-identical
+  to what the down kernel consumes because it converts its input to f16
+  anyway.
+- `gemma4_moe_down_grouped_coopmat.comp`: grouped down at BM64xBN32xBK32
+  (the smaller K tile won here and lost in gate/up), expert scale applied to
+  the F32 accumulator in registers, f16 staging matching the f16 `downAll`
+  element the scalar kernel produces, unchanged rank-ordered reduce.
+- `gemma4_attn_batch_flash_coopmat_f16.comp`: the prefill flash QK phase now
+  runs on every subgroup over interleaved head-dimension tiles with an F32
+  partial-sum tile, instead of one subgroup while three idled; the
+  loop-invariant probability load in PV is hoisted.
+- Host: `VkPhysicalDeviceSubgroupProperties` query, pipeline wiring, and
+  profiling-only `QK_G4_SKIP_MOE_*` attribution knobs (never set in accepted
+  runs).
+
+The development ladder was measured on the XT (03:00.0) because the decode
+agent owned the XTX; steps are 2-3-rep pp512 medians with the busy reading
+at launch (nonzero values are decay residue of the immediately preceding
+run): baseline 763.9 (busy 0) -> first coopmat dense+grouped 993.9 ->
+coopMatLoad dedup 1062.4 -> grouped register prefetch 1344.5 -> dense
+register prefetch 1641.5 -> dense BM128xBN64 1792.1 -> down BK32 1823.2 ->
+f16 staging 2002.3 -> distributed QK score 2059.8. The single largest lever
+was register prefetch: without it the kernels exposed full VRAM latency
+between barriers at 2-3 workgroups per WGP.
+
+Measured and rejected end to end (XT): BN64 grouped tiles 1518.1 (padding
+waste at the ~32-assignment average count plus occupancy loss); BK32
+gate/up 1587.9; a bit-identical one-workgroup-per-token router 1897.3
+against 2002.3 (the 65,536 tiny router workgroups hide latency better than a
+serial 128-expert loop — the earlier suspicion that router launch overhead
+dominated the routed bucket was disproved by skip-differencing: router +
+select + counting sort cost only ~9 ms of the routed term); sliding
+QUERY_TOKENS=4 within noise; global QUERY_TOKENS=2 was not attempted because
+outputState+queryTile+pvTile would exceed the 64 KiB shared-memory limit at
+head_dim 512.
+
+Final XT attribution (profile, busy 8 -> 79): 247.5 ms accounted = routed
+124.1 (gate/up ~75, down+reduce ~45, router/select/sort ~9), attention 94.7
+(prep 34.5, fused score core 38.6, finalize 21.5), shared 26.5, head 1.3.
+Both MoE GEMMs run near 11-12 TFLOP/s XT-effective against ~16 for the
+dense coopmat GEMM; the gap is the per-expert tile scheduling overhead.
+
+Final XTX campaigns, five repetitions each, every campaign beginning at
+`gpu_busy_percent=0` with the immediate post-campaign reading recorded.
+llama.cpp values are the accepted same-XTX `571d0d5` Stage 6 campaigns:
+
+| test | Stage 12 qk tok/s | vs Stage 11 | llama.cpp | qk / llama | post busy |
+|---|---:|---:|---:|---:|---:|
+| pp512 | **3154.54 (3036.03--3273.11)** | **+164.4%** | 3405.88 | **0.926x** | 60% |
+| tg128 d0 | 146.83 (145.85--147.07) | -0.1% | 139.94 | **1.049x, qk wins** | 75% |
+| tg128 d4096 | 130.16 (130.01--130.45) | +0.2% | 125.73 | **1.035x, qk wins** | 89% |
+| tg128 d16384 | 68.31 (68.17--68.55) | -0.2% | 120.22 | 0.568x | 99% |
+
+Both decode wins are preserved and d16384 is unchanged, as expected from the
+tokens>1 dispatch guard; a paired XT check with `QK_G4_NO_COOPMAT_GEMM=1`
+showed identical decode throughput.
+
+Parity. The formal gate ran on the exact final binary on the XTX and passed
+all six fixtures with no waiver: ordinary chat 32/32, coding 32/32, the
+three SWA boundary fixtures 16/16 each, and global-context-8192 16/16, with
+empty-cache repeats to **1,024 token-exact generated tokens**. The gate's
+launch busy reading was 53% (decay residue of this session's immediately
+preceding spot checks; the gate is correctness-only and no timing is claimed
+from it); the post-gate reading was 97%. Batched-path spot checks were exact
+for ordinary chat and coding on both cards at every retained step. One
+pre-existing limitation was measured precisely rather than hidden: on the
+8192-token fixture the *batched* path diverges from the accuracy-path oracle
+at continuation index 5 (818 vs 4661 — the exact router-sensitive boundary
+Stage 6 documented), and the Stage 11 scalar batched path produces the
+byte-identical divergent continuation. The coopmat path reproduces the
+established batched behavior exactly; the batched-vs-accuracy split at deep
+context predates this stage and remains covered by the gate's serial
+accuracy path, exactly as Stage 6 scoped it.
+
+Assessment. The pp512 gap closed from -65.0% to -7.4% (about 12 ms of the
+162 ms prompt). qk now runs the prompt at ~19.7 TFLOP/s effective against
+llama.cpp's ~21.3. The remainder is attributable, in order, to: the grouped
+MoE kernels' per-expert scheduling overhead relative to the dense GEMM
+(~2/3 of the gap — a two-deep prefetch pipeline, indirect dispatch that
+skips the ~94% empty expert tiles, or llama.cpp-style per-N tile-size
+selection are the credible next levers); the fused flash score core, whose
+K/V loads are not LDS-staged; and residual dense-GEMM efficiency. Parity
+risk, not kernel structure, is the binding constraint on the MoE side: every
+faster tile shape that changes reduction order must survive the batched spot
+checks, and the BN64 experiment shows the expert-count distribution punishes
+wider tiles. Full parity-preserving closure to 1.0x looks reachable but not
+cheap; the three levers above are concrete and none requires weakening the
+gate. All four generated modules pass `spirv-val --target-env vulkan1.2`,
+`git diff --check` passes, the tree is intentionally dirty, and no commit
+was created.

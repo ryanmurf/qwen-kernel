@@ -1,0 +1,137 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// Cooperative-matrix grouped expert down projection. Same expert-major
+// schedule, bindings, and f16 downAll output as gemma4_moe_down_grouped.comp;
+// the weight and hidden tiles move through f16 shared memory into 16x16x16
+// cooperative products with F32 accumulation, and the expert scale plus f16
+// store ordering is preserved via a staging tile. Structure follows llama.cpp
+// 571d0d5's Vulkan mul_mm tiling, reimplemented for qk's layout. Requires
+// subgroup size 64; the host falls back to the scalar grouped kernel
+// otherwise.
+layout(local_size_x = 256) in;
+
+#include "q4_0.glsl"
+
+layout(std430, binding = 0) readonly buffer BufW { block_q4_0 weights[]; };
+layout(std430, binding = 1) readonly buffer BufH { float hidden[]; };
+layout(std430, binding = 2) readonly buffer BufM { uint meta[]; };
+layout(std430, binding = 3) readonly buffer BufA { uint assignments[]; };
+layout(std430, binding = 4) readonly buffer BufS { float downScale[]; };
+layout(std430, binding = 5) writeonly buffer BufD { float16_t downAll[]; };
+
+const uint BM = 64u, BN = 32u, BK = 32u, SK = BK + 8u, SN = BN + 8u;
+
+shared float16_t Wsh[BM*SK];
+shared float16_t Xsh[BN*SK];
+// The expert scale is applied to the F32 accumulator in registers and the
+// staged value is rounded to f16 exactly once, matching the f16 downAll
+// element the scalar grouped kernel produces.
+shared float16_t staging[BM*SN];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint expert = gl_WorkGroupID.z;
+    uint rowBase = gl_WorkGroupID.x*BM;
+    uint begin = meta[128u + expert];
+    uint end = meta[129u + expert];
+    uint assignmentBase = begin + gl_WorkGroupID.y*BN;
+    if (assignmentBase >= end) return;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2];
+    acc[0] = coopmat<float, gl_ScopeSubgroup, 16, 16,
+                     gl_MatrixUseAccumulator>(0.0);
+    acc[1] = coopmat<float, gl_ScopeSubgroup, 16, 16,
+                     gl_MatrixUseAccumulator>(0.0);
+    // Subgroup s owns 16-row strip s of the 64-row tile.
+    uint rt = gl_SubgroupID;
+
+    const uint blocksPerRow = 22u;
+    const uint expertBase = expert*2816u*blocksPerRow;
+    // Fixed per-lane roles with one-step register prefetch, as in the
+    // grouped gate/up kernel: four lanes dequantize each of the 64 blocks
+    // per K step and each lane loads 4 consecutive hidden values.
+    const uint blockIndex = tid >> 2u;
+    const uint quarter4 = (tid & 3u)*4u;
+    const uint rowLocal = blockIndex & (BM - 1u);
+    const uint wRowBase = expertBase + (rowBase + rowLocal)*blocksPerRow;
+    const uint la = tid >> 3u;
+    const uint kk4 = (tid & 7u)*4u;
+    const uint listIndex = assignmentBase + la;
+    const bool xValid = listIndex < end;
+    const uint xBase =
+        (xValid ? assignments[listIndex] : 0u)*704u + kk4;
+
+    block_q4_0 qNext = weights[wRowBase];
+    float xNext[4];
+    [[unroll]] for (uint j = 0u; j < 4u; ++j)
+        xNext[j] = xValid ? hidden[xBase + j] : 0.0;
+
+    for (uint b0 = 0u; b0 < blocksPerRow; ++b0) {
+        {
+            block_q4_0 q = qNext;
+            uint offset = rowLocal*SK + quarter4;
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                float lo, hi;
+                q4_0_dequant_pair(q, quarter4 + j, lo, hi);
+                Wsh[offset + j] = float16_t(lo);
+                Wsh[offset + 16u + j] = float16_t(hi);
+            }
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                Xsh[la*SK + kk4 + j] = float16_t(xNext[j]);
+        }
+        barrier();
+        if (b0 + 1u < blocksPerRow) {
+            qNext = weights[wRowBase + b0 + 1u];
+            [[unroll]] for (uint j = 0u; j < 4u; ++j)
+                xNext[j] = xValid ? hidden[xBase + (b0 + 1u)*32u + j] : 0.0;
+        }
+        [[unroll]] for (uint kt = 0u; kt < BK; kt += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseB> x0, x1;
+            coopMatLoad(x0, Xsh, kt, SK,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(x1, Xsh, 16u*SK + kt, SK,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                    gl_MatrixUseA> wm;
+            coopMatLoad(wm, Wsh, rt*16u*SK + kt, SK,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            acc[0] = coopMatMulAdd(wm, x0, acc[0]);
+            acc[1] = coopMatMulAdd(wm, x1, acc[1]);
+        }
+        barrier();
+    }
+
+    {
+        const float scale = downScale[expert];
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+            scaled0, scaled1;
+        for (uint i = 0u; i < acc[0].length(); ++i) {
+            scaled0[i] = float16_t(acc[0][i]*scale);
+            scaled1[i] = float16_t(acc[1][i]*scale);
+        }
+        coopMatStore(scaled0, staging, rt*16u*SN, SN,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(scaled1, staging, rt*16u*SN + 16u, SN,
+                     gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+    for (uint idx = tid; idx < BM*BN; idx += 256u) {
+        uint rowLocal = idx >> 5u;
+        uint n = idx & (BN - 1u);
+        uint listIndex = assignmentBase + n;
+        if (listIndex < end) {
+            uint assignment = assignments[listIndex];
+            downAll[assignment*2816u + rowBase + rowLocal] =
+                staging[rowLocal*SN + n];
+        }
+    }
+}

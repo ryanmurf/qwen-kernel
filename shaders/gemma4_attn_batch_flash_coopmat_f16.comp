@@ -37,9 +37,12 @@ layout(constant_id = 1) const uint MAX_GROUP_SIZE = 8u;
 layout(constant_id = 2) const uint QUERY_TOKENS = 1u;
 const float NEG_MAX = -3.402823466e38;
 
+// Every subgroup accumulates a partial QK product over an interleaved subset
+// of head-dimension tiles; the partials are summed to F32 before the softmax.
 shared float16_t queryTile[TILE * MAX_HEAD_DIM];
-shared float16_t scoreTile[TILE * TILE];       // [key][q-head]
-shared float16_t probabilityTile[TILE * TILE]; // [q-head][key]
+shared float16_t scorePartials[8u * TILE * TILE]; // [subgroup][key][q-head]
+shared float scoreTile[TILE * TILE];              // [key][q-head]
+shared float16_t probabilityTile[TILE * TILE];    // [q-head][key]
 shared float16_t pvTile[TILE * MAX_HEAD_DIM];
 shared float outputState[MAX_GROUP_SIZE * QUERY_TOKENS * MAX_HEAD_DIM];
 shared float maxima[TILE];
@@ -93,7 +96,7 @@ void main() {
     uint blockEnd = (lastPosition + 1u + TILE - 1u) & ~(TILE - 1u);
     for (uint absoluteBlock = blockBegin;
          absoluteBlock < blockEnd; absoluteBlock += TILE) {
-        if (gl_SubgroupID == 0u) {
+        {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseAccumulator> scoreMatrix =
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
@@ -104,7 +107,8 @@ void main() {
                     gl_MatrixUseB> queryMatrix;
             uint keyBase = (kvHead * pc.cacheLength +
                             cache_slot(absoluteBlock)) * pc.headDim;
-            for (uint dim = 0u; dim < pc.headDim; dim += TILE) {
+            for (uint dim = gl_SubgroupID * TILE; dim < pc.headDim;
+                 dim += gl_NumSubgroups * TILE) {
                 coopMatLoad(keyMatrix, keyCache, keyBase + dim, pc.headDim,
                             gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(queryMatrix, queryTile, dim, pc.headDim,
@@ -112,8 +116,16 @@ void main() {
                 scoreMatrix = coopMatMulAdd(
                     keyMatrix, queryMatrix, scoreMatrix);
             }
-            coopMatStore(scoreMatrix, scoreTile, 0u, TILE,
+            coopMatStore(scoreMatrix, scorePartials,
+                         gl_SubgroupID * TILE * TILE, TILE,
                          gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        if (lane < TILE * TILE) {
+            float sum = 0.0;
+            for (uint sg = 0u; sg < gl_NumSubgroups; ++sg)
+                sum += float(scorePartials[sg * TILE * TILE + lane]);
+            scoreTile[lane] = sum;
         }
         barrier();
 
@@ -133,7 +145,7 @@ void main() {
                 if (absolutePosition >= activeBegin &&
                     absolutePosition < activeEnd)
                     blockMaximum = max(
-                        blockMaximum, float(scoreTile[key * TILE + row]));
+                        blockMaximum, scoreTile[key * TILE + row]);
             }
             float oldMaximum = maxima[row];
             float newMaximum = max(oldMaximum, blockMaximum);
@@ -147,7 +159,7 @@ void main() {
                 if (activeBlock && absolutePosition >= activeBegin &&
                     absolutePosition < activeEnd) {
                     probability = float16_t(exp(
-                        float(scoreTile[key * TILE + row]) - newMaximum));
+                        scoreTile[key * TILE + row] - newMaximum));
                     blockSum += float(probability);
                 }
                 probabilityTile[row * TILE + key] = probability;
@@ -161,28 +173,32 @@ void main() {
         }
         barrier();
 
-        for (uint dimTile = gl_SubgroupID;
-             dimTile < pc.headDim / TILE;
-             dimTile += gl_NumSubgroups) {
+        {
+            // The probability tile is invariant across dimension tiles; load
+            // it once per subgroup.
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
                     gl_MatrixUseA> probabilityMatrix;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
-                    gl_MatrixUseB> valueMatrix;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
-                    gl_MatrixUseAccumulator> pvMatrix =
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
-                        gl_MatrixUseAccumulator>(0.0);
             coopMatLoad(probabilityMatrix, probabilityTile, 0u, TILE,
                         gl_CooperativeMatrixLayoutRowMajor);
-            uint valueBase = (kvHead * pc.cacheLength +
-                              cache_slot(absoluteBlock)) * pc.headDim +
-                             dimTile * TILE;
-            coopMatLoad(valueMatrix, valueCache, valueBase, pc.headDim,
-                        gl_CooperativeMatrixLayoutRowMajor);
-            pvMatrix = coopMatMulAdd(
-                probabilityMatrix, valueMatrix, pvMatrix);
-            coopMatStore(pvMatrix, pvTile, dimTile * TILE, pc.headDim,
-                         gl_CooperativeMatrixLayoutRowMajor);
+            for (uint dimTile = gl_SubgroupID;
+                 dimTile < pc.headDim / TILE;
+                 dimTile += gl_NumSubgroups) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseB> valueMatrix;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                        gl_MatrixUseAccumulator> pvMatrix =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16,
+                            gl_MatrixUseAccumulator>(0.0);
+                uint valueBase = (kvHead * pc.cacheLength +
+                                  cache_slot(absoluteBlock)) * pc.headDim +
+                                 dimTile * TILE;
+                coopMatLoad(valueMatrix, valueCache, valueBase, pc.headDim,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                pvMatrix = coopMatMulAdd(
+                    probabilityMatrix, valueMatrix, pvMatrix);
+                coopMatStore(pvMatrix, pvTile, dimTile * TILE, pc.headDim,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
         }
         barrier();
 

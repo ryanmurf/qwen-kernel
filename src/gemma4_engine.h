@@ -159,6 +159,12 @@ class Gemma4Engine {
         useNormFusion = !getenv("QK_G4_NO_NORM_FUSION");
         useCoopBatch = coopF16;
         useCoopBatchSliding = coopF16;
+        // Prefill GEMMs and grouped MoE move to cooperative-matrix tiles when
+        // the device offers the F32 accumulator; the scalar path remains the
+        // opt-out fallback.
+        useCoopGemm = coopF16 && c.cooperativeMatrixF32Acc &&
+                      c.subgroupSize == 64u &&
+                      !getenv("QK_G4_NO_COOPMAT_GEMM");
         if (!uploadModel(error)) return false;
         makePipelines();
         makeDescriptorPool();
@@ -428,6 +434,10 @@ class Gemma4Engine {
     Pipe pBatchMask{};
     Pipe pBatchRouter{}, pBatchSelect{}, pBatchExpertGateUp{}, pBatchExpertDown{};
     Pipe pBatchExpertGroup{}, pBatchExpertReduce{};
+    Pipe pBatchGemmCoop88{}, pBatchGemmCoop66{}, pBatchGemmCoop128{};
+    Pipe pBatchGemmCoop256{};
+    Pipe pBatchExpertGateUpCoop{}, pBatchExpertDownCoop{};
+    bool useCoopGemm = false;
 
     static constexpr uint32_t kBatch = 512;
     // The first three sliding layers retain scalar decode attention. Their tiny
@@ -835,6 +845,20 @@ class Gemma4Engine {
         pBatchMask = makePipe(c, "gemma4_mask_f16.spv", 1, 16);
         pBatchRouter = makePipe(c, "gemma4_router_batch.spv", 4, 12);
         pBatchSelect = makePipe(c, "gemma4_select_batch.spv", 2, 0);
+        if (useCoopGemm) {
+            pBatchGemmCoop88 = makePipeSpecs(
+                c, "gemm_q4_0_coopmat.spv", 3, 12, {88u});
+            pBatchGemmCoop66 = makePipeSpecs(
+                c, "gemm_q4_0_coopmat.spv", 3, 12, {66u});
+            pBatchGemmCoop128 = makePipeSpecs(
+                c, "gemm_q4_0_coopmat.spv", 3, 12, {128u});
+            pBatchGemmCoop256 = makePipeSpecs(
+                c, "gemm_q4_0_coopmat.spv", 3, 12, {256u});
+            pBatchExpertGateUpCoop = makePipe(
+                c, "gemma4_moe_gateup_grouped_coopmat.spv", 5, 0);
+            pBatchExpertDownCoop = makePipe(
+                c, "gemma4_moe_down_grouped_coopmat.spv", 6, 0);
+        }
         pBatchExpertGroup = makePipe(c, "gemma4_moe_group.spv", 3, 4);
         pBatchExpertGateUp = makePipe(c, "gemma4_moe_gateup_grouped.spv",
                                       5, 0);
@@ -951,6 +975,14 @@ class Gemma4Engine {
         if (K == 2112) return pBatchGemm66;
         if (K == 4096) return pBatchGemm128;
         if (K == 8192) return pBatchGemm256;
+        throw std::runtime_error("unsupported Gemma batch GEMM K");
+    }
+
+    Pipe& batchGemmCoopPipe(uint32_t K) {
+        if (K == 2816) return pBatchGemmCoop88;
+        if (K == 2112) return pBatchGemmCoop66;
+        if (K == 4096) return pBatchGemmCoop128;
+        if (K == 8192) return pBatchGemmCoop256;
         throw std::runtime_error("unsupported Gemma batch GEMM K");
     }
 
@@ -1194,6 +1226,12 @@ class Gemma4Engine {
     void batchGemm(VkDescriptorSet descriptor, uint32_t M, uint32_t K,
                    uint32_t tokens) {
         struct { uint32_t M, K, N; } push{M, K, tokens};
+        if (useCoopGemm) {
+            bindDispatch(batchGemmCoopPipe(K), descriptor,
+                         &push, sizeof(push),
+                         (M + 127)/128, 1, (tokens + 63)/64);
+            return;
+        }
         Pipe& pipe = batchGemmPipe(K);
         bindDispatch(pipe, descriptor, &push, sizeof(push),
                      (M + 127)/128, 1, (tokens + 63)/64);
@@ -1218,13 +1256,15 @@ class Gemma4Engine {
     }
 
     void batchExpertGateUp(VkDescriptorSet descriptor, uint32_t tokens) {
-        bindDispatch(pBatchExpertGateUp, descriptor, nullptr, 0,
+        bindDispatch(useCoopGemm ? pBatchExpertGateUpCoop : pBatchExpertGateUp,
+                     descriptor, nullptr, 0,
                      (gemma4::kExpertFf + 63)/64,
                      (tokens + 31)/32, gemma4::kExperts);
     }
 
     void batchExpertDown(VkDescriptorSet descriptor, uint32_t tokens) {
-        bindDispatch(pBatchExpertDown, descriptor, nullptr, 0,
+        bindDispatch(useCoopGemm ? pBatchExpertDownCoop : pBatchExpertDown,
+                     descriptor, nullptr, 0,
                      (gemma4::kEmbedding + 63)/64,
                      (tokens + 31)/32, gemma4::kExperts);
         struct { uint32_t tokens; } push{tokens};
@@ -1607,9 +1647,13 @@ class Gemma4Engine {
                      1.0f/std::sqrt((float)gemma4::kEmbedding));
             struct { uint32_t n, experts, tokens; } routerPush{
                 gemma4::kEmbedding, gemma4::kExperts, tokens};
-            bindDispatch(pBatchRouter, l.bRouter, &routerPush,
-                         sizeof(routerPush), gemma4::kExperts, tokens);
-            bindDispatch(pBatchSelect, sbSelect, nullptr, 0, tokens);
+            static const bool skipRouter = getenv("QK_G4_SKIP_MOE_ROUTER");
+            static const bool skipSelect = getenv("QK_G4_SKIP_MOE_SELECT");
+            if (!(skipRouter && tokens > 1))
+                bindDispatch(pBatchRouter, l.bRouter, &routerPush,
+                             sizeof(routerPush), gemma4::kExperts, tokens);
+            if (!(skipSelect && tokens > 1))
+                bindDispatch(pBatchSelect, sbSelect, nullptr, 0, tokens);
             if (diagnostics && il == diagnosticLayer)
                 recordRouterDump(
                     bbRouterLogits,
@@ -1621,11 +1665,17 @@ class Gemma4Engine {
                 decodeExpertGateUp(l.dExpertGateUp);
                 decodeExpertDown(l.dExpertDown);
             } else {
+                // Temporary profiling-only attribution skips; never set in
+                // accepted runs.
+                static const bool skipGroup = getenv("QK_G4_SKIP_MOE_GROUP");
+                static const bool skipGateUp = getenv("QK_G4_SKIP_MOE_GATEUP");
+                static const bool skipDown = getenv("QK_G4_SKIP_MOE_DOWN");
                 struct { uint32_t tokens; } groupPush{tokens};
-                bindDispatch(pBatchExpertGroup, sbExpertGroup,
-                             &groupPush, sizeof(groupPush), 1);
-                batchExpertGateUp(l.bExpertGateUp, tokens);
-                batchExpertDown(l.bExpertDown, tokens);
+                if (!skipGroup)
+                    bindDispatch(pBatchExpertGroup, sbExpertGroup,
+                                 &groupPush, sizeof(groupPush), 1);
+                if (!skipGateUp) batchExpertGateUp(l.bExpertGateUp, tokens);
+                if (!skipDown) batchExpertDown(l.bExpertDown, tokens);
             }
             batchRms(l.bRoutedPost, tokens);
             if (profile && il == profileLayer)
@@ -1909,7 +1959,10 @@ class Gemma4Engine {
                         &pDecodeAttentionCoopSlidingSoftmax,
                         &pBatchRouter, &pBatchSelect,
                         &pBatchExpertGroup, &pBatchExpertGateUp,
-                        &pBatchExpertDown, &pBatchExpertReduce}) {
+                        &pBatchExpertDown, &pBatchExpertReduce,
+                        &pBatchGemmCoop88, &pBatchGemmCoop66,
+                        &pBatchGemmCoop128, &pBatchGemmCoop256,
+                        &pBatchExpertGateUpCoop, &pBatchExpertDownCoop}) {
             if (p->p) destroyPipe(c, *p);
         }
         for (VkDeviceMemory memory : mappedMemories) vkUnmapMemory(c.dev, memory);
