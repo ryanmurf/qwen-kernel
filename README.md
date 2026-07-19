@@ -36,18 +36,21 @@ day), same model file, f16 KV both sides — see [`bench/`](bench/README.md#refr
 |---|---|---|
 | single-stream decode, **7900 XTX** | **190.7 tok/s** (5.24 ms/tok) | 132.3 tok/s (**1.44×**) |
 | single-stream decode, **7900 XT** | **147.1 tok/s** (6.80 ms/tok) | 109.7 tok/s (**1.34×**) |
-| **prefill** pp512, 7900 XTX | 1205.7 tok/s | **2892.5 tok/s (llama.cpp 2.40× faster)** |
-| **prefill** pp1024, 7900 XTX | 1292.3 tok/s | **2857.4 tok/s (llama.cpp 2.21× faster)** |
-| **prefill** pp2048, 7900 XTX | 1227.5 tok/s | **2822.2 tok/s (llama.cpp 2.30× faster)** |
+| **prefill** pp512, 7900 XTX | **2904.2 tok/s** | 2900.3 tok/s (**1.00×** — parity) |
+| **prefill** pp1024, 7900 XTX | **3098.1 tok/s** | 2852.0 tok/s (**1.09×**) |
+| **prefill** pp2048, 7900 XTX | **2907.9 tok/s** | 2812.6 tok/s (**1.03×**) |
 | aggregate decode, 16 streams | **384 tok/s** † | — |
 | warm start from prefix cache | 0.3 ms restore (vs 341 ms/64-tok prefill) | — |
 
-**qk wins decode and loses prefill.** That is the honest summary. The reason is
-structural: batch-1 decode is memory-bandwidth-bound, where specialization and
-pre-recorded command buffers win; prefill is compute-bound batched GEMM, where
-llama.cpp uses cooperative-matrix (`KHR_coopmat`) kernels and qk's Qwen path
-currently uses none. For a workload dominated by long prompts, llama.cpp is
-likely the better choice today.
+Prefill reached parity on 2026-07-19 after a cooperative-matrix
+(`KHR_coopmat`) rewrite of the DeltaNet batch step, attention core, dense
+projections and router-logits GEMM. Note **pp512 is parity, not a win** — 1.001×
+sits inside llama.cpp's own ±1.4% run-to-run spread. pp1024 and pp2048 are
+genuine wins. Both sides are measured hot (repetitions back-to-back with
+`gpu_busy` verified 0 beforehand), which is llama-bench's protocol; qk's earlier
+published prefill numbers used a polling harness that forced a ≥100 ms idle
+between repetitions and therefore paid an ~11% down-clocked-DPM penalty
+llama.cpp never paid.
 
 † Not re-measured on 2026-07-18 and not backed by raw data in `bench/`; treat
 as provisional. The end-to-end CLI table above uses a llama.cpp build from
@@ -210,14 +213,23 @@ The decode advantage comes from three things, roughly in order of size:
    resident on the GPU, route+select is fused, expert dispatches are grouped,
    and norm/residual epilogues are folded into their producers.
 
-**Why prefill loses**: matrix cores only help when there is data reuse.
-Batch-1 decode is a matrix-*vector* product — each weight is read once and
-discarded, so it is bandwidth-bound and RDNA3's `KHR_coopmat` units cannot help
-(our Q4_0 GEMV already runs at ~87% of achievable bandwidth). Prefill is a
+**Prefill is a different regime**: matrix cores only help when there is data
+reuse. Batch-1 decode is a matrix-*vector* product — each weight is read once
+and discarded, so it is bandwidth-bound and RDNA3's `KHR_coopmat` units cannot
+help (our Q4_0 GEMV already runs at ~87% of achievable bandwidth). Prefill is a
 matrix-*matrix* product where 512 tokens share every weight read; it is
-compute-bound and coopmat is exactly the right tool. llama.cpp uses it there and
-this engine's Qwen path does not. **We win where matrix cores don't matter and
-lose where they do.**
+compute-bound, and coopmat is exactly the right tool. This engine originally
+used none there and lost prefill ~2.4×; adding native cooperative-matrix kernels
+closed it to parity.
+
+The instructive part was *where* the time actually went. Three optimization
+passes attacked the routed-MoE gate/up kernel on the assumption it dominated.
+Dumping llama.cpp's own per-op times (`GGML_VK_PERF_LOGGER`) and lining them up
+against qk's stage counters showed qk was **already faster** there (59.0 vs
+63.4 ms). The real deficits were the DeltaNet batch step (32.4 vs 6.3 ms), the
+attention core (17.1 vs 1.6 ms), and dense projections held on a scalar path by
+a precision constraint. Profiling the *opponent*, not just ourselves, is what
+found it.
 
 Porting to other hardware: the ideas in (1)-(3) are architecture-independent,
 but every tile size, threads-per-row and split width here was chosen by sweep on
