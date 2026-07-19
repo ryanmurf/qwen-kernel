@@ -9,6 +9,12 @@ runs against it directly. Inspired by
 [KernelBench Mega](https://kernelbench.com/mega) (CUDA-only); this is the
 RDNA3/Vulkan equivalent, taken all the way to a serving engine.
 
+> **Hardware scope:** tested only on **RDNA3** (Radeon RX 7900 XT / XTX) with
+> Mesa RADV on Linux. The kernels assume RDNA3 subgroup behaviour. It will
+> *build* on other vendors — Vulkan is Vulkan — and then not work correctly.
+> There is also an experimental Apple/Metal backend (`src/main_metal.mm`,
+> `shaders/metal/`); it is not the primary target.
+
 ## Benchmarks
 
 **End-to-end through the Claude Code CLI** (same GGUF, same GPU, one backend
@@ -89,9 +95,25 @@ specialization is where the speed comes from.
 
 ## Build & run
 
+**Prerequisites**
+
+- CMake >= 3.16
+- Vulkan headers + loader (`libvulkan-dev` / `vulkan-headers`)
+- `glslc` (from shaderc) — required to compile the shaders
+- a C++17 compiler
+- Rust toolchain supporting **edition 2024** (recent stable) — for the server only
+- Mesa RADV. Tested on Mesa 25.x with a 7900 XT / XTX.
+- `spirv-val` (from spirv-tools) if you want to validate shaders
+
 ```bash
-/usr/bin/cmake -B build      # NB: bare `cmake`/`ninja` on this box are broken pip shims
-/usr/bin/cmake --build build -j
+cmake -B build
+cmake --build build -j
+```
+
+<sub>If `cmake` on your system is a broken pip shim (it happens), use
+`/usr/bin/cmake` explicitly.</sub>
+
+```bash
 
 # serve (Anthropic + llama.cpp-compatible HTTP)
 cd server && cargo build --release

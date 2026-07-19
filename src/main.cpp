@@ -43,8 +43,9 @@
 #include "quants.h"
 #include "../include/qk.h"
 
-static const char* kDefaultGguf =
-    "/home/ryan/intellij/ggerganov/llama.cpp/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf";
+// No default model path: set QK_GGUF. ggufPath() reports this rather than
+// failing inside the loader on a path that only existed on the author's box.
+static const char* kDefaultGguf = "";
 
 #define VK_CHECK(call)                                                        \
     do {                                                                      \
@@ -753,7 +754,12 @@ static void qkStatsLine(const char* fmt, ...) {
 
 static const char* ggufPath() {
     const char* p = getenv("QK_GGUF");
-    return p ? p : kDefaultGguf;
+    if (p && *p) return p;
+    if (*kDefaultGguf) return kDefaultGguf;
+    fprintf(stderr,
+            "error: no model path. Set QK_GGUF=/path/to/model.gguf\n"
+            "       (this build has no compiled-in default)\n");
+    exit(1);
 }
 
 static bool caseGguf(VkCtx& c, const std::string& tensorName, uint32_t iters) {
