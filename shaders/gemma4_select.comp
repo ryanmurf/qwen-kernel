@@ -1,0 +1,48 @@
+#version 450
+
+// Exact 128-wide, stable top-8. Ties resolve to the lower physical expert id.
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer BufL { float logits[]; };
+struct SelT { uint ids[8]; float weights[8]; };
+layout(std430, binding = 1) buffer BufS { SelT selected; };
+shared float values[128];
+shared float sourceValues[128];
+shared uint ids[128];
+
+bool better(float av, uint ai, float bv, uint bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float value = logits[t];
+    sourceValues[t] = (isnan(value) || isinf(value)) ? -3.402823466e38 : value;
+    barrier();
+    for (uint rank = 0u; rank < 8u; ++rank) {
+        values[t] = sourceValues[t];
+        ids[t] = t;
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (t < stride && better(values[t + stride], ids[t + stride], values[t], ids[t])) {
+                values[t] = values[t + stride];
+                ids[t] = ids[t + stride];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            selected.ids[rank] = ids[0];
+            selected.weights[rank] = values[0];
+            sourceValues[ids[0]] = -3.402823466e38;
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        float maximum = selected.weights[0];
+        float sum = 0.0;
+        for (uint rank = 0u; rank < 8u; ++rank) {
+            selected.weights[rank] = exp(selected.weights[rank] - maximum);
+            sum += selected.weights[rank];
+        }
+        for (uint rank = 0u; rank < 8u; ++rank) selected.weights[rank] /= sum;
+    }
+}

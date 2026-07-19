@@ -1,8 +1,8 @@
-# Gemma 4 Stage 0/1 artifacts
+# Gemma 4 Stage 0--4 artifacts
 
-Stage 0 is complete and Stage 1 contains standalone loader and quant-kernel
-gates. No Gemma model graph, attention, MoE scheduling, or 30-layer assembly is
-executed by these harnesses.
+Stages 0--4 contain the loader, native quant kernels, dense primitives, both
+attention geometries, and the shared-plus-routed sparse block. Full 30-layer
+serial assembly and fixture continuation parity remain Stage 5.
 
 ## Artifact ledger
 
@@ -99,6 +99,43 @@ QK_DEVICE_PCI=1a:00.0 QK_GGUF="$MODEL" QK_TPR=16 \
 Check `/sys/class/drm/card2/device/gpu_busy_percent` immediately before every
 timing run. Full sweeps, workgroups, cold/hot ratios, GEMM results, and Q6_K
 argmax timing are in `stage1-results.json` and `docs/GEMMA4-LOG.md`.
+
+## Stage 2--4 graph gates
+
+The standalone graph gates use the exact `gemma4.cpp` order. On AMD, llama.cpp
+uses Q4×Q8_1 MMVQ for the 2816- and 2112-wide projections, but retains
+Q4×F32 for the 704-wide expert-down projection; the harness reproduces that
+split for dump parity.
+
+```bash
+MODEL=/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf
+
+QK_DEVICE_PCI=1a:00.0 QK_GGUF="$MODEL" \
+  rtk proxy ./build/qk gemma4-stage2
+QK_DEVICE_PCI=1a:00.0 QK_GGUF="$MODEL" \
+  rtk proxy ./build/qk gemma4-stage3
+QK_DEVICE_PCI=1a:00.0 QK_GGUF="$MODEL" \
+  rtk proxy ./build/qk gemma4-stage4 2000
+```
+
+Set `QK_G4_ORACLE_DIR` to a llama-debug tensor-dump directory to add real
+llama.cpp gates. The verified dump set used physical ubatch 1 (`-b 2 -ub 1`)
+so every file's final row is the second token at position 1.
+
+Stage 3 checks positions 0, 1, 1023, 1024, and 1025 for the 1024-entry sliding
+ring and the linear global cache, across layer 0 and all five global layers.
+It checks raw projections, learned Q/K norms, unweighted global V norm, RoPE,
+separate K/V cache contents, probabilities, attention outputs, output
+projection, and the attention residual hidden state. Stage 4 checks stable
+top-8 selection (including ties), every shared and routed branch tensor, and a
+complete sparse block.
+
+The grouped benchmark cycles 16 disjoint routes across all 128 experts. Its
+headline 2,000-iteration XTX result is TPR64 for both weight dispatches:
+521.6 GB/s gate_up (+25.3% versus isolated 416.4) and 333.1 GB/s down (+28.3%
+versus isolated 259.5), with `gpu_busy_percent=0` before every timing. The pair
+reaches 451.9 GB/s, not the assumed 700 GB/s. Full gates and timing records are
+in `stage2-4-results.json`.
 
 ## Q4_0 large-stream calibration
 

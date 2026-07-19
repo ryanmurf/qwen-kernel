@@ -38,6 +38,9 @@ find_package(Vulkan REQUIRED)
 find_program(GLSLC glslc REQUIRED)
 
 set(SHADERS gemv_f16 gemv_q4_0 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs
+    gemma4_embed gemma4_rms gemma4_elementwise gemma4_router gemma4_select
+    gemma4_quant_q8 gemma4_gemv_q4_q8 gemma4_moe_gateup gemma4_moe_down
+    gemma4_attn_prep gemma4_attn gemma4_argmax
     moe_logits moe_route_select moe_route_select_hier moe_select moe_select_256 moe_group_pairs
     moe_gateup_iq3 moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_q8 moe_gateup_q8_64
     moe_down_iq4 moe_down_iq4_grouped moe_down_q6k moe_down_q6k_grouped moe_down_q8
@@ -58,6 +61,7 @@ foreach(s ${SHADERS})
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/${s}.comp
                 ${CMAKE_SOURCE_DIR}/shaders/iq_tables.glsl
                 ${CMAKE_SOURCE_DIR}/shaders/q4_0.glsl
+                ${CMAKE_SOURCE_DIR}/shaders/q8_1.glsl
                 ${CMAKE_SOURCE_DIR}/shaders/gemm_q4_0_impl.glsl
         COMMENT "glslc ${s}.comp")
     list(APPEND SPV_FILES ${CMAKE_BINARY_DIR}/shaders/${s}.spv)

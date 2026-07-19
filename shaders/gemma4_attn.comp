@@ -1,0 +1,129 @@
+#version 450
+
+// Decode attention grouped by KV head. A workgroup computes every GQA query
+// sharing that KV head, so each physical K/V scalar is loaded once per position.
+// Scores are materialized for the parity gate; f_attention_scale is exactly 1.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufQ { float query[]; };
+layout(std430, binding = 1) readonly buffer BufK { float keyCache[]; };
+layout(std430, binding = 2) readonly buffer BufV { float valueCache[]; };
+layout(std430, binding = 3) buffer BufP { float probabilities[]; };
+layout(std430, binding = 4) writeonly buffer BufO { float outputValue[]; };
+
+layout(push_constant) uniform PC {
+    uint position;
+    uint headDim;
+    uint queryHeads;
+    uint kvHeads;
+    uint cacheLength;
+    uint sliding;
+    uint probabilityStride;
+    uint unused;
+} pc;
+
+shared float reduction[8][256];
+shared float maxima[8];
+shared float sums[8];
+
+void main() {
+    uint kvHead = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint groupSize = pc.queryHeads / pc.kvHeads;
+    uint start = pc.sliding != 0u && pc.position + 1u > pc.cacheLength
+               ? pc.position + 1u - pc.cacheLength : 0u;
+    uint count = pc.position + 1u - start;
+
+    // Materialize unscaled logits. Gemma 4's learned Q/K norms absorb the
+    // conventional 1/sqrt(head_dim), so no score multiplier appears here.
+    for (uint localPos = 0u; localPos < count; ++localPos) {
+        uint absolutePos = start + localPos;
+        uint slot = pc.sliding != 0u ? absolutePos % pc.cacheLength : absolutePos;
+        uint keyBase = (kvHead * pc.cacheLength + slot) * pc.headDim;
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead * groupSize + rank;
+            float dot = 0.0;
+            for (uint dim = lane; dim < pc.headDim; dim += 256u)
+                dot += query[qHead * pc.headDim + dim] * keyCache[keyBase + dim];
+            reduction[rank][lane] = dot;
+        }
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lane < stride)
+                for (uint rank = 0u; rank < groupSize; ++rank)
+                    reduction[rank][lane] += reduction[rank][lane + stride];
+            barrier();
+        }
+        if (lane == 0u)
+            for (uint rank = 0u; rank < groupSize; ++rank) {
+                uint qHead = kvHead * groupSize + rank;
+                probabilities[qHead * pc.probabilityStride + localPos] = reduction[rank][0];
+            }
+        barrier();
+    }
+
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead * groupSize + rank;
+        float maximum = -3.402823466e38;
+        for (uint p = lane; p < count; p += 256u)
+            maximum = max(maximum, probabilities[qHead * pc.probabilityStride + p]);
+        reduction[rank][lane] = maximum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                reduction[rank][lane] = max(reduction[rank][lane], reduction[rank][lane + stride]);
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank) maxima[rank] = reduction[rank][0];
+    barrier();
+
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead * groupSize + rank;
+        float sum = 0.0;
+        for (uint p = lane; p < count; p += 256u) {
+            float value = exp(probabilities[qHead * pc.probabilityStride + p] - maxima[rank]);
+            probabilities[qHead * pc.probabilityStride + p] = value;
+            sum += value;
+        }
+        reduction[rank][lane] = sum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                reduction[rank][lane] += reduction[rank][lane + stride];
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank) sums[rank] = reduction[rank][0];
+    barrier();
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead * groupSize + rank;
+        for (uint p = lane; p < count; p += 256u)
+            probabilities[qHead * pc.probabilityStride + p] /= sums[rank];
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    // V is read once for the entire GQA group and accumulated into all query
+    // heads. Each lane owns one or two head dimensions.
+    for (uint dim = lane; dim < pc.headDim; dim += 256u) {
+        float accumulators[8];
+        for (uint rank = 0u; rank < groupSize; ++rank) accumulators[rank] = 0.0;
+        for (uint localPos = 0u; localPos < count; ++localPos) {
+            uint absolutePos = start + localPos;
+            uint slot = pc.sliding != 0u ? absolutePos % pc.cacheLength : absolutePos;
+            float value = valueCache[(kvHead * pc.cacheLength + slot) * pc.headDim + dim];
+            for (uint rank = 0u; rank < groupSize; ++rank) {
+                uint qHead = kvHead * groupSize + rank;
+                accumulators[rank] += probabilities[qHead * pc.probabilityStride + localPos] * value;
+            }
+        }
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead * groupSize + rank;
+            outputValue[qHead * pc.headDim + dim] = accumulators[rank];
+        }
+    }
+}

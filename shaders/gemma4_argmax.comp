@@ -1,0 +1,42 @@
+#version 450
+
+// Fused Gemma logit softcap, optional contiguous suppression range, and stable
+// greedy reduction. Ties resolve to the lower vocabulary id.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufL { float logits[]; };
+layout(std430, binding = 1) writeonly buffer BufT { uint token[]; };
+layout(push_constant) uniform PC {
+    uint n;
+    float softcap;
+    uint suppressLo;
+    uint suppressHi;
+} pc;
+shared float values[256];
+shared uint ids[256];
+
+bool better(float av, uint ai, float bv, uint bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    float bestValue = -3.402823466e38;
+    uint bestId = 0xffffffffu;
+    for (uint i = lane; i < pc.n; i += 256u) {
+        float value = pc.softcap * tanh(logits[i] / pc.softcap);
+        if (i >= pc.suppressLo && i < pc.suppressHi) value = -1.0/0.0;
+        if (better(value, i, bestValue, bestId)) { bestValue = value; bestId = i; }
+    }
+    values[lane] = bestValue;
+    ids[lane] = bestId;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride && better(values[lane + stride], ids[lane + stride],
+                                    values[lane], ids[lane])) {
+            values[lane] = values[lane + stride];
+            ids[lane] = ids[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u) token[0] = ids[0];
+}

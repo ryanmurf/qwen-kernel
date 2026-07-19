@@ -211,3 +211,66 @@ The exact 262144x2816 Q6_K head also passed CPU dequant and GPU two-pass argmax
 XTX `gpu_busy=0%` selected TPR16: **805.3 GB/s**, 752.0 us for GEMV plus 5.4 us
 for the 64-workgroup argmax reduction. Full machine-readable sweeps are in
 `tests/gemma4/stage1-results.json`.
+
+### 2026-07-18 — Stages 2--4 graph primitives, attention, and grouped top-8 MoE
+
+- Implemented the Stage 2 dense primitives in Gemma graph order: tied Q6_K
+  embedding/head, `sqrt(2816)` embedding scale, weighted and unweighted RMS
+  norm, GELU, residual/output scalars, `30*tanh(x/30)`, and stable greedy
+  argmax. The dense CPU/GPU gate passes; representative max-abs/RMS values are
+  `4.86e-7` embedding, `3.76e-5` dense post-norm, and `5.33e-6` for a
+  256-row tied-head slice. The adversarial softcap near-tie selects lower ID 17.
+- Implemented both Stage 3 attention geometries with `f_attention_scale=1`:
+  25 layer-local 1024-slot circular SWA caches and five linear global caches.
+  Global raw V aliases the K projection input, while learned K norm+RoPE and
+  unweighted V RMS write separate cache buffers. Q/K/V, cache slots,
+  probabilities, attention outputs, output projections, and attention residual
+  hidden states pass at positions 0, 1, 1023, 1024, and 1025. The worst
+  boundary probability absolute error is `7.93e-6`; worst attention-output
+  max-abs/RMS is `1.15e-4`. Real llama.cpp dumps pass for layer-0 sliding and
+  layer-5 global raw projections (worst `2.59e-6`) and layer-0 post-RoPE Q/K/V
+  (worst `1.86e-6`).
+- Implemented the Stage 4 parallel shared/routed branches, the router's distinct
+  unnormalized-attention input path, a 128-lane stable selector with an exact
+  64-byte top-8 ABI, fused expert gate/up, per-expert down scaling, the three
+  post norms, branch sum, attention residual, and layer-output scalar. Equal
+  adversarial logits select IDs `[3,9,12,17,20,50,90,127]`. A real
+  llama.cpp position-1 dump passes every branch tensor and the complete sparse
+  block; the worst dump max-abs/RMS is `4.35e-6`.
+- The dump campaign exposed an important backend numerical fact. On this AMD
+  Vulkan path llama.cpp quantizes F32 activations to Q8_1 for Q4 projections at
+  K=2816 and K=2112, but not for expert down at K=704. Reproducing that split,
+  including the separately rounded Q8_1 sum member, closed initial 2--24%
+  branch errors without relaxing a gate. The grouped down dispatch preserves
+  per-expert reduction -> expert scale -> route weight -> stable serial-rank
+  addition.
+
+The final grouped campaign used 2,000 GPU-timestamped iterations and cycled 16
+disjoint top-8 selections spanning all 128 experts, so each route reads a
+different 17,842,176-byte gate/up payload and 8,921,088-byte down payload.
+Every timing below began at XTX `gpu_busy_percent=0`.
+
+| dispatch | winner | cold us / busy | repeat us / busy | GB/s | isolated baseline | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| Q8_1 activation quant | -- | 2.52 / 0% | 2.66 / 0% | -- | -- | -- |
+| grouped gate/up | TPR64 | 34.92 / 0% | 34.21 / 0% | **521.6** | 416.4 | **+25.3%** |
+| grouped down | TPR64 | 26.62 / 0% | 26.79 / 0% | **333.1** | 259.5 | **+28.3%** |
+| two weight dispatches | 64+64 | 59.26 / 0% | 59.22 / 0% | **451.9** | 346.6 effective | **+30.4%** |
+| integrated quant+pair | 64+64 | 51.20 / 0% | 50.84 / 0% | -- | -- | -- |
+
+The grouped design is a clear win over 480 tiny expert GEMVs, but it does
+**not** reach the assumed 700 GB/s. The two weight dispatches are 35.4% below
+that assumption and cost 1.7766 ms across 30 layers. The integrated
+quant+gate/up+down phase is reproducibly faster (1.5252 ms/30 layers) because
+the quant dispatch raises XTX auto-DPM residency; these separately timed phases
+must not be subtracted from one another. Replacing Stage 1's 2.32-ms routed
+term in the 5.14-ms budget yields about **230 tok/s** from the integrated phase,
+or **218 tok/s** using the conservative separate-pair timing, rather than the
+~252 tok/s 700-GB/s projection. These are budget replacements, not Stage 5
+full-model throughput.
+
+All 12 new SPIR-V modules pass `spirv-val --target-env vulkan1.2`; the build,
+all three stage gates, real-dump gates, and `git diff --check` pass. CTest has no
+registered tests. Full machine-readable results are in
+`tests/gemma4/stage2-4-results.json`. Stage 5 remains the next run: persistent
+30-layer serial assembly against the frozen numeric fixtures.

@@ -41,6 +41,7 @@
 
 #include "gguf.h"
 #include "gemma4_loader.h"
+#include "gemma4_graph.h"
 #include "quants.h"
 #include "../include/qk.h"
 
@@ -5511,6 +5512,8 @@ static bool caseGemma4Q4Gemm(VkCtx& c, uint32_t N, uint32_t iters) {
     return ok;
 }
 
+#include "gemma4_stages.h"
+
 static void listTensors(const std::string& filter) {
     Gguf g;
     if (!g.open(ggufPath())) return;
@@ -6770,6 +6773,12 @@ int main(int argc, char** argv) {
         ok = caseGemma4Q4Gemm(c, argU(2, 32), argU(3, 100));
     } else if (mode == "gemma4-head") {
         ok = caseGemma4Head(c, argU(2, 2000));
+    } else if (mode == "gemma4-stage2") {
+        ok = caseGemma4Stage2(c);
+    } else if (mode == "gemma4-stage3") {
+        ok = caseGemma4Stage3(c);
+    } else if (mode == "gemma4-stage4") {
+        ok = caseGemma4Stage4(c, argU(2, 2000));
     } else if (mode == "iq4_xs") {
         ok = caseIQ4XS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "iq3_xxs") {

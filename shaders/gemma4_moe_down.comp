@@ -1,0 +1,77 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// One dispatch covers every selected expert and directly reduces the weighted
+// contributions. Each wave owns one of eight output rows.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 64u;
+#include "q4_0.glsl"
+layout(std430, binding = 0) readonly buffer BufW { block_q4_0 weights[]; };
+layout(std430, binding = 1) readonly buffer BufH { float hidden[]; };
+struct SelT { uint ids[8]; float routeWeights[8]; };
+layout(std430, binding = 2) readonly buffer BufS { SelT selected; };
+layout(std430, binding = 3) readonly buffer BufScale { float downScale[]; };
+layout(std430, binding = 4) writeonly buffer BufY { float y[]; };
+shared float partial[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint groupsPerWorkgroup = 256u / TPR;
+    uint row = gl_WorkGroupID.x * groupsPerWorkgroup + tid / TPR;
+    uint lane = tid % TPR;
+    if (row >= 2816u) return;
+    float total = 0.0;
+    for (uint rank = 0u; rank < 8u; ++rank) {
+        uint expert = selected.ids[rank];
+        uint base = (expert * 2816u + row) * 22u;
+        float expertAcc = 0.0;
+        for (uint fragmentIndex = lane; fragmentIndex < 88u; fragmentIndex += TPR) {
+            uint blockIndex = fragmentIndex/4u;
+            uint fragment = fragmentIndex & 3u;
+            block_q4_0 block = weights[base + blockIndex];
+            uint q = fragment*4u;
+            uint xoff = rank*704u + blockIndex*32u + q;
+            vec4 xv0 = vec4(hidden[xoff], hidden[xoff + 16u],
+                            hidden[xoff + 1u], hidden[xoff + 17u]);
+            vec4 xv1 = vec4(hidden[xoff + 2u], hidden[xoff + 18u],
+                            hidden[xoff + 3u], hidden[xoff + 19u]);
+            uint p0 = uint(block.qs[q]);
+            uint p1 = uint(block.qs[q + 1u]);
+            uint p2 = uint(block.qs[q + 2u]);
+            uint p3 = uint(block.qs[q + 3u]);
+            vec4 wv0 = vec4(int(p0 & 15u) - 8, int(p0 >> 4u) - 8,
+                            int(p1 & 15u) - 8, int(p1 >> 4u) - 8);
+            vec4 wv1 = vec4(int(p2 & 15u) - 8, int(p2 >> 4u) - 8,
+                            int(p3 & 15u) - 8, int(p3 >> 4u) - 8);
+            float fragmentSum = dot(xv0, wv0);
+            fragmentSum += dot(xv1, wv1);
+            expertAcc += fragmentSum*float(block.d);
+        }
+        if (TPR == gl_SubgroupSize) {
+            float expertSum = subgroupAdd(expertAcc);
+            if (lane == 0u) {
+                precise float scaled = expertSum * downScale[expert];
+                scaled = scaled * selected.routeWeights[rank];
+                total += scaled;
+            }
+        } else {
+            partial[tid] = expertAcc;
+            barrier();
+            for (uint stride = TPR / 2u; stride > 0u; stride >>= 1u) {
+                if (lane < stride) partial[tid] += partial[tid + stride];
+                barrier();
+            }
+            if (lane == 0u) {
+                precise float scaled = partial[tid] * downScale[expert];
+                scaled = scaled * selected.routeWeights[rank];
+                total += scaled;
+            }
+        }
+    }
+    if (lane == 0u) y[row] = total;
+}
