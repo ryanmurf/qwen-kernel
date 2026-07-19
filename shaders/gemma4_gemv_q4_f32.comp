@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Serial-position prefill diagnostic path: Q4 weights against the F32
+// activation retained by llama.cpp's batch GEMM path. Unlike gemv_q4_0, the
+// block count is dynamic because one persistent pipeline serves all Gemma
+// projection widths.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 64u;
+#include "q4_0.glsl"
+layout(std430, binding = 0) readonly buffer BufW { block_q4_0 weights[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+shared float partial[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % TPR;
+    uint row = gl_WorkGroupID.x*(256u/TPR) + tid/TPR;
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint blocksPerRow = pc.K/32u;
+        for (uint block = lane; block < blocksPerRow; block += TPR) {
+            float blockSum = 0.0;
+            for (uint j = 0u; j < 16u; ++j) {
+                float lo, hi;
+                q4_0_dequant_pair(weights[row*blocksPerRow + block], j, lo, hi);
+                blockSum += lo*x[block*32u + j];
+                blockSum += hi*x[block*32u + j + 16u];
+            }
+            acc += blockSum;
+        }
+    }
+    partial[tid] = acc;
+    barrier();
+    for (uint stride = TPR/2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    if (lane == 0u && row < pc.M) y[row] = partial[tid];
+}

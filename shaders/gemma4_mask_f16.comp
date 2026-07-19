@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) writeonly buffer BufMask { float16_t mask[]; };
+layout(push_constant) uniform PC {
+    uint basePosition;
+    uint tokens;
+    uint kvLength;
+    uint window;
+} pc;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint count = pc.tokens*pc.kvLength;
+    if (index >= count) return;
+    uint row = index/pc.kvLength;
+    uint key = index - row*pc.kvLength;
+    uint query = pc.basePosition + row;
+    uint first = pc.window != 0u && query + 1u > pc.window
+               ? query + 1u - pc.window : 0u;
+    bool allowed = key >= first && key <= query;
+    mask[index] = allowed ? float16_t(0.0) : float16_t(-1.0/0.0);
+}

@@ -1,0 +1,58 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// F32-activation companion to gemma4_moe_gateup for prompt-state diagnosis.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 64u;
+#include "q4_0.glsl"
+layout(std430, binding = 0) readonly buffer BufW { block_q4_0 weights[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+struct SelT { uint ids[8]; float routeWeights[8]; };
+layout(std430, binding = 2) readonly buffer BufS { SelT selected; };
+layout(std430, binding = 3) writeonly buffer BufH { float hidden[]; };
+shared float sharedGate[256];
+shared float sharedUp[256];
+
+float gelu(float value) {
+    const float val = 0.79788456080286535587989211986876*value*
+                      (1.0 + 0.044715*value*value);
+    return 0.5*value*(2.0 - 2.0/(exp(2.0*val) + 1.0));
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint groupsPerWorkgroup = 256u/TPR;
+    uint rank = gl_WorkGroupID.y*groupsPerWorkgroup + tid/TPR;
+    uint lane = tid%TPR;
+    if (row >= 704u || rank >= 8u) return;
+    uint expert = selected.ids[rank];
+    uint slice = expert*1408u*88u;
+    float gate = 0.0, up = 0.0;
+    for (uint block = lane; block < 88u; block += TPR) {
+        block_q4_0 bg = weights[slice + row*88u + block];
+        block_q4_0 bu = weights[slice + (704u + row)*88u + block];
+        for (uint j = 0u; j < 16u; ++j) {
+            float gl, gh, ul, uh;
+            q4_0_dequant_pair(bg, j, gl, gh);
+            q4_0_dequant_pair(bu, j, ul, uh);
+            gate += gl*x[block*32u + j] + gh*x[block*32u + j + 16u];
+            up += ul*x[block*32u + j] + uh*x[block*32u + j + 16u];
+        }
+    }
+    sharedGate[tid] = gate;
+    sharedUp[tid] = up;
+    barrier();
+    for (uint stride = TPR/2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sharedGate[tid] += sharedGate[tid + stride];
+            sharedUp[tid] += sharedUp[tid + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u)
+        hidden[rank*704u + row] = gelu(sharedGate[tid])*sharedUp[tid];
+}

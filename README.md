@@ -32,6 +32,25 @@ with llama.cpp verified across the full stack:
 | batched prefill (128-tok chunk) | **~450 tok/s** (4.2× own serial) | 37.5 tok/s |
 | warm start from prefix cache | 0.3 ms restore (vs 341 ms/64-tok prefill) | — |
 
+**Gemma 4 26B-A4B Stage 5**, measured on the dedicated 7900 XTX with the same
+Q4_0 model and f16 KV on both engines (`llama.cpp` `571d0d5`, Vulkan FA on).
+Each entry is the median and min–max spread over five repetitions; both
+campaigns began at `gpu_busy_percent=0`:
+
+| test | qk tok/s / busy | llama.cpp tok/s / busy | qk / llama |
+|---|---:|---:|---:|
+| pp512 | 2508.74 (2500.69–2538.72) / 0% | **3432.78** (3405.56–3596.48) / 0% | 0.731× |
+| tg128 d0 | **146.10** (145.04–146.50) / 0% | 139.85 (139.19–139.93) / 0% | **1.045×** |
+| tg128 d4096 | **129.79** (129.53–130.37) / 0% | 127.89 (126.03–127.90) / 0% | **1.015×** |
+| tg128 d16384 | 104.15 (103.92–104.26) / 0% | **120.33** (119.09–120.66) / 0% | 0.866× |
+
+The Gemma engine is token-exact on all six frozen fixtures, including the
+1023/1024/1025 sliding-ring boundaries and an 8192-token global-attention
+case; repeated fixture generation validates 1,024 continuation tokens. It
+wins shallow decode, narrowly wins at d4096, and loses both pp512 and deep
+decode. Raw samples, exact commands, GPU-busy readings, and stage profiles are
+in [`bench/results-gemma4-qk.jsonl`](bench/results-gemma4-qk.jsonl).
+
 Correctness bar throughout: greedy output is **token-for-token identical** to
 llama.cpp on identical input ids, batched paths are validated bit-identical
 (or argmax-stable at ~1e-7 rel) against serial references, and the server's

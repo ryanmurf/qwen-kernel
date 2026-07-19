@@ -1,0 +1,122 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufQ { float query[]; };
+layout(std430, binding = 1) readonly buffer BufK { float16_t keyCache[]; };
+layout(std430, binding = 2) readonly buffer BufV { float16_t valueCache[]; };
+layout(std430, binding = 3) buffer BufP { float probabilities[]; };
+layout(std430, binding = 4) writeonly buffer BufO { float outputValue[]; };
+layout(push_constant) uniform PC {
+    uint basePosition;
+    uint tokens;
+    uint headDim;
+    uint queryHeads;
+    uint kvHeads;
+    uint cacheLength;
+    uint sliding;
+    uint probabilityStride;
+} pc;
+shared float reduction[8][256];
+shared float maxima[8];
+shared float sums[8];
+
+void main() {
+    uint kvHead = gl_WorkGroupID.x;
+    uint token = gl_WorkGroupID.y;
+    if (token >= pc.tokens) return;
+    uint position = pc.basePosition + token;
+    uint lane = gl_LocalInvocationID.x;
+    uint groupSize = pc.queryHeads/pc.kvHeads;
+    uint start = pc.sliding != 0u && position + 1u > pc.cacheLength
+               ? position + 1u - pc.cacheLength : 0u;
+    uint count = position + 1u - start;
+    uint qWidth = pc.queryHeads*pc.headDim;
+    uint probTokenBase = token*pc.queryHeads*pc.probabilityStride;
+    for (uint localPos = 0u; localPos < count; ++localPos) {
+        uint absolutePos = start + localPos;
+        uint slot = pc.sliding != 0u ? absolutePos%pc.cacheLength : absolutePos;
+        uint keyBase = (kvHead*pc.cacheLength + slot)*pc.headDim;
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead*groupSize + rank;
+            float dot = 0.0;
+            for (uint dim = lane; dim < pc.headDim; dim += 256u)
+                dot += query[token*qWidth + qHead*pc.headDim + dim]*float(keyCache[keyBase + dim]);
+            reduction[rank][lane] = dot;
+        }
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lane < stride)
+                for (uint rank = 0u; rank < groupSize; ++rank)
+                    reduction[rank][lane] += reduction[rank][lane + stride];
+            barrier();
+        }
+        if (lane == 0u)
+            for (uint rank = 0u; rank < groupSize; ++rank) {
+                uint qHead = kvHead*groupSize + rank;
+                probabilities[probTokenBase + qHead*pc.probabilityStride + localPos] = reduction[rank][0];
+            }
+        barrier();
+    }
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead*groupSize + rank;
+        float maximum = -3.402823466e38;
+        for (uint p = lane; p < count; p += 256u)
+            maximum = max(maximum, probabilities[probTokenBase + qHead*pc.probabilityStride + p]);
+        reduction[rank][lane] = maximum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                reduction[rank][lane] = max(reduction[rank][lane], reduction[rank][lane + stride]);
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank) maxima[rank] = reduction[rank][0];
+    barrier();
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead*groupSize + rank;
+        float sum = 0.0;
+        for (uint p = lane; p < count; p += 256u) {
+            float value = exp(probabilities[probTokenBase + qHead*pc.probabilityStride + p] - maxima[rank]);
+            probabilities[probTokenBase + qHead*pc.probabilityStride + p] = value;
+            sum += value;
+        }
+        reduction[rank][lane] = sum;
+    }
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            for (uint rank = 0u; rank < groupSize; ++rank)
+                reduction[rank][lane] += reduction[rank][lane + stride];
+        barrier();
+    }
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank) sums[rank] = reduction[rank][0];
+    barrier();
+    for (uint rank = 0u; rank < groupSize; ++rank) {
+        uint qHead = kvHead*groupSize + rank;
+        for (uint p = lane; p < count; p += 256u)
+            probabilities[probTokenBase + qHead*pc.probabilityStride + p] /= sums[rank];
+    }
+    memoryBarrierBuffer(); barrier();
+    for (uint dim = lane; dim < pc.headDim; dim += 256u) {
+        float accumulators[8];
+        for (uint rank = 0u; rank < groupSize; ++rank) accumulators[rank] = 0.0;
+        for (uint localPos = 0u; localPos < count; ++localPos) {
+            uint absolutePos = start + localPos;
+            uint slot = pc.sliding != 0u ? absolutePos%pc.cacheLength : absolutePos;
+            float value = float(valueCache[(kvHead*pc.cacheLength + slot)*pc.headDim + dim]);
+            for (uint rank = 0u; rank < groupSize; ++rank) {
+                uint qHead = kvHead*groupSize + rank;
+                accumulators[rank] += probabilities[probTokenBase + qHead*pc.probabilityStride + localPos]*value;
+            }
+        }
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead*groupSize + rank;
+            outputValue[token*qWidth + qHead*pc.headDim + dim] = accumulators[rank];
+        }
+    }
+}

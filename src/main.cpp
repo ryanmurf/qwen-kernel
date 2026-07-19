@@ -81,6 +81,7 @@ struct VkCtx {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout      pl = VK_NULL_HANDLE;
     const char*           argv0 = nullptr;
+    bool                  cooperativeMatrix = false;
 };
 
 static uint32_t findMemType(const VkPhysicalDeviceMemoryProperties& mp,
@@ -214,8 +215,24 @@ static void initVk(VkCtx& c, const char* argv0) {
            pickBdf.empty() ? "?" : pickBdf.c_str());
 
     // 8/16-bit storage + int8/fp16 arithmetic for raw ggml block access
+    uint32_t nextCount = 0;
+    vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &nextCount, nullptr);
+    std::vector<VkExtensionProperties> deviceExtensions(nextCount);
+    vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &nextCount,
+                                         deviceExtensions.data());
+    for (const auto& extension : deviceExtensions) {
+        if (!strcmp(extension.extensionName,
+                    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+            c.cooperativeMatrix = true;
+            break;
+        }
+    }
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR haveCoop{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    have12.pNext = c.cooperativeMatrix ? &haveCoop : nullptr;
     have11.pNext = &have12;
     VkPhysicalDeviceFeatures2 have2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     have2.pNext = &have11;
@@ -231,6 +248,17 @@ static void initVk(VkCtx& c, const char* argv0) {
     en12.uniformAndStorageBuffer8BitAccess = have12.uniformAndStorageBuffer8BitAccess;
     en12.shaderInt8 = VK_TRUE;
     en12.shaderFloat16 = VK_TRUE;
+    en12.shaderSubgroupExtendedTypes = have12.shaderSubgroupExtendedTypes;
+    en12.vulkanMemoryModel = have12.vulkanMemoryModel;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR enCoop{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    if (c.cooperativeMatrix && haveCoop.cooperativeMatrix &&
+        have12.vulkanMemoryModel) {
+        enCoop.cooperativeMatrix = VK_TRUE;
+        en12.pNext = &enCoop;
+    } else {
+        c.cooperativeMatrix = false;
+    }
     VkPhysicalDeviceVulkan11Features en11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     en11.storageBuffer16BitAccess = VK_TRUE;
     en11.uniformAndStorageBuffer16BitAccess = have11.uniformAndStorageBuffer16BitAccess;
@@ -261,6 +289,13 @@ static void initVk(VkCtx& c, const char* argv0) {
     dci.pNext = &en11;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    const char* enabledExtensions[] = {
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+    };
+    if (c.cooperativeMatrix) {
+        dci.enabledExtensionCount = 1;
+        dci.ppEnabledExtensionNames = enabledExtensions;
+    }
     VK_CHECK(vkCreateDevice(c.phys, &dci, nullptr, &c.dev));
     vkGetDeviceQueue(c.dev, c.qfi, 0, &c.queue);
 
@@ -951,6 +986,53 @@ static Pipe makePipe(VkCtx& c, const char* spvName, uint32_t nBind, uint32_t pcS
     if (tpr) cpi.stage.pSpecializationInfo = &spec;
     cpi.layout = pp.pl;
     VK_CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pp.p));
+    return pp;
+}
+
+static Pipe makePipeSpecs(VkCtx& c, const char* spvName, uint32_t nBind,
+                          uint32_t pcSize,
+                          const std::vector<uint32_t>& constants) {
+    Pipe pp;
+    pp.nBind = nBind;
+    std::vector<VkDescriptorSetLayoutBinding> binds(nBind);
+    for (uint32_t i = 0; i < nBind; ++i)
+        binds[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo dsli{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dsli.bindingCount = nBind;
+    dsli.pBindings = binds.data();
+    VK_CHECK(vkCreateDescriptorSetLayout(c.dev, &dsli, nullptr, &pp.dsl));
+
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, pcSize};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &pp.dsl;
+    plci.pushConstantRangeCount = pcSize ? 1u : 0u;
+    plci.pPushConstantRanges = pcSize ? &pcr : nullptr;
+    VK_CHECK(vkCreatePipelineLayout(c.dev, &plci, nullptr, &pp.pl));
+
+    std::vector<uint32_t> code = loadSpv(c.argv0, spvName);
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = code.size()*sizeof(uint32_t);
+    smci.pCode = code.data();
+    VK_CHECK(vkCreateShaderModule(c.dev, &smci, nullptr, &pp.sm));
+
+    std::vector<VkSpecializationMapEntry> entries(constants.size());
+    for (uint32_t i = 0; i < entries.size(); ++i)
+        entries[i] = {i, (uint32_t)(i*sizeof(uint32_t)), sizeof(uint32_t)};
+    VkSpecializationInfo specialization{
+        (uint32_t)entries.size(), entries.data(),
+        constants.size()*sizeof(uint32_t), constants.data()};
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = pp.sm;
+    cpi.stage.pName = "main";
+    cpi.stage.pSpecializationInfo = &specialization;
+    cpi.layout = pp.pl;
+    VK_CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &cpi,
+                                      nullptr, &pp.p));
     return pp;
 }
 
@@ -5513,6 +5595,7 @@ static bool caseGemma4Q4Gemm(VkCtx& c, uint32_t N, uint32_t iters) {
 }
 
 #include "gemma4_stages.h"
+#include "gemma4_engine.h"
 
 static void listTensors(const std::string& filter) {
     Gguf g;
@@ -6779,6 +6862,26 @@ int main(int argc, char** argv) {
         ok = caseGemma4Stage3(c);
     } else if (mode == "gemma4-stage4") {
         ok = caseGemma4Stage4(c, argU(2, 2000));
+    } else if (mode == "gemma4-stage5-fixtures") {
+        ok = caseGemma4Fixtures(c);
+    } else if (mode == "gemma4-generate") {
+        if (argc < 3) {
+            fprintf(stderr, "usage: qk gemma4-generate <fixture.json> [nGen] [nCtx]\n");
+            return 1;
+        }
+        ok = caseGemma4Generate(c, argv[2], argU(3, 16), argU(4, 0));
+    } else if (mode == "gemma4-bench") {
+        if (argc < 4) {
+            fprintf(stderr,
+                    "usage: qk gemma4-bench tg <depth> [repetitions]\n"
+                    "       qk gemma4-bench pp <tokens> [repetitions]\n");
+            return 1;
+        }
+        ok = caseGemma4Bench(c, argv[2], argU(3, 0), argU(4, 5));
+    } else if (mode == "gemma4-profile") {
+        ok = caseGemma4Profile(c, argU(2, 0));
+    } else if (mode == "gemma4-profile-pp") {
+        ok = caseGemma4ProfilePrompt(c, argU(2, 512));
     } else if (mode == "iq4_xs") {
         ok = caseIQ4XS(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "iq3_xxs") {

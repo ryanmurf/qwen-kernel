@@ -274,3 +274,82 @@ all three stage gates, real-dump gates, and `git diff --check` pass. CTest has n
 registered tests. Full machine-readable results are in
 `tests/gemma4/stage2-4-results.json`. Stage 5 remains the next run: persistent
 30-layer serial assembly against the frozen numeric fixtures.
+
+### 2026-07-18 — Stage 5 assembled, token-exact; mixed head-to-head result
+
+- Added the persistent text-only Gemma 4 engine and wired all 30 layers. Layers
+  5, 11, 17, 23, and 29 use global attention; the other 25 use sliding
+  attention. Every sliding layer owns an independent canonical 1024-cell f16
+  circular K/V ring, while every global layer owns an independent linear f16
+  K/V cache. The decode graph keeps all model weights and KV state resident on
+  the GPU. Prefill runs in chunks of up to 512 tokens.
+- Numerical bisection against the supplied llama.cpp dump patch established
+  that token parity requires the oracle's exact Q4xF32 decode matvec/matvec-id,
+  cooperative Q4xF32 prompt matmul, fused RMS+RoPE, and split-K flash-attention
+  reduction order. Those frozen `571d0d5` SPIR-V modules are now part of the
+  build. `QK_G4_DUMP_DIR` retains per-layer/per-op evidence capture, but all
+  diagnostic copies are absent from normal benchmark command buffers.
+- Added `gemma4-stage5-fixtures`, `gemma4-generate`, `gemma4-bench`, and
+  integrated timestamp profiling for decode and pp512. The benchmark timer
+  excludes cache reset and depth-prefix preparation. Decode measures exactly
+  128 fresh one-token evaluations; pp512 measures exactly one 512-token prompt.
+
+The hard parity command was:
+
+```text
+QK_DEVICE_PCI=1a:00.0 QK_GGUF=/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf ./build/qk gemma4-stage5-fixtures
+```
+
+It passed all six frozen fixtures token-for-token: ordinary chat 32/32, coding
+32/32, the 1023/1024/1025 ring cases 16/16 each, and the 8192-token global case
+16/16. Repeating the ordinary and coding fixtures from empty caches raised the
+cumulative evidence to **1,024 exact generated tokens**. No near-tie waiver was
+used. The XTX was at `gpu_busy_percent=0` before the run.
+
+All head-to-head campaigns used the same model, XTX PCI `1a:00.0`, f16 K and V,
+and began at 0% GPU busy. Values are medians with min--max spread over five
+repetitions:
+
+| test | qk tok/s | qk busy | llama.cpp tok/s | llama busy | qk / llama | result |
+|---|---:|---:|---:|---:|---:|---|
+| pp512 | 2508.74 (2500.69--2538.72) | 0% | **3432.78** (3405.56--3596.48) | 0% | 0.731x | qk loses |
+| tg128 d0 | **146.10** (145.04--146.50) | 0% | 139.85 (139.19--139.93) | 0% | **1.045x** | qk wins |
+| tg128 d4096 | **129.79** (129.53--130.37) | 0% | 127.89 (126.03--127.90) | 0% | **1.015x** | qk wins |
+| tg128 d16384 | 104.15 (103.92--104.26) | 0% | **120.33** (119.09--120.66) | 0% | 0.866x | qk loses |
+
+Exact qk commands (one idle-start campaign per line):
+
+```text
+QK_DEVICE_PCI=1a:00.0 QK_GGUF=/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf ./build/qk gemma4-bench pp 512 5
+QK_DEVICE_PCI=1a:00.0 QK_GGUF=/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf ./build/qk gemma4-bench tg 0 5
+QK_DEVICE_PCI=1a:00.0 QK_GGUF=/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf ./build/qk gemma4-bench tg 4096 5
+QK_DEVICE_PCI=1a:00.0 QK_GGUF=/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf ./build/qk gemma4-bench tg 16384 5
+```
+
+Exact llama.cpp commands:
+
+```text
+GGML_VK_VISIBLE_DEVICES=2 /mnt/data/llama.cpp-master/build/bin/llama-bench -m /mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf -dev Vulkan0 -sm none -mg 0 -ngl 99 -fa on -ctk f16 -ctv f16 -p 512 -n 0 -d 0 -b 8192 -ub 512 -r 5 --delay 5 -o jsonl
+GGML_VK_VISIBLE_DEVICES=2 /mnt/data/llama.cpp-master/build/bin/llama-bench -m /mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf -dev Vulkan0 -sm none -mg 0 -ngl 99 -fa on -ctk f16 -ctv f16 -p 0 -n 128 -d 0,4096,16384 -b 8192 -ub 512 -r 5 --delay 5 -o jsonl
+```
+
+The ~230 tok/s component budget does not survive full token-exact assembly.
+Integrated timestamps account for the measured time rather than a shortened
+harness:
+
+| profile | attention | shared expert | routed experts | residual/norm | head | accounted | busy |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tg d0 | 2.238 ms (34.5%) | 0.936 ms (14.4%) | 1.993 ms (30.7%) | 0.266 ms (4.1%) | 1.058 ms (16.3%) | 6.492 ms | 0% |
+| tg d16384 | 4.958 ms (53.6%) | 0.931 ms (10.1%) | 2.041 ms (22.1%) | 0.262 ms (2.8%) | 1.060 ms (11.5%) | 9.251 ms | 0% |
+| pp512 | 36.558 ms (18.1%) | 17.972 ms (8.9%) | **144.880 ms (71.9%)** | 1.117 ms (0.6%) | 1.109 ms (0.6%) | 201.637 ms | 0% |
+
+At d0, the parity-preserving frozen Q4xF32 projection and expert kernels are
+materially slower than the Stage-1 Q4xQ8 component assumptions, while the tied
+head alone costs about 1.06 ms. At d16384, attention rises by 2.72 ms and
+becomes 53.6% of the token, which explains the deep-context loss to llama.cpp.
+For pp512 the grouped batched MoE path dominates at 144.88 ms, explaining the
+prefill loss. These are measured attributions, not inferred substitutions.
+
+Raw samples, commands, GPU-busy readings, ratios, and profile summaries are in
+`bench/results-gemma4-qk.jsonl`. The README benchmark section now records the
+mixed outcome; qk is not described as faster than llama.cpp at all depths.
