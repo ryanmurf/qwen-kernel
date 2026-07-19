@@ -122,7 +122,9 @@ class Gemma4Engine {
         bbRoutedIn = dev(batchEmbedding);
         bbExpertHidden = dev((size_t)kBatch*gemma4::kExpertsUsed*
                              gemma4::kExpertFf*4);
-        bbExpertMeta = dev(257u*4);
+        // 257 counting-sort words plus meta[257] tile total and up to 256
+        // compacted (expert, tile) entries for the grouped coopmat GEMMs.
+        bbExpertMeta = dev(514u*4);
         bbExpertAssignments = dev((size_t)kBatch*gemma4::kExpertsUsed*4);
         bbExpertDownAll = dev((size_t)kBatch*gemma4::kExpertsUsed*
                               gemma4::kEmbedding*2);
@@ -1255,18 +1257,39 @@ class Gemma4Engine {
                      (M + rowsPerGroup - 1u)/rowsPerGroup);
     }
 
+    // Upper bound on the compacted (expert, BN32-tile) list length written
+    // by gemma4_moe_group: every nonempty expert contributes one tile plus
+    // one more per full extra 32 assignments.
+    uint32_t expertTileBound(uint32_t tokens) const {
+        const uint32_t assignments = tokens*gemma4::kExpertsUsed;
+        return std::min(gemma4::kExperts, assignments) +
+               (assignments + 31u)/32u;
+    }
+
     void batchExpertGateUp(VkDescriptorSet descriptor, uint32_t tokens) {
-        bindDispatch(useCoopGemm ? pBatchExpertGateUpCoop : pBatchExpertGateUp,
+        if (useCoopGemm) {
+            bindDispatch(pBatchExpertGateUpCoop, descriptor, nullptr, 0,
+                         (gemma4::kExpertFf + 63)/64,
+                         expertTileBound(tokens), 1);
+            return;
+        }
+        bindDispatch(pBatchExpertGateUp,
                      descriptor, nullptr, 0,
                      (gemma4::kExpertFf + 63)/64,
                      (tokens + 31)/32, gemma4::kExperts);
     }
 
     void batchExpertDown(VkDescriptorSet descriptor, uint32_t tokens) {
-        bindDispatch(useCoopGemm ? pBatchExpertDownCoop : pBatchExpertDown,
-                     descriptor, nullptr, 0,
-                     (gemma4::kEmbedding + 63)/64,
-                     (tokens + 31)/32, gemma4::kExperts);
+        if (useCoopGemm) {
+            bindDispatch(pBatchExpertDownCoop, descriptor, nullptr, 0,
+                         (gemma4::kEmbedding + 63)/64,
+                         expertTileBound(tokens), 1);
+        } else {
+            bindDispatch(pBatchExpertDown,
+                         descriptor, nullptr, 0,
+                         (gemma4::kEmbedding + 63)/64,
+                         (tokens + 31)/32, gemma4::kExperts);
+        }
         struct { uint32_t tokens; } push{tokens};
         bindDispatch(pBatchExpertReduce, sbExpertReduce,
                      &push, sizeof(push),

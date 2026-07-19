@@ -46,12 +46,17 @@ float gelu(float value) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint expert = gl_WorkGroupID.z;
+    // Compacted tile list from gemma4_moe_group: gl_WorkGroupID.y indexes
+    // only occupied (expert, BN32-tile) pairs, so the ~94% empty tiles of
+    // the dense expert grid are never launched with real work.
+    uint tileSlot = gl_WorkGroupID.y;
+    if (tileSlot >= meta[257u]) return;
+    uint entry = meta[258u + tileSlot];
+    uint expert = entry & 255u;
     uint rowBase = gl_WorkGroupID.x*BM;
     uint begin = meta[128u + expert];
     uint end = meta[129u + expert];
-    uint assignmentBase = begin + gl_WorkGroupID.y*BN;
-    if (assignmentBase >= end) return;
+    uint assignmentBase = begin + (entry >> 8u)*BN;
 
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
         gate0 = coopmat<float, gl_ScopeSubgroup, 16, 16,

@@ -20,12 +20,21 @@ void main() {
     memoryBarrierBuffer(); barrier();
     if (lane == 0u) {
         uint offset = 0u;
+        uint tileCount = 0u;
         for (uint expert = 0u; expert < 128u; ++expert) {
             meta[128u + expert] = offset;
-            offset += meta[expert];
+            uint expertCount = meta[expert];
+            offset += expertCount;
             meta[expert] = 0u;
+            // Compacted (expert, BN32-tile) list for the grouped GEMMs:
+            // meta[257] holds the total and meta[258+i] packs expert in the
+            // low 8 bits with the tile index above. Order is expert-major,
+            // identical to the dense grid the grouped kernels walked before.
+            for (uint tile = 0u; tile*32u < expertCount; ++tile)
+                meta[258u + tileCount++] = expert | (tile << 8u);
         }
         meta[256] = offset;
+        meta[257] = tileCount;
     }
     memoryBarrierBuffer(); barrier();
     for (uint assignment = lane; assignment < count; assignment += 256u) {

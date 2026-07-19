@@ -27,7 +27,7 @@ layout(std430, binding = 3) readonly buffer BufA { uint assignments[]; };
 layout(std430, binding = 4) readonly buffer BufS { float downScale[]; };
 layout(std430, binding = 5) writeonly buffer BufD { float16_t downAll[]; };
 
-const uint BM = 64u, BN = 32u, BK = 32u, SK = BK + 8u, SN = BN + 8u;
+const uint BM = 64u, BN = 32u, BK = 64u, SK = BK + 8u, SN = BN + 8u;
 
 shared float16_t Wsh[BM*SK];
 shared float16_t Xsh[BN*SK];
@@ -38,12 +38,16 @@ shared float16_t staging[BM*SN];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint expert = gl_WorkGroupID.z;
+    // Compacted tile list from gemma4_moe_group, as in the grouped gate/up
+    // kernel: only occupied (expert, BN32-tile) pairs carry real work.
+    uint tileSlot = gl_WorkGroupID.y;
+    if (tileSlot >= meta[257u]) return;
+    uint entry = meta[258u + tileSlot];
+    uint expert = entry & 255u;
     uint rowBase = gl_WorkGroupID.x*BM;
     uint begin = meta[128u + expert];
     uint end = meta[129u + expert];
-    uint assignmentBase = begin + gl_WorkGroupID.y*BN;
-    if (assignmentBase >= end) return;
+    uint assignmentBase = begin + (entry >> 8u)*BN;
 
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2];
     acc[0] = coopmat<float, gl_ScopeSubgroup, 16, 16,
@@ -56,42 +60,45 @@ void main() {
     const uint blocksPerRow = 22u;
     const uint expertBase = expert*2816u*blocksPerRow;
     // Fixed per-lane roles with one-step register prefetch, as in the
-    // grouped gate/up kernel: four lanes dequantize each of the 64 blocks
-    // per K step and each lane loads 4 consecutive hidden values.
-    const uint blockIndex = tid >> 2u;
-    const uint quarter4 = (tid & 3u)*4u;
+    // grouped gate/up kernel. BK64 covers two Q4_0 blocks per K step, so two
+    // lanes dequantize each of the 128 blocks (eight pairs per lane) and
+    // each lane loads 8 consecutive hidden values.
+    const uint blockIndex = tid & 127u;
+    const uint half8 = (tid >> 7u)*8u;
     const uint rowLocal = blockIndex & (BM - 1u);
-    const uint wRowBase = expertBase + (rowBase + rowLocal)*blocksPerRow;
+    const uint blockLocal = blockIndex >> 6u;
+    const uint wRowBase =
+        expertBase + (rowBase + rowLocal)*blocksPerRow;
     const uint la = tid >> 3u;
-    const uint kk4 = (tid & 7u)*4u;
+    const uint kk8 = (tid & 7u)*8u;
     const uint listIndex = assignmentBase + la;
     const bool xValid = listIndex < end;
     const uint xBase =
-        (xValid ? assignments[listIndex] : 0u)*704u + kk4;
+        (xValid ? assignments[listIndex] : 0u)*704u + kk8;
 
-    block_q4_0 qNext = weights[wRowBase];
-    float xNext[4];
-    [[unroll]] for (uint j = 0u; j < 4u; ++j)
+    block_q4_0 qNext = weights[wRowBase + blockLocal];
+    float xNext[8];
+    [[unroll]] for (uint j = 0u; j < 8u; ++j)
         xNext[j] = xValid ? hidden[xBase + j] : 0.0;
 
-    for (uint b0 = 0u; b0 < blocksPerRow; ++b0) {
+    for (uint b0 = 0u; b0 < blocksPerRow; b0 += 2u) {
         {
             block_q4_0 q = qNext;
-            uint offset = rowLocal*SK + quarter4;
-            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            uint offset = rowLocal*SK + blockLocal*32u;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
                 float lo, hi;
-                q4_0_dequant_pair(q, quarter4 + j, lo, hi);
-                Wsh[offset + j] = float16_t(lo);
-                Wsh[offset + 16u + j] = float16_t(hi);
+                q4_0_dequant_pair(q, half8 + j, lo, hi);
+                Wsh[offset + half8 + j] = float16_t(lo);
+                Wsh[offset + 16u + half8 + j] = float16_t(hi);
             }
-            [[unroll]] for (uint j = 0u; j < 4u; ++j)
-                Xsh[la*SK + kk4 + j] = float16_t(xNext[j]);
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                Xsh[la*SK + kk8 + j] = float16_t(xNext[j]);
         }
         barrier();
-        if (b0 + 1u < blocksPerRow) {
-            qNext = weights[wRowBase + b0 + 1u];
-            [[unroll]] for (uint j = 0u; j < 4u; ++j)
-                xNext[j] = xValid ? hidden[xBase + (b0 + 1u)*32u + j] : 0.0;
+        if (b0 + 2u < blocksPerRow) {
+            qNext = weights[wRowBase + b0 + 2u + blockLocal];
+            [[unroll]] for (uint j = 0u; j < 8u; ++j)
+                xNext[j] = xValid ? hidden[xBase + (b0 + 2u)*32u + j] : 0.0;
         }
         [[unroll]] for (uint kt = 0u; kt < BK; kt += 16u) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16,

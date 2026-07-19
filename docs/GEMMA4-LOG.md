@@ -1183,3 +1183,103 @@ cheap; the three levers above are concrete and none requires weakening the
 gate. All four generated modules pass `spirv-val --target-env vulkan1.2`,
 `git diff --check` passes, the tree is intentionally dirty, and no commit
 was created.
+
+### 2026-07-19 — Stage 13: all four benchmarks won
+
+Stage 13 starts from the merged tree (`817f23e`, Stage 12 deep-context fix
+plus the cooperative-matrix prefill) and closes the two remaining gaps. The
+provisional handoff numbers were taken under ~96% contention, so the stage
+began with a clean XTX baseline; every campaign below has five repetitions,
+began at `gpu_busy_percent=0`, and reports the immediate post-run reading.
+
+Clean merged baseline (XTX): pp512 3190.51 (2819.57–3302.01, post 30%),
+tg128 d0 146.85 (146.17–147.20, post 81%), d4096 131.30 (129.36–131.41,
+post 91%), d16384 117.76 (117.46–118.03, post 97%). Against the accepted
+llama.cpp `571d0d5` campaigns that is 0.937x, 1.049x, 1.044x, and 0.980x —
+slightly better than the contended handoff estimates.
+
+Five changes are retained:
+
+- `gemma4_moe_group.comp` additionally emits a compacted (expert, BN32-tile)
+  list: `meta[257]` holds the tile total and `meta[258+i]` packs the expert
+  in the low 8 bits with the tile index above, in the same expert-major
+  order the dense grid walked. `bbExpertMeta` grows 257 -> 514 words. The
+  list is built by the existing lane-0 serial pass, so it is deterministic.
+- both grouped coopmat MoE kernels index that list through
+  `gl_WorkGroupID.y` instead of walking a dense (tokens/32) x 128-expert
+  grid, and the host dispatches `min(128, 8t) + ceil(8t/32)` tile slots in
+  one flat dimension (coopmat path only; the scalar grouped fallback keeps
+  its old geometry). At pp512 this cuts launched workgroups from 45,056 to
+  5,657 (gate/up) and 90,112 to 11,314 (down); ~94% of the old grid was
+  exiting on `assignmentBase >= end`.
+- the grouped down kernel moves from BK32 to BK64: two Q4_0 blocks per K
+  step, two lanes dequantizing each of the 128 blocks, halving the
+  barrier count per output. The 16-wide K tiles accumulate in the same
+  chronological order, so the F32 accumulator sequence is unchanged.
+  Skip-differencing had shown down+reduce (~57 ms XT) costing as much as
+  gate/up (~59 ms XT) on half the FLOPs; gate/up was already at dense-GEMM
+  efficiency (~16.5 TF/s XT) and was left alone.
+- the batched flash kernel (`gemma4_attn_batch_flash_coopmat_f16.comp`)
+  keeps its running output state in registers with the identical
+  lane-strided element mapping the shared array used (per-element update
+  order unchanged), halving LDS so the sliding specialization fits two
+  workgroups per WGP; and its softmax phase computes the exponentials
+  one-per-lane across all 256 lanes while the parity-sensitive per-row sum
+  keeps the original scalar key order (inactive keys add exact 0.0, which
+  is bit-identical to the skipped-key form).
+- the decode flash kernel's f16 (global) branch applies the same
+  register-output-state transform (query-half production LDS ~33 KiB ->
+  ~17 KiB, one -> three workgroups per WGP), and the shared
+  `scoreReduction` array shrinks from a hardcoded [8][256] to
+  [MAX_GROUP_SIZE][256], which takes the sliding F32 specialization from
+  ~36.7 KiB to ~30.5 KiB and one to two workgroups per WGP. Neither branch
+  changes any arithmetic order; unused rows simply stop occupying LDS.
+
+Measured and rejected end to end (XT dev ladder, 3-rep medians):
+
+- two-deep register prefetch in both grouped MoE kernels: 2038.1 vs the
+  2089.7 control, reverted (register pressure);
+- grouped down at BM128xBN32xBK32: 2063.8, reverted (four -> two resident
+  workgroups per WGP outweighed the load:WMMA ratio gain);
+- the decode-kernel parallel-exp softmax: flat at d16384 (59.25 vs 59.20)
+  after the register change, reverted to keep the decode diff minimal.
+
+The XT development ladder for pp512: 2089.7 with tile compaction -> 2160.9
+with the BK64 down kernel -> 2255.5 with the batch register output state ->
+2276.7 with the parallel-exp batch softmax. For decode at d16384: 54.84
+control -> 59.20 with decode register output state -> 61.09 with the
+scoreReduction trim; d4096 rose 100.3 -> 106.8 on the same pair. XTX
+profile attribution for prefill: routed experts 82.68 -> 73.71 ms and total
+161.66 -> 150.69 ms across the MoE changes, with attention 57.4 ms
+(prep 22.2, fused score core 24.4, finalize 10.9) before the flash changes
+landed.
+
+The exact final binary passes the full gate on the XTX with no waiver:
+ordinary chat 32/32, coding 32/32, all three SWA boundary fixtures 16/16,
+and global-context-8192 16/16, with empty-cache repeats to **1,024
+token-exact generated tokens** (launch busy 0%, post-gate 97%).
+
+Because the pp512 margin is thin, llama.cpp `571d0d5` was re-benchmarked
+fresh in the same session on the same idle XTX (llama-bench, five
+repetitions, launch busy 0%): pp512 3431.42 +/- 83.86 (post 54%), tg128 d0
+139.63 +/- 0.22, d4096 126.50 +/- 0.79, d16384 119.00 +/- 0.93 (post 91%).
+
+Final campaigns, exact final binary, XTX:
+
+| test | Stage 13 qk tok/s | post busy | llama fresh | qk / fresh | llama accepted | qk / accepted |
+|---|---:|---:|---:|---:|---:|---:|
+| pp512 | **3455.44 (3264.69–3569.09)** | 63% | 3431.42 +/- 83.86 | **1.007x** | 3405.88 | **1.015x** |
+| tg128 d0 | **146.33 (145.62–146.74)** | 77% | 139.63 +/- 0.22 | **1.048x** | 139.94 | **1.046x** |
+| tg128 d4096 | **137.17 (137.12–137.29)** | 88% | 126.50 +/- 0.79 | **1.084x** | 125.73 | **1.091x** |
+| tg128 d16384 | **127.41 (127.00–127.78)** | 96% | 119.00 +/- 0.93 | **1.071x** | 120.22 | **1.060x** |
+
+All four benchmarks are won against both the accepted and the same-session
+llama.cpp references. The decode wins are decisive; the pp512 win is real
+on medians against both references but sits inside llama's +/- 83.86
+spread, so it is honestly a parity-to-slight-win rather than a decisive
+one. All twelve regenerated modules (the two flash sources across their
+f16/f32, query-half, and p1/p2 variants, plus the three MoE kernels) pass
+`spirv-val --target-env vulkan1.2`; the forbidden binary/path scan over the
+changed files is empty; `git diff --check` passes. No compiled SPIR-V or
+binary from another project was copied, linked, loaded, or executed. The
+tree is intentionally dirty and no commit was created.

@@ -72,13 +72,21 @@ shared G4_ACCUMULATOR_TYPE scoreTile[TILE * TILE]; // [key][q-head]
 shared G4_PROBABILITY_TYPE probabilityTile[TILE * TILE]; // [q-head][key]
 #if !G4_COOPMAT_F32
 shared G4_ACCUMULATOR_TYPE pvTile[TILE * MAX_HEAD_DIM];
+// The f16 specialization keeps the running output state in registers with
+// the same lane-strided element mapping the shared array used, so each
+// element's update order is unchanged while the LDS footprint drops enough
+// for three resident workgroups per WGP.
+const uint OUT_REGS = (MAX_GROUP_SIZE * MAX_HEAD_DIM + 255u) / 256u;
 #else
 shared float chunkScores[MAX_GROUP_SIZE * 1024];
-shared float scoreReduction[8][256];
+// Sized by the specialization's real group count: the sliding {256,2}
+// variant only ever reduces two ranks, and the smaller footprint fits two
+// workgroups per WGP.
+shared float scoreReduction[MAX_GROUP_SIZE][256];
 shared float16_t probabilityHighTile[TILE * TILE];
 shared float pvTileF32[TILE * MAX_HEAD_DIM];
-#endif
 shared float outputState[MAX_GROUP_SIZE * MAX_HEAD_DIM];
+#endif
 shared float maxima[8];
 shared float sums[8];
 shared float corrections[8];
@@ -127,8 +135,13 @@ void main() {
 #endif
     for (uint index = lane; index < TILE * TILE; index += 256u)
         probabilityTile[index] = G4_PROBABILITY_TYPE(0.0);
+#if !G4_COOPMAT_F32
+    float outputState[OUT_REGS];
+    for (uint i = 0u; i < OUT_REGS; ++i) outputState[i] = 0.0;
+#else
     for (uint index = lane; index < groupSize * pc.headDim; index += 256u)
         outputState[index] = 0.0;
+#endif
     if (lane < groupSize) {
         maxima[lane] = NEG_MAX;
         sums[lane] = 0.0;
@@ -407,28 +420,36 @@ void main() {
         }
         barrier();
 
-        for (uint index = lane;
-             index < groupSize * pc.headDim; index += 256u) {
-            uint rank = index / pc.headDim;
-            // Cooperative PV is f16-accumulated, while block-to-block online
-            // rescaling stays F32 to avoid compounding dh=512 roundoff.
-            outputState[index] = corrections[rank] * outputState[index] +
+        for (uint i = 0u; i < OUT_REGS; ++i) {
+            uint index = i * 256u + lane;
+            if (index < groupSize * pc.headDim) {
+                uint rank = index / pc.headDim;
+                // Cooperative PV is f16-accumulated, while block-to-block
+                // online rescaling stays F32 to avoid compounding dh=512
+                // roundoff.
+                outputState[i] = corrections[rank] * outputState[i] +
                                  float(pvTile[index]);
+            }
         }
         barrier();
 #endif
     }
 
-    for (uint rank = 0u; rank < groupSize; ++rank) {
-        uint qHead = kvHead * groupSize + rank;
-        uint stateBase = (split * pc.queryHeads + qHead) * stateStride;
-        if (lane == 0u) {
+    if (lane == 0u)
+        for (uint rank = 0u; rank < groupSize; ++rank) {
+            uint qHead = kvHead * groupSize + rank;
+            uint stateBase = (split * pc.queryHeads + qHead) * stateStride;
             states[stateBase] = maxima[rank];
             states[stateBase + 1u] = sums[rank];
         }
-        for (uint dim = lane; dim < pc.headDim; dim += 256u)
-            states[stateBase + 2u + dim] =
-                outputState[rank * pc.headDim + dim];
+    for (uint i = 0u; i < OUT_REGS; ++i) {
+        uint index = i * 256u + lane;
+        if (index >= groupSize * pc.headDim) continue;
+        uint rank = index / pc.headDim;
+        uint dim = index % pc.headDim;
+        uint qHead = kvHead * groupSize + rank;
+        uint stateBase = (split * pc.queryHeads + qHead) * stateStride;
+        states[stateBase + 2u + dim] = outputState[i];
     }
 #endif
 }
