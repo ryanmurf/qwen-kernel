@@ -81,6 +81,13 @@ struct VkCtx {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout      pl = VK_NULL_HANDLE;
     const char*           argv0 = nullptr;
+    bool                  cooperativeMatrix = false;
+    bool                  cooperativeMatrixF16Acc = false;
+    bool                  cooperativeMatrixF32Acc = false;
+    uint32_t              cooperativeMatrixM = 0;
+    uint32_t              cooperativeMatrixN = 0;
+    uint32_t              cooperativeMatrixK = 0;
+    uint32_t              cooperativeMatrixSubgroupSize = 0;
 };
 
 static uint32_t findMemType(const VkPhysicalDeviceMemoryProperties& mp,
@@ -209,13 +216,38 @@ static void initVk(VkCtx& c, const char* argv0) {
     c.phys = devs[pick];
     vkGetPhysicalDeviceProperties(c.phys, &c.props);
     vkGetPhysicalDeviceMemoryProperties(c.phys, &c.mp);
+    VkPhysicalDeviceSubgroupProperties subgroupProperties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties2{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties2.pNext = &subgroupProperties;
+    vkGetPhysicalDeviceProperties2(c.phys, &properties2);
+    c.cooperativeMatrixSubgroupSize = subgroupProperties.subgroupSize;
     pickBdf = pciBdf(c.phys);
     printf("device: %s [%s]\n", c.props.deviceName,
            pickBdf.empty() ? "?" : pickBdf.c_str());
 
-    // 8/16-bit storage + int8/fp16 arithmetic for raw ggml block access
+    // 8/16-bit storage + int8/fp16 arithmetic for raw ggml block access.
+    // Cooperative-matrix discovery mirrors qk's source-native Gemma-4 path;
+    // only the advertised 16x16x16 f16-input/F32-accumulator shape is selected.
+    uint32_t nextCount = 0;
+    vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &nextCount, nullptr);
+    std::vector<VkExtensionProperties> deviceExtensions(nextCount);
+    vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &nextCount,
+                                         deviceExtensions.data());
+    for (const auto& extension : deviceExtensions) {
+        if (!strcmp(extension.extensionName,
+                    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+            c.cooperativeMatrix = true;
+            break;
+        }
+    }
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR haveCoop{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    have12.pNext = c.cooperativeMatrix ? &haveCoop : nullptr;
     have11.pNext = &have12;
     VkPhysicalDeviceFeatures2 have2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     have2.pNext = &have11;
@@ -231,6 +263,58 @@ static void initVk(VkCtx& c, const char* argv0) {
     en12.uniformAndStorageBuffer8BitAccess = have12.uniformAndStorageBuffer8BitAccess;
     en12.shaderInt8 = VK_TRUE;
     en12.shaderFloat16 = VK_TRUE;
+    en12.shaderSubgroupExtendedTypes = have12.shaderSubgroupExtendedTypes;
+    en12.vulkanMemoryModel = have12.vulkanMemoryModel;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR enCoop{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    if (c.cooperativeMatrix && haveCoop.cooperativeMatrix &&
+        have12.vulkanMemoryModel) {
+        enCoop.cooperativeMatrix = VK_TRUE;
+        en12.pNext = &enCoop;
+        auto getCooperativeMatrixProperties =
+            (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(
+                c.inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        if (getCooperativeMatrixProperties) {
+            uint32_t propertyCount = 0;
+            VK_CHECK(getCooperativeMatrixProperties(
+                c.phys, &propertyCount, nullptr));
+            std::vector<VkCooperativeMatrixPropertiesKHR> properties(
+                propertyCount,
+                VkCooperativeMatrixPropertiesKHR{
+                    VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            VK_CHECK(getCooperativeMatrixProperties(
+                c.phys, &propertyCount, properties.data()));
+            for (const auto& property : properties) {
+                if (property.AType != VK_COMPONENT_TYPE_FLOAT16_KHR ||
+                    property.BType != VK_COMPONENT_TYPE_FLOAT16_KHR ||
+                    property.scope != VK_SCOPE_SUBGROUP_KHR)
+                    continue;
+                bool shape16 = property.MSize == 16 && property.NSize == 16 &&
+                               property.KSize == 16;
+                if (shape16 &&
+                    property.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                    property.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR)
+                    c.cooperativeMatrixF16Acc = true;
+                if (shape16 && property.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                    property.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+                    c.cooperativeMatrixF32Acc = true;
+                    c.cooperativeMatrixM = property.MSize;
+                    c.cooperativeMatrixN = property.NSize;
+                    c.cooperativeMatrixK = property.KSize;
+                }
+            }
+        }
+    } else {
+        c.cooperativeMatrix = false;
+    }
+    if (c.cooperativeMatrix) {
+        printf("cooperative matrix: KHR f16acc=%s f32acc=%s shape=%ux%ux%u subgroup=%u\n",
+               c.cooperativeMatrixF16Acc ? "yes" : "no",
+               c.cooperativeMatrixF32Acc ? "yes" : "no",
+               c.cooperativeMatrixM, c.cooperativeMatrixN,
+               c.cooperativeMatrixK, c.cooperativeMatrixSubgroupSize);
+    }
     VkPhysicalDeviceVulkan11Features en11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     en11.storageBuffer16BitAccess = VK_TRUE;
     en11.uniformAndStorageBuffer16BitAccess = have11.uniformAndStorageBuffer16BitAccess;
@@ -262,6 +346,13 @@ static void initVk(VkCtx& c, const char* argv0) {
     dci.pNext = &en11;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    const char* enabledExtensions[] = {
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+    };
+    if (c.cooperativeMatrix) {
+        dci.enabledExtensionCount = 1;
+        dci.ppEnabledExtensionNames = enabledExtensions;
+    }
     VK_CHECK(vkCreateDevice(c.phys, &dci, nullptr, &c.dev));
     vkGetDeviceQueue(c.dev, c.qfi, 0, &c.queue);
 
@@ -3029,7 +3120,7 @@ struct qk_engine {
     Pipe pAttnS, pAttnSG2, pAttnSG4, pAttnSG8, pAttnR;
     // split-K decode attention (QK_NO_SPLITK=1 -> legacy pAttn); SG variants
     // reuse one KV read across 2/4/8 query heads.
-    Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
+    Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBCoop;
     // IQ4_XS twins of the dense-projection / routed-gateup pipes (80B weights).
     // Identical bindings and push constants — only the in-shader dequant differs,
     // so descriptor sets stay layout-compatible with the Q8_0 pipes.
@@ -3080,6 +3171,10 @@ struct qk_engine {
     uint32_t moeGroupPrefillDownRows = 2; // QK_MOE_GROUP_PREFILL_DOWN_ROWS={1,2}
     bool dnStepReg = false; // QK_DN_STEP_REG caches each state row across both passes
     bool dnStepGate = false; // QK_DN_STEP_GATE_FUSED removes the o[] round trip
+    bool prefillCoopmat = false; // QK_PREFILL_COOPMAT: complete Q8 dense prefill tiles
+    // ids4 layer-bisection: starting at layer 9 changes the established decode
+    // trajectory, while layer 10 preserves all 64 rollback tokens.
+    uint32_t prefillCoopmatFirstLayer = 10;
     Buf bbPos;                 // 1-entry position buffer: the batch n==1 split-K
     uint32_t* bbPosMap = nullptr;  // case binds it where the srv shaders read slotPos
     VkDescriptorSet sHead, sAm1, sAm2, sEmb;
@@ -3261,7 +3356,7 @@ qk_engine::~qk_engine() {
                      &pMoeDnsB, &pMoeDnsB32, &pMoeDnGroup4, &pMoeDnGroup6,
                      &pMoeDnGroup4Row2, &pMoeDnGroup6Row2,
                      &pMoeGU4, &pAdd3, &pAdd3Group, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB,
-                     &pAbB, &pConvB, &pStepB, &pGateB, &pGemmB, &pGemmB4})
+                     &pAbB, &pConvB, &pStepB, &pGateB, &pGemmB, &pGemmBCoop, &pGemmB4})
         destroyPipe(c, *pp);
     if (c.pool) vkDestroyCommandPool(c.dev, c.pool, nullptr);
     if (c.pl) vkDestroyPipelineLayout(c.dev, c.pl, nullptr);
@@ -3542,6 +3637,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pStepB = makePipe(c, "dn_step_batch.spv", 4, 20);   // +delta-rule S seed/persist (decode handoff)
     pGateB = makePipe(c, "dn_gate_batch.spv", 4, 16);
     pGemmB = makePipe(c, "gemm_q8_0.spv", 3, 12);  // batched projections (weight reads amortized)
+    if (c.cooperativeMatrixF32Acc &&
+        c.cooperativeMatrixM == 16 && c.cooperativeMatrixN == 16 &&
+        c.cooperativeMatrixK == 16 && c.cooperativeMatrixSubgroupSize == 64)
+        pGemmBCoop = makePipe(c, "gemm_q8_0_coopmat.spv", 3, 12);
     pGemmB4 = makePipe(c, "gemm_iq4_xs.spv", 3, 12);
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 vec4s; dState must be <= 128");
 
@@ -4071,6 +4170,13 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
     dnStepReg = getenv("QK_DN_STEP_REG") != nullptr;
     dnStepGate = getenv("QK_DN_STEP_GATE_FUSED") != nullptr;
+    prefillCoopmat = getenv("QK_PREFILL_COOPMAT") != nullptr &&
+                       pGemmBCoop.p != VK_NULL_HANDLE;
+    if (getenv("QK_PREFILL_COOPMAT") && !prefillCoopmat)
+        fprintf(stderr,
+                "QK_PREFILL_COOPMAT requested, but 16x16x16 f16/F32 wave64 KHR coopmat is unavailable\n");
+    if (const char* v = getenv("QK_PREFILL_COOPMAT_FIRST_LAYER"))
+        prefillCoopmatFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
     const uint32_t amWgs = (vocab + 4095) / 4096;
     struct { uint32_t n, span; } pcAm{vocab, 4096};
     struct { uint32_t m; } pcAm2{amWgs};
@@ -4590,9 +4696,16 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     // Reuses the gemv projection sets ({W,X,Y} storage buffers) — layout-compatible.
     // Reads each weight ONCE for all n tokens (vs gemv's n re-reads). K%32==0 (holds
     // for nEmbd=2048, dIn=4096). grid (ceil(M/128),1,ceil(n/64)) per gemm_q8_0.comp.
+    uint32_t currentPrefillLayer = 0;
     auto gemmProj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K, bool iq4) {
         struct { uint32_t M, K, N; } pcg{M, K, n};
-        Pipe& pg = iq4 ? pGemmB4 : pGemmB;
+        // Cooperative stores are deliberately limited to complete production
+        // tiles. N=128 remains on the established scalar-order path, preserving
+        // the serial/batched handoff boundary while pp512+ exercises matrix cores.
+        bool coop = prefillCoopmat && currentPrefillLayer >= prefillCoopmatFirstLayer &&
+                    !iq4 && n >= 192 &&
+                    (M % 128u) == 0u && (K % 32u) == 0u && (n % 64u) == 0u;
+        Pipe& pg = iq4 ? pGemmB4 : (coop ? pGemmBCoop : pGemmB);
         vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.p);
         vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.pl, 0, 1, &ds, 0, nullptr);
         vkCmdPushConstants(c.cb, pg.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pcg);
@@ -4697,6 +4810,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     for (uint32_t il = lFirst; il < lEnd; il++) {
         Layer& L = layers[il];
         BLayer& BL = blayers[il];
+        currentPrefillLayer = il;
         zdim = n;
         if (L.rec) {
             tap(il, "xn", bbXn.buf, (size_t)n * nEmbd * 4);
@@ -5215,6 +5329,17 @@ int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint
 static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t iters) {
     printf("\n== batched GEMM  Y[%u,%u] = X[%u,%u] . W[%u,%u]^T  (Q8_0) ==\n", N, M, N, K, M, K);
     if (K % 32) { fprintf(stderr, "K must be a multiple of 32\n"); return false; }
+    bool coop = getenv("QK_BGEMM_COOPMAT") != nullptr;
+    if (coop && (!c.cooperativeMatrixF32Acc || c.cooperativeMatrixM != 16 ||
+                 c.cooperativeMatrixN != 16 || c.cooperativeMatrixK != 16 ||
+                 c.cooperativeMatrixSubgroupSize != 64)) {
+        fprintf(stderr, "QK_BGEMM_COOPMAT requires 16x16x16 f16/F32 wave64 KHR coopmat\n");
+        return false;
+    }
+    if (coop && ((M % 128u) != 0u || (N % 64u) != 0u)) {
+        fprintf(stderr, "QK_BGEMM_COOPMAT requires M%%128 == 0 and N%%64 == 0\n");
+        return false;
+    }
     size_t nb = (size_t)M * (K / 32);
     std::vector<block_q8_0> W(nb);
     std::mt19937 rng(7);
@@ -5236,7 +5361,9 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t ite
         }
     }
 
-    Pipe p = makePipe(c, "gemm_q8_0.spv", 3, 12);
+    Pipe p = makePipe(c, coop ? "gemm_q8_0_coopmat.spv" : "gemm_q8_0.spv", 3, 12);
+    printf("  variant: %s\n", coop ? "KHR_coopmat f16 inputs / F32 accumulate"
+                                  : "scalar F32 tile");
     const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     Buf bW = createBuf(c, nb * sizeof(block_q8_0), stor, true);
     Buf bX = createBuf(c, (size_t)N * K * 4, stor, true);
@@ -5321,11 +5448,19 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t ite
         sumsq += (double)Yref[i] * Yref[i];
     }
     double rms = std::sqrt(sumsq / ((size_t)N * M));
-    bool ok = maxErr < 1e-3 * rms;  // fp32 kernel vs double reference, scale-relative
+    // Cooperative inputs are intentionally F16 (accumulation remains F32), so
+    // validate against a correspondingly bounded input-rounding tolerance.
+    double relTolerance = coop ? 2e-3 : 1e-3;
+    bool ok = maxErr < relTolerance * rms;
+    if (!ok) {
+        printf("  debug y[0..2]={%.7g,%.7g,%.7g} ref0=%.7g y[64]=%.7g ref=%.7g y[mid]=%.7g ref=%.7g\n",
+               Y[0], Y[1], Y[2], Yref[0], Y[64], Yref[64],
+               Y[((size_t)N * M) / 2], Yref[((size_t)N * M) / 2]);
+    }
     double tflops = 2.0 * M * N * K / (ms * 1e9);
     double peak = 52.0;                                             // RX 7900 XT ~52 TFLOP/s FP32
     double serialMs = (double)N * ((double)M * K / 32.0 * 34.0) / 938e6;  // N GEMVs at ~938 GB/s
-    printf("  N=%-5u %7.3f ms | %5.1f TFLOP/s (%2.0f%% peak) | vs serial %6.1f ms = %.2fx | err/rms %.1g -> %s\n",
+    printf("  N=%-5u %7.3f ms | %5.1f TFLOP/s (%2.0f%% peak) | vs serial %6.1f ms = %.2fx | err/rms %.6g -> %s\n",
            N, ms, tflops, tflops / peak * 100, serialMs, serialMs / ms, maxErr / rms, ok ? "PASS" : "FAIL");
     vkUnmapMemory(c.dev, stage.mem);
     vkDestroyDescriptorPool(c.dev, pool, nullptr);
