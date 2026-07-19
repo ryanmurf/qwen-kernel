@@ -1,0 +1,74 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// Batched router logits: logits[rq][e] = gate_inp[e] . x[rq], F32 weights.
+//
+// moe_logits.comp gives every (expert, token) pair its own 256-thread
+// workgroup: at N=512 that is 131072 workgroups re-reading the 2 MB f32
+// router matrix once per token. This is the same computation as one
+// [256 x 2048] x [2048 x N] GEMM; here each 256-thread workgroup owns a
+// 64-expert x 32-token tile (8 accumulators per thread) with both operands
+// staged through LDS, reading the router matrix once per 32-token group.
+//
+// Not bit-identical to moe_logits.comp (serial ascending-k dot instead of
+// the strided subgroup reduction), and router logits feed top-8 selection,
+// so it follows the wide-chunk / bisected-layer gating policy.
+// Bindings and push constants match moe_logits.comp. Host requires
+// n_expert % 64 == 0, n_embd % 32 == 0, N % 32 == 0.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufW { float gi[]; };  // [n_expert][n_embd]
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufL { float logits[]; };
+
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+const uint BM = 64u;   // experts per tile
+const uint BN = 32u;   // tokens per tile
+const uint BK = 32u;
+
+shared float Wt[BM * (BK + 1u)];
+shared float Xt[BN * (BK + 1u)];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint rowBase = gl_WorkGroupID.x * BM;
+    uint tokBase = gl_WorkGroupID.z * BN;
+
+    // Each thread: 2 adjacent expert rows x 4 adjacent tokens.
+    uint r0 = (tid % 32u) * 2u;
+    uint c0 = (tid / 32u) * 4u;
+
+    float acc[8];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) acc[i] = 0.0;
+
+    for (uint k0 = 0u; k0 < pc.n_embd; k0 += BK) {
+        [[unroll]] for (uint i = 0u; i < BM * BK / 256u; ++i) {
+            uint lin = i * 256u + tid;
+            uint r = lin / BK, k = lin % BK;
+            Wt[r * (BK + 1u) + k] = gi[(rowBase + r) * pc.n_embd + k0 + k];
+        }
+        [[unroll]] for (uint i = 0u; i < BN * BK / 256u; ++i) {
+            uint lin = i * 256u + tid;
+            uint c = lin / BK, k = lin % BK;
+            Xt[c * (BK + 1u) + k] = x[(tokBase + c) * pc.n_embd + k0 + k];
+        }
+        barrier();
+        for (uint k = 0u; k < BK; ++k) {
+            float w0 = Wt[r0 * (BK + 1u) + k];
+            float w1 = Wt[(r0 + 1u) * (BK + 1u) + k];
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                float xv = Xt[(c0 + j) * (BK + 1u) + k];
+                acc[j] += w0 * xv;
+                acc[4u + j] += w1 * xv;
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        logits[(tokBase + c0 + j) * pc.n_expert + rowBase + r0] = acc[j];
+        logits[(tokBase + c0 + j) * pc.n_expert + rowBase + r0 + 1u] = acc[4u + j];
+    }
+}

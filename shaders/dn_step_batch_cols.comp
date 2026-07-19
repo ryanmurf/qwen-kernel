@@ -1,0 +1,101 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+// Column-sharded batched gated delta rule (dState fixed at 128).
+//
+// dn_step_batch.comp assigns one 128-thread workgroup per v-head and keeps a
+// whole 128-float state row in each thread's registers: 32 workgroups total on
+// a 96-CU part, ~128 VGPRs of state per lane, and a serial per-token
+// dependency chain with nothing to hide its latency. This kernel keeps the
+// same recurrence but shards each state row across LANES lanes, so a wave-64
+// workgroup covers 64/LANES output elements and the grid becomes
+// hV x dS/(64/LANES) workgroups with dS/LANES state floats per lane. Parallel
+// decomposition follows the approach of llama.cpp's ggml-vulkan
+// gated_delta_net.comp (column sharding + clustered subgroup reductions,
+// lanes_per_column=8 for dState=128), reimplemented natively for qk's buffer
+// layout and gating semantics.
+//
+// NOT bit-identical to dn_step_batch: the two dot products per token are
+// reduced as LANES lane-partials + a clustered tree instead of one serial
+// 32x vec4 chain. Selection is therefore layer-gated exactly like the
+// cooperative-matrix kernels (wide chunks only; first layer by bisection).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer BufC  { float conv[]; };
+layout(std430, binding = 1) readonly  buffer BufGB { float gb[]; };    // [Tn][g[hV], beta[hV]]
+layout(std430, binding = 2) writeonly buffer BufO  { float o[]; };     // [Tn][hV][dS]
+layout(std430, binding = 3)          buffer BufS  { float s[]; };      // slot state [hV][dS][dS]
+
+layout(push_constant) uniform PC { uint dState; uint hK; uint hV; uint Tn; uint kDiv; } pc;
+
+layout(constant_id = 0) const uint LANES = 8;  // lanes sharding one state row
+const uint DS   = 128u;                        // dState (host gates dS==128)
+const uint COLS = 64u / LANES;                 // output elements per workgroup
+const uint ROWS = DS / LANES;                  // state floats per lane
+
+// subgroupClusteredAdd needs a literal cluster size; branch on the spec
+// constant (dead branches fold away). Same workaround as llama.cpp.
+float clusterAdd(float x) {
+    switch (LANES) {
+        case 4u:  return subgroupClusteredAdd(x, 4u);
+        case 8u:  return subgroupClusteredAdd(x, 8u);
+        case 16u: return subgroupClusteredAdd(x, 16u);
+        case 32u: return subgroupClusteredAdd(x, 32u);
+        default:  return subgroupClusteredAdd(x, 8u);
+    }
+}
+
+void main() {
+    uint h    = gl_WorkGroupID.x;
+    uint col  = gl_WorkGroupID.z * COLS + gl_LocalInvocationID.x / LANES;
+    uint lane = gl_LocalInvocationID.x % LANES;
+
+    uint kh = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
+    float qScale = inversesqrt(float(DS));
+
+    // Row `col` of head h's [dS][dS] state, sharded lane-contiguously.
+    uint sBase = (h * DS + col) * DS;
+    float srow[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+        srow[r] = s[sBase + r * LANES + lane];
+
+    for (uint t = 0u; t < pc.Tn; ++t) {
+        uint co    = t * (2u * pc.hK + pc.hV) * DS;
+        uint qBase = co + kh * DS;
+        uint kBase = co + pc.hK * DS + kh * DS;
+        uint vBase = co + 2u * pc.hK * DS + h * DS;
+
+        float kreg[ROWS], qreg[ROWS];
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
+            uint i = r * LANES + lane;
+            kreg[r] = conv[kBase + i];
+            qreg[r] = conv[qBase + i] * qScale;
+        }
+
+        float decay = exp(gb[t * 2u * pc.hV + h]);
+        float beta  = gb[t * 2u * pc.hV + pc.hV + h];
+        float vj    = conv[vBase + col];
+
+        float skp = 0.0;
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r) skp += srow[r] * kreg[r];
+        float sk = clusterAdd(skp) * decay;
+
+        float dj = beta * (vj - sk);
+
+        float op = 0.0;
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
+            float sn = srow[r] * decay + kreg[r] * dj;
+            srow[r] = sn;
+            op += sn * qreg[r];
+        }
+        float oj = clusterAdd(op);
+        if (lane == 0u) o[t * pc.hV * DS + h * DS + col] = oj;
+    }
+
+    // Persist the final state so serial decode continues from position Tn.
+    [[unroll]] for (uint r = 0u; r < ROWS; ++r)
+        s[sBase + r * LANES + lane] = srow[r];
+}

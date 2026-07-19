@@ -3110,7 +3110,7 @@ struct qk_engine {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pStepReg, pStepGate, pGate, pGemvO,
         pAddN, pAddNRoute,
-        pPrep, pAttn, pMoeL, pMoeRS, pMoeRSHier, pMoeS, pMoeS256, pMoeGroupPairs,
+        pPrep, pAttn, pMoeL, pMoeLGemm, pMoeRS, pMoeRSHier, pMoeS, pMoeS256, pMoeGroupPairs,
         pMoeGU, pMoeGURow3, pMoeGUGroup3, pMoeGUGroup3Row2,
         pMoeGUs, pMoeGUs64, pMoeDn4, pMoeDn4_128, pMoeDn6, pMoeDnsB,
         pMoeDnsB32, pMoeDnGroup4, pMoeDnGroup6,
@@ -3122,7 +3122,7 @@ struct qk_engine {
     Pipe pAttnS, pAttnSG2, pAttnSG4, pAttnSG8, pAttnR;
     // split-K decode attention (QK_NO_SPLITK=1 -> legacy pAttn); SG variants
     // reuse one KV read across 2/4/8 query heads.
-    Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB, pGemmBCoop, pGemmBCoop2;
+    Pipe pPrepB, pAttnB, pAttnBCoop, pAttnBCoop2, pAbB, pConvB, pStepB, pStepBCols, pGateB, pGemmB, pGemmBCoop, pGemmBCoop2, pGemmBCoop2B64, pGemmBCoopSplit;
     bool gemmCoopV1 = false; // QK_PREFILL_COOPMAT_V1: original coopmat schedule
     // IQ4_XS twins of the dense-projection / routed-gateup pipes (80B weights).
     // Identical bindings and push constants — only the in-shader dequant differs,
@@ -3174,6 +3174,28 @@ struct qk_engine {
     uint32_t moeGroupPrefillDownRows = 2; // QK_MOE_GROUP_PREFILL_DOWN_ROWS={1,2}
     bool dnStepReg = false; // QK_DN_STEP_REG caches each state row across both passes
     bool dnStepGate = false; // QK_DN_STEP_GATE_FUSED removes the o[] round trip
+    bool dnStepCols = false; // QK_DN_STEP_COLS: column-sharded batch delta rule (wide chunks)
+    // Pure-f32 reassociation (no f16 staging), so the perturbation is ~1e-7
+    // relative and ids4 is exact from layer 0 at both admission geometries
+    // (2026-07-19 bisection) — unlike the f16 coopmat paths.
+    uint32_t dnStepColsFirstLayer = 0; // QK_DN_STEP_COLS_FIRST_LAYER (ids4 bisection)
+    uint32_t dnStepColsLanes = 8;      // QK_DN_COLS_LANES: lanes sharding one state row
+    bool attnPrefillCoopmat = false;   // QK_ATTN_PREFILL_COOPMAT: coopmat batched attention
+    // ids4 bisection (2026-07-19), Br=32 kernel: first layer 0/8 diverge the
+    // rollback trajectory at generated index 32 (onto llama's ref token,
+    // interestingly — still a gate violation); 4 is exact at both admission
+    // geometries. The Br=16 kernel was exact from 0, but loses 38 ms at
+    // pp2048 to K/V read amplification.
+    uint32_t attnPrefillCoopmatFirstLayer = 4; // QK_ATTN_PREFILL_COOPMAT_FIRST_LAYER
+    bool attnCoopBr32 = true;          // QK_ATTN_PREFILL_COOPMAT_BR16=1 rolls back to 16-query blocks
+    bool gemmCoopB64 = false;          // QK_PREFILL_COOPMAT_BM64: opt-in 64-row dense tiles
+    bool moeLogitsGemm = false;        // QK_MOE_LOGITS_GEMM: tiled batched router logits
+    // ids4 bisection (2026-07-19): 0/4/6 diverge, 8 exact at both geometries.
+    uint32_t moeLogitsGemmFirstLayer = 8; // QK_MOE_LOGITS_GEMM_FIRST_LAYER
+    bool prefillCoopmatSplit = false;  // QK_PREFILL_COOPMAT_SPLIT: hi/lo dense below boundary
+    // ids4 bisection (2026-07-19): first layer 0/2/6 diverge, 4 is exact at
+    // both admission geometries — these boundaries are empirical knife-edges.
+    uint32_t prefillCoopmatSplitFirstLayer = 4; // QK_PREFILL_COOPMAT_SPLIT_FIRST_LAYER
     bool prefillCoopmat = false; // QK_PREFILL_COOPMAT: complete Q8 dense prefill tiles
     // ids4 layer-bisection: starting at layer 9 changes the established decode
     // trajectory, while layer 10 preserves all 64 rollback tokens.
@@ -3368,7 +3390,7 @@ qk_engine::~qk_engine() {
                      &pGate, &pGemvO,
                      &pGemvO4, &pAddN, &pAddNRoute, &pPrep,
                      &pAttn, &pAttnS, &pAttnSG2, &pAttnSG4, &pAttnSG8, &pAttnR,
-                     &pMoeL, &pMoeRS, &pMoeRSHier, &pMoeS, &pMoeS256, &pMoeGroupPairs,
+                     &pMoeL, &pMoeLGemm, &pMoeRS, &pMoeRSHier, &pMoeS, &pMoeS256, &pMoeGroupPairs,
                      &pMoeGU, &pMoeGURow3, &pMoeGUGroup3, &pMoeGUGroup3Row2,
                      &pMoeGUs, &pMoeGUs64, &pMoeDn4, &pMoeDn4_128, &pMoeDn6,
                      &pMoeDnsB, &pMoeDnsB32, &pMoeDnGroup4, &pMoeDnGroup6,
@@ -3376,7 +3398,9 @@ qk_engine::~qk_engine() {
                      &pMoeGUGroupCoop, &pMoeDnGroupCoop4, &pMoeDnGroupCoop6,
                      &pMoeGUsCoop, &pMoeDnsCoop,
                      &pMoeGU4, &pAdd3, &pAdd3Group, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB,
-                     &pAbB, &pConvB, &pStepB, &pGateB, &pGemmB, &pGemmBCoop, &pGemmBCoop2,
+                     &pAttnBCoop, &pAttnBCoop2,
+                     &pAbB, &pConvB, &pStepB, &pStepBCols, &pGateB, &pGemmB, &pGemmBCoop, &pGemmBCoop2,
+                     &pGemmBCoop2B64, &pGemmBCoopSplit,
                      &pGemmB4})
         destroyPipe(c, *pp);
     if (c.pool) vkDestroyCommandPool(c.dev, c.pool, nullptr);
@@ -3623,6 +3647,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAttnSG8 = makePipe(c, "fa_attn_srv_split_gqa.spv", 5, 40, 8);
     pAttnR = makePipe(c, "fa_attn_srv_reduce.spv", 4, 40);
     pMoeL = makePipe(c, "moe_logits.spv", 3, 16);
+    pMoeLGemm = makePipe(c, "moe_logits_gemm.spv", 3, 16);
     pMoeRS = makePipe(c, "moe_route_select.spv", 5, 16);
     pMoeRSHier = makePipe(c, "moe_route_select_hier.spv", 5, 16,
                           nUsed <= 8 ? 2 : 4);
@@ -3656,6 +3681,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAbB = makePipe(c, "dn_ab_batch.spv", 6, 12);
     pConvB = makePipe(c, "dn_conv_batch.spv", 5, 20);   // +conv-window state out (decode handoff)
     pStepB = makePipe(c, "dn_step_batch.spv", 4, 20);   // +delta-rule S seed/persist (decode handoff)
+    {   // column-sharded wide-chunk twin; QK_DN_COLS_LANES in {4,8,16,32}
+        const char* v = getenv("QK_DN_COLS_LANES");
+        long l = v ? atol(v) : 8;
+        dnStepColsLanes = (l == 4 || l == 8 || l == 16 || l == 32) ? (uint32_t)l : 8u;
+        pStepBCols = makePipe(c, "dn_step_batch_cols.spv", 4, 20, dnStepColsLanes);
+    }
     pGateB = makePipe(c, "dn_gate_batch.spv", 4, 16);
     pGemmB = makePipe(c, "gemm_q8_0.spv", 3, 12);  // batched projections (weight reads amortized)
     if (c.cooperativeMatrixF32Acc &&
@@ -3668,6 +3699,10 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         pMoeDnGroupCoop6 = makePipe(c, "moe_down_q6k_grouped_coopmat.spv", 6, 16);
         pMoeGUsCoop = makePipe(c, "moe_gateup_q8_coopmat.spv", 4, 16);
         pMoeDnsCoop = makePipe(c, "moe_down_q8_coopmat.spv", 4, 16);
+        pAttnBCoop = makePipe(c, "fa_attn_batch_coopmat.spv", 5, 40);
+        pAttnBCoop2 = makePipe(c, "fa_attn_batch_coopmat2.spv", 5, 40);
+        pGemmBCoopSplit = makePipe(c, "gemm_q8_0_coopmat_split.spv", 3, 12);
+        pGemmBCoop2B64 = makePipe(c, "gemm_q8_0_coopmat2_bm64.spv", 3, 12);
     }
     pGemmB4 = makePipe(c, "gemm_iq4_xs.spv", 3, 12);
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 vec4s; dState must be <= 128");
@@ -4198,6 +4233,26 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
     dnStepReg = getenv("QK_DN_STEP_REG") != nullptr;
     dnStepGate = getenv("QK_DN_STEP_GATE_FUSED") != nullptr;
+    dnStepCols = getenv("QK_DN_STEP_COLS") != nullptr;
+    if (const char* v = getenv("QK_DN_STEP_COLS_FIRST_LAYER"))
+        dnStepColsFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    attnPrefillCoopmat = getenv("QK_ATTN_PREFILL_COOPMAT") != nullptr &&
+                         pAttnBCoop.p != VK_NULL_HANDLE;
+    attnCoopBr32 = getenv("QK_ATTN_PREFILL_COOPMAT_BR16") == nullptr &&
+                   pAttnBCoop2.p != VK_NULL_HANDLE;
+    if (getenv("QK_ATTN_PREFILL_COOPMAT") && !attnPrefillCoopmat)
+        fprintf(stderr,
+                "QK_ATTN_PREFILL_COOPMAT requested, but 16x16x16 f16/F32 wave64 KHR coopmat is unavailable\n");
+    if (const char* v = getenv("QK_ATTN_PREFILL_COOPMAT_FIRST_LAYER"))
+        attnPrefillCoopmatFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    gemmCoopB64 = getenv("QK_PREFILL_COOPMAT_BM64") != nullptr;
+    moeLogitsGemm = getenv("QK_MOE_LOGITS_GEMM") != nullptr;
+    if (const char* v = getenv("QK_MOE_LOGITS_GEMM_FIRST_LAYER"))
+        moeLogitsGemmFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    prefillCoopmatSplit = getenv("QK_PREFILL_COOPMAT_SPLIT") != nullptr &&
+                          pGemmBCoopSplit.p != VK_NULL_HANDLE;
+    if (const char* v = getenv("QK_PREFILL_COOPMAT_SPLIT_FIRST_LAYER"))
+        prefillCoopmatSplitFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
     prefillCoopmat = getenv("QK_PREFILL_COOPMAT") != nullptr &&
                        pGemmBCoop.p != VK_NULL_HANDLE;
     if (getenv("QK_PREFILL_COOPMAT") && !prefillCoopmat)
@@ -4756,12 +4811,27 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         bool coop = prefillCoopmat && currentPrefillLayer >= prefillCoopmatFirstLayer &&
                     !iq4 && n >= 192 &&
                     (M % 128u) == 0u && (K % 32u) == 0u && (n % 64u) == 0u;
+        // Below the single-f16 boundary: the split-precision twin (f16 hi/lo
+        // planes, three cooperative products) — the recipe proven ids4-exact
+        // for the shared down projection.
+        bool coopSplit = !coop && prefillCoopmatSplit &&
+                         currentPrefillLayer >= prefillCoopmatSplitFirstLayer &&
+                         !iq4 && n >= 192 &&
+                         (M % 64u) == 0u && (K % 32u) == 0u && (n % 64u) == 0u;
+        // Short-M 64-row twin (bit-identical to coopmat2). Measured a WASH at
+        // pp512 on the XTX (ABAB 192.5/192.5/193.2/192.8 ms) — the grid-tail
+        // hypothesis for dn.out was wrong — so it is opt-in only.
+        bool coopB64 = coop && !gemmCoopV1 && M <= 2048u &&
+                       pGemmBCoop2B64.p != VK_NULL_HANDLE && gemmCoopB64;
         Pipe& pg = iq4 ? pGemmB4
-                       : (coop ? (gemmCoopV1 ? pGemmBCoop : pGemmBCoop2) : pGemmB);
+                       : (coop ? (gemmCoopV1 ? pGemmBCoop
+                                             : (coopB64 ? pGemmBCoop2B64 : pGemmBCoop2))
+                               : (coopSplit ? pGemmBCoopSplit : pGemmB));
         vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.p);
         vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.pl, 0, 1, &ds, 0, nullptr);
         vkCmdPushConstants(c.cb, pg.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pcg);
-        vkCmdDispatch(c.cb, (M + 127) / 128, 1, (n + 63) / 64);
+        vkCmdDispatch(c.cb, (coopSplit || coopB64) ? (M + 63) / 64 : (M + 127) / 128,
+                      1, (n + 63) / 64);
     };
     // Optimal projection per chunk width: the 128x64-tiled GEMM amortizes weight
     // reads and wins for wide chunks, but wastes work when n fills <1 N-tile; the
@@ -4883,8 +4953,14 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 barrier();
                 stamp("dn.step+gate");
             } else {
-                zdim = 1;
-                disp(pStepB, BL.sStep, hV, &pcStepB, 20);
+                // Column-sharded twin: same recurrence, 1024 workgroups instead
+                // of hV=32, 8 state floats per lane. Reduction association
+                // differs from the serial rollback, so it follows the coopmat
+                // gating policy (wide complete chunks, bisected first layer).
+                bool stepCols = dnStepCols && n >= 192 &&
+                                il >= dnStepColsFirstLayer && dS == 128;
+                zdim = stepCols ? dS * dnStepColsLanes / 64u : 1;
+                disp(stepCols ? pStepBCols : pStepB, BL.sStep, hV, &pcStepB, 20);
                 zdim = n;
                 barrier();
                 stamp("dn.step");
@@ -4942,14 +5018,24 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 zdim = n;
             } else {
                 constexpr uint32_t kQB = 16;  // must match QB in fa_attn_batch.comp
+                // Coopmat twin: same host contract (dh==256 only); follows the
+                // wide-chunk / bisected-layer gating policy of the other
+                // cooperative paths.
+                bool attnCoop = attnPrefillCoopmat && n >= 192 && dh == 256 &&
+                                il >= attnPrefillCoopmatFirstLayer && !tapsDir;
+                // 32-query twin halves K/V read amplification; query tiles
+                // stay 32-aligned so its blocks match the host offsets.
+                bool attnBr32 = attnCoop && attnCoopBr32;
+                uint32_t qb = attnBr32 ? 32u : kQB;
                 uint32_t qt = (uint32_t)std::max<uint64_t>(1, attnBudget / (uint64_t)(base + n));
                 qt = std::min(qt, n);
-                qt = std::max(kQB, qt - qt % kQB);
+                qt = std::max(qb, qt - qt % qb);
                 for (uint32_t qo = 0; qo < n; qo += qt) {
                     uint32_t tile = std::min(qt, n - qo);
                     pcFaB.qbase = qo;
-                    zdim = (tile + kQB - 1) / kQB;
-                    disp(pAttnB, BL.sAttn, hQ, &pcFaB, 40);
+                    zdim = (tile + qb - 1) / qb;
+                    disp(attnBr32 ? pAttnBCoop2 : (attnCoop ? pAttnBCoop : pAttnB),
+                         BL.sAttn, hQ, &pcFaB, 40);
                     if (qo + tile < n) { barrier(); flushCB(); }
                 }
                 pcFaB.qbase = 0;
@@ -4965,8 +5051,21 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
              fuseRoute ? BL.sAddNRoute : BL.sAddN, 1, &pcRms, 8);
         barrier();
         stamp("addN");
-        disp(fuseRoute ? (moeSelectHier ? pMoeRSHier : pMoeRS) : pMoeL,
-             fuseRoute ? BL.sMoeRS : BL.sMoeL, nExp, &pcv, 16);
+        // Batched router logits: one 64-expert x 32-token tile per workgroup
+        // instead of one workgroup per (expert, token). Router logits feed
+        // top-8 selection, so gated like the other perturbing prefill paths.
+        bool logitsGemm = moeLogitsGemm && !fuseRoute && n >= 192 &&
+                          (n % 32u) == 0u && (nExp % 64u) == 0u &&
+                          (nEmbd % 32u) == 0u &&
+                          currentPrefillLayer >= moeLogitsGemmFirstLayer;
+        if (logitsGemm) {
+            zdim = n / 32u;
+            disp(pMoeLGemm, BL.sMoeL, nExp / 64u, &pcv, 16);
+            zdim = n;
+        } else {
+            disp(fuseRoute ? (moeSelectHier ? pMoeRSHier : pMoeRS) : pMoeL,
+                 fuseRoute ? BL.sMoeRS : BL.sMoeL, nExp, &pcv, 16);
+        }
         // Shared-expert cooperative selection follows the same wide-chunk /
         // bisected-layer policy as the routed MoE cooperative kernels.
         bool sharedCoopOk = currentPrefillLayer >= moeSharedCoopmatFirstLayer &&
