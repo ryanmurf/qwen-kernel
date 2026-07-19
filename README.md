@@ -36,9 +36,18 @@ day), same model file, f16 KV both sides — see [`bench/`](bench/README.md#refr
 |---|---|---|
 | single-stream decode, **7900 XTX** | **190.7 tok/s** (5.24 ms/tok) | 132.3 tok/s (**1.44×**) |
 | single-stream decode, **7900 XT** | **147.1 tok/s** (6.80 ms/tok) | 109.7 tok/s (**1.34×**) |
+| **prefill** pp512, 7900 XTX | 1205.7 tok/s | **2892.5 tok/s (llama.cpp 2.40× faster)** |
+| **prefill** pp1024, 7900 XTX | 1292.3 tok/s | **2857.4 tok/s (llama.cpp 2.21× faster)** |
+| **prefill** pp2048, 7900 XTX | 1227.5 tok/s | **2822.2 tok/s (llama.cpp 2.30× faster)** |
 | aggregate decode, 16 streams | **384 tok/s** † | — |
-| batched prefill (128-tok chunk) | **~450 tok/s** † (4.2× own serial) | not re-measured |
 | warm start from prefix cache | 0.3 ms restore (vs 341 ms/64-tok prefill) | — |
+
+**qk wins decode and loses prefill.** That is the honest summary. The reason is
+structural: batch-1 decode is memory-bandwidth-bound, where specialization and
+pre-recorded command buffers win; prefill is compute-bound batched GEMM, where
+llama.cpp uses cooperative-matrix (`KHR_coopmat`) kernels and qk's Qwen path
+currently uses none. For a workload dominated by long prompts, llama.cpp is
+likely the better choice today.
 
 † Not re-measured on 2026-07-18 and not backed by raw data in `bench/`; treat
 as provisional. The end-to-end CLI table above uses a llama.cpp build from
@@ -177,6 +186,55 @@ Env knobs:
   precompute) — lives in this file's git history and the commit log.
 - Reference shaders: llama.cpp's Vulkan backend
   (`ggml/src/ggml-vulkan/vulkan-shaders/`).
+
+## Why is it faster (and where it isn't)
+
+Every compute kernel here is hand-written. From llama.cpp/ggml this project
+takes only the quantization lookup *tables* in `shaders/iq_tables.glsl`, the
+*work shape* of three Metal GEMVs, and the GGUF container format — see
+[`NOTICE`](NOTICE). No llama.cpp shader or binary is compiled, linked or
+executed.
+
+The decode advantage comes from three things, roughly in order of size:
+
+1. **Pre-recorded command buffers.** llama.cpp walks a generic graph and
+   dispatches per node; qk records a whole decode step once and submits it as a
+   single command buffer, reading token ids back only at the end. At batch 1
+   that removes hundreds of tiny dispatches per token. (llama.cpp has an
+   equivalent for CUDA via `GGML_CUDA_GRAPHS`, but its Vulkan backend has no
+   command-buffer-reuse path.)
+2. **Shape specialization.** Kernels are compiled for the exact `K`, `n_ff` and
+   expert count, so trip counts and tails are compile-time constants and there
+   is no runtime shape dispatch. A general runtime cannot do this.
+3. **Architecture-specific fusion.** The gated-DeltaNet recurrent state stays
+   resident on the GPU, route+select is fused, expert dispatches are grouped,
+   and norm/residual epilogues are folded into their producers.
+
+**Why prefill loses**: matrix cores only help when there is data reuse.
+Batch-1 decode is a matrix-*vector* product — each weight is read once and
+discarded, so it is bandwidth-bound and RDNA3's `KHR_coopmat` units cannot help
+(our Q4_0 GEMV already runs at ~87% of achievable bandwidth). Prefill is a
+matrix-*matrix* product where 512 tokens share every weight read; it is
+compute-bound and coopmat is exactly the right tool. llama.cpp uses it there and
+this engine's Qwen path does not. **We win where matrix cores don't matter and
+lose where they do.**
+
+Porting to other hardware: the ideas in (1)-(3) are architecture-independent,
+but every tile size, threads-per-row and split width here was chosen by sweep on
+96 CUs with 96 MB of Infinity Cache. Expect to re-tune all of them — in related
+work on this repo the best threads-per-row varied from 16 to 256 *across shapes
+on the same card*.
+
+## Known issues
+
+- `tests/ids4.txt` diverges from `ref4.txt` at token 32 (735 vs 13914). This is
+  pre-existing and reproduces on an untouched tree; it is not yet diagnosed.
+  `tests/ids2.txt` and `ids4.txt` also produce `produced=0` under `serve-bench`,
+  and `block`/`ablock` carry pre-existing Vulkan CPU-reference threshold
+  failures. Given that token-exact parity is this project's headline claim,
+  these are being treated as real and are under investigation.
+- The 80B path requires a repacked `-qk` GGUF produced by a tool that has not
+  been published, so it is not reproducible outside this machine.
 
 ## License
 
