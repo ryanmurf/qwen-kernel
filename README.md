@@ -148,3 +148,16 @@ Env knobs:
   precompute) — lives in this file's git history and the commit log.
 - Reference shaders: llama.cpp's Vulkan backend
   (`ggml/src/ggml-vulkan/vulkan-shaders/`).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
+
+This project derives from [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)
+(also MIT): the quantization lookup tables in `shaders/iq_tables.glsl`, the Metal
+kernel work shape for three GEMVs, and the GGUF quantization block layouts. See
+[`NOTICE`](NOTICE) for details. llama.cpp is also the reference implementation
+for all token-exact parity testing here.
+
+Model weights are not distributed with this software and carry their own
+licenses from their respective publishers.

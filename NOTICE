@@ -1,0 +1,33 @@
+qwen-kernel
+Copyright (c) 2026 Ryan Murphy
+Licensed under the MIT License (see LICENSE).
+
+This project contains work derived from llama.cpp / ggml, which is likewise
+distributed under the MIT License:
+
+    llama.cpp / ggml
+    Copyright (c) 2023-2026 The ggml authors
+    https://github.com/ggml-org/llama.cpp
+
+Specifically derived from llama.cpp:
+
+  - shaders/iq_tables.glsl
+      Quantization lookup tables generated from
+      ggml/src/ggml-common.h.
+
+  - shaders/metal/gemv_iq4_xs.metal
+    shaders/metal/gemv_q6_k.metal
+    shaders/metal/gemv_iq3_xxs.metal
+      Adopt the llama.cpp Metal kernel work shape (threads-per-row and
+      per-lane block assignment). The dequantization and accumulation
+      code is original to this project.
+
+  - The GGUF container format and its quantization block layouts
+      (Q4_0, Q8_0, Q6_K, IQ4_XS, IQ3_XXS) as defined by ggml.
+
+Correctness throughout this project is defined as token-for-token agreement
+with llama.cpp on identical input token IDs; llama.cpp is used as the
+reference implementation for all parity testing.
+
+Model weights are not distributed with this software. Qwen and Gemma model
+weights are subject to their own licenses from their respective publishers.
