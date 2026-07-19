@@ -18,33 +18,51 @@ shared uint cursors[512];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    for (uint e = tid; e < pc.n_expert; e += 256u) counts[e] = 0u;
+    uint nExpert = pc.n_expert & 0x7fffffffu;
+    bool emitTiles = (pc.n_expert & 0x80000000u) == 0u;
+    for (uint e = tid; e < nExpert; e += 256u) counts[e] = 0u;
     barrier();
 
     uint np = pc.n_tokens * pc.n_used;
     for (uint p = tid; p < np; p += 256u) {
         uint rq = p / pc.n_used;
         uint s = p - rq * pc.n_used;
-        uint e = min(sel[rq].ids[s], pc.n_expert - 1u);
+        uint e = min(sel[rq].ids[s], nExpert - 1u);
         atomicAdd(counts[e], 1u);
     }
     barrier();
 
     if (tid == 0u) {
         uint off = 0u;
-        for (uint e = 0u; e < pc.n_expert; ++e) {
+        uint ntiles = 0u;
+        // The cooperative consumers use a compact list of real 32-pair
+        // expert tiles.  Store it after the public [n_expert+1] offsets plus
+        // one tile-count word, so the scalar grouped consumers keep the same
+        // ABI.  One workgroup per tile prevents a hot expert from serializing
+        // all of its tiles inside a single workgroup.
+        uint tileBase = nExpert + 2u;
+        for (uint e = 0u; e < nExpert; ++e) {
             offsets[e] = off;
             cursors[e] = off;
-            off += counts[e];
+            uint next = off + counts[e];
+            if (emitTiles) {
+                for (uint tb = off; tb < next; tb += 32u) {
+                    offsets[tileBase + 2u * ntiles] = e;
+                    offsets[tileBase + 2u * ntiles + 1u] = tb;
+                    ++ntiles;
+                }
+            }
+            off = next;
         }
-        offsets[pc.n_expert] = off;
+        offsets[nExpert] = off;
+        offsets[nExpert + 1u] = ntiles;
     }
     barrier();
 
     for (uint p = tid; p < np; p += 256u) {
         uint rq = p / pc.n_used;
         uint s = p - rq * pc.n_used;
-        uint e = min(sel[rq].ids[s], pc.n_expert - 1u);
+        uint e = min(sel[rq].ids[s], nExpert - 1u);
         uint dst = atomicAdd(cursors[e], 1u);
         pairs[dst] = (rq << 4u) | s;
     }

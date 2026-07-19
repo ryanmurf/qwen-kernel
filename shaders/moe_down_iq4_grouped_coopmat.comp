@@ -44,10 +44,23 @@ shared float staging[BM * SN];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint eid = gl_WorkGroupID.y;
     uint rowBase = gl_WorkGroupID.x * BM;
-    if (rowBase >= pc.n_embd || eid >= pc.n_expert) return;
-    uint begin = offsets[eid], end = offsets[eid + 1u];
+    if (rowBase >= pc.n_embd) return;
+    uint eid, begin, end;
+    if (gl_NumWorkGroups.y > pc.n_expert) {
+        uint tile = gl_WorkGroupID.y;
+        uint ntiles = offsets[pc.n_expert + 1u];
+        if (tile >= ntiles) return;
+        uint tileDesc = pc.n_expert + 2u + 2u * tile;
+        eid = offsets[tileDesc];
+        begin = offsets[tileDesc + 1u];
+        end = min(begin + BN, offsets[eid + 1u]);
+    } else {
+        eid = gl_WorkGroupID.y;
+        if (eid >= pc.n_expert) return;
+        begin = offsets[eid];
+        end = offsets[eid + 1u];
+    }
     if (begin == end) return;
 
     uint kb = pc.n_ff / 256u;
@@ -67,6 +80,10 @@ void main() {
     uint k8 = (tid & 7u) * 8u;
 
     for (uint tb = begin; tb < end; tb += BN) {
+        // Avoid issuing a wholly padded second 16-column fragment.  Retaining
+        // BN=32 (instead of splitting into BN=16 tiles) keeps one dequant pass
+        // for the experts that really do have 17..32 pairs.
+        bool haveSecond = gl_NumWorkGroups.y <= pc.n_expert || tb + 16u < end;
         uint listIndex = tb + la;
         bool hValid = listIndex < end;
         uint pairLa = hValid ? pairs[listIndex] : 0u;
@@ -131,23 +148,27 @@ void main() {
                     hN[j] = hValid ? h[hBase + ksn * BK + j] : 0.0;
             }
             [[unroll]] for (uint kt = 0u; kt < BK; kt += 16u) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> h0, h1;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> h0;
                 coopMatLoad(h0, Hsh, kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
-                coopMatLoad(h1, Hsh, 16u * SK + kt, SK,
-                            gl_CooperativeMatrixLayoutColumnMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> wd;
                 coopMatLoad(wd, Wd, rt * 16u * SK + kt, SK,
                             gl_CooperativeMatrixLayoutRowMajor);
                 c0 = coopMatMulAdd(wd, h0, c0);
-                c1 = coopMatMulAdd(wd, h1, c1);
+                if (haveSecond) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> h1;
+                    coopMatLoad(h1, Hsh, 16u * SK + kt, SK,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                    c1 = coopMatMulAdd(wd, h1, c1);
+                }
             }
             barrier();
         }
 
         coopMatStore(c0, staging, rt * 16u * SN, SN,
                      gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(c1, staging, rt * 16u * SN + 16u, SN,
-                     gl_CooperativeMatrixLayoutRowMajor);
+        if (haveSecond)
+            coopMatStore(c1, staging, rt * 16u * SN + 16u, SN,
+                         gl_CooperativeMatrixLayoutRowMajor);
         barrier();
         for (uint idx = tid; idx < BM * BN; idx += 256u) {
             uint r = idx >> 5u;

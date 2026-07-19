@@ -3175,14 +3175,16 @@ struct qk_engine {
     bool dnStepReg = false; // QK_DN_STEP_REG caches each state row across both passes
     bool dnStepGate = false; // QK_DN_STEP_GATE_FUSED removes the o[] round trip
     bool prefillCoopmat = false; // QK_PREFILL_COOPMAT: complete Q8 dense prefill tiles
-    // ids4 layer-bisection: starting at layer 9 changes the established decode
-    // trajectory, while layer 10 preserves all 64 rollback tokens.
-    uint32_t prefillCoopmatFirstLayer = 10;
+    // ids4 layer-bisection with the compact routed schedule: layer 6 changes
+    // token 32 after a long prefill, while layer 7 preserves all 64 rollback
+    // tokens at both admission geometries.
+    uint32_t prefillCoopmatFirstLayer = 7;
     bool moePrefillCoopmat = false; // QK_MOE_PREFILL_COOPMAT: routed MoE coop GEMMs
-    // ids4 layer-bisection (2026-07-19): routed cooperative MoE from layer 3
-    // changes the established decode trajectory; layer 4 preserves all 64
-    // rollback tokens at both maxB=1024 and maxB=512.
-    uint32_t moePrefillCoopmatFirstLayer = 4; // QK_MOE_PREFILL_COOPMAT_FIRST_LAYER
+    // The combined routed gate/up + down path is ids4-exact from layer zero
+    // with compact tiles (64 tokens, maxB=1024 and 512).
+    uint32_t moePrefillCoopmatFirstLayer = 0; // QK_MOE_PREFILL_COOPMAT_FIRST_LAYER
+    // Same-binary rollback to the original one-workgroup-per-expert schedule.
+    bool moePrefillCompactTiles = true; // QK_MOE_PREFILL_COMPACT_TILES=0
     bool moeSharedCoopmatGu = false;   // QK_MOE_PREFILL_COOPMAT or QK_MOE_SHARED_COOPMAT_GU
     bool moeSharedCoopmatDown = false; // QK_MOE_PREFILL_COOPMAT or QK_MOE_SHARED_COOPMAT_DOWN
     // Shared-expert gate/up bisection: layer 4 diverges, 6 is exact.
@@ -3191,8 +3193,9 @@ struct qk_engine {
     // stream and compounds fastest: single-f16 staging diverges ids4 even
     // with only layers 32..39 cooperative. The shipped kernel therefore
     // splits both operands into scaled f16 hi/lo planes (three cooperative
-    // products per tile), which is ids4-exact from layer 6.
-    uint32_t moeSharedCoopmatDownFirstLayer = 6; // QK_MOE_SHARED_COOPMAT_DOWN_FIRST_LAYER
+    // products per tile).  With the compact routed schedule it is ids4-exact
+    // from layer zero; shared gate/up independently remains bounded at six.
+    uint32_t moeSharedCoopmatDownFirstLayer = 0; // QK_MOE_SHARED_COOPMAT_DOWN_FIRST_LAYER
     Buf bbPos;                 // 1-entry position buffer: the batch n==1 split-K
     uint32_t* bbPosMap = nullptr;  // case binds it where the srv shaders read slotPos
     VkDescriptorSet sHead, sAm1, sAm2, sEmb;
@@ -3822,7 +3825,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     bbMSel = createBuf(c, (size_t)cap * 160, stor, true);
     bbMY = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
     bbMY2 = createBuf(c, (size_t)cap * nEmbd * 4, stor, true);
-    bbMOffsets = createBuf(c, (size_t)(nExp + 1) * 4, stor, true);
+    // Public expert offsets, compact-tile count, then (expert, pairBegin) for
+    // every possible 32-pair tile.  The loose upper bound is tiny compared to
+    // the activation arena and lets the host issue a fixed direct dispatch.
+    uint32_t maxMoeTiles = nExp + (cap * nUsed + 31u) / 32u;
+    bbMOffsets = createBuf(c, (size_t)(nExp + 2u + 2u * maxMoeTiles) * 4,
+                           stor, true);
     bbMPairs = createBuf(c, (size_t)cap * nUsed * 4, stor, true);
     bbMContrib = createBuf(c, (size_t)cap * nUsed * nEmbd * 4, stor, true);
     if (lastStage()) bbLogits = createBuf(c, (size_t)cap * vocab * 4, storSrc, true);
@@ -4212,6 +4220,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
                 "QK_MOE_PREFILL_COOPMAT requested, but 16x16x16 f16/F32 wave64 KHR coopmat is unavailable\n");
     if (const char* v = getenv("QK_MOE_PREFILL_COOPMAT_FIRST_LAYER"))
         moePrefillCoopmatFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    if (const char* v = getenv("QK_MOE_PREFILL_COMPACT_TILES"))
+        moePrefillCompactTiles = atol(v) != 0;
     gemmCoopV1 = getenv("QK_PREFILL_COOPMAT_V1") != nullptr;
     {
         bool haveShared = pMoeGUsCoop.p != VK_NULL_HANDLE;
@@ -4223,7 +4233,8 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
         if (const char* v = getenv("QK_MOE_SHARED_COOPMAT_FIRST_LAYER"))
             moeSharedCoopmatFirstLayer =
                 std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
-        moeSharedCoopmatDownFirstLayer = moeSharedCoopmatFirstLayer;
+        // Down has an independently bisected default; do not inherit the
+        // gate/up boundary unless the caller explicitly overrides it below.
         if (const char* v = getenv("QK_MOE_SHARED_COOPMAT_DOWN_FIRST_LAYER"))
             moeSharedCoopmatDownFirstLayer =
                 std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
@@ -5016,7 +5027,10 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         bool groupGu = groupEligible && !guIq4 && moeGroupPrefillGu;
         bool groupDown = groupEligible && moeGroupPrefillDown;
         if (groupGu || groupDown) {
-            struct { uint32_t nExpert, nUsed, nTokens; } pcPairs{nExp, nUsed, n};
+            // The high bit controls compact-descriptor emission only.
+            uint32_t pairExperts = nExp | (moePrefillCompactTiles ? 0u : 0x80000000u);
+            struct { uint32_t nExpert, nUsed, nTokens; }
+                pcPairs{pairExperts, nUsed, n};
             zdim = 1;
             disp(pMoeGroupPairs, sbMoeGroupPairs, 1, &pcPairs, 12);
             barrier();
@@ -5034,7 +5048,9 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                                     pMoeGUGroupCoop.pl, 0, 1, &BL.sMoeGUGroup, 0, nullptr);
             vkCmdPushConstants(c.cb, pMoeGUGroupCoop.pl, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, 16, &pcv);
-            vkCmdDispatch(c.cb, ffE / 64u, nExp, 1);
+            uint32_t yGroups = moePrefillCompactTiles
+                ? nExp + (n * nUsed + 31u) / 32u : nExp;
+            vkCmdDispatch(c.cb, ffE / 64u, yGroups, 1);
         } else if (groupGu) {
             Pipe& pgg = moeGroupPrefillRows == 2 ? pMoeGUGroup3Row2 : pMoeGUGroup3;
             vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pgg.p);
@@ -5056,7 +5072,9 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pgd.pl, 0, 1, &BL.sMoeDnGroup, 0, nullptr);
             vkCmdPushConstants(c.cb, pgd.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pcv);
-            vkCmdDispatch(c.cb, nEmbd / 64u, nExp, 1);
+            uint32_t yGroups = moePrefillCompactTiles
+                ? nExp + (n * nUsed + 31u) / 32u : nExp;
+            vkCmdDispatch(c.cb, nEmbd / 64u, yGroups, 1);
             zdim = n;
             dispSharedDown();
             barrier();
