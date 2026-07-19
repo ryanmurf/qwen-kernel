@@ -81,6 +81,13 @@ struct VkCtx {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout      pl = VK_NULL_HANDLE;
     const char*           argv0 = nullptr;
+    bool                  cooperativeMatrix = false;
+    bool                  cooperativeMatrixF16Acc = false;
+    bool                  cooperativeMatrixF32Acc = false;
+    uint32_t              cooperativeMatrixM = 0;
+    uint32_t              cooperativeMatrixN = 0;
+    uint32_t              cooperativeMatrixK = 0;
+    uint32_t              cooperativeMatrixSubgroupSize = 0;
 };
 
 static uint32_t findMemType(const VkPhysicalDeviceMemoryProperties& mp,
@@ -209,13 +216,38 @@ static void initVk(VkCtx& c, const char* argv0) {
     c.phys = devs[pick];
     vkGetPhysicalDeviceProperties(c.phys, &c.props);
     vkGetPhysicalDeviceMemoryProperties(c.phys, &c.mp);
+    VkPhysicalDeviceSubgroupProperties subgroupProperties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties2{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties2.pNext = &subgroupProperties;
+    vkGetPhysicalDeviceProperties2(c.phys, &properties2);
+    c.cooperativeMatrixSubgroupSize = subgroupProperties.subgroupSize;
     pickBdf = pciBdf(c.phys);
     printf("device: %s [%s]\n", c.props.deviceName,
            pickBdf.empty() ? "?" : pickBdf.c_str());
 
-    // 8/16-bit storage + int8/fp16 arithmetic for raw ggml block access
+    // 8/16-bit storage + int8/fp16 arithmetic for raw ggml block access.
+    // Cooperative-matrix discovery mirrors qk's source-native Gemma-4 path;
+    // only the advertised 16x16x16 f16-input/F32-accumulator shape is selected.
+    uint32_t nextCount = 0;
+    vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &nextCount, nullptr);
+    std::vector<VkExtensionProperties> deviceExtensions(nextCount);
+    vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &nextCount,
+                                         deviceExtensions.data());
+    for (const auto& extension : deviceExtensions) {
+        if (!strcmp(extension.extensionName,
+                    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+            c.cooperativeMatrix = true;
+            break;
+        }
+    }
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR haveCoop{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    have12.pNext = c.cooperativeMatrix ? &haveCoop : nullptr;
     have11.pNext = &have12;
     VkPhysicalDeviceFeatures2 have2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     have2.pNext = &have11;
@@ -231,6 +263,58 @@ static void initVk(VkCtx& c, const char* argv0) {
     en12.uniformAndStorageBuffer8BitAccess = have12.uniformAndStorageBuffer8BitAccess;
     en12.shaderInt8 = VK_TRUE;
     en12.shaderFloat16 = VK_TRUE;
+    en12.shaderSubgroupExtendedTypes = have12.shaderSubgroupExtendedTypes;
+    en12.vulkanMemoryModel = have12.vulkanMemoryModel;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR enCoop{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    if (c.cooperativeMatrix && haveCoop.cooperativeMatrix &&
+        have12.vulkanMemoryModel) {
+        enCoop.cooperativeMatrix = VK_TRUE;
+        en12.pNext = &enCoop;
+        auto getCooperativeMatrixProperties =
+            (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(
+                c.inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        if (getCooperativeMatrixProperties) {
+            uint32_t propertyCount = 0;
+            VK_CHECK(getCooperativeMatrixProperties(
+                c.phys, &propertyCount, nullptr));
+            std::vector<VkCooperativeMatrixPropertiesKHR> properties(
+                propertyCount,
+                VkCooperativeMatrixPropertiesKHR{
+                    VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            VK_CHECK(getCooperativeMatrixProperties(
+                c.phys, &propertyCount, properties.data()));
+            for (const auto& property : properties) {
+                if (property.AType != VK_COMPONENT_TYPE_FLOAT16_KHR ||
+                    property.BType != VK_COMPONENT_TYPE_FLOAT16_KHR ||
+                    property.scope != VK_SCOPE_SUBGROUP_KHR)
+                    continue;
+                bool shape16 = property.MSize == 16 && property.NSize == 16 &&
+                               property.KSize == 16;
+                if (shape16 &&
+                    property.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                    property.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR)
+                    c.cooperativeMatrixF16Acc = true;
+                if (shape16 && property.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                    property.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+                    c.cooperativeMatrixF32Acc = true;
+                    c.cooperativeMatrixM = property.MSize;
+                    c.cooperativeMatrixN = property.NSize;
+                    c.cooperativeMatrixK = property.KSize;
+                }
+            }
+        }
+    } else {
+        c.cooperativeMatrix = false;
+    }
+    if (c.cooperativeMatrix) {
+        printf("cooperative matrix: KHR f16acc=%s f32acc=%s shape=%ux%ux%u subgroup=%u\n",
+               c.cooperativeMatrixF16Acc ? "yes" : "no",
+               c.cooperativeMatrixF32Acc ? "yes" : "no",
+               c.cooperativeMatrixM, c.cooperativeMatrixN,
+               c.cooperativeMatrixK, c.cooperativeMatrixSubgroupSize);
+    }
     VkPhysicalDeviceVulkan11Features en11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     en11.storageBuffer16BitAccess = VK_TRUE;
     en11.uniformAndStorageBuffer16BitAccess = have11.uniformAndStorageBuffer16BitAccess;
@@ -262,6 +346,13 @@ static void initVk(VkCtx& c, const char* argv0) {
     dci.pNext = &en11;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    const char* enabledExtensions[] = {
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+    };
+    if (c.cooperativeMatrix) {
+        dci.enabledExtensionCount = 1;
+        dci.ppEnabledExtensionNames = enabledExtensions;
+    }
     VK_CHECK(vkCreateDevice(c.phys, &dci, nullptr, &c.dev));
     vkGetDeviceQueue(c.dev, c.qfi, 0, &c.queue);
 
@@ -3019,17 +3110,20 @@ struct qk_engine {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     Pipe pRms, pGemvA, pAb, pConvN, pStep, pStepReg, pStepGate, pGate, pGemvO,
         pAddN, pAddNRoute,
-        pPrep, pAttn, pMoeL, pMoeRS, pMoeRSHier, pMoeS, pMoeS256, pMoeGroupPairs,
+        pPrep, pAttn, pMoeL, pMoeLGemm, pMoeRS, pMoeRSHier, pMoeS, pMoeS256, pMoeGroupPairs,
         pMoeGU, pMoeGURow3, pMoeGUGroup3, pMoeGUGroup3Row2,
         pMoeGUs, pMoeGUs64, pMoeDn4, pMoeDn4_128, pMoeDn6, pMoeDnsB,
         pMoeDnsB32, pMoeDnGroup4, pMoeDnGroup6,
         pMoeDnGroup4Row2, pMoeDnGroup6Row2,
+        pMoeGUGroupCoop, pMoeDnGroupCoop4, pMoeDnGroupCoop6,
+        pMoeGUsCoop, pMoeDnsCoop,
         pAdd3, pAdd3Group, pHead,
         pAm1, pAm2, pEmb;
     Pipe pAttnS, pAttnSG2, pAttnSG4, pAttnSG8, pAttnR;
     // split-K decode attention (QK_NO_SPLITK=1 -> legacy pAttn); SG variants
     // reuse one KV read across 2/4/8 query heads.
-    Pipe pPrepB, pAttnB, pAbB, pConvB, pStepB, pGateB, pGemmB;
+    Pipe pPrepB, pAttnB, pAttnBCoop, pAttnBCoop2, pAbB, pConvB, pStepB, pStepBCols, pGateB, pGemmB, pGemmBCoop, pGemmBCoop2, pGemmBCoop2B64, pGemmBCoopSplit;
+    bool gemmCoopV1 = false; // QK_PREFILL_COOPMAT_V1: original coopmat schedule
     // IQ4_XS twins of the dense-projection / routed-gateup pipes (80B weights).
     // Identical bindings and push constants — only the in-shader dequant differs,
     // so descriptor sets stay layout-compatible with the Q8_0 pipes.
@@ -3080,6 +3174,47 @@ struct qk_engine {
     uint32_t moeGroupPrefillDownRows = 2; // QK_MOE_GROUP_PREFILL_DOWN_ROWS={1,2}
     bool dnStepReg = false; // QK_DN_STEP_REG caches each state row across both passes
     bool dnStepGate = false; // QK_DN_STEP_GATE_FUSED removes the o[] round trip
+    bool dnStepCols = false; // QK_DN_STEP_COLS: column-sharded batch delta rule (wide chunks)
+    // Pure-f32 reassociation (no f16 staging), so the perturbation is ~1e-7
+    // relative and ids4 is exact from layer 0 at both admission geometries
+    // (2026-07-19 bisection) — unlike the f16 coopmat paths.
+    uint32_t dnStepColsFirstLayer = 0; // QK_DN_STEP_COLS_FIRST_LAYER (ids4 bisection)
+    uint32_t dnStepColsLanes = 8;      // QK_DN_COLS_LANES: lanes sharding one state row
+    bool attnPrefillCoopmat = false;   // QK_ATTN_PREFILL_COOPMAT: coopmat batched attention
+    // ids4 bisection (2026-07-19), Br=32 kernel: first layer 0/8 diverge the
+    // rollback trajectory at generated index 32 (onto llama's ref token,
+    // interestingly — still a gate violation); 4 is exact at both admission
+    // geometries. The Br=16 kernel was exact from 0, but loses 38 ms at
+    // pp2048 to K/V read amplification.
+    uint32_t attnPrefillCoopmatFirstLayer = 4; // QK_ATTN_PREFILL_COOPMAT_FIRST_LAYER
+    bool attnCoopBr32 = true;          // QK_ATTN_PREFILL_COOPMAT_BR16=1 rolls back to 16-query blocks
+    bool gemmCoopB64 = false;          // QK_PREFILL_COOPMAT_BM64: opt-in 64-row dense tiles
+    bool moeLogitsGemm = false;        // QK_MOE_LOGITS_GEMM: tiled batched router logits
+    // ids4 bisection (2026-07-19): 0/4/6 diverge, 8 exact at both geometries.
+    uint32_t moeLogitsGemmFirstLayer = 8; // QK_MOE_LOGITS_GEMM_FIRST_LAYER
+    bool prefillCoopmatSplit = false;  // QK_PREFILL_COOPMAT_SPLIT: hi/lo dense below boundary
+    // ids4 bisection (2026-07-19): first layer 0/2/6 diverge, 4 is exact at
+    // both admission geometries — these boundaries are empirical knife-edges.
+    uint32_t prefillCoopmatSplitFirstLayer = 4; // QK_PREFILL_COOPMAT_SPLIT_FIRST_LAYER
+    bool prefillCoopmat = false; // QK_PREFILL_COOPMAT: complete Q8 dense prefill tiles
+    // ids4 layer-bisection: starting at layer 9 changes the established decode
+    // trajectory, while layer 10 preserves all 64 rollback tokens.
+    uint32_t prefillCoopmatFirstLayer = 10;
+    bool moePrefillCoopmat = false; // QK_MOE_PREFILL_COOPMAT: routed MoE coop GEMMs
+    // ids4 layer-bisection (2026-07-19): routed cooperative MoE from layer 3
+    // changes the established decode trajectory; layer 4 preserves all 64
+    // rollback tokens at both maxB=1024 and maxB=512.
+    uint32_t moePrefillCoopmatFirstLayer = 4; // QK_MOE_PREFILL_COOPMAT_FIRST_LAYER
+    bool moeSharedCoopmatGu = false;   // QK_MOE_PREFILL_COOPMAT or QK_MOE_SHARED_COOPMAT_GU
+    bool moeSharedCoopmatDown = false; // QK_MOE_PREFILL_COOPMAT or QK_MOE_SHARED_COOPMAT_DOWN
+    // Shared-expert gate/up bisection: layer 4 diverges, 6 is exact.
+    uint32_t moeSharedCoopmatFirstLayer = 6; // QK_MOE_SHARED_COOPMAT_FIRST_LAYER
+    // The shared-expert down projection injects straight into the residual
+    // stream and compounds fastest: single-f16 staging diverges ids4 even
+    // with only layers 32..39 cooperative. The shipped kernel therefore
+    // splits both operands into scaled f16 hi/lo planes (three cooperative
+    // products per tile), which is ids4-exact from layer 6.
+    uint32_t moeSharedCoopmatDownFirstLayer = 6; // QK_MOE_SHARED_COOPMAT_DOWN_FIRST_LAYER
     Buf bbPos;                 // 1-entry position buffer: the batch n==1 split-K
     uint32_t* bbPosMap = nullptr;  // case binds it where the srv shaders read slotPos
     VkDescriptorSet sHead, sAm1, sAm2, sEmb;
@@ -3255,13 +3390,18 @@ qk_engine::~qk_engine() {
                      &pGate, &pGemvO,
                      &pGemvO4, &pAddN, &pAddNRoute, &pPrep,
                      &pAttn, &pAttnS, &pAttnSG2, &pAttnSG4, &pAttnSG8, &pAttnR,
-                     &pMoeL, &pMoeRS, &pMoeRSHier, &pMoeS, &pMoeS256, &pMoeGroupPairs,
+                     &pMoeL, &pMoeLGemm, &pMoeRS, &pMoeRSHier, &pMoeS, &pMoeS256, &pMoeGroupPairs,
                      &pMoeGU, &pMoeGURow3, &pMoeGUGroup3, &pMoeGUGroup3Row2,
                      &pMoeGUs, &pMoeGUs64, &pMoeDn4, &pMoeDn4_128, &pMoeDn6,
                      &pMoeDnsB, &pMoeDnsB32, &pMoeDnGroup4, &pMoeDnGroup6,
                      &pMoeDnGroup4Row2, &pMoeDnGroup6Row2,
+                     &pMoeGUGroupCoop, &pMoeDnGroupCoop4, &pMoeDnGroupCoop6,
+                     &pMoeGUsCoop, &pMoeDnsCoop,
                      &pMoeGU4, &pAdd3, &pAdd3Group, &pHead, &pAm1, &pAm2, &pEmb, &pPrepB, &pAttnB,
-                     &pAbB, &pConvB, &pStepB, &pGateB, &pGemmB, &pGemmB4})
+                     &pAttnBCoop, &pAttnBCoop2,
+                     &pAbB, &pConvB, &pStepB, &pStepBCols, &pGateB, &pGemmB, &pGemmBCoop, &pGemmBCoop2,
+                     &pGemmBCoop2B64, &pGemmBCoopSplit,
+                     &pGemmB4})
         destroyPipe(c, *pp);
     if (c.pool) vkDestroyCommandPool(c.dev, c.pool, nullptr);
     if (c.pl) vkDestroyPipelineLayout(c.dev, c.pl, nullptr);
@@ -3507,6 +3647,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAttnSG8 = makePipe(c, "fa_attn_srv_split_gqa.spv", 5, 40, 8);
     pAttnR = makePipe(c, "fa_attn_srv_reduce.spv", 4, 40);
     pMoeL = makePipe(c, "moe_logits.spv", 3, 16);
+    pMoeLGemm = makePipe(c, "moe_logits_gemm.spv", 3, 16);
     pMoeRS = makePipe(c, "moe_route_select.spv", 5, 16);
     pMoeRSHier = makePipe(c, "moe_route_select_hier.spv", 5, 16,
                           nUsed <= 8 ? 2 : 4);
@@ -3540,8 +3681,29 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     pAbB = makePipe(c, "dn_ab_batch.spv", 6, 12);
     pConvB = makePipe(c, "dn_conv_batch.spv", 5, 20);   // +conv-window state out (decode handoff)
     pStepB = makePipe(c, "dn_step_batch.spv", 4, 20);   // +delta-rule S seed/persist (decode handoff)
+    {   // column-sharded wide-chunk twin; QK_DN_COLS_LANES in {4,8,16,32}
+        const char* v = getenv("QK_DN_COLS_LANES");
+        long l = v ? atol(v) : 8;
+        dnStepColsLanes = (l == 4 || l == 8 || l == 16 || l == 32) ? (uint32_t)l : 8u;
+        pStepBCols = makePipe(c, "dn_step_batch_cols.spv", 4, 20, dnStepColsLanes);
+    }
     pGateB = makePipe(c, "dn_gate_batch.spv", 4, 16);
     pGemmB = makePipe(c, "gemm_q8_0.spv", 3, 12);  // batched projections (weight reads amortized)
+    if (c.cooperativeMatrixF32Acc &&
+        c.cooperativeMatrixM == 16 && c.cooperativeMatrixN == 16 &&
+        c.cooperativeMatrixK == 16 && c.cooperativeMatrixSubgroupSize == 64) {
+        pGemmBCoop = makePipe(c, "gemm_q8_0_coopmat.spv", 3, 12);
+        pGemmBCoop2 = makePipe(c, "gemm_q8_0_coopmat2.spv", 3, 12);
+        pMoeGUGroupCoop = makePipe(c, "moe_gateup_iq3_grouped_coopmat.spv", 6, 16);
+        pMoeDnGroupCoop4 = makePipe(c, "moe_down_iq4_grouped_coopmat.spv", 6, 16);
+        pMoeDnGroupCoop6 = makePipe(c, "moe_down_q6k_grouped_coopmat.spv", 6, 16);
+        pMoeGUsCoop = makePipe(c, "moe_gateup_q8_coopmat.spv", 4, 16);
+        pMoeDnsCoop = makePipe(c, "moe_down_q8_coopmat.spv", 4, 16);
+        pAttnBCoop = makePipe(c, "fa_attn_batch_coopmat.spv", 5, 40);
+        pAttnBCoop2 = makePipe(c, "fa_attn_batch_coopmat2.spv", 5, 40);
+        pGemmBCoopSplit = makePipe(c, "gemm_q8_0_coopmat_split.spv", 3, 12);
+        pGemmBCoop2B64 = makePipe(c, "gemm_q8_0_coopmat2_bm64.spv", 3, 12);
+    }
     pGemmB4 = makePipe(c, "gemm_iq4_xs.spv", 3, 12);
     static_assert(dS <= 128, "dn_step_batch srow[32] holds dState/4 vec4s; dState must be <= 128");
 
@@ -4071,6 +4233,56 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     }
     dnStepReg = getenv("QK_DN_STEP_REG") != nullptr;
     dnStepGate = getenv("QK_DN_STEP_GATE_FUSED") != nullptr;
+    dnStepCols = getenv("QK_DN_STEP_COLS") != nullptr;
+    if (const char* v = getenv("QK_DN_STEP_COLS_FIRST_LAYER"))
+        dnStepColsFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    attnPrefillCoopmat = getenv("QK_ATTN_PREFILL_COOPMAT") != nullptr &&
+                         pAttnBCoop.p != VK_NULL_HANDLE;
+    attnCoopBr32 = getenv("QK_ATTN_PREFILL_COOPMAT_BR16") == nullptr &&
+                   pAttnBCoop2.p != VK_NULL_HANDLE;
+    if (getenv("QK_ATTN_PREFILL_COOPMAT") && !attnPrefillCoopmat)
+        fprintf(stderr,
+                "QK_ATTN_PREFILL_COOPMAT requested, but 16x16x16 f16/F32 wave64 KHR coopmat is unavailable\n");
+    if (const char* v = getenv("QK_ATTN_PREFILL_COOPMAT_FIRST_LAYER"))
+        attnPrefillCoopmatFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    gemmCoopB64 = getenv("QK_PREFILL_COOPMAT_BM64") != nullptr;
+    moeLogitsGemm = getenv("QK_MOE_LOGITS_GEMM") != nullptr;
+    if (const char* v = getenv("QK_MOE_LOGITS_GEMM_FIRST_LAYER"))
+        moeLogitsGemmFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    prefillCoopmatSplit = getenv("QK_PREFILL_COOPMAT_SPLIT") != nullptr &&
+                          pGemmBCoopSplit.p != VK_NULL_HANDLE;
+    if (const char* v = getenv("QK_PREFILL_COOPMAT_SPLIT_FIRST_LAYER"))
+        prefillCoopmatSplitFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    prefillCoopmat = getenv("QK_PREFILL_COOPMAT") != nullptr &&
+                       pGemmBCoop.p != VK_NULL_HANDLE;
+    if (getenv("QK_PREFILL_COOPMAT") && !prefillCoopmat)
+        fprintf(stderr,
+                "QK_PREFILL_COOPMAT requested, but 16x16x16 f16/F32 wave64 KHR coopmat is unavailable\n");
+    if (const char* v = getenv("QK_PREFILL_COOPMAT_FIRST_LAYER"))
+        prefillCoopmatFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    moePrefillCoopmat = getenv("QK_MOE_PREFILL_COOPMAT") != nullptr &&
+                        pMoeGUGroupCoop.p != VK_NULL_HANDLE;
+    if (getenv("QK_MOE_PREFILL_COOPMAT") && !moePrefillCoopmat)
+        fprintf(stderr,
+                "QK_MOE_PREFILL_COOPMAT requested, but 16x16x16 f16/F32 wave64 KHR coopmat is unavailable\n");
+    if (const char* v = getenv("QK_MOE_PREFILL_COOPMAT_FIRST_LAYER"))
+        moePrefillCoopmatFirstLayer = std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    gemmCoopV1 = getenv("QK_PREFILL_COOPMAT_V1") != nullptr;
+    {
+        bool haveShared = pMoeGUsCoop.p != VK_NULL_HANDLE;
+        moeSharedCoopmatGu = haveShared &&
+            (moePrefillCoopmat || getenv("QK_MOE_SHARED_COOPMAT_GU") != nullptr);
+        moeSharedCoopmatDown = haveShared &&
+            (moePrefillCoopmat ||
+             getenv("QK_MOE_SHARED_COOPMAT_DOWN") != nullptr);
+        if (const char* v = getenv("QK_MOE_SHARED_COOPMAT_FIRST_LAYER"))
+            moeSharedCoopmatFirstLayer =
+                std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+        moeSharedCoopmatDownFirstLayer = moeSharedCoopmatFirstLayer;
+        if (const char* v = getenv("QK_MOE_SHARED_COOPMAT_DOWN_FIRST_LAYER"))
+            moeSharedCoopmatDownFirstLayer =
+                std::min(nLayer, (uint32_t)std::max(0l, atol(v)));
+    }
     const uint32_t amWgs = (vocab + 4095) / 4096;
     struct { uint32_t n, span; } pcAm{vocab, 4096};
     struct { uint32_t m; } pcAm2{amWgs};
@@ -4590,13 +4802,36 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     // Reuses the gemv projection sets ({W,X,Y} storage buffers) — layout-compatible.
     // Reads each weight ONCE for all n tokens (vs gemv's n re-reads). K%32==0 (holds
     // for nEmbd=2048, dIn=4096). grid (ceil(M/128),1,ceil(n/64)) per gemm_q8_0.comp.
+    uint32_t currentPrefillLayer = 0;
     auto gemmProj = [&](VkDescriptorSet ds, uint32_t M, uint32_t K, bool iq4) {
         struct { uint32_t M, K, N; } pcg{M, K, n};
-        Pipe& pg = iq4 ? pGemmB4 : pGemmB;
+        // Cooperative stores are deliberately limited to complete production
+        // tiles. N=128 remains on the established scalar-order path, preserving
+        // the serial/batched handoff boundary while pp512+ exercises matrix cores.
+        bool coop = prefillCoopmat && currentPrefillLayer >= prefillCoopmatFirstLayer &&
+                    !iq4 && n >= 192 &&
+                    (M % 128u) == 0u && (K % 32u) == 0u && (n % 64u) == 0u;
+        // Below the single-f16 boundary: the split-precision twin (f16 hi/lo
+        // planes, three cooperative products) — the recipe proven ids4-exact
+        // for the shared down projection.
+        bool coopSplit = !coop && prefillCoopmatSplit &&
+                         currentPrefillLayer >= prefillCoopmatSplitFirstLayer &&
+                         !iq4 && n >= 192 &&
+                         (M % 64u) == 0u && (K % 32u) == 0u && (n % 64u) == 0u;
+        // Short-M 64-row twin (bit-identical to coopmat2). Measured a WASH at
+        // pp512 on the XTX (ABAB 192.5/192.5/193.2/192.8 ms) — the grid-tail
+        // hypothesis for dn.out was wrong — so it is opt-in only.
+        bool coopB64 = coop && !gemmCoopV1 && M <= 2048u &&
+                       pGemmBCoop2B64.p != VK_NULL_HANDLE && gemmCoopB64;
+        Pipe& pg = iq4 ? pGemmB4
+                       : (coop ? (gemmCoopV1 ? pGemmBCoop
+                                             : (coopB64 ? pGemmBCoop2B64 : pGemmBCoop2))
+                               : (coopSplit ? pGemmBCoopSplit : pGemmB));
         vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.p);
         vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pg.pl, 0, 1, &ds, 0, nullptr);
         vkCmdPushConstants(c.cb, pg.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, &pcg);
-        vkCmdDispatch(c.cb, (M + 127) / 128, 1, (n + 63) / 64);
+        vkCmdDispatch(c.cb, (coopSplit || coopB64) ? (M + 63) / 64 : (M + 127) / 128,
+                      1, (n + 63) / 64);
     };
     // Optimal projection per chunk width: the 128x64-tiled GEMM amortizes weight
     // reads and wins for wide chunks, but wastes work when n fills <1 N-tile; the
@@ -4697,6 +4932,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
     for (uint32_t il = lFirst; il < lEnd; il++) {
         Layer& L = layers[il];
         BLayer& BL = blayers[il];
+        currentPrefillLayer = il;
         zdim = n;
         if (L.rec) {
             tap(il, "xn", bbXn.buf, (size_t)n * nEmbd * 4);
@@ -4717,8 +4953,14 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 barrier();
                 stamp("dn.step+gate");
             } else {
-                zdim = 1;
-                disp(pStepB, BL.sStep, hV, &pcStepB, 20);
+                // Column-sharded twin: same recurrence, 1024 workgroups instead
+                // of hV=32, 8 state floats per lane. Reduction association
+                // differs from the serial rollback, so it follows the coopmat
+                // gating policy (wide complete chunks, bisected first layer).
+                bool stepCols = dnStepCols && n >= 192 &&
+                                il >= dnStepColsFirstLayer && dS == 128;
+                zdim = stepCols ? dS * dnStepColsLanes / 64u : 1;
+                disp(stepCols ? pStepBCols : pStepB, BL.sStep, hV, &pcStepB, 20);
                 zdim = n;
                 barrier();
                 stamp("dn.step");
@@ -4776,14 +5018,24 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                 zdim = n;
             } else {
                 constexpr uint32_t kQB = 16;  // must match QB in fa_attn_batch.comp
+                // Coopmat twin: same host contract (dh==256 only); follows the
+                // wide-chunk / bisected-layer gating policy of the other
+                // cooperative paths.
+                bool attnCoop = attnPrefillCoopmat && n >= 192 && dh == 256 &&
+                                il >= attnPrefillCoopmatFirstLayer && !tapsDir;
+                // 32-query twin halves K/V read amplification; query tiles
+                // stay 32-aligned so its blocks match the host offsets.
+                bool attnBr32 = attnCoop && attnCoopBr32;
+                uint32_t qb = attnBr32 ? 32u : kQB;
                 uint32_t qt = (uint32_t)std::max<uint64_t>(1, attnBudget / (uint64_t)(base + n));
                 qt = std::min(qt, n);
-                qt = std::max(kQB, qt - qt % kQB);
+                qt = std::max(qb, qt - qt % qb);
                 for (uint32_t qo = 0; qo < n; qo += qt) {
                     uint32_t tile = std::min(qt, n - qo);
                     pcFaB.qbase = qo;
-                    zdim = (tile + kQB - 1) / kQB;
-                    disp(pAttnB, BL.sAttn, hQ, &pcFaB, 40);
+                    zdim = (tile + qb - 1) / qb;
+                    disp(attnBr32 ? pAttnBCoop2 : (attnCoop ? pAttnBCoop : pAttnB),
+                         BL.sAttn, hQ, &pcFaB, 40);
                     if (qo + tile < n) { barrier(); flushCB(); }
                 }
                 pcFaB.qbase = 0;
@@ -4799,9 +5051,54 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
              fuseRoute ? BL.sAddNRoute : BL.sAddN, 1, &pcRms, 8);
         barrier();
         stamp("addN");
-        disp(fuseRoute ? (moeSelectHier ? pMoeRSHier : pMoeRS) : pMoeL,
-             fuseRoute ? BL.sMoeRS : BL.sMoeL, nExp, &pcv, 16);
-        disp(moeSharedGu64 ? pMoeGUs64 : pMoeGUs, BL.sMoeGUs, ffE, &pcv, 16);
+        // Batched router logits: one 64-expert x 32-token tile per workgroup
+        // instead of one workgroup per (expert, token). Router logits feed
+        // top-8 selection, so gated like the other perturbing prefill paths.
+        bool logitsGemm = moeLogitsGemm && !fuseRoute && n >= 192 &&
+                          (n % 32u) == 0u && (nExp % 64u) == 0u &&
+                          (nEmbd % 32u) == 0u &&
+                          currentPrefillLayer >= moeLogitsGemmFirstLayer;
+        if (logitsGemm) {
+            zdim = n / 32u;
+            disp(pMoeLGemm, BL.sMoeL, nExp / 64u, &pcv, 16);
+            zdim = n;
+        } else {
+            disp(fuseRoute ? (moeSelectHier ? pMoeRSHier : pMoeRS) : pMoeL,
+                 fuseRoute ? BL.sMoeRS : BL.sMoeL, nExp, &pcv, 16);
+        }
+        // Shared-expert cooperative selection follows the same wide-chunk /
+        // bisected-layer policy as the routed MoE cooperative kernels.
+        bool sharedCoopOk = currentPrefillLayer >= moeSharedCoopmatFirstLayer &&
+                            n >= 192 && (n % 64u) == 0u &&
+                            (ffE % 64u) == 0u && (nEmbd % 64u) == 0u && !tapsDir;
+        bool sharedCoopGu = moeSharedCoopmatGu && sharedCoopOk;
+        bool sharedCoopDown = moeSharedCoopmatDown && sharedCoopOk &&
+                              currentPrefillLayer >= moeSharedCoopmatDownFirstLayer;
+        // Shared-expert down: cooperative when selected, else the scalar
+        // shared kernel. Used identically by every routed-down branch below.
+        auto dispSharedDown = [&]() {
+            if (sharedCoopDown) {
+                vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pMoeDnsCoop.p);
+                vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pMoeDnsCoop.pl, 0, 1, &BL.sMoeDns, 0, nullptr);
+                vkCmdPushConstants(c.cb, pMoeDnsCoop.pl, VK_SHADER_STAGE_COMPUTE_BIT,
+                                   0, 16, &pcv);
+                vkCmdDispatch(c.cb, nEmbd / 64u, 1, n / 64u);
+            } else {
+                disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
+                     BL.sMoeDns, nEmbd, &pcv, 16);
+            }
+        };
+        if (sharedCoopGu) {
+            vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pMoeGUsCoop.p);
+            vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pMoeGUsCoop.pl, 0, 1, &BL.sMoeGUs, 0, nullptr);
+            vkCmdPushConstants(c.cb, pMoeGUsCoop.pl, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, 16, &pcv);
+            vkCmdDispatch(c.cb, ffE / 64u, 1, n / 64u);
+        } else {
+            disp(moeSharedGu64 ? pMoeGUs64 : pMoeGUs, BL.sMoeGUs, ffE, &pcv, 16);
+        }
         barrier();
         stamp("moe.route+shared_gu");
         if (!fuseRoute) {
@@ -4824,7 +5121,20 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             barrier();
             stamp("moe.pairs");
         }
-        if (groupGu) {
+        // Cooperative-matrix routed MoE selection mirrors the dense policy:
+        // only wide complete chunks (N >= 192; N=128 stays on the exact
+        // scalar-order rollback) and only from the bisected first layer.
+        bool moeCoop = moePrefillCoopmat && !guIq4 &&
+                       currentPrefillLayer >= moePrefillCoopmatFirstLayer &&
+                       n >= 192 && (nEmbd % 64u) == 0u && (ffE % 64u) == 0u;
+        if (groupGu && moeCoop) {
+            vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pMoeGUGroupCoop.p);
+            vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pMoeGUGroupCoop.pl, 0, 1, &BL.sMoeGUGroup, 0, nullptr);
+            vkCmdPushConstants(c.cb, pMoeGUGroupCoop.pl, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, 16, &pcv);
+            vkCmdDispatch(c.cb, ffE / 64u, nExp, 1);
+        } else if (groupGu) {
             Pipe& pgg = moeGroupPrefillRows == 2 ? pMoeGUGroup3Row2 : pMoeGUGroup3;
             vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pgg.p);
             vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -4839,7 +5149,21 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
         }
         barrier();
         stamp("moe.gate+up");
-        if (groupDown) {
+        if (groupDown && moeCoop) {
+            Pipe& pgd = L.downQ6 ? pMoeDnGroupCoop6 : pMoeDnGroupCoop4;
+            vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pgd.p);
+            vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pgd.pl, 0, 1, &BL.sMoeDnGroup, 0, nullptr);
+            vkCmdPushConstants(c.cb, pgd.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, &pcv);
+            vkCmdDispatch(c.cb, nEmbd / 64u, nExp, 1);
+            zdim = n;
+            dispSharedDown();
+            barrier();
+            stamp("moe.down");
+            struct { uint32_t n; float e; uint32_t nUsed; }
+                pcGroupTail{nEmbd, eps, nUsed};
+            disp(pAdd3Group, BL.sAdd3Group, 1, &pcGroupTail, 12);
+        } else if (groupDown) {
             // The row-paired schedule is tuned for the 35B IQ3 gate/up family.
             // Keep the 80B IQ4 graph on its independently measured grouped-down
             // path even though the descriptor ABI and down formats also fit.
@@ -4855,8 +5179,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
                           (nEmbd + downRows - 1) / downRows,
                           nExp, 1);
             zdim = n;
-            disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
-                 BL.sMoeDns, nEmbd, &pcv, 16);
+            dispSharedDown();
             barrier();
             stamp("moe.down");
             struct { uint32_t n; float e; uint32_t nUsed; }
@@ -4866,8 +5189,7 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
             zdim = n;
             disp(L.downQ6 ? pMoeDn6 : (moeDown128 ? pMoeDn4_128 : pMoeDn4),
                  BL.sMoeDn, nEmbd, &pcv, 16);
-            disp(moeSharedDown32 ? pMoeDnsB32 : pMoeDnsB,
-                 BL.sMoeDns, nEmbd, &pcv, 16);
+            dispSharedDown();
             barrier();
             stamp("moe.down");
             disp(pAdd3, BL.sAdd3, 1, &pcRms, 8);
@@ -5215,6 +5537,17 @@ int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint
 static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t iters) {
     printf("\n== batched GEMM  Y[%u,%u] = X[%u,%u] . W[%u,%u]^T  (Q8_0) ==\n", N, M, N, K, M, K);
     if (K % 32) { fprintf(stderr, "K must be a multiple of 32\n"); return false; }
+    bool coop = getenv("QK_BGEMM_COOPMAT") != nullptr;
+    if (coop && (!c.cooperativeMatrixF32Acc || c.cooperativeMatrixM != 16 ||
+                 c.cooperativeMatrixN != 16 || c.cooperativeMatrixK != 16 ||
+                 c.cooperativeMatrixSubgroupSize != 64)) {
+        fprintf(stderr, "QK_BGEMM_COOPMAT requires 16x16x16 f16/F32 wave64 KHR coopmat\n");
+        return false;
+    }
+    if (coop && ((M % 128u) != 0u || (N % 64u) != 0u)) {
+        fprintf(stderr, "QK_BGEMM_COOPMAT requires M%%128 == 0 and N%%64 == 0\n");
+        return false;
+    }
     size_t nb = (size_t)M * (K / 32);
     std::vector<block_q8_0> W(nb);
     std::mt19937 rng(7);
@@ -5236,7 +5569,9 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t ite
         }
     }
 
-    Pipe p = makePipe(c, "gemm_q8_0.spv", 3, 12);
+    Pipe p = makePipe(c, coop ? "gemm_q8_0_coopmat.spv" : "gemm_q8_0.spv", 3, 12);
+    printf("  variant: %s\n", coop ? "KHR_coopmat f16 inputs / F32 accumulate"
+                                  : "scalar F32 tile");
     const VkBufferUsageFlags stor = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     Buf bW = createBuf(c, nb * sizeof(block_q8_0), stor, true);
     Buf bX = createBuf(c, (size_t)N * K * 4, stor, true);
@@ -5321,11 +5656,19 @@ static bool caseBGemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N, uint32_t ite
         sumsq += (double)Yref[i] * Yref[i];
     }
     double rms = std::sqrt(sumsq / ((size_t)N * M));
-    bool ok = maxErr < 1e-3 * rms;  // fp32 kernel vs double reference, scale-relative
+    // Cooperative inputs are intentionally F16 (accumulation remains F32), so
+    // validate against a correspondingly bounded input-rounding tolerance.
+    double relTolerance = coop ? 2e-3 : 1e-3;
+    bool ok = maxErr < relTolerance * rms;
+    if (!ok) {
+        printf("  debug y[0..2]={%.7g,%.7g,%.7g} ref0=%.7g y[64]=%.7g ref=%.7g y[mid]=%.7g ref=%.7g\n",
+               Y[0], Y[1], Y[2], Yref[0], Y[64], Yref[64],
+               Y[((size_t)N * M) / 2], Yref[((size_t)N * M) / 2]);
+    }
     double tflops = 2.0 * M * N * K / (ms * 1e9);
     double peak = 52.0;                                             // RX 7900 XT ~52 TFLOP/s FP32
     double serialMs = (double)N * ((double)M * K / 32.0 * 34.0) / 938e6;  // N GEMVs at ~938 GB/s
-    printf("  N=%-5u %7.3f ms | %5.1f TFLOP/s (%2.0f%% peak) | vs serial %6.1f ms = %.2fx | err/rms %.1g -> %s\n",
+    printf("  N=%-5u %7.3f ms | %5.1f TFLOP/s (%2.0f%% peak) | vs serial %6.1f ms = %.2fx | err/rms %.6g -> %s\n",
            N, ms, tflops, tflops / peak * 100, serialMs, serialMs / ms, maxErr / rms, ok ? "PASS" : "FAIL");
     vkUnmapMemory(c.dev, stage.mem);
     vkDestroyDescriptorPool(c.dev, pool, nullptr);

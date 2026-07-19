@@ -1,0 +1,129 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// qk-native cooperative-matrix Q8_0 prefill GEMM. The 16x16x16 subgroup
+// tiling follows the source-level cooperative-matrix structure developed for
+// qk's Gemma-4 flash-attention kernels; this is an independent dense GEMM for
+// qk's Qwen activation/weight ABI. No external SPIR-V or binary is used.
+//
+// Y[N,M] = X[N,K] * W[M,K]^T. One 256-thread workgroup owns a 128x64 output
+// tile. Each of four RDNA3 wave64 subgroups owns two 16-row bands and four
+// adjacent 16-token cooperative tiles per band. Q8 blocks and F32 activations
+// are converted to F16 in LDS; every matrix accumulator and the complete K
+// reduction stay F32. Host selection requires M%128 == 0, N%64 == 0,
+// K%32 == 0, and the advertised 16x16x16 wave64 f16/F32 KHR shape.
+layout(local_size_x = 256) in;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 0) readonly  buffer BufW { block_q8_0 wb[]; };
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PC { uint M; uint K; uint N; } pc;
+
+const uint TILE = 16u;
+const uint BM = 128u;
+const uint BN = 64u;
+const uint BK = 32u;
+
+shared float16_t Wsh[BM * BK];
+shared float16_t Xsh[BK * BN];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint subgroup = gl_SubgroupID;
+    uint rowBase = gl_WorkGroupID.x * BM;
+    uint tokBase = gl_WorkGroupID.z * BN;
+    uint blocks = pc.K / BK;
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> c0 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> c1 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> c2 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> c3 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> d0 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> d1 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> d2 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> d3 =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint block = 0u; block < blocks; ++block) {
+        if (tid < BM) {
+            block_q8_0 q = wb[(rowBase + tid) * blocks + block];
+            float scale = float(q.d);
+            for (uint k = 0u; k < BK; ++k)
+                Wsh[tid * BK + k] =
+                    float16_t(scale * float(int(q.qs[k])));
+        }
+        for (uint index = tid; index < BK * BN; index += 256u) {
+            uint k = index / BN;
+            uint token = index - k * BN;
+            Xsh[index] = float16_t(
+                x[(tokBase + token) * pc.K + block * BK + k]);
+        }
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> b0;
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> b1;
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> b2;
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> b3;
+        for (uint k0 = 0u; k0 < BK; k0 += TILE) {
+            coopMatLoad(b0, Xsh, k0 * BN, BN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, Xsh, k0 * BN + TILE, BN,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b2, Xsh, k0 * BN + 2u * TILE, BN,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b3, Xsh, k0 * BN + 3u * TILE, BN,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a, Wsh, subgroup * TILE * BK + k0, BK,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            c0 = coopMatMulAdd(a, b0, c0);
+            c1 = coopMatMulAdd(a, b1, c1);
+            c2 = coopMatMulAdd(a, b2, c2);
+            c3 = coopMatMulAdd(a, b3, c3);
+            coopMatLoad(a, Wsh, (subgroup + 4u) * TILE * BK + k0, BK,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            d0 = coopMatMulAdd(a, b0, d0);
+            d1 = coopMatMulAdd(a, b1, d1);
+            d2 = coopMatMulAdd(a, b2, d2);
+            d3 = coopMatMulAdd(a, b3, d3);
+        }
+        barrier();
+    }
+
+    uint row = rowBase + subgroup * TILE;
+    coopMatStore(c0, y, tokBase * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(c1, y, (tokBase + TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(c2, y, (tokBase + 2u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(c3, y, (tokBase + 3u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    row += 4u * TILE;
+    coopMatStore(d0, y, tokBase * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(d1, y, (tokBase + TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(d2, y, (tokBase + 2u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatStore(d3, y, (tokBase + 3u * TILE) * pc.M + row, pc.M,
+                 gl_CooperativeMatrixLayoutColumnMajor);
+}

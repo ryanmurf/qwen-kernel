@@ -1,0 +1,170 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// 32-query twin of fa_attn_batch_coopmat.comp. Same math and gating; the
+// query block doubles to Br=32 (two 16-row cooperative blocks), which halves
+// the K/V global read amplification — each workgroup walks its head's key
+// stream once for 32 queries instead of 16. Bc drops to 32 so all four
+// wave64 subgroups compute one 16x16 score tile each. Host contract: grid
+// z indexes 32-query blocks (zdim = ceil(tile/32)), pc.qbase 16-aligned.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQH { float qhat[]; };
+layout(std430, binding = 1) readonly  buffer BufKC { float kc[]; };
+layout(std430, binding = 2) readonly  buffer BufVC { float vc[]; };
+layout(std430, binding = 3) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 4) writeonly buffer BufA  { float att[]; };
+
+layout(push_constant) uniform PC {
+    uint tmax; uint dh; uint nRot; uint hQ;
+    uint hKV; float eps; float freqBase; uint base;
+    uint Tn; uint qbase;
+} pc;
+
+const uint BR  = 32u;   // queries per block
+const uint BC  = 32u;   // keys per tile
+const uint DH  = 256u;  // head dim (host gates dh==256)
+
+const uint QS_STRIDE = 264u;  // f16
+const uint KS_STRIDE = 264u;  // f16
+const uint SF_STRIDE = 36u;   // f32
+const uint PS_STRIDE = 40u;   // f16
+const uint PV_STRIDE = 260u;  // f32
+
+shared float16_t Qs[BR * QS_STRIDE];
+shared float16_t Ks[BC * KS_STRIDE];      // K tile, then reused as the V tile
+shared float     sfsh[BR * SF_STRIDE];
+shared float16_t Psh[BR * PS_STRIDE];
+shared float     pvsh[16u * PV_STRIDE];   // one 16-row block at a time
+shared float     mi[BR];
+shared float     li[BR];
+shared float     corr[BR];
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint t   = gl_LocalInvocationID.x;
+    uint sg  = gl_SubgroupID;            // 4 wave64 subgroups
+    uint blk = pc.qbase + gl_WorkGroupID.z * BR;
+    uint kv  = h / (pc.hQ / pc.hKV);
+    float scale = inversesqrt(float(DH));
+
+    uint nq = min(BR, pc.Tn - min(blk, pc.Tn));
+    if (nq == 0u) return;
+    uint nkMax = pc.base + blk + nq;
+
+    for (uint x = 0u; x < BR * DH / 256u; ++x) {
+        uint idx = x * 256u + t;
+        uint i = idx / DH, d = idx % DH;
+        float q = (i < nq) ? qhat[(blk + i) * pc.hQ * DH + h * DH + d] * scale : 0.0;
+        Qs[i * QS_STRIDE + d] = float16_t(q);
+    }
+    if (t < BR) { mi[t] = -3.4e38; li[t] = 0.0; }
+    float acc[BR];
+    [[unroll]] for (uint i = 0u; i < BR; ++i) acc[i] = 0.0;
+
+    for (uint p0 = 0u; p0 < nkMax; p0 += BC) {
+        uint ts = min(BC, nkMax - p0);
+
+        barrier();
+        for (uint x = 0u; x < BC * DH / 256u; ++x) {
+            uint idx = x * 256u + t;
+            uint j = idx / DH, d = idx % DH;
+            float k = (j < ts) ? kc[(kv * pc.tmax + (p0 + j)) * DH + d] : 0.0;
+            Ks[j * KS_STRIDE + d] = float16_t(k);
+        }
+        barrier();
+
+        // S = Q . K^T: subgroup sg owns (row block sg>>1, key block sg&1).
+        {
+            uint rb = sg >> 1u, cb = sg & 1u;
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint dk = 0u; dk < DH / 16u; ++dk) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, Qs, rb * 16u * QS_STRIDE + dk * 16u, QS_STRIDE,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, Ks, (cb * 16u) * KS_STRIDE + dk * 16u, KS_STRIDE,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                S = coopMatMulAdd(A, B, S);
+            }
+            coopMatStore(S, sfsh, rb * 16u * SF_STRIDE + cb * 16u, SF_STRIDE,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        if (t < BR) {
+            uint i = t;
+            float rowmax = -3.4e38;
+            uint jmax = min(ts, pc.base + blk + i + 1u - min(p0, pc.base + blk + i + 1u));
+            for (uint j = 0u; j < jmax; ++j) rowmax = max(rowmax, sfsh[i * SF_STRIDE + j]);
+            float newm = max(mi[i], rowmax);
+            corr[i] = exp(mi[i] - newm);
+            mi[i] = newm;
+        }
+        barrier();
+        [[unroll]] for (uint x = 0u; x < BR * BC / 256u; ++x) {
+            uint idx = x * 256u + t;
+            uint i = idx / BC, j = idx % BC;
+            bool vis = j < ts && i < nq && p0 + j <= pc.base + blk + i;
+            float p = vis ? exp(sfsh[i * SF_STRIDE + j] - mi[i]) : 0.0;
+            Psh[i * PS_STRIDE + j] = float16_t(p);
+        }
+        barrier();
+        if (t < BR) {
+            uint i = t;
+            float sum = 0.0;
+            for (uint j = 0u; j < ts; ++j) sum += float(Psh[i * PS_STRIDE + j]);
+            li[i] = li[i] * corr[i] + sum;
+        }
+        barrier();
+        for (uint x = 0u; x < BC * DH / 256u; ++x) {
+            uint idx = x * 256u + t;
+            uint j = idx / DH, d = idx % DH;
+            float v = (j < ts) ? vc[(kv * pc.tmax + (p0 + j)) * DH + d] : 0.0;
+            Ks[j * KS_STRIDE + d] = float16_t(v);
+        }
+        barrier();
+
+        // PV per 16-row block: subgroup sg owns output dims [64sg, 64sg+64).
+        [[unroll]] for (uint rb = 0u; rb < 2u; ++rb) {
+            [[unroll]] for (uint nt = 0u; nt < 4u; ++nt) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> PV =
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                [[unroll]] for (uint kk = 0u; kk < BC / 16u; ++kk) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                    coopMatLoad(A, Psh, rb * 16u * PS_STRIDE + kk * 16u, PS_STRIDE,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    coopMatLoad(B, Ks, (kk * 16u) * KS_STRIDE + sg * 64u + nt * 16u,
+                                KS_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                    PV = coopMatMulAdd(A, B, PV);
+                }
+                coopMatStore(PV, pvsh, sg * 64u + nt * 16u, PV_STRIDE,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+            {
+                float cr;
+                [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+                    cr = corr[rb * 16u + i];
+                    acc[rb * 16u + i] = acc[rb * 16u + i] * cr + pvsh[i * PV_STRIDE + t];
+                }
+            }
+            barrier();
+        }
+    }
+
+    for (uint i = 0u; i < nq; ++i) {
+        uint n = blk + i;
+        float o = acc[i] / li[i];
+        float g = qfull[n * pc.hQ * 2u * DH + h * 2u * DH + DH + t];
+        att[n * pc.hQ * DH + h * DH + t] = o * (1.0 / (1.0 + exp(-g)));
+    }
+}
