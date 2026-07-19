@@ -47,7 +47,9 @@ set(SHADERS gemv_f16 gemv_q4_0 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs
     gemma4_moe_reduce_grouped gemma4_moe_geglu_batch gemma4_moe_reduce_batch
     gemma4_attn_prep gemma4_attn gemma4_attn_prep_f16 gemma4_attn_f16
     gemma4_attn_prep_batch_f16 gemma4_attn_batch_f16
-    gemma4_attn_split_f16 gemma4_attn_split_reduce gemma4_mask_f16
+    gemma4_attn_split_f16 gemma4_attn_flash_coopmat_f16
+    gemma4_attn_batch_flash_coopmat_f16
+    gemma4_attn_split_reduce gemma4_mask_f16
     gemma4_cache_scatter_f16 gemma4_argmax
     moe_logits moe_route_select moe_route_select_hier moe_select moe_select_256 moe_group_pairs
     moe_gateup_iq3 moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_q8 moe_gateup_q8_64

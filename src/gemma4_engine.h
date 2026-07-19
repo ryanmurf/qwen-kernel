@@ -131,6 +131,18 @@ class Gemma4Engine {
         bRouterSnapshot = dev((size_t)gemma4::kExperts*4 +
                               sizeof(gemma4::Selection));
 
+        profilePhaseEnabled = getenv("QK_G4_PROFILE_PHASES") && c.hasTimestamps;
+        const bool coopF16 = !getenv("QK_G4_NO_COOPMAT") &&
+                             c.cooperativeMatrix &&
+                             c.cooperativeMatrixF16Acc &&
+                             c.cooperativeMatrixM == 16 &&
+                             c.cooperativeMatrixN == 16 &&
+                             c.cooperativeMatrixK == 16;
+        useCoopAttention = coopF16;
+        useCoopSliding = getenv("QK_G4_COOPMAT_SLIDING") &&
+                         coopF16;
+        useCoopBatch = coopF16;
+        useCoopBatchSliding = coopF16;
         if (!uploadModel(error)) return false;
         makePipelines();
         makeDescriptorPool();
@@ -139,7 +151,8 @@ class Gemma4Engine {
         makeBatchSharedSets();
         makeBatchLayerSets(error);
         if (!error.empty()) return false;
-        profileEnabled = getenv("QK_G4_PROFILE") && c.hasTimestamps;
+        profileEnabled = (getenv("QK_G4_PROFILE") || profilePhaseEnabled) &&
+                         c.hasTimestamps;
         if (profileEnabled) {
             VkQueryPoolCreateInfo queryInfo{
                 VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -242,6 +255,8 @@ class Gemma4Engine {
     struct ProfileSample {
         uint32_t position = 0, layer = 0;
         double gpuTotalUs = 0.0, attentionUs = 0.0;
+        double attentionPrepUs = 0.0, scoreUs = 0.0, softmaxUs = 0.0;
+        double valueUs = 0.0, attentionFinalizeUs = 0.0;
         double sharedUs = 0.0, routedUs = 0.0;
         double residualUs = 0.0, headUs = 0.0;
     };
@@ -258,12 +273,17 @@ class Gemma4Engine {
         const double usPerTick = c.props.limits.timestampPeriod/1000.0;
         sample.position = lastProfilePosition;
         sample.layer = profileLayer;
-        sample.gpuTotalUs = (stamps[7] - stamps[0])*usPerTick;
-        sample.attentionUs = (stamps[2] - stamps[1])*usPerTick;
-        sample.sharedUs = (stamps[3] - stamps[2])*usPerTick;
-        sample.routedUs = (stamps[4] - stamps[3])*usPerTick;
-        sample.residualUs = (stamps[5] - stamps[4])*usPerTick;
-        sample.headUs = (stamps[7] - stamps[6])*usPerTick;
+        sample.gpuTotalUs = (stamps[11] - stamps[0])*usPerTick;
+        sample.attentionUs = (stamps[6] - stamps[1])*usPerTick;
+        sample.attentionPrepUs = (stamps[2] - stamps[1])*usPerTick;
+        sample.scoreUs = (stamps[3] - stamps[2])*usPerTick;
+        sample.softmaxUs = (stamps[4] - stamps[3])*usPerTick;
+        sample.valueUs = (stamps[5] - stamps[4])*usPerTick;
+        sample.attentionFinalizeUs = (stamps[6] - stamps[5])*usPerTick;
+        sample.sharedUs = (stamps[7] - stamps[6])*usPerTick;
+        sample.routedUs = (stamps[8] - stamps[7])*usPerTick;
+        sample.residualUs = (stamps[9] - stamps[8])*usPerTick;
+        sample.headUs = (stamps[11] - stamps[10])*usPerTick;
         return true;
     }
 
@@ -305,7 +325,16 @@ class Gemma4Engine {
         VkDescriptorSet bAttnRms = VK_NULL_HANDLE, bQ = VK_NULL_HANDLE;
         VkDescriptorSet bK = VK_NULL_HANDLE, bV = VK_NULL_HANDLE;
         VkDescriptorSet bPrep = VK_NULL_HANDLE, bAttention = VK_NULL_HANDLE;
+        VkDescriptorSet bAttentionCoop = VK_NULL_HANDLE;
         VkDescriptorSet dAttentionSplit = VK_NULL_HANDLE;
+        VkDescriptorSet bAttentionScore = VK_NULL_HANDLE;
+        VkDescriptorSet bAttentionSoftmax = VK_NULL_HANDLE;
+        VkDescriptorSet bAttentionValue = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionScore = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionSoftmax = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionValue = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionCoop = VK_NULL_HANDLE;
+        VkDescriptorSet dAttentionCoopSliding = VK_NULL_HANDLE;
         VkDescriptorSet bAttnOutput = VK_NULL_HANDLE, bPostAttention = VK_NULL_HANDLE;
         VkDescriptorSet bSharedRms = VK_NULL_HANDLE, bSharedGate = VK_NULL_HANDLE;
         VkDescriptorSet bSharedUp = VK_NULL_HANDLE, bSharedDown = VK_NULL_HANDLE;
@@ -336,9 +365,12 @@ class Gemma4Engine {
     uint32_t* positionMap = nullptr;
     uint32_t* tokenOutMap = nullptr;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    static constexpr uint32_t kProfileQueries = 8;
+    static constexpr uint32_t kProfileQueries = 12;
     VkQueryPool profileQueries = VK_NULL_HANDLE;
-    bool profileEnabled = false, profileReady = false;
+    bool profileEnabled = false, profilePhaseEnabled = false;
+    bool useCoopAttention = false, useCoopSliding = false;
+    bool useCoopBatch = false, useCoopBatchSliding = false;
+    bool profileReady = false;
     uint32_t lastProfilePosition = 0, profileLayer = 0;
     VkCommandBuffer stepCb = VK_NULL_HANDLE, prefillCb = VK_NULL_HANDLE;
     VkCommandBuffer recordingCb = VK_NULL_HANDLE;
@@ -348,7 +380,11 @@ class Gemma4Engine {
     Pipe pHead{}, pArgmax{};
     Pipe pBatchEmbed{}, pBatchGemm88{}, pBatchGemm66{};
     Pipe pBatchGemm128{}, pBatchGemm256{}, pBatchPrep{}, pBatchAttention{};
+    Pipe pBatchAttentionCoop{}, pBatchAttentionCoopSliding{};
     Pipe pDecodeAttentionSplit{}, pDecodeAttentionReduce{};
+    Pipe pBatchAttentionScore{}, pBatchAttentionSoftmax{}, pBatchAttentionValue{};
+    Pipe pDecodeAttentionScore{}, pDecodeAttentionSoftmax{}, pDecodeAttentionValue{};
+    Pipe pDecodeAttentionCoop{}, pDecodeAttentionCoopSliding{};
     Pipe pBatchMask{};
     Pipe pBatchRouter{}, pBatchSelect{}, pBatchExpertGateUp{}, pBatchExpertDown{};
     Pipe pBatchExpertGroup{}, pBatchExpertReduce{};
@@ -689,8 +725,38 @@ class Gemma4Engine {
         pBatchGemm256 = makePipe(c, "gemm_q4_0.spv", 3, 12, 256);
         pBatchPrep = makePipe(c, "gemma4_attn_prep_batch_f16.spv", 11, 44);
         pBatchAttention = makePipe(c, "gemma4_attn_batch_f16.spv", 5, 32);
+        if (useCoopBatch)
+            pBatchAttentionCoop = makePipeSpecs(
+                c, "gemma4_attn_batch_flash_coopmat_f16.spv", 4, 32,
+                {512u, 8u});
+        if (useCoopBatchSliding)
+            pBatchAttentionCoopSliding = makePipeSpecs(
+                c, "gemma4_attn_batch_flash_coopmat_f16.spv", 4, 32,
+                {256u, 2u});
         pDecodeAttentionSplit = makePipe(c, "gemma4_attn_split_f16.spv", 5, 40);
         pDecodeAttentionReduce = makePipe(c, "gemma4_attn_split_reduce.spv", 2, 12);
+        if (useCoopAttention)
+            pDecodeAttentionCoop = makePipeSpecs(
+                c, "gemma4_attn_flash_coopmat_f16.spv", 4, 40,
+                {512u, 8u});
+        if (useCoopSliding)
+            pDecodeAttentionCoopSliding = makePipeSpecs(
+                c, "gemma4_attn_flash_coopmat_f16.spv", 4, 40,
+                {256u, 2u});
+        if (profilePhaseEnabled) {
+            pBatchAttentionScore = makePipe(
+                c, "gemma4_attn_batch_f16.spv", 5, 32, 1);
+            pBatchAttentionSoftmax = makePipe(
+                c, "gemma4_attn_batch_f16.spv", 5, 32, 2);
+            pBatchAttentionValue = makePipe(
+                c, "gemma4_attn_batch_f16.spv", 5, 32, 3);
+            pDecodeAttentionScore = makePipe(
+                c, "gemma4_attn_split_f16.spv", 5, 40, 1);
+            pDecodeAttentionSoftmax = makePipe(
+                c, "gemma4_attn_split_f16.spv", 5, 40, 2);
+            pDecodeAttentionValue = makePipe(
+                c, "gemma4_attn_split_f16.spv", 5, 40, 3);
+        }
         pBatchMask = makePipe(c, "gemma4_mask_f16.spv", 1, 16);
         pBatchRouter = makePipe(c, "gemma4_router_batch.spv", 4, 12);
         pBatchSelect = makePipe(c, "gemma4_select_batch.spv", 2, 0);
@@ -857,11 +923,53 @@ class Gemma4Engine {
                      l.cfg.sliding ? l.keyCache : l.linearKeyCache,
                      l.cfg.sliding ? l.valueCache : l.linearValueCache,
                      bbProbabilities, bbAttentionValue});
+                if ((useCoopBatch && !l.cfg.sliding) ||
+                    (useCoopBatchSliding && l.cfg.sliding)) {
+                    Pipe& batchAttentionPipe = l.cfg.sliding
+                        ? pBatchAttentionCoopSliding : pBatchAttentionCoop;
+                    l.bAttentionCoop = set(batchAttentionPipe,
+                        {bbQuery,
+                         l.cfg.sliding ? l.keyCache : l.linearKeyCache,
+                         l.cfg.sliding ? l.valueCache : l.linearValueCache,
+                         bbAttentionValue});
+                }
                 l.dAttentionSplit = set(pDecodeAttentionSplit,
                     {bbQuery,
                      l.cfg.sliding ? l.keyCache : l.linearKeyCache,
                      l.cfg.sliding ? l.valueCache : l.linearValueCache,
                      bbProbabilities, bAttnSplit});
+                if (useCoopAttention && !l.cfg.sliding)
+                    l.dAttentionCoop = set(pDecodeAttentionCoop,
+                        {bbQuery,
+                         l.linearKeyCache, l.linearValueCache,
+                         bAttnSplit});
+                if (useCoopSliding && l.cfg.sliding)
+                    l.dAttentionCoopSliding = set(pDecodeAttentionCoopSliding,
+                        {bbQuery, l.keyCache, l.valueCache, bAttnSplit});
+                if (profilePhaseEnabled) {
+                    const std::initializer_list<VkBuffer> attentionBuffers{
+                        bbQuery,
+                        l.cfg.sliding ? l.keyCache : l.linearKeyCache,
+                        l.cfg.sliding ? l.valueCache : l.linearValueCache,
+                        bbProbabilities, bbAttentionValue};
+                    l.bAttentionScore = set(pBatchAttentionScore,
+                                            attentionBuffers);
+                    l.bAttentionSoftmax = set(pBatchAttentionSoftmax,
+                                              attentionBuffers);
+                    l.bAttentionValue = set(pBatchAttentionValue,
+                                            attentionBuffers);
+                    const std::initializer_list<VkBuffer> splitBuffers{
+                        bbQuery,
+                        l.cfg.sliding ? l.keyCache : l.linearKeyCache,
+                        l.cfg.sliding ? l.valueCache : l.linearValueCache,
+                        bbProbabilities, bAttnSplit};
+                    l.dAttentionScore = set(pDecodeAttentionScore,
+                                            splitBuffers);
+                    l.dAttentionSoftmax = set(pDecodeAttentionSoftmax,
+                                              splitBuffers);
+                    l.dAttentionValue = set(pDecodeAttentionValue,
+                                            splitBuffers);
+                }
                 l.bAttnOutput = set(batchGemmPipe(qWidth),
                     {l.attnOut, bbAttentionValue, bbAttnProjected});
                 l.bPostAttention = set(pRms,
@@ -1115,6 +1223,10 @@ class Gemma4Engine {
             if (diagnostics && il == diagnosticLayer && tokens == 1)
                 recordAttnOpDump(bbQuery,
                     (VkDeviceSize)(tokens - 1)*qWidth*4, 4, qWidth*4);
+            if (profile && il == profileLayer)
+                vkCmdWriteTimestamp(recordingCb,
+                                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                    profileQueries, 2);
             if (tokens == 1) {
                 const uint32_t actualLength = basePosition + 1;
                 const uint32_t kvLength = std::min(
@@ -1134,15 +1246,59 @@ class Gemma4Engine {
                             l.cfg.sliding ? gemma4::kSlidingWindow : kvCapacity,
                             l.cfg.sliding ? 1u : 0u, probabilityStride,
                             kvLength, splitKv, splitK};
-                bindDispatch(pDecodeAttentionSplit, l.dAttentionSplit,
-                             &splitPush, sizeof(splitPush),
-                             l.cfg.kvHeads, splitK);
+                if (useCoopAttention && !l.cfg.sliding &&
+                    !profilePhaseEnabled) {
+                    bindDispatch(pDecodeAttentionCoop, l.dAttentionCoop,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                } else if (useCoopSliding && l.cfg.sliding &&
+                    !profilePhaseEnabled) {
+                    bindDispatch(pDecodeAttentionCoopSliding,
+                                 l.dAttentionCoopSliding,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                } else if (profilePhaseEnabled) {
+                    bindDispatch(pDecodeAttentionScore, l.dAttentionScore,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 3);
+                    bindDispatch(pDecodeAttentionSoftmax, l.dAttentionSoftmax,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 4);
+                    bindDispatch(pDecodeAttentionValue, l.dAttentionValue,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                } else {
+                    bindDispatch(pDecodeAttentionSplit, l.dAttentionSplit,
+                                 &splitPush, sizeof(splitPush),
+                                 l.cfg.kvHeads, splitK);
+                }
                 struct ReducePush { uint32_t headDim, queryHeads, splitK; };
                 ReducePush reducePush{l.cfg.headDim, l.cfg.queryHeads, splitK};
                 bindDispatch(pDecodeAttentionReduce, sdAttentionReduce,
                              &reducePush, sizeof(reducePush),
                              l.cfg.queryHeads,
                              (l.cfg.headDim + 63u)/64u);
+                if (profile && il == profileLayer) {
+                    if (!profilePhaseEnabled) {
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 3);
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 4);
+                    }
+                    vkCmdWriteTimestamp(recordingCb,
+                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        profileQueries, 5);
+                }
             } else {
                 struct AttentionPush {
                     uint32_t basePosition, tokens, headDim, queryHeads, kvHeads;
@@ -1152,8 +1308,49 @@ class Gemma4Engine {
                     l.cfg.kvHeads,
                     l.cfg.sliding ? gemma4::kSlidingWindow : kvCapacity,
                     l.cfg.sliding ? 1u : 0u, probabilityStride};
-                bindDispatch(pBatchAttention, l.bAttention, &attentionPush,
-                             sizeof(attentionPush), l.cfg.kvHeads, tokens);
+                if (((useCoopBatch && !l.cfg.sliding) ||
+                     (useCoopBatchSliding && l.cfg.sliding)) &&
+                    !profilePhaseEnabled) {
+                    Pipe& batchAttentionPipe = l.cfg.sliding
+                        ? pBatchAttentionCoopSliding : pBatchAttentionCoop;
+                    bindDispatch(batchAttentionPipe, l.bAttentionCoop,
+                                 &attentionPush, sizeof(attentionPush),
+                                 l.cfg.kvHeads, tokens);
+                } else if (profilePhaseEnabled) {
+                    bindDispatch(pBatchAttentionScore, l.bAttentionScore,
+                                 &attentionPush, sizeof(attentionPush),
+                                 l.cfg.kvHeads, tokens);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 3);
+                    bindDispatch(pBatchAttentionSoftmax, l.bAttentionSoftmax,
+                                 &attentionPush, sizeof(attentionPush),
+                                 l.cfg.kvHeads, tokens);
+                    if (profile && il == profileLayer)
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 4);
+                    bindDispatch(pBatchAttentionValue, l.bAttentionValue,
+                                 &attentionPush, sizeof(attentionPush),
+                                 l.cfg.kvHeads, tokens);
+                } else {
+                    bindDispatch(pBatchAttention, l.bAttention, &attentionPush,
+                                 sizeof(attentionPush), l.cfg.kvHeads, tokens);
+                }
+                if (profile && il == profileLayer) {
+                    if (!profilePhaseEnabled) {
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 3);
+                        vkCmdWriteTimestamp(recordingCb,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            profileQueries, 4);
+                    }
+                    vkCmdWriteTimestamp(recordingCb,
+                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        profileQueries, 5);
+                }
             }
             if (diagnostics && il == diagnosticLayer && tokens == 1)
                 recordAttnOpDump(bbAttentionValue, 0, 5, qWidth*4);
@@ -1169,7 +1366,7 @@ class Gemma4Engine {
             if (profile && il == profileLayer)
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                    profileQueries, 2);
+                                    profileQueries, 6);
             if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbAttnOut, tokens - 1, 0);
 
@@ -1198,7 +1395,7 @@ class Gemma4Engine {
             if (profile && il == profileLayer)
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                    profileQueries, 3);
+                                    profileQueries, 7);
             if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbSharedBranch, tokens - 1, 1);
 
@@ -1231,7 +1428,7 @@ class Gemma4Engine {
             if (profile && il == profileLayer)
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                    profileQueries, 4);
+                                    profileQueries, 8);
             if (diagnostics && il == diagnosticLayer)
                 recordOpDump(bbRoutedBranch, tokens - 1, 2);
 
@@ -1246,7 +1443,7 @@ class Gemma4Engine {
             if (profile && il == profileLayer)
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                    profileQueries, 5);
+                                    profileQueries, 9);
             if (diagnostics) {
                 VkMemoryBarrier toCopy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                 toCopy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1274,7 +1471,7 @@ class Gemma4Engine {
             if (profile)
                 vkCmdWriteTimestamp(recordingCb,
                                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                    profileQueries, 6);
+                                    profileQueries, 10);
             batchRms(sbFinalNorm, tokens);
             VkMemoryBarrier toCopy{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             toCopy.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1495,7 +1692,12 @@ class Gemma4Engine {
                         &pBatchEmbed, &pBatchGemm88, &pBatchGemm66,
                         &pBatchGemm128, &pBatchGemm256, &pBatchPrep,
                         &pBatchAttention, &pDecodeAttentionSplit,
+                        &pBatchAttentionCoop, &pBatchAttentionCoopSliding,
                         &pDecodeAttentionReduce, &pBatchMask,
+                        &pBatchAttentionScore, &pBatchAttentionSoftmax,
+                        &pBatchAttentionValue, &pDecodeAttentionScore,
+                        &pDecodeAttentionSoftmax, &pDecodeAttentionValue,
+                        &pDecodeAttentionCoop, &pDecodeAttentionCoopSliding,
                         &pBatchRouter, &pBatchSelect,
                         &pBatchExpertGroup, &pBatchExpertGateUp,
                         &pBatchExpertDown, &pBatchExpertReduce}) {
@@ -1765,6 +1967,11 @@ static bool caseGemma4Profile(VkCtx& c, uint32_t depth) {
     }
     double attentionUs = 0.0, sharedUs = 0.0;
     double routedUs = 0.0, residualUs = 0.0;
+    double attentionPrepUs = 0.0, scoreUs = 0.0, softmaxUs = 0.0;
+    double valueUs = 0.0, attentionFinalizeUs = 0.0;
+    double slidingAttentionUs = 0.0, globalAttentionUs = 0.0;
+    double slidingScoreUs = 0.0, slidingSoftmaxUs = 0.0, slidingValueUs = 0.0;
+    double globalScoreUs = 0.0, globalSoftmaxUs = 0.0, globalValueUs = 0.0;
     std::vector<double> gpuTotals, wallTotals, headTimes;
     for (uint32_t il = 0; il < gemma4::kLayers; ++il) {
         engine.selectProfileLayer(il);
@@ -1779,17 +1986,38 @@ static bool caseGemma4Profile(VkCtx& c, uint32_t depth) {
         wallTotals.push_back(wallUs);
         headTimes.push_back(sample.headUs);
         attentionUs += sample.attentionUs;
+        attentionPrepUs += sample.attentionPrepUs;
+        scoreUs += sample.scoreUs;
+        softmaxUs += sample.softmaxUs;
+        valueUs += sample.valueUs;
+        attentionFinalizeUs += sample.attentionFinalizeUs;
+        if (gemma4::attentionConfig(il).sliding) {
+            slidingAttentionUs += sample.attentionUs;
+            slidingScoreUs += sample.scoreUs;
+            slidingSoftmaxUs += sample.softmaxUs;
+            slidingValueUs += sample.valueUs;
+        } else {
+            globalAttentionUs += sample.attentionUs;
+            globalScoreUs += sample.scoreUs;
+            globalSoftmaxUs += sample.softmaxUs;
+            globalValueUs += sample.valueUs;
+        }
         sharedUs += sample.sharedUs;
         routedUs += sample.routedUs;
         residualUs += sample.residualUs;
         printf("QK_G4_PROFILE_LAYER {\"position\":%u,\"layer\":%u,"
                "\"global\":%s,\"gpu_total_us\":%.3f,\"wall_us\":%.3f,"
-               "\"attention_us\":%.3f,\"shared_expert_us\":%.3f,"
+               "\"attention_us\":%.3f,\"attention_prep_us\":%.3f,"
+               "\"score_us\":%.3f,\"softmax_us\":%.3f,"
+               "\"value_us\":%.3f,\"attention_finalize_us\":%.3f,"
+               "\"shared_expert_us\":%.3f,"
                "\"routed_experts_us\":%.3f,\"residual_norm_us\":%.3f,"
                "\"head_us\":%.3f}\n",
                sample.position, sample.layer,
                gemma4::attentionConfig(il).sliding ? "false" : "true",
                sample.gpuTotalUs, wallUs, sample.attentionUs,
+               sample.attentionPrepUs, sample.scoreUs, sample.softmaxUs,
+               sample.valueUs, sample.attentionFinalizeUs,
                sample.sharedUs, sample.routedUs, sample.residualUs,
                sample.headUs);
     }
@@ -1798,10 +2026,21 @@ static bool caseGemma4Profile(VkCtx& c, uint32_t depth) {
                                residualUs + headUs;
     printf("QK_G4_PROFILE_SUMMARY {\"depth\":%u,"
            "\"median_gpu_total_us\":%.3f,\"median_wall_us\":%.3f,"
-           "\"attention_us\":%.3f,\"shared_expert_us\":%.3f,"
+           "\"attention_us\":%.3f,\"sliding_attention_us\":%.3f,"
+           "\"global_attention_us\":%.3f,\"attention_prep_us\":%.3f,"
+           "\"score_us\":%.3f,\"softmax_us\":%.3f,\"value_us\":%.3f,"
+           "\"attention_finalize_us\":%.3f,"
+           "\"sliding_score_us\":%.3f,\"sliding_softmax_us\":%.3f,"
+           "\"sliding_value_us\":%.3f,\"global_score_us\":%.3f,"
+           "\"global_softmax_us\":%.3f,\"global_value_us\":%.3f,"
+           "\"shared_expert_us\":%.3f,"
            "\"routed_experts_us\":%.3f,\"residual_norm_us\":%.3f,"
            "\"head_us\":%.3f,\"accounted_us\":%.3f}\n",
            depth, g4Median(gpuTotals), g4Median(wallTotals), attentionUs,
+           slidingAttentionUs, globalAttentionUs, attentionPrepUs,
+           scoreUs, softmaxUs, valueUs, attentionFinalizeUs,
+           slidingScoreUs, slidingSoftmaxUs, slidingValueUs,
+           globalScoreUs, globalSoftmaxUs, globalValueUs,
            sharedUs, routedUs, residualUs, headUs, accountedUs);
     return true;
 }
@@ -1824,6 +2063,11 @@ static bool caseGemma4ProfilePrompt(VkCtx& c, uint32_t promptTokens) {
     if (!engine.ingest(tokens, ignored)) return false; // discarded warm-up
     double attentionUs = 0.0, sharedUs = 0.0;
     double routedUs = 0.0, residualUs = 0.0;
+    double attentionPrepUs = 0.0, scoreUs = 0.0, softmaxUs = 0.0;
+    double valueUs = 0.0, attentionFinalizeUs = 0.0;
+    double slidingAttentionUs = 0.0, globalAttentionUs = 0.0;
+    double slidingScoreUs = 0.0, slidingSoftmaxUs = 0.0, slidingValueUs = 0.0;
+    double globalScoreUs = 0.0, globalSoftmaxUs = 0.0, globalValueUs = 0.0;
     std::vector<double> gpuTotals, wallTotals, headTimes;
     for (uint32_t il = 0; il < gemma4::kLayers; ++il) {
         engine.reset();
@@ -1839,19 +2083,53 @@ static bool caseGemma4ProfilePrompt(VkCtx& c, uint32_t promptTokens) {
         wallTotals.push_back(wallUs);
         headTimes.push_back(sample.headUs);
         attentionUs += sample.attentionUs;
+        attentionPrepUs += sample.attentionPrepUs;
+        scoreUs += sample.scoreUs;
+        softmaxUs += sample.softmaxUs;
+        valueUs += sample.valueUs;
+        attentionFinalizeUs += sample.attentionFinalizeUs;
+        if (gemma4::attentionConfig(il).sliding) {
+            slidingAttentionUs += sample.attentionUs;
+            slidingScoreUs += sample.scoreUs;
+            slidingSoftmaxUs += sample.softmaxUs;
+            slidingValueUs += sample.valueUs;
+        } else {
+            globalAttentionUs += sample.attentionUs;
+            globalScoreUs += sample.scoreUs;
+            globalSoftmaxUs += sample.softmaxUs;
+            globalValueUs += sample.valueUs;
+        }
         sharedUs += sample.sharedUs;
         routedUs += sample.routedUs;
         residualUs += sample.residualUs;
+        printf("QK_G4_PROFILE_PP_LAYER {\"layer\":%u,\"global\":%s,"
+               "\"attention_us\":%.3f,\"attention_prep_us\":%.3f,"
+               "\"score_us\":%.3f,\"softmax_us\":%.3f,"
+               "\"value_us\":%.3f,\"attention_finalize_us\":%.3f}\n",
+               il, gemma4::attentionConfig(il).sliding ? "false" : "true",
+               sample.attentionUs, sample.attentionPrepUs, sample.scoreUs,
+               sample.softmaxUs, sample.valueUs, sample.attentionFinalizeUs);
     }
     const double headUs = g4Median(headTimes);
     const double accountedUs = attentionUs + sharedUs + routedUs +
                                residualUs + headUs;
     printf("QK_G4_PROFILE_PP_SUMMARY {\"tokens\":%u,"
            "\"median_gpu_total_us\":%.3f,\"median_wall_us\":%.3f,"
-           "\"attention_us\":%.3f,\"shared_expert_us\":%.3f,"
+           "\"attention_us\":%.3f,\"sliding_attention_us\":%.3f,"
+           "\"global_attention_us\":%.3f,\"attention_prep_us\":%.3f,"
+           "\"score_us\":%.3f,\"softmax_us\":%.3f,\"value_us\":%.3f,"
+           "\"attention_finalize_us\":%.3f,"
+           "\"sliding_score_us\":%.3f,\"sliding_softmax_us\":%.3f,"
+           "\"sliding_value_us\":%.3f,\"global_score_us\":%.3f,"
+           "\"global_softmax_us\":%.3f,\"global_value_us\":%.3f,"
+           "\"shared_expert_us\":%.3f,"
            "\"routed_experts_us\":%.3f,\"residual_norm_us\":%.3f,"
            "\"head_us\":%.3f,\"accounted_us\":%.3f}\n",
            promptTokens, g4Median(gpuTotals), g4Median(wallTotals),
-           attentionUs, sharedUs, routedUs, residualUs, headUs, accountedUs);
+           attentionUs, slidingAttentionUs, globalAttentionUs, attentionPrepUs,
+           scoreUs, softmaxUs, valueUs, attentionFinalizeUs,
+           slidingScoreUs, slidingSoftmaxUs, slidingValueUs,
+           globalScoreUs, globalSoftmaxUs, globalValueUs,
+           sharedUs, routedUs, residualUs, headUs, accountedUs);
     return true;
 }

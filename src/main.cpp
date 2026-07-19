@@ -82,6 +82,11 @@ struct VkCtx {
     VkPipelineLayout      pl = VK_NULL_HANDLE;
     const char*           argv0 = nullptr;
     bool                  cooperativeMatrix = false;
+    bool                  cooperativeMatrixF16Acc = false;
+    bool                  cooperativeMatrixF32Acc = false;
+    uint32_t              cooperativeMatrixM = 0;
+    uint32_t              cooperativeMatrixN = 0;
+    uint32_t              cooperativeMatrixK = 0;
 };
 
 static uint32_t findMemType(const VkPhysicalDeviceMemoryProperties& mp,
@@ -256,8 +261,46 @@ static void initVk(VkCtx& c, const char* argv0) {
         have12.vulkanMemoryModel) {
         enCoop.cooperativeMatrix = VK_TRUE;
         en12.pNext = &enCoop;
+        auto getCooperativeMatrixProperties =
+            (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(
+                c.inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        if (getCooperativeMatrixProperties) {
+            uint32_t propertyCount = 0;
+            VK_CHECK(getCooperativeMatrixProperties(
+                c.phys, &propertyCount, nullptr));
+            std::vector<VkCooperativeMatrixPropertiesKHR> properties(
+                propertyCount,
+                VkCooperativeMatrixPropertiesKHR{
+                    VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            VK_CHECK(getCooperativeMatrixProperties(
+                c.phys, &propertyCount, properties.data()));
+            for (const auto& property : properties) {
+                if (property.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                    property.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                    property.scope == VK_SCOPE_SUBGROUP_KHR) {
+                    if (property.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                        property.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR) {
+                        c.cooperativeMatrixF16Acc = true;
+                        c.cooperativeMatrixM = property.MSize;
+                        c.cooperativeMatrixN = property.NSize;
+                        c.cooperativeMatrixK = property.KSize;
+                    }
+                    if (property.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                        property.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR)
+                        c.cooperativeMatrixF32Acc = true;
+                }
+            }
+        }
     } else {
         c.cooperativeMatrix = false;
+    }
+    if (c.cooperativeMatrix) {
+        printf("cooperative matrix: KHR f16acc=%s f32acc=%s shape=%ux%ux%u\n",
+               c.cooperativeMatrixF16Acc ? "yes" : "no",
+               c.cooperativeMatrixF32Acc ? "yes" : "no",
+               c.cooperativeMatrixM, c.cooperativeMatrixN,
+               c.cooperativeMatrixK);
     }
     VkPhysicalDeviceVulkan11Features en11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     en11.storageBuffer16BitAccess = VK_TRUE;

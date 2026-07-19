@@ -3,6 +3,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 layout(local_size_x = 256) in;
+// Profiling-only specializations: 0=fused production path, 1=score,
+// 2=softmax, 3=value output. Normal inference always uses 0.
+layout(constant_id = 0) const uint PROFILE_PHASE = 0u;
 layout(std430, binding = 0) readonly buffer BufQ { float query[]; };
 layout(std430, binding = 1) readonly buffer BufK { float16_t keyCache[]; };
 layout(std430, binding = 2) readonly buffer BufV { float16_t valueCache[]; };
@@ -34,17 +37,22 @@ void main() {
     uint count = position + 1u - start;
     uint qWidth = pc.queryHeads*pc.headDim;
     uint probTokenBase = token*pc.queryHeads*pc.probabilityStride;
+    if (PROFILE_PHASE == 0u || PROFILE_PHASE == 1u)
     for (uint localPos = 0u; localPos < count; ++localPos) {
         uint absolutePos = start + localPos;
         uint slot = pc.sliding != 0u ? absolutePos%pc.cacheLength : absolutePos;
         uint keyBase = (kvHead*pc.cacheLength + slot)*pc.headDim;
-        for (uint rank = 0u; rank < groupSize; ++rank) {
-            uint qHead = kvHead*groupSize + rank;
-            float dot = 0.0;
-            for (uint dim = lane; dim < pc.headDim; dim += 256u)
-                dot += query[token*qWidth + qHead*pc.headDim + dim]*float(keyCache[keyBase + dim]);
-            reduction[rank][lane] = dot;
+        float dots[8];
+        for (uint rank = 0u; rank < groupSize; ++rank) dots[rank] = 0.0;
+        for (uint dim = lane; dim < pc.headDim; dim += 256u) {
+            float key = float(keyCache[keyBase + dim]);
+            for (uint rank = 0u; rank < groupSize; ++rank) {
+                uint qHead = kvHead*groupSize + rank;
+                dots[rank] += query[token*qWidth + qHead*pc.headDim + dim]*key;
+            }
         }
+        for (uint rank = 0u; rank < groupSize; ++rank)
+            reduction[rank][lane] = dots[rank];
         barrier();
         for (uint stride = 128u; stride > 0u; stride >>= 1u) {
             if (lane < stride)
@@ -59,6 +67,8 @@ void main() {
             }
         barrier();
     }
+    if (PROFILE_PHASE == 1u) return;
+    if (PROFILE_PHASE == 0u || PROFILE_PHASE == 2u) {
     for (uint rank = 0u; rank < groupSize; ++rank) {
         uint qHead = kvHead*groupSize + rank;
         float maximum = -3.402823466e38;
@@ -101,6 +111,8 @@ void main() {
         for (uint p = lane; p < count; p += 256u)
             probabilities[probTokenBase + qHead*pc.probabilityStride + p] /= sums[rank];
     }
+    }
+    if (PROFILE_PHASE == 2u) return;
     memoryBarrierBuffer(); barrier();
     for (uint dim = lane; dim < pc.headDim; dim += 256u) {
         float accumulators[8];

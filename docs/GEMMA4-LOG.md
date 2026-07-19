@@ -469,3 +469,109 @@ grouped MoE roughly halved the original native routed term, but attention plus
 routed experts still consume 86.0% of the prompt. At d0 the head remains a
 fixed 1.06 ms. These are qk's own kernels and an honest result; Stage 6 does
 not claim to beat llama.cpp at any measured depth.
+
+### 2026-07-19 — Stage 7 native cooperative-matrix attention
+
+Stage 7 keeps the Stage 6 de-vendoring intact. The only new GPU artifacts are
+qk GLSL sources compiled by qk's normal build. A forbidden-path scan remains
+empty for `/mnt/data/llama.cpp-master/build`, `vulkan-shaders.spv`, and
+`llama_*.spv`; both new modules pass `spirv-val --target-env vulkan1.2`. The
+source comments credit llama.cpp `571d0d5`'s `flash_attn_cm1.comp` as an
+algorithmic reference. No compiled SPIR-V or binary was copied, linked, loaded,
+or executed from that project.
+
+Before changing attention, five independent launches split the existing qk
+kernel into profiling-only score, softmax, and output phases. Every launch
+began at XTX `gpu_busy_percent=0`. The phase-specialized path is slightly faster
+than the unchanged fused pipeline because specialization changes compiler
+scheduling, so its phase sum is reported separately from the fused baseline:
+
+| profile before changes | attention | sliding / global | prep | score | softmax | output | finalize |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tg d16384, fused | **34.520 ms** (34.452--34.536) | -- | -- | -- | -- | -- | -- |
+| tg d16384, phase run | 33.261 ms (33.120--33.392) | 26.452 / 6.822 ms | 1.086 ms | **21.775 ms** | 0.213 ms | **9.615 ms** | 0.584 ms |
+| pp512, fused | **218.060 ms** (217.635--218.377) | -- | -- | -- | -- | -- | -- |
+| pp512, phase run | 221.273 ms (220.035--222.700) | 172.151 / 49.111 ms | **90.187 ms** | **60.521 ms** | 6.694 ms | 16.401 ms | **47.571 ms** |
+
+At d16384, the direct phase run assigns 18.394/0.127/6.587 ms of
+score/softmax/output to the 25 sliding layers and 3.381/0.086/3.030 ms to the
+five global layers. The sliding total is larger because there are five times as
+many sliding layers, even though each global layer is individually more
+expensive and grows with depth. At pp512 the corresponding medians are
+44.721/5.579/12.687 ms sliding and 15.798/1.111/3.715 ms global. This is the
+requested measured attribution of the Stage 6 34.444-ms attention term, not a
+cost-model estimate.
+
+The first retained change exploits GQA directly in qk's scalar fallback. One K
+or V cache load now serves all query heads owned by that KV head—eight heads in
+a global layer and two in a sliding layer—while preserving each head's original
+dimension and position accumulation order. The full six-fixture gate passed
+immediately after this change with 1,024 exact generated tokens. In isolation,
+d16384 improved from 25.567 to **29.253 tok/s** (29.195--29.259, busy 0%);
+pp512 was effectively flat at 989.022 tok/s (916.948--989.437, busy 0%).
+
+The XTX advertises `VK_KHR_cooperative_matrix` with 16x16x16 f16-input shapes
+and both f16 and F32 accumulators. The qk-native decode flash kernel assigns one
+workgroup to a KV head and split. A cooperative QK tile produces scores for all
+GQA rows, an online F32 max/sum state avoids materializing the probability
+matrix, and a cooperative PV tile updates the output numerator. The unusually
+wide global dh=512 state is held in shared memory rather than registers:
+16 KiB query, 0.5 KiB score, 0.5 KiB probability, 16 KiB live PV, and 16 KiB
+F32 output state, about 49 KiB plus scalar state. Compile-time cooperative-pipe
+specializations use dh=512/GQA=8 for global and dh=256/GQA=2 for sliding, so the
+sliding allocation is about 19 KiB rather than inheriting the global budget.
+
+Global decode is parity-safe and is now the default on a compatible device.
+At d16384 its five-layer attention median falls from 6.822 to **1.869 ms**, a
+72.6% reduction. Sliding cooperative decode is not parity-safe: with
+`QK_G4_COOPMAT_SLIDING=1`, `swa_position_1024` diverges at continuation index
+13 (absolute position 1037), expected token 1816, actual 506. There is no
+waiver. That path remains explicitly opt-in; default sliding decode uses the
+parity-safe F32 scalar path with GQA reuse.
+
+Prefill uses a second native flash kernel with one workgroup per prompt token
+and KV head. It applies the same eight-head global and two-head sliding K/V
+reuse and specializes shared allocation to each shape. Both global and sliding
+prefill are default on compatible devices. Ordinary and coding grouped-batch
+spot checks reproduce their fixture continuations exactly; the SWA grouped
+batch output is unchanged from Stage 6's scalar grouped-batch output. As in
+Stage 6, the formal fixture claim below deliberately covers the serial accuracy
+path selected by the gate, not every prompt grouping choice.
+
+The final default gate began at 0% XTX busy and passed all six fixtures:
+ordinary chat 32/32, coding 32/32, all three 1023/1024/1025 ring cases 16/16,
+and global-context-8192 16/16. Repeating ordinary and coding from empty caches
+raised the cumulative evidence to **1,024 exact generated tokens**. No waiver
+was used. The post-run busy reading was 97%, recorded as an observation rather
+than an idle claim.
+
+Final default performance is below. Each campaign contains five repetitions
+and began at `gpu_busy_percent=0`; spreads are min--max. llama.cpp values are
+the accepted Stage 6 campaigns on the same XTX, model, f16 K/V setting, and
+`571d0d5` revision.
+
+| test | Stage 7 qk tok/s | vs Stage 6 | llama.cpp tok/s | qk / llama | result |
+|---|---:|---:|---:|---:|---|
+| pp512 | 1046.54 (968.33--1047.91), busy 0% | **+6.3%** | 3405.88, busy 0% | 0.307x | qk loses |
+| tg128 d0 | 119.02 (118.20--119.21), busy 0% | **+12.9%** | 139.94, busy 0% | 0.850x | qk loses |
+| tg128 d4096 | 73.73 (73.62--73.84), busy 0% | **+14.7%** | 125.73, busy 0% | 0.586x | qk loses |
+| tg128 d16384 | 31.61 (31.60--31.65), busy 0% | **+23.7%** | 120.22, busy 0% | 0.263x | qk loses |
+
+Five-launch final profiles, each launch beginning at busy 0%, put d16384
+attention at **26.793 ms** (26.768--27.018): 24.938 ms sliding and 1.869 ms
+global. This is a 22.4% reduction from the reprofiled 34.520-ms fused baseline,
+but the retained scalar sliding layers now account for 93.1% of attention.
+pp512 attention is **186.133 ms** (184.830--186.249): 148.852 ms sliding and
+37.149 ms global, 14.6% below the reprofiled fused baseline. Prompt attention
+prep/finalize still cost 89.871/44.268 ms, limiting the end-to-end pp gain.
+
+For completeness, the rejected sliding decode mode was also measured over five
+repetitions from busy 0%. It reaches **69.709 tok/s** at d16384
+(69.660--69.752), 0.580x llama.cpp and 2.21x the parity-safe default. That is a
+real speed result but not an accepted result: it fails the non-negotiable ring
+fixture above and therefore remains behind `QK_G4_COOPMAT_SLIDING=1`.
+
+Raw profile launches, benchmark samples, commands, busy readings, ratios,
+parity disposition, and validation results are appended to
+`bench/results-gemma4-qk.jsonl`. The tree is intentionally dirty and no commit
+was created.
