@@ -969,3 +969,100 @@ vulkan1.2`; the forbidden binary/path scan is empty; `git diff --check`
 passes. No compiled SPIR-V or binary from another project was copied, linked,
 loaded, or executed. The tree is intentionally dirty, no commit was created,
 and the d4096 stopping target is honestly met rather than relaxed.
+
+### 2026-07-19 — Stage 12: deep-context split fix and an explained plateau
+
+Stage 12 carries Stage 11's split-width correction through deep context and
+produces a large, parity-safe gain without claiming a third win. The final
+default measures **116.900 tok/s** at tg128 d16384, **+70.71%** over Stage 11's
+68.479, but remains below llama.cpp `571d0d5` at 120.224: **0.972x / -2.76%**.
+The requested stopping condition therefore applies; no pp512 optimization was
+attempted and no target or parity gate was relaxed.
+
+The first measurement confirmed the specific lead. One 15-launch production
+profile sweep began at `gpu_busy_percent=0`; each depth has five repetitions
+and reports the median and min--max spread. The post-depth busy readings were
+62%, 77%, and 93% respectively.
+
+| initial Stage 12 production profile | d1024 | d4096 | d16384 |
+|---|---:|---:|---:|
+| sliding attention | 2703.88 us (2646.96--2742.84) | 2578.64 us (2555.12--2596.84) | 8572.72 us (8561.48--8623.16) |
+| global attention | 572.36 us (556.44--585.20) | 847.00 us (832.88--851.88) | 1697.64 us (1679.84--1711.56) |
+
+Thus the 25 sliding layers cost 3.17x as much at d16384 as at d1024 even
+though all useful reads are confined to the same 1024-token ring. Source
+inspection found the exact cause: Stage 11's 32-token split guard ended at
+8192. Beyond it, the full padded context again selected roughly 192-token
+splits, leaving only about six useful workgroups per sliding KV head.
+
+Two related changes are retained:
+
+- sliding decode uses 32-token absolute-aligned splits whenever `kvLength` is
+  above 2048, with the short-context arithmetic guard unchanged. The shared
+  partial-state allocation now scales to `ceil(kvCapacity/32)` slots (with the
+  old 256-slot floor), so deep absolute split numbering remains in bounds and
+  the reduction tree is not compacted or renumbered;
+- the split reducer starts each lane at its first active absolute split and
+  limits the output merge to the active interval. This preserves the original
+  split-to-lane mapping, per-lane order, 64-lane tree, and chronological output
+  merge while avoiding scans over hundreds of neutral full-context slots.
+
+The first change alone reduced the d16384 sliding-attention median to 2734.96
+us (2679.60--2740.00, five profiles, busy 0%--93%), essentially matching
+d1024, and reached 114.718 tok/s (114.641--114.948, five reps, busy 0%--98%).
+The active-range reducer then reached 117.563 tok/s in its isolated campaign
+(117.317--117.873, five reps, busy 0%--98%). The final production profile is
+8126.88 us median GPU time (8119.32--8133.52), 4213.92 us total attention
+(4175.48--4251.36), 2519.36 us sliding attention (2485.08--2556.68), and
+1694.56 us global attention (1690.40--1706.12), five profiles, busy 0%--93%.
+Compared with the initial deep profile, sliding attention falls **70.61%**.
+
+A five-repetition cumulative phase profile after the split-width change and
+before the reducer showed sliding QK 157.32 us (155.28--159.84), sliding
+softmax/reduction 492.00 us (487.64--496.64), and sliding PV/reducer 655.52 us
+(654.00--658.56), busy 0%--95%. The deep full-numbering scan was therefore
+still visible in the final phase, motivating the retained exact-order reducer
+change. A later phase-only rerun was discarded completely after an unrelated
+`qwen-kernel-g4-prefill` fixture process began using the same XTX and the RADV
+contexts were reset; none of those contended or device-lost attempts enters a
+reported median. All production campaigns reported here began at 0% busy.
+
+The 5 global layers already implement the intended 8:1 GQA reuse at depth.
+Their `{headDim=512, queryHeads=16, kvHeads=2}` cooperative specialization
+uses eight active query ranks per KV workgroup; each K tile and V tile is
+loaded once before the matrix operation serves all eight ranks. The valid
+split-only phase campaign measured global QK 26.64 us (21.00--27.00), global
+softmax/reduction 891.56 us (878.92--906.84), and global PV 390.44 us
+(379.36--398.76), five repetitions, busy 0%--95%.
+
+Two deep-only global split experiments were rejected end to end. A 256-token
+split produced 112.697 tok/s (112.387--112.891, five reps, busy 0%--98%); a
+320-token split produced 107.674 (106.993--107.859, five reps, busy 0%--98%).
+Both lose to the restored context-derived 384-token geometry. More global
+workgroups are not the missing mechanism.
+
+Final default performance follows. Every campaign has five repetitions,
+began at `gpu_busy_percent=0`, and reports the immediate post-run reading.
+
+| test | Stage 12 qk tok/s | vs Stage 11 | llama.cpp tok/s | qk / llama | post busy |
+|---|---:|---:|---:|---:|---:|
+| pp512 | 1203.876 (1130.051--1204.502) | +0.9% | 3405.88 | 0.353x | 68% |
+| tg128 d0 | **146.881 (145.201--147.059)** | -0.1% | 139.943 | **1.050x, qk wins** | 75% |
+| tg128 d4096 | **130.841 (130.669--131.066)** | +0.7% | 125.734 | **1.041x, qk wins** | 92% |
+| tg128 d16384 | 116.900 (116.630--117.163) | **+70.7%** | 120.224 | 0.972x | 98% |
+
+The remaining target delta is about 236.5 us per token, equivalent to 14.0%
+of the measured 1694.56 us production global-attention cost. Since GQA reuse
+is present and split-width occupancy experiments regress, reaching 120.224 now
+requires a materially better arithmetic-compatible global softmax/state merge
+or PV formulation, likely one that avoids the partial-state round trip while
+retaining the frozen order. This is not an incremental host-geometry fix.
+
+The retained changes pass ordinary chat, coding, all three SWA boundary
+fixtures, and global context for **1,024 token-exact generated tokens**, with
+no waiver (final exact-binary gate busy 0%--87%). Fourteen relevant generated
+modules pass `spirv-val --target-env
+vulkan1.2`; the forbidden binary/path scan is empty; `git diff --check`
+passes. No compiled SPIR-V or binary from another project was copied, linked,
+loaded, or executed. The tree is intentionally dirty and no commit was
+created.

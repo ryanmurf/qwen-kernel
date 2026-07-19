@@ -54,8 +54,13 @@ class Gemma4Engine {
         bAttentionValue = dev(gemma4::kGlobalAttention.queryHeads*
                               gemma4::kGlobalAttention.headDim*4);
         // Global decode attention uses at most one split state per target
-        // workgroup. Leave headroom above the current 96-workgroup heuristic.
-        bAttnSplit = dev((size_t)256*gemma4::kGlobalAttention.queryHeads*
+        // workgroup. Sliding decode keeps 32-token absolute split numbering
+        // beyond medium context, so size the shared state buffer for that
+        // parity-sensitive reduction tree as well.
+        const uint32_t maxAttentionSplits = std::max(
+            256u, (kvCapacity + 31u)/32u);
+        bAttnSplit = dev((size_t)maxAttentionSplits*
+                         gemma4::kGlobalAttention.queryHeads*
                          (gemma4::kGlobalAttention.headDim + 2)*4);
         bAttnProjected = dev(gemma4::kEmbedding*4);
         bAttnPost = dev(gemma4::kEmbedding*4);
@@ -1358,12 +1363,10 @@ class Gemma4Engine {
                     1u, (kvLength + desiredGroups - 1)/desiredGroups);
                 splitKv = (splitKv + 63u) & ~63u;
                 // A full sliding ring needs enough useful groups to occupy the
-                // XTX. Use 32-token absolute splits only at medium context:
-                // short-context arithmetic stays unchanged, while the upper
-                // bound keeps every partial state inside the 256-slot buffer.
+                // XTX. Use 32-token absolute splits at medium and deep context;
+                // short-context arithmetic stays unchanged.
                 if (l.cfg.sliding &&
-                    kvLength > 2048u &&
-                    kvLength <= 256u*32u)
+                    kvLength > 2048u)
                     splitKv = 32u;
                 const uint32_t splitK = (kvLength + splitKv - 1)/splitKv;
                 uint32_t activeSplitBegin = 0u;

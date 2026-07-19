@@ -23,12 +23,15 @@ void main() {
     uint lane = gl_LocalInvocationID.x;
     uint stateStride = pc.headDim + 2u;
     float maximum = -3.402823466e38;
-    for (uint split = lane; split < pc.splitK; split += 64u) {
-        if (split >= pc.activeSplitBegin && split < pc.activeSplitEnd) {
-            uint base = (split*pc.queryHeads + qHead)*stateStride;
-            if (states[base + 1u] > 0.0)
-                maximum = max(maximum, states[base]);
-        }
+    // Start at the first active absolute split owned by this lane. This keeps
+    // the exact split-to-lane mapping and reduction tree while avoiding a
+    // full-context scan for a 1024-token sliding ring.
+    uint firstSplit = pc.activeSplitBegin +
+        ((lane + 64u - (pc.activeSplitBegin & 63u)) & 63u);
+    for (uint split = firstSplit; split < pc.activeSplitEnd; split += 64u) {
+        uint base = (split*pc.queryHeads + qHead)*stateStride;
+        if (states[base + 1u] > 0.0)
+            maximum = max(maximum, states[base]);
     }
     reduction[lane] = maximum;
     barrier();
@@ -42,12 +45,10 @@ void main() {
     maximum = reduction[0];
 
     float sum = 0.0;
-    for (uint split = lane; split < pc.splitK; split += 64u) {
-        if (split >= pc.activeSplitBegin && split < pc.activeSplitEnd) {
-            uint base = (split*pc.queryHeads + qHead)*stateStride;
-            if (states[base + 1u] > 0.0)
-                sum += states[base + 1u]*exp(states[base] - maximum);
-        }
+    for (uint split = firstSplit; split < pc.activeSplitEnd; split += 64u) {
+        uint base = (split*pc.queryHeads + qHead)*stateStride;
+        if (states[base + 1u] > 0.0)
+            sum += states[base + 1u]*exp(states[base] - maximum);
     }
     reduction[lane] = sum;
     barrier();
@@ -67,13 +68,12 @@ void main() {
     uint dim = lane + gl_WorkGroupID.y*64u;
     if (dim < pc.headDim) {
         float total = 0.0;
-        for (uint split = 0u; split < pc.splitK; ++split) {
-            if (split >= pc.activeSplitBegin && split < pc.activeSplitEnd) {
-                uint base = (split*pc.queryHeads + qHead)*stateStride;
-                if (states[base + 1u] > 0.0)
-                    total += states[base + 2u + dim]*
-                             exp(states[base] - globalMaximum);
-            }
+        for (uint split = pc.activeSplitBegin;
+             split < pc.activeSplitEnd; ++split) {
+            uint base = (split*pc.queryHeads + qHead)*stateStride;
+            if (states[base + 1u] > 0.0)
+                total += states[base + 2u + dim]*
+                         exp(states[base] - globalMaximum);
         }
         outputValue[qHead*pc.headDim + dim] = total*globalInverseSum;
     }
