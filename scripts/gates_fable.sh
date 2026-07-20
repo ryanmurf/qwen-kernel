@@ -25,7 +25,16 @@ gen() {  # gen <ids> <n> <tmax> [env...]
 }
 
 echo "== prefillcmp (candidate) =="
-env "${TUNED[@]}" "${CAND[@]}" $QK prefillcmp 2>/dev/null | tail -2
+# QK_ATTN_LIVE_DISPATCH is a serve-loop optimization: only the serve loop fills
+# bAttnIndirect. prefillcmp's serial reference records the same command buffer
+# without populating it, so the indirect attention dispatch reads stale counts
+# and the serial side silently returns zero logits (tokS=0, 0/42, rel diff 0).
+# Pre-existing at b4412b9; unrelated to the coopmat work. Drop the flag here so
+# this gate actually compares something — with it in, the check was vacuous.
+PFC=(); for v in "${TUNED[@]}" "${CAND[@]}"; do
+    [ "${v%%=*}" = "QK_ATTN_LIVE_DISPATCH" ] || PFC+=("$v")
+done
+env "${PFC[@]}" $QK prefillcmp 2>/dev/null | tail -2
 
 echo "== dncmp =="
 env "${TUNED[@]}" "${CAND[@]}" $QK dncmp 2>/dev/null | tail -1

@@ -2,3 +2,7 @@ server/target/
 build/
 *.o
 *.spv
+
+# Python
+__pycache__/
+*.pyc
