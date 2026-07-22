@@ -1,0 +1,41 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Weighted Gemma RMS norm or unweighted RMS norm.  One workgroup per vector;
+// n=256/512 handles Q/K/V heads and n=2816 handles residual branches.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufX { float x[]; };
+layout(std430, binding = 1) readonly buffer BufW { float w[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC {
+    uint n;
+    uint weighted;
+    float eps;
+    float postScale;
+} pc;
+
+shared float waveSums[8];
+shared float normScale;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint vector = gl_WorkGroupID.x;
+    uint base = vector * pc.n;
+    float sum = 0.0;
+    for (uint i = t; i < pc.n; i += 256u) {
+        float value = x[base + i];
+        sum += value * value;
+    }
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0u) waveSums[gl_SubgroupID] = sum;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint wave = 0u; wave < gl_NumSubgroups; ++wave) total += waveSums[wave];
+        normScale = pc.postScale / sqrt(total / float(pc.n) + pc.eps);
+    }
+    barrier();
+    for (uint i = t; i < pc.n; i += 256u)
+        y[base + i] = x[base + i] * normScale * (pc.weighted != 0u ? w[i] : 1.0);
+}

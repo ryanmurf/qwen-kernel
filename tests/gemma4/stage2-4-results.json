@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-07-18T20:31:03-06:00",
+  "branch": "gemma4-port",
+  "base_commit": "4510fcc",
+  "status": "PASS",
+  "device": {
+    "name": "AMD Radeon RX 7900 XTX (RADV NAVI31)",
+    "pci": "1a:00.0",
+    "sysfs_gpu_busy": "/sys/class/drm/card2/device/gpu_busy_percent"
+  },
+  "oracle": {
+    "implementation": "llama.cpp Vulkan",
+    "commit": "571d0d540df04f25298d0e159e520d9fc62ed121",
+    "physical_ubatch": 1,
+    "model": "/mnt/data/models/gemma-4-26B-A4B-qat/gemma-4-26B_q4_0-it.gguf",
+    "model_sha256": "3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d",
+    "note": "common/debug.cpp QK_DUMP_DIR/QK_DUMP_FILTER patch; arithmetic unchanged"
+  },
+  "stage2": {
+    "status": "PASS",
+    "gates": {
+      "embedding_sqrt2816_max_abs_over_rms": 4.86e-7,
+      "weighted_rms_max_abs_over_rms": 1.33e-6,
+      "unweighted_rms_max_abs_over_rms": 4.77e-7,
+      "dense_gate_max_abs_over_rms": 2.43e-6,
+      "dense_up_max_abs_over_rms": 2.52e-6,
+      "dense_gelu_product_max_abs_over_rms": 5.91e-6,
+      "dense_down_max_abs_over_rms": 2.59e-6,
+      "dense_post_norm_max_abs_over_rms": 3.76e-5,
+      "tied_q6_k_head_slice_max_abs_over_rms": 5.33e-6,
+      "softcap_max_abs_over_rms": 1.37e-6,
+      "near_tie_argmax_expected": 17,
+      "near_tie_argmax_actual": 17
+    }
+  },
+  "stage3": {
+    "status": "PASS",
+    "positions": [0, 1, 1023, 1024, 1025],
+    "layers_checked": [0, 5, 11, 17, 23, 29],
+    "sliding_cache_slots_at_boundary": [1023, 0, 1],
+    "global_cache_slots_at_boundary": [1023, 1024, 1025],
+    "f_attention_scale": 1.0,
+    "worst_rope_or_cache_max_abs_over_rms": 1.70e-4,
+    "worst_probability_max_abs": 7.93e-6,
+    "worst_attention_output_max_abs_over_rms": 1.15e-4,
+    "llama_dump_gates": {
+      "sliding_raw_q_max_abs_over_rms": 2.59e-6,
+      "sliding_raw_k_max_abs_over_rms": 4.79e-7,
+      "sliding_raw_v_max_abs_over_rms": 1.02e-6,
+      "global_raw_q_max_abs_over_rms": 2.10e-6,
+      "global_raw_k_max_abs_over_rms": 9.16e-7,
+      "sliding_q_post_rope_max_abs_over_rms": 1.86e-6,
+      "sliding_k_post_rope_max_abs_over_rms": 9.77e-7,
+      "sliding_v_norm_max_abs_over_rms": 9.54e-7
+    },
+    "global_raw_v_aliases_raw_k": true,
+    "global_cached_k_v_distinct": true
+  },
+  "stage4": {
+    "status": "PASS",
+    "selector_lanes": 128,
+    "selection_bytes": 64,
+    "random_top8_ids": [103, 57, 68, 59, 64, 6, 86, 3],
+    "llama_top8_ids": [102, 105, 99, 54, 52, 22, 116, 60],
+    "adversarial_tie_ids": [3, 9, 12, 17, 20, 50, 90, 127],
+    "llama_dump_worst_component_max_abs_over_rms": 4.35e-6,
+    "dispatch_design": {
+      "gate_up_expert_dispatches_per_layer": 1,
+      "down_expert_dispatches_per_layer": 1,
+      "gate_up_activation_type": "Q8_1 (matches llama.cpp AMD MMVQ at K=2816)",
+      "down_activation_type": "F32 (matches llama.cpp AMD path at K=704)",
+      "down_order": "per-expert reduction, expert scale, route weight, stable serial rank sum"
+    },
+    "benchmark": {
+      "iterations": 2000,
+      "routes": 16,
+      "route_policy": "cycle 16 disjoint top-8 routes spanning all 128 experts",
+      "gate_up_payload_bytes": 17842176,
+      "down_payload_bytes": 8921088,
+      "quant_q8": {
+        "cold_us": 2.52,
+        "cold_gpu_busy_percent": 0,
+        "repeat_us": 2.66,
+        "repeat_gpu_busy_percent": 0
+      },
+      "gate_up_sweep": [
+        {"tpr": 32, "cold_us": 41.87, "cold_gpu_busy_percent": 0, "repeat_us": 40.41, "repeat_gpu_busy_percent": 0, "gbps": 441.5, "vs_isolated_percent": 6.0},
+        {"tpr": 64, "cold_us": 34.92, "cold_gpu_busy_percent": 0, "repeat_us": 34.21, "repeat_gpu_busy_percent": 0, "gbps": 521.6, "vs_isolated_percent": 25.3},
+        {"tpr": 128, "cold_us": 39.42, "cold_gpu_busy_percent": 0, "repeat_us": 39.51, "repeat_gpu_busy_percent": 0, "gbps": 451.6, "vs_isolated_percent": 8.5},
+        {"tpr": 256, "cold_us": 39.99, "cold_gpu_busy_percent": 0, "repeat_us": 39.99, "repeat_gpu_busy_percent": 0, "gbps": 446.2, "vs_isolated_percent": 7.2}
+      ],
+      "down_sweep": [
+        {"tpr": 32, "cold_us": 28.14, "cold_gpu_busy_percent": 0, "repeat_us": 28.81, "repeat_gpu_busy_percent": 0, "gbps": 309.6, "vs_isolated_percent": 19.3},
+        {"tpr": 64, "cold_us": 26.62, "cold_gpu_busy_percent": 0, "repeat_us": 26.79, "repeat_gpu_busy_percent": 0, "gbps": 333.1, "vs_isolated_percent": 28.3},
+        {"tpr": 128, "cold_us": 33.59, "cold_gpu_busy_percent": 0, "repeat_us": 33.20, "repeat_gpu_busy_percent": 0, "gbps": 268.7, "vs_isolated_percent": 3.6},
+        {"tpr": 256, "cold_us": 41.09, "cold_gpu_busy_percent": 0, "repeat_us": 41.67, "repeat_gpu_busy_percent": 0, "gbps": 214.1, "vs_isolated_percent": -17.5}
+      ],
+      "winner": {
+        "gate_up_tpr": 64,
+        "gate_up_gbps": 521.6,
+        "gate_up_isolated_baseline_gbps": 416.4,
+        "gate_up_delta_percent": 25.3,
+        "down_tpr": 64,
+        "down_gbps": 333.1,
+        "down_isolated_baseline_gbps": 259.5,
+        "down_delta_percent": 28.3,
+        "pair_cold_us": 59.26,
+        "pair_cold_gpu_busy_percent": 0,
+        "pair_repeat_us": 59.22,
+        "pair_repeat_gpu_busy_percent": 0,
+        "pair_effective_gbps": 451.9,
+        "pair_isolated_effective_gbps": 346.6,
+        "pair_delta_percent": 30.4,
+        "full_cold_us": 51.20,
+        "full_cold_gpu_busy_percent": 0,
+        "full_repeat_us": 50.84,
+        "full_repeat_gpu_busy_percent": 0
+      },
+      "interpretation": {
+        "assumed_grouped_gbps": 700.0,
+        "two_dispatch_pair_delta_vs_assumption_percent": -35.4,
+        "measured_pair_ms_for_30_layers": 1.7766,
+        "measured_integrated_full_ms_for_30_layers": 1.5252,
+        "assumed_ms_for_30_layers": 1.1470,
+        "stage1_budget_replacement_tok_s_integrated": 230.1,
+        "stage1_budget_replacement_tok_s_pair_conservative": 217.6,
+        "note": "The integrated quant+gate_up+down phase is faster than the separately timed pair because the quant dispatch raises XTX auto-DPM residency. Do not subtract phase timings; both integrated repeats were stable and began at gpu_busy_percent=0. These are budget replacements, not Stage-5 full-model throughput."
+      }
+    }
+  },
+  "validation": {
+    "cmake_build": "PASS",
+    "spirv_val_vulkan_1_2": "PASS (12 new modules)",
+    "ctest": "PASS (no tests registered)",
+    "git_diff_check": "PASS"
+  }
+}

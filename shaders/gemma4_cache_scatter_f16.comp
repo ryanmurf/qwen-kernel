@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// K has already been normalized, RoPE'd, converted to f16, and inserted in
+// llama.cpp's exact [position][head][dim] linear layout.  V uses the exact
+// RMS kernel but needs the final f32->f16 cache insertion.  Sliding layers
+// additionally mirror both values into their independent 1024-slot ring.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufV { float vNorm[]; };
+layout(std430, binding = 1) readonly buffer BufK { float16_t keyLinear[]; };
+layout(std430, binding = 2) buffer BufVL { float16_t valueLinear[]; };
+layout(std430, binding = 3) buffer BufKR { float16_t keyRing[]; };
+layout(std430, binding = 4) buffer BufVR { float16_t valueRing[]; };
+layout(std430, binding = 5) readonly buffer BufP { uint positions[]; };
+layout(push_constant) uniform PC {
+    uint tokens;
+    uint headDim;
+    uint kvHeads;
+    uint sliding;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint token = row / pc.kvHeads;
+    uint head = row - token*pc.kvHeads;
+    if (token >= pc.tokens) return;
+    uint position = positions[token];
+    uint t = gl_LocalInvocationID.x;
+    uint srcBase = (token*pc.kvHeads + head)*pc.headDim;
+    uint linearBase = (position*pc.kvHeads + head)*pc.headDim;
+    uint ringBase = ((position & 1023u)*pc.kvHeads + head)*pc.headDim;
+    for (uint dim = t; dim < pc.headDim; dim += 256u) {
+        float16_t v = float16_t(vNorm[srcBase + dim]);
+        valueLinear[linearBase + dim] = v;
+        if (pc.sliding != 0u) {
+            keyRing[ringBase + dim] = keyLinear[linearBase + dim];
+            valueRing[ringBase + dim] = v;
+        }
+    }
+}

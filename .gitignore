@@ -6,3 +6,7 @@ build/
 # Python
 __pycache__/
 *.pyc
+tests/gemma4/__pycache__/
+
+# stray build dirs
+build*/

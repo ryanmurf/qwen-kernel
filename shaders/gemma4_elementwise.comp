@@ -1,0 +1,22 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { uint n; uint mode; float scale; uint suppressLo; uint suppressHi; } pc;
+
+float gelu(float x) {
+    return 0.5*x*(1.0 + tanh(0.7978845608028654*x*(1.0 + 0.044715*x*x)));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    if (pc.mode == 0u) y[i] = gelu(a[i]) * b[i];
+    else if (pc.mode == 1u) y[i] = (a[i] + b[i]) * pc.scale;
+    else if (pc.mode == 2u) y[i] = a[i] + b[i];
+    else if (pc.mode == 3u) y[i] = pc.scale * tanh(a[i] / pc.scale);
+    else if (pc.mode == 4u)
+        y[i] = (i >= pc.suppressLo && i < pc.suppressHi) ? -1.0/0.0 : a[i];
+}

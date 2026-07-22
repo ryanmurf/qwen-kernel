@@ -1,0 +1,116 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// Cooperative-matrix Q4_0 prefill GEMM. Dequantizes a BM x BK weight tile and
+// a BN x BK activation tile to f16 shared memory, then accumulates 16x16x16
+// cooperative products in F32. Raw weight blocks and activations are
+// prefetched one K step ahead so their memory latency overlaps the previous
+// step's cooperative products. The output layout matches the scalar GEMM:
+// y[token*M + row]. The 16x16 tiling approach follows the coopmat structure
+// llama.cpp 571d0d5 uses for its own Vulkan prompt matmuls (mul_mm.comp),
+// reimplemented from scratch against qk's Q4_0 block ABI. No external SPIR-V
+// or binary is copied, linked, loaded, or executed. Requires subgroup size
+// 64; the host falls back to the scalar GEMM otherwise.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint Q4_BLOCKS_PER_ROW = 88u;
+
+#include "q4_0.glsl"
+
+layout(std430, binding = 0) readonly buffer BufW { block_q4_0 wb[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { uint M; uint K; uint N; } pc;
+
+const uint BM = 128u, BN = 64u, BK = 64u, SK = BK + 8u;
+
+shared float16_t Wsh[BM*SK];
+shared float16_t Xsh[BN*SK];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint rowBase = gl_WorkGroupID.x*BM;
+    uint tokBase = gl_WorkGroupID.z*BN;
+
+    // Subgroup s owns output column strip s (16 tokens) across all eight
+    // 16-row strips.
+    uint ct = gl_SubgroupID;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i)
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16,
+                         gl_MatrixUseAccumulator>(0.0);
+
+    // Fixed per-lane roles with one-step register prefetch: one lane
+    // dequantizes one of the 256 blocks per K step (128 rows x 2 blocks) and
+    // loads 16 consecutive activation values.
+    const uint blockIndex = tid;
+    const uint rowLocal = blockIndex & (BM - 1u);
+    const uint blockLocal = blockIndex >> 7u;
+    const bool wValid = rowBase + rowLocal < pc.M;
+    const uint wRowBase = (rowBase + rowLocal)*Q4_BLOCKS_PER_ROW;
+    const uint la = tid >> 2u;
+    const uint kk16 = (tid & 3u)*16u;
+    const bool xValid = tokBase + la < pc.N;
+    const uint xBase = (tokBase + la)*pc.K + kk16;
+
+    block_q4_0 qNext;
+    if (wValid) qNext = wb[wRowBase + blockLocal];
+    float xNext[16];
+    [[unroll]] for (uint j = 0u; j < 16u; ++j)
+        xNext[j] = xValid ? x[xBase + j] : 0.0;
+
+    for (uint b0 = 0u; b0 < Q4_BLOCKS_PER_ROW; b0 += 2u) {
+        {
+            uint offset = rowLocal*SK + blockLocal*32u;
+            if (wValid) {
+                block_q4_0 q = qNext;
+                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                    float lo, hi;
+                    q4_0_dequant_pair(q, j, lo, hi);
+                    Wsh[offset + j] = float16_t(lo);
+                    Wsh[offset + 16u + j] = float16_t(hi);
+                }
+            } else {
+                [[unroll]] for (uint j = 0u; j < 32u; ++j)
+                    Wsh[offset + j] = float16_t(0.0);
+            }
+            [[unroll]] for (uint j = 0u; j < 16u; ++j)
+                Xsh[la*SK + kk16 + j] = float16_t(xNext[j]);
+        }
+        barrier();
+        if (b0 + 2u < Q4_BLOCKS_PER_ROW) {
+            if (wValid) qNext = wb[wRowBase + b0 + 2u + blockLocal];
+            [[unroll]] for (uint j = 0u; j < 16u; ++j)
+                xNext[j] = xValid ? x[xBase + (b0 + 2u)*32u + j] : 0.0;
+        }
+        [[unroll]] for (uint kt = 0u; kt < BK; kt += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> xm;
+            coopMatLoad(xm, Xsh, ct*16u*SK + kt, SK,
+                        gl_CooperativeMatrixLayoutColumnMajor);
+            [[unroll]] for (uint rt = 0u; rt < 8u; ++rt) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> wm;
+                coopMatLoad(wm, Wsh, rt*16u*SK + kt, SK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                acc[rt] = coopMatMulAdd(wm, xm, acc[rt]);
+            }
+        }
+        barrier();
+    }
+
+    // Column-major store transposes the M x N accumulator into the
+    // token-major output. M is always a multiple of 16, so row tiles are
+    // either fully inside or fully outside the matrix. Padded tokens receive
+    // zero products; the batch buffers are sized for the padded token count.
+    [[unroll]] for (uint rt = 0u; rt < 8u; ++rt) {
+        if (rowBase + rt*16u < pc.M)
+            coopMatStore(acc[rt], y,
+                         (tokBase + ct*16u)*pc.M + rowBase + rt*16u, pc.M,
+                         gl_CooperativeMatrixLayoutColumnMajor);
+    }
+}

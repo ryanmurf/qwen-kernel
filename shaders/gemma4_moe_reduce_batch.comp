@@ -1,0 +1,25 @@
+#version 450
+
+// Match the llama.cpp graph order after expert-down matmul_id:
+// down-scale multiply, router-weight multiply, then rank-ordered adds.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufExperts { float experts[]; };
+struct SelT { uint ids[8]; float routeWeights[8]; };
+layout(std430, binding = 1) readonly buffer BufS { SelT selections[]; };
+layout(std430, binding = 2) readonly buffer BufScale { float downScale[]; };
+layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform Push { uint tokens; } pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint token = gl_WorkGroupID.y;
+    if (row >= 2816u || token >= pc.tokens) return;
+    precise float total = 0.0;
+    for (uint rank = 0u; rank < 8u; ++rank) {
+        precise float scaled = experts[(token*8u + rank)*2816u + row] *
+                               downScale[selections[token].ids[rank]];
+        scaled = scaled*selections[token].routeWeights[rank];
+        total = total + scaled;
+    }
+    y[token*2816u + row] = total;
+}

@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Tied Q6_K embedding lookup followed by Gemma's mandatory sqrt(2816) scale.
+layout(local_size_x = 256) in;
+
+struct block_q6_K {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    float16_t d;
+};
+layout(std430, binding = 0) readonly buffer BufW { block_q6_K wb[]; };
+layout(std430, binding = 1) readonly buffer BufI { uint ids[]; };
+layout(std430, binding = 2) writeonly buffer BufX { float x[]; };
+layout(push_constant) uniform PC { uint kdim; uint tokenIndex; } pc;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint kb = pc.kdim / 256u;
+    uint base = ids[pc.tokenIndex] * kb;
+    float embeddingScale = sqrt(float(pc.kdim));
+    for (uint g = t; g < kb * 16u; g += 256u) {
+        uint b = g >> 4u, gg = g & 15u;
+        uint h = gg >> 3u, r = (gg & 7u) >> 1u, is = gg & 1u;
+        float d = float(wb[base + b].d);
+        float sc = float(int(wb[base + b].scales[h * 8u + r * 2u + is]));
+        uint qlBase = h * 64u + (r & 1u) * 32u + is * 16u;
+        uint qhBase = h * 32u + is * 16u;
+        uint shift = r * 2u;
+        bool hi = r >= 2u;
+        uint xo = b * 256u + gg * 16u;
+        for (uint i = 0u; i < 16u; ++i) {
+            uint qlv = uint(wb[base + b].ql[qlBase + i]);
+            uint qhv = uint(wb[base + b].qh[qhBase + i]);
+            uint lo = hi ? qlv >> 4u : qlv & 15u;
+            int q = int(lo | (((qhv >> shift) & 3u) << 4u)) - 32;
+            x[xo + i] = embeddingScale * d * sc * float(q);
+        }
+    }
+}

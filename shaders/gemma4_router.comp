@@ -1,0 +1,30 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// F32 router GEMV. Input has already followed the distinct unweighted path:
+// rms_norm(attn_out) * (1/sqrt(2816)) * ffn_gate_inp.scale.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufX { float x[]; };
+layout(std430, binding = 1) readonly buffer BufS { float inputScale[]; };
+layout(std430, binding = 2) readonly buffer BufW { float weights[]; };
+layout(std430, binding = 3) writeonly buffer BufL { float logits[]; };
+layout(push_constant) uniform PC { uint n; uint experts; } pc;
+shared float waveSums[8];
+
+void main() {
+    uint expert = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (expert >= pc.experts) return;
+    float acc = 0.0;
+    for (uint k = t; k < pc.n; k += 256u)
+        acc += weights[expert * pc.n + k] * inputScale[k] * x[k];
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) waveSums[gl_SubgroupID] = acc;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint wave = 0u; wave < gl_NumSubgroups; ++wave) total += waveSums[wave];
+        logits[expert] = total;
+    }
+}

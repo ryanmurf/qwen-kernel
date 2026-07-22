@@ -1,0 +1,70 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Native decode GEMV: y[M] = W[M,K] * x[K], raw ggml Q4_0
+// (18 B/32 weights). The block decode is shared with both prefill GEMMs.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+layout(constant_id = 1) const uint Q4_BLOCKS_PER_ROW = 88u;
+
+#include "q4_0.glsl"
+
+layout(std430, binding = 0) readonly  buffer BufW { block_q4_0 wb[]; };
+layout(std430, binding = 1) readonly  buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+
+shared float partial[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % TPR;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row = wg * (256u / TPR) + tid / TPR;
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint blocks_per_row = Q4_BLOCKS_PER_ROW;
+        uint base = row * blocks_per_row;
+        for (uint block = lane; block < blocks_per_row; block += TPR) {
+            uint xoff = block * 32u;
+            float sum = 0.0;
+            for (uint j = 0u; j < 16u; ++j) {
+                float lo, hi;
+                q4_0_dequant_pair(wb[base + block], j, lo, hi);
+                sum += lo * x[xoff + j];
+                sum += hi * x[xoff + j + 16u];
+            }
+            acc += sum;
+        }
+    }
+
+    if (TPR >= gl_SubgroupSize) {
+        float wave_sum = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u)
+            partial[tid / gl_SubgroupSize] = wave_sum;
+        barrier();
+        if (lane == 0u && row < pc.M) {
+            uint waves = TPR / gl_SubgroupSize;
+            uint base = (tid / TPR) * waves;
+            float total = 0.0;
+            for (uint index = 0u; index < waves; ++index)
+                total += partial[base + index];
+            y[row] = total;
+        }
+    } else {
+        partial[tid] = acc;
+        barrier();
+        for (uint stride = TPR / 2u; stride > 0u; stride >>= 1u) {
+            if (lane < stride)
+                partial[tid] += partial[tid + stride];
+            barrier();
+        }
+        if (lane == 0u && row < pc.M)
+            y[row] = partial[tid];
+    }
+}

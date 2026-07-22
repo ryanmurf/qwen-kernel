@@ -1,0 +1,21 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufD { float16_t downAll[]; };
+struct SelT { uint ids[8]; float routeWeights[8]; };
+layout(std430, binding = 1) readonly buffer BufS { SelT selections[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { uint tokens; } pc;
+
+void main() {
+    uint token = gl_WorkGroupID.y;
+    uint row = gl_WorkGroupID.x*256u + gl_LocalInvocationID.x;
+    if (token >= pc.tokens || row >= 2816u) return;
+    precise float total = 0.0;
+    for (uint rank = 0u; rank < 8u; ++rank)
+        total += float(downAll[(token*8u + rank)*2816u + row])*
+                 selections[token].routeWeights[rank];
+    y[token*2816u + row] = total;
+}

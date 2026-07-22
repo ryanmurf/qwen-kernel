@@ -16,6 +16,9 @@
 
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint TPR = 256u;
+// Zero keeps the generic Qwen path dynamic; the Gemma Stage-1 head supplies
+// 11 so the 2816-wide trip count is specialized at pipeline creation.
+layout(constant_id = 1) const uint Q6_SUPERBLOCKS_PER_ROW = 0u;
 
 struct block_q6_K {
     uint8_t   ql[128];
@@ -42,7 +45,8 @@ void main() {
 
     float acc = 0.0;
     if (row < pc.M) {
-        uint kb   = pc.K / 256u;  // super-blocks per row
+        uint kb   = Q6_SUPERBLOCKS_PER_ROW != 0u
+                  ? Q6_SUPERBLOCKS_PER_ROW : pc.K / 256u;
         uint ng   = kb * 16u;     // 16-element groups per row
         uint base = row * kb;
         for (uint g = lane; g < ng; g += TPR) {

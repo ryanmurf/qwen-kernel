@@ -57,6 +57,36 @@ as provisional. The end-to-end CLI table above uses a llama.cpp build from
 2026-04-05 and overstates the current gap — see
 [`bench/README.md`](bench/README.md#refresh-2026-07-18).
 
+### Gemma 4 26B-A4B
+
+A second engine targets **google/gemma-4-26B-A4B-it-qat-q4_0** (13.43 GiB, Q4_0
+with a tied Q6_K head), built entirely from qk-owned source kernels. An earlier
+stage vendored llama.cpp's compiled SPIR-V, which made its benchmark circular;
+that result was disqualified and the shaders were rewritten from source
+understanding.
+
+Measured on the dedicated 7900 XTX against llama.cpp `571d0d5` (Vulkan, FA on,
+f16 KV both sides), five repetitions, every campaign launched at
+`gpu_busy_percent=0`, with llama.cpp re-benchmarked fresh in the same session:
+
+| test | qk tok/s | llama.cpp tok/s | qk / llama |
+|---|---:|---:|---:|
+| pp512 | **3455.44** | 3431.42 ± 83.86 | 1.007× |
+| tg128 d0 | **146.33** | 139.63 ± 0.22 | 1.048× |
+| tg128 d4096 | **137.17** | 126.50 ± 0.79 | 1.084× |
+| tg128 d16384 | **127.41** | 119.00 ± 0.93 | 1.071× |
+
+Decode leads at every depth. **pp512 is parity-to-slight-win, not a decisive
+result** — the median wins but sits inside llama.cpp's own ±83.86 spread.
+
+The engine is token-exact on all six frozen fixtures — ordinary chat, a coding
+prompt, the 1023/1024/1025 sliding-window ring boundaries, and an 8192-token
+case exercising all five global-attention layers — validating 1,024 generated
+tokens with no waiver. Raw samples, exact commands, GPU-busy readings and stage
+profiles are in
+[`bench/results-gemma4-qk.jsonl`](bench/results-gemma4-qk.jsonl) and
+[`docs/GEMMA4-LOG.md`](docs/GEMMA4-LOG.md).
+
 Correctness bar throughout: greedy output is **token-for-token identical** to
 llama.cpp on identical input ids, batched paths are validated bit-identical
 (or argmax-stable at ~1e-7 rel) against serial references, and the server's

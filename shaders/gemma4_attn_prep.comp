@@ -1,0 +1,86 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Q/K/V head normalization, NeoX RoPE, and separate K/V cache writes for both
+// Gemma attention geometries. On global layers rawK and rawV may alias, but the
+// destinations never do: K is learned-normalized + rotary; V is unweighted RMS.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufQ { float rawQ[]; };
+layout(std430, binding = 1) readonly buffer BufK { float rawK[]; };
+layout(std430, binding = 2) readonly buffer BufV { float rawV[]; };
+layout(std430, binding = 3) readonly buffer BufQN { float qWeight[]; };
+layout(std430, binding = 4) readonly buffer BufKN { float kWeight[]; };
+layout(std430, binding = 5) readonly buffer BufRF { float ropeFactors[]; };
+layout(std430, binding = 6) writeonly buffer BufQO { float query[]; };
+layout(std430, binding = 7) buffer BufKC { float keyCache[]; };
+layout(std430, binding = 8) buffer BufVC { float valueCache[]; };
+
+layout(push_constant) uniform PC {
+    uint position;
+    uint headDim;
+    uint queryHeads;
+    uint kvHeads;
+    uint ropeDim;
+    uint cacheLength;
+    uint sliding;
+    uint useFactors;
+    float eps;
+    float ropeBase;
+} pc;
+
+shared float waveSums[8];
+shared float normScale;
+shared float normalized[512];
+
+void main() {
+    uint group = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    bool isQ = group < pc.queryHeads;
+    bool isK = group >= pc.queryHeads && group < pc.queryHeads + pc.kvHeads;
+    uint head = isQ ? group : isK ? group - pc.queryHeads
+                                     : group - pc.queryHeads - pc.kvHeads;
+    uint sourceBase = head * pc.headDim;
+    float sum = 0.0;
+    for (uint dim = t; dim < pc.headDim; dim += 256u) {
+        float value = isQ ? rawQ[sourceBase + dim]
+                          : isK ? rawK[sourceBase + dim] : rawV[sourceBase + dim];
+        normalized[dim] = value;
+        sum += value * value;
+    }
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0u) waveSums[gl_SubgroupID] = sum;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint wave = 0u; wave < gl_NumSubgroups; ++wave) total += waveSums[wave];
+        normScale = 1.0 / sqrt(total / float(pc.headDim) + pc.eps);
+    }
+    barrier();
+    for (uint dim = t; dim < pc.headDim; dim += 256u) {
+        float weight = isQ ? qWeight[dim] : isK ? kWeight[dim] : 1.0;
+        normalized[dim] *= normScale * weight;
+    }
+    barrier();
+
+    uint slot = pc.sliding != 0u ? pc.position % pc.cacheLength : pc.position;
+    uint cacheBase = (head * pc.cacheLength + slot) * pc.headDim;
+    for (uint dim = t; dim < pc.headDim; dim += 256u) {
+        float outValue = normalized[dim];
+        if ((isQ || isK) && dim < pc.ropeDim) {
+            uint halfDim = pc.ropeDim / 2u;
+            uint pair = dim < halfDim ? dim : dim - halfDim;
+            float factor = pc.useFactors != 0u ? ropeFactors[pair] : 1.0;
+            float frequency = pow(pc.ropeBase,
+                                  -2.0 * float(pair) / float(pc.ropeDim)) / factor;
+            float angle = float(pc.position) * frequency;
+            float c = cos(angle), s = sin(angle);
+            float first = normalized[pair];
+            float second = normalized[pair + halfDim];
+            outValue = dim < halfDim ? first*c - second*s : first*s + second*c;
+        }
+        if (isQ) query[sourceBase + dim] = outValue;
+        else if (isK) keyCache[cacheBase + dim] = outValue;
+        else valueCache[cacheBase + dim] = outValue;
+    }
+}

@@ -1,0 +1,42 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer BufL { float logits[]; };
+struct SelT { uint ids[8]; float weights[8]; };
+layout(std430, binding = 1) buffer BufS { SelT selections[]; };
+shared float values[128];
+shared float sourceValues[128];
+shared uint ids[128];
+bool better(float av, uint ai, float bv, uint bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+void main() {
+    uint token = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    float value = logits[token*128u + t];
+    sourceValues[t] = (isnan(value) || isinf(value)) ? -3.402823466e38 : value;
+    barrier();
+    for (uint rank = 0u; rank < 8u; ++rank) {
+        values[t] = sourceValues[t]; ids[t] = t; barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (t < stride && better(values[t + stride], ids[t + stride], values[t], ids[t])) {
+                values[t] = values[t + stride]; ids[t] = ids[t + stride];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            selections[token].ids[rank] = ids[0];
+            selections[token].weights[rank] = values[0];
+            sourceValues[ids[0]] = -3.402823466e38;
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        float maximum = selections[token].weights[0], sum = 0.0;
+        for (uint rank = 0u; rank < 8u; ++rank) {
+            selections[token].weights[rank] = exp(selections[token].weights[rank] - maximum);
+            sum += selections[token].weights[rank];
+        }
+        for (uint rank = 0u; rank < 8u; ++rank) selections[token].weights[rank] /= sum;
+    }
+}

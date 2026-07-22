@@ -15,7 +15,7 @@
 #include <vector>
 
 enum GgmlType : uint32_t {
-    GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8,
+    GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8,
     GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13,
     GGML_Q6_K = 14, GGML_IQ3_XXS = 18, GGML_IQ4_XS = 23, GGML_BF16 = 30,
 };
@@ -24,6 +24,7 @@ static inline const char* ggmlTypeName(uint32_t t) {
     switch (t) {
         case GGML_F32: return "F32";
         case GGML_F16: return "F16";
+        case GGML_Q4_0: return "Q4_0";
         case GGML_Q8_0: return "Q8_0";
         case GGML_Q6_K: return "Q6_K";
         case GGML_IQ3_XXS: return "IQ3_XXS";
@@ -37,6 +38,7 @@ static inline size_t ggmlRowBytes(uint32_t type, uint64_t ne0) {
     switch (type) {
         case GGML_F32:  return ne0 * 4;
         case GGML_F16:  return ne0 * 2;
+        case GGML_Q4_0: return ne0 / 32 * 18;
         case GGML_Q8_0: return ne0 / 32 * 34;
         case GGML_Q6_K: return ne0 / 256 * 210;
         case GGML_IQ4_XS: return ne0 / 256 * 136;
@@ -47,7 +49,10 @@ static inline size_t ggmlRowBytes(uint32_t type, uint64_t ne0) {
 
 struct GgufTensor {
     uint32_t type = 0;
+    uint32_t nDims = 0;
     uint64_t ne[4] = {1, 1, 1, 1};
+    uint64_t dataOffset = 0;       // absolute byte offset in the owning GGUF shard
+    size_t nbytes = 0;             // exact encoded payload size when the type is recognized
     const uint8_t* data = nullptr;  // points into the mmap
 };
 
@@ -184,13 +189,43 @@ class Gguf {
         for (auto& inf : infos) {
             inf.name = rdStr();
             uint32_t nd = rd<uint32_t>();
-            for (uint32_t d = 0; d < nd && d < 4; d++) inf.t.ne[d] = rd<uint64_t>();
+            inf.t.nDims = nd;
+            for (uint32_t d = 0; d < nd; d++) {
+                uint64_t ne = rd<uint64_t>();
+                if (d < 4) inf.t.ne[d] = ne;
+            }
             inf.t.type = rd<uint32_t>();
             inf.off = rd<uint64_t>();
         }
         uint64_t dataStart = (pos_ + alignment_ - 1) / alignment_ * alignment_;
         for (auto& inf : infos) {
-            inf.t.data = base_ + dataStart + inf.off;
+            uint64_t absolute = dataStart + inf.off;
+            if (absolute < dataStart || absolute > size_) {
+                fprintf(stderr, "gguf: tensor %s offset is outside the file\n", inf.name.c_str());
+                return false;
+            }
+            // Only publish an exact encoded range when every dimension is
+            // represented in GgufTensor::ne.  Higher-dimensional tensors are
+            // still parsed, but callers must reject them before range use.
+            size_t rowBytes = inf.t.nDims <= 4
+                            ? ggmlRowBytes(inf.t.type, inf.t.ne[0]) : 0;
+            if (rowBytes) {
+                uint64_t total = rowBytes;
+                for (uint32_t d = 1; d < inf.t.nDims && d < 4; d++) {
+                    if (inf.t.ne[d] && total > UINT64_MAX / inf.t.ne[d]) {
+                        fprintf(stderr, "gguf: tensor %s byte size overflows\n", inf.name.c_str());
+                        return false;
+                    }
+                    total *= inf.t.ne[d];
+                }
+                if (total > size_ - absolute) {
+                    fprintf(stderr, "gguf: tensor %s payload extends past EOF\n", inf.name.c_str());
+                    return false;
+                }
+                inf.t.nbytes = (size_t)total;
+            }
+            inf.t.dataOffset = absolute;
+            inf.t.data = base_ + absolute;
             tensors_[inf.name] = inf.t;
         }
         return true;
