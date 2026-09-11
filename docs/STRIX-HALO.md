@@ -1,6 +1,6 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-10: operator/model-loading foundations, not end-to-end serving.
+Status, 2026-09-10: first four native layers validated, not end-to-end serving.
 No production service or port has been changed by this branch. No Halogen
 binary has been installed or executed; its checkpoint is a reference download,
 not a format that this engine currently accepts.
@@ -117,6 +117,86 @@ The test allocator requires host-visible/coherent memory and keeps the imported
 payload alive until Vulkan releases it, as required by the
 [Vulkan host-import contract](https://docs.vulkan.org/refpages/latest/refpages/source/VkImportMemoryHostPointerInfoEXT.html).
 
+## Native prefix validation
+
+`qk qwen4-prefix LAST_LAYER TOKEN REFERENCE.f32 STEPS` now runs the first one
+through four layers of the installed checkpoint using only this engine's
+Vulkan kernels. It includes complete HC modules, GDN recurrence with the
+Qwen4-specific norm/gate semantics, dense full attention with partial text
+RoPE, MoE, and PLE's projections, norms, gate and dilated convolution.
+
+PLE uses a nine-frame circular history instead of shifting 10240 channels per
+token. The 35.763 GiB table stays disk-backed; only the selected rows are
+dequantized and uploaded. Reset clears both recurrent/convolution state and
+token history. The harness is limited to 32 tokens and 8 GiB of weights;
+the four-layer fixture holds 7.867 GiB of weights with 16 MiB staging. It is
+not exposed through `qk_open` or the serving endpoint.
+
+Actual-model checks (all require per-frame relative RMS < 1e-5):
+
+| Native device / layers | Tokens | Relative RMS | Worst-frame relative RMS |
+| --- | --- | --- | --- |
+| Halo / first 1 | 198..205 | 3.18e-7 | 3.51e-7 |
+| XTX / first 1 | 198..205 | 3.32e-7 | 3.81e-7 |
+| Halo / first 2 | 198..213 | 3.59e-7 | 5.59e-7 |
+| Halo / first 2, includes EOS | 248042..248057 | 4.00e-7 | 6.15e-7 |
+| Halo / first 4 | 198..213 | 4.57e-7 | 6.21e-7 |
+
+Every case reproduces its first frame exactly after resetting a used graph.
+These are intermediate-activation checks, **not full-model logits or tokens**.
+Records: `bench/results-halo-qwen4-prefix.jsonl`.
+
+The optional `flash-reference` test executable links to the separately built
+llama.cpp fork at `2dff8596dcb7bdf765d24d44e1155d51f04c82b7`. It is never
+linked into this runtime or server. Only the requested prefix's weights are
+placed on Halo; remaining weights are CPU-mapped. A graph callback captures
+the requested layer and stops that forward pass. Reference jobs on this node
+used user-systemd memory limits (6 GiB high / 8 GiB max).
+
+For a like-for-like F32 oracle, disable Vulkan MMVQ and F16, and disable flash
+attention (the test executable does the latter). The default CPU reference
+quantizes matrix inputs; the default Vulkan path also uses reduced-precision
+inputs/attention. Initial first-layer CPU relative RMS was 0.0116, and the
+four-layer flash-attention comparison was 0.000144. Using the F32 reference
+resolved these differences; the tolerance was tightened, not loosened. These
+reference settings are for accuracy comparisons, not production recommendations.
+
+Build and run the optional reference on an idle, adequately sized GPU:
+
+```bash
+cmake -S . -B build-halo -DCMAKE_BUILD_TYPE=Release \
+  -DQK_LLAMA_REFERENCE_ROOT=/path/to/llama-qwen-next-b10685
+cmake --build build-halo --target qk flash-reference -j4
+
+QK_REFERENCE_GPU_PREFIX=3 GGML_VK_DISABLE_MMVQ=1 GGML_VK_DISABLE_F16=1 \
+  build-halo/flash-reference MODEL.gguf reference.f32 198 l_last-3 16
+python3 tests/gpu_qwen4_prefix.py MODEL.gguf reference.f32 --last-layer 3 --steps 16
+```
+
+`QK_REFERENCE_DUMP=1` captures layer-0 intermediates, while
+`QK_LAYER_DUMP=/path/to/prefix` captures native intermediates by token/layer.
+Do not run large prefix jobs on a nearly full GPU; an idle request slot does
+not mean sufficient free VRAM. The active production XTX currently has room
+for the one-layer test, not the four-layer test.
+
+### Remaining expert format and placement
+
+Twenty-four layers use Q5_1 expert down-projections rather than Q8_0. New native
+routed/shared Q5_1 down kernels pass independent CPU checks on layers 6, 7, 30
+and 40 plus zero-input routing on both GPUs. Two randomized sweeps each cover
+27 configurations. In the longer 3000-iteration sweep, the 64/128 gate/down
+choice has a 193.8 us median versus 211.9 us for 128/128. Timings vary with
+cache/clocks; this selects a provisional Halo Q5_1-path default, not a claim
+of full-model speedup. Q8_0-path defaults remain 128/128. Records:
+`bench/results-halo-moe-q51-{initial,steady,validation}.jsonl`.
+
+The audit now reports weight-only split sizes. A candidate Halo-first 0:37,
+XTX-tail 37:48 layout is 67.394 / 21.322 GiB, excluding mapped embeddings,
+KV and scratch. The XTX owns the large vocabulary head, and the boundary
+carries all 10240 residual floats (40 KiB per token). This has not been loaded
+or benchmarked as a complete native model. Context, scratch, device budgets
+and any future MTP head still need to fit; these numbers are not free VRAM.
+
 ## Reproduce
 
 ```bash
@@ -143,8 +223,8 @@ reservation; final benchmarks need a dedicated window with the server drained.
 
 ## Remaining implementation and performance gates
 
-1. Wire the native `qwen4exp` graph: complete HC modules, PLE projection/gate/
-   dilated convolution, corrected GDN recurrence, the tested MoE chain, and output head.
+1. Extend the validated native prefix to the complete `qwen4exp` graph,
+   including the remaining expert formats and output head, then the serving ABI.
 2. Compare intermediate activations and greedy token IDs against the pinned
    working reference on exactly the same GGUF and input IDs. Include multi-turn,
    reset, EOS, and chunk-boundary cases before exposing requests.

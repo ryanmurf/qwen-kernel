@@ -1273,6 +1273,7 @@ static void destroyPipe(VkCtx& c, Pipe& pp) {
 }
 
 #include "qwen4_hc_test.h"
+#include "qwen4_prefix_test.h"
 
 // QK_STATS_FILE: mirror per-request stat lines ([pcache], [spec]) to an
 // append-only file — pod logs reset on every restart, which kept wiping the
@@ -1452,13 +1453,16 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     const bool sharedQ5 = tGS->type == GGML_Q5_K && tUS->type == GGML_Q5_K;
     if (tGI->type != GGML_F32 || tGIS->type != GGML_F32 ||
         (!guIq3 && !guIq4 && !guQ5) ||
-        (tDE->type != GGML_IQ4_XS && tDE->type != GGML_Q6_K && tDE->type != GGML_Q8_0) ||
-        (!sharedQ5 && (tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0)) || tDS->type != GGML_Q8_0) {
+        (tDE->type != GGML_IQ4_XS && tDE->type != GGML_Q6_K && tDE->type != GGML_Q8_0 && tDE->type != GGML_Q5_1) ||
+        (!sharedQ5 && (tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0)) ||
+        (tDS->type != GGML_Q8_0 && tDS->type != GGML_Q5_1)) {
         fprintf(stderr, "layer %u tensor types don't match the compiled kernels\n", layer);
         return false;
     }
     const bool downQ6 = tDE->type == GGML_Q6_K;  // deep layers in the 35B GGUF
     const bool downQ8 = tDE->type == GGML_Q8_0;
+    const bool downQ51 = tDE->type == GGML_Q5_1;
+    const bool sharedDownQ51 = tDS->type == GGML_Q5_1;
 
     const uint32_t nEmbd = (uint32_t)tGE->ne[0];
     const uint32_t nFf   = (uint32_t)tGE->ne[1];
@@ -1466,7 +1470,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     const uint32_t nUsed =
         (uint32_t)g.kvInt(g.kvStr("general.architecture", "") + ".expert_used_count", 8);
     if (!nExp || nExp > 512 || !nUsed || nUsed > 16 || nUsed > nExp ||
-        !nEmbd || nEmbd % 256 || !nFf || nFf % (downQ8 ? 32 : 256)) {
+        !nEmbd || nEmbd % 256 || !nFf || nFf % (downQ8 || downQ51 ? 32 : 256)) {
         fprintf(stderr, "n_expert %u / top-%u exceeds moe_select limits (512/16)\n", nExp, nUsed);
         return false;
     }
@@ -1488,7 +1492,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     const size_t rbGE = ggmlRowBytes(tGE->type, nEmbd);
     const size_t rbDE = ggmlRowBytes(tDE->type, nFf);
     const size_t rbGS = ggmlRowBytes(tGS->type, nEmbd);
-    const size_t rbDS = ggmlRowBytes(GGML_Q8_0, nFf);
+    const size_t rbDS = ggmlRowBytes(tDS->type, nFf);
 
     // ---- CPU reference (mirrors llama.cpp build_moe_ffn semantics) ----
     printf("cpu reference...\n");
@@ -1541,6 +1545,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
         for (uint32_t o = 0; o < nEmbd; o++) {
             const uint8_t* drow = tDE->data + ((size_t)e * nEmbd + o) * rbDE;
             if (downQ8) dequant_row_q8_0((const block_q8_0*)drow, tmpF.data(), nFf);
+            else if (downQ51) dequant_row_q5_1((const block_q5_1*)drow, tmpF.data(), nFf);
             else if (downQ6) dequant_row_q6_K((const block_q6_K*)drow, tmpF.data(), nFf);
             else        dequant_row_iq4_xs((const block_iq4_xs*)drow, tmpF.data(), nFf);
             double a = 0;
@@ -1560,7 +1565,8 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
         hrow[r] = (float)(silu(ga) * ua);
     }
     for (uint32_t o = 0; o < nEmbd; o++) {
-        dequant_row_q8_0((const block_q8_0*)(tDS->data + (size_t)o * rbDS), tmpF.data(), nFf);
+        if (sharedDownQ51) dequant_row_q5_1((const block_q5_1*)(tDS->data + (size_t)o * rbDS), tmpF.data(), nFf);
+        else dequant_row_q8_0((const block_q8_0*)(tDS->data + (size_t)o * rbDS), tmpF.data(), nFf);
         double a = 0;
         for (uint32_t k = 0; k < nFf; k++) a += (double)tmpF[k] * hrow[k];
         yref[o] += (float)(wShared * a);
@@ -1568,7 +1574,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
 
     // ---- GPU setup ----
     bool halo = c.props.vendorID == 0x1002 && c.props.deviceID == 0x1586;
-    uint32_t q5Wg = halo && guQ5 ? 128 : 64, q8Wg = halo && downQ8 ? 128 : 256;
+    uint32_t q5Wg = halo && guQ5 && !downQ51 ? 128 : 64, q8Wg = halo && (downQ8 || downQ51) ? 128 : 256;
     if (const char* v = getenv("QK_MOE_Q5_WG")) q5Wg = (uint32_t)atoi(v);
     if (const char* v = getenv("QK_MOE_Q8_WG")) q8Wg = (uint32_t)atoi(v);
     for (auto wg : {q5Wg, q8Wg}) if (wg != 64 && wg != 128 && wg != 256) return false;
@@ -1577,9 +1583,9 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     Pipe pGuIq3  = makePipe(c, guQ5 ? "moe_gateup_q5k.spv" : (guIq4 ? "moe_gateup_iq4.spv" : "moe_gateup_iq3.spv"),
                            5, 16, guQ5 ? q5Wg : 0);
     Pipe pGuQ8   = makePipe(c, sharedQ5 ? "moe_shared_q5k.spv" : "moe_gateup_q8.spv", 4, 16, sharedQ5 ? q5Wg : 0);
-    Pipe pDnIq4  = makePipe(c, downQ8 ? "moe_down_q8_routed.spv" : (downQ6 ? "moe_down_q6k.spv" : "moe_down_iq4.spv"),
-                           4, 16, downQ8 ? q8Wg : (downQ6 ? 0 : 256));
-    Pipe pDnQ8   = makePipe(c, "moe_down_q8.spv", 4, 16);
+    Pipe pDnIq4  = makePipe(c, downQ51 ? "moe_down_q5_1.spv" : (downQ8 ? "moe_down_q8_routed.spv" : (downQ6 ? "moe_down_q6k.spv" : "moe_down_iq4.spv")),
+                           4, 16, downQ8 || downQ51 ? q8Wg : (downQ6 ? 0 : 256));
+    Pipe pDnQ8   = makePipe(c, sharedDownQ51 ? "moe_down_shared_q5_1.spv" : "moe_down_q8.spv", 4, 16, sharedDownQ51 ? 64 : 0);
 
     const size_t szGI = (size_t)nExp * nEmbd * 4, szGIS = (size_t)nEmbd * 4;
     const size_t szGE = (size_t)nExp * nFf * rbGE, szDE = (size_t)nExp * nEmbd * rbDE;
@@ -7775,6 +7781,10 @@ int main(int argc, char** argv) {
         ok = caseF16(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "qwen4-hc") {
         ok = caseQwen4Hc(c, argU(2, 2560), argU(3, 4), argU(4, 1));
+    } else if (mode == "qwen4-layer0") {
+        ok = caseQwen4Prefix(c, ggufPath(), argU(2,198), argc > 3 ? argv[3] : nullptr, argU(4,1));
+    } else if (mode == "qwen4-prefix") {
+        ok = caseQwen4Prefix(c, ggufPath(), argU(3,198), argc > 4 ? argv[4] : nullptr, argU(5,1), argU(2,1));
     } else if (mode == "q5_k") {
         ok = caseQ5<block_q5_K, true>(c, argU(2, 640), argU(3, 2560), argU(4, 100));
     } else if (mode == "q5_1") {

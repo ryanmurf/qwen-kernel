@@ -1,0 +1,5 @@
+{"device":"STRIX_HALO","layers":4,"token_start":198,"steps":16,"relative_rms":4.56869e-7,"max_abs":1.3411e-7,"worst_frame_relative_rms":6.20826e-7,"reset_exact":true,"scope":"native prefix; not logits or serving"}
+{"device":"STRIX_HALO","layers":2,"token_start":248042,"steps":16,"relative_rms":3.99825e-7,"max_abs":9.53674e-7,"worst_frame_relative_rms":6.149e-7,"reset_exact":true,"scope":"native prefix; not logits or serving"}
+{"device":"STRIX_HALO","layers":2,"token_start":198,"steps":16,"relative_rms":3.59484e-7,"max_abs":1.3411e-7,"worst_frame_relative_rms":5.5852e-7,"reset_exact":true,"scope":"native prefix; not logits or serving"}
+{"device":"STRIX_HALO","layers":1,"token_start":198,"steps":8,"relative_rms":3.1845e-7,"max_abs":1.19209e-7,"worst_frame_relative_rms":3.50977e-7,"reset_exact":true,"scope":"native prefix; not logits or serving"}
+{"device":"NAVI31","layers":1,"token_start":198,"steps":8,"relative_rms":3.31914e-7,"max_abs":1.63913e-7,"worst_frame_relative_rms":3.81207e-7,"reset_exact":true,"scope":"native prefix; not logits or serving"}

@@ -21,11 +21,18 @@ int main(int argc, char** argv) {
                     (unsigned long long)model.kvInt(arch + "." + key, 0));
     }
     std::map<uint32_t, uint64_t> counts, bytes;
+    std::map<unsigned, uint64_t> layerBytes;
+    uint64_t headBytes = 0;
     uint64_t total = 0;
     for (const auto& [name, tensor] : model.tensors()) {
         ++counts[tensor.type];
         bytes[tensor.type] += tensor.nbytes;
         total += tensor.nbytes;
+        unsigned layer = 0; int consumed = 0;
+        if (std::sscanf(name.c_str(),"blk.%u.%n",&layer,&consumed) == 1 && consumed > 0)
+            layerBytes[layer] += tensor.nbytes;
+        else if (name != "per_layer_token_embd.weight" && name != "token_embd.weight")
+            headBytes += tensor.nbytes;
         if (name == "per_layer_token_embd.weight") {
             std::printf("PLE table: %s, %llu x %llu, %.3f GiB (keep disk-backed)\n",
                 ggmlTypeName(tensor.type), (unsigned long long)tensor.ne[0],
@@ -43,6 +50,14 @@ int main(int argc, char** argv) {
         for (uint64_t r : ratios) active += r != 0;
         std::printf("nonzero attention compression ratios: %u of %zu (zero bypasses QSA indexer)\n",
                     active, ratios.size());
+        for (unsigned split : {32,34,36,37,38,40}) {
+            const auto layers = model.kvInt(arch+".block_count",0);
+            if (split >= layers) continue;
+            uint64_t first=0, last=headBytes;
+            for (const auto& [layer, nbytes] : layerBytes) (layer<split ? first : last) += nbytes;
+            std::printf("weight-only split 0:%u / %u:%llu+head: %.3f / %.3f GiB (excludes KV, scratch, mapped embeddings)\n",
+                        split,split,(unsigned long long)layers,first/double(1ull<<30),last/double(1ull<<30));
+        }
         std::puts("native qwen4exp serving: NOT IMPLEMENTED; Q5 kernel tests are not a full model port");
     }
     return 0;

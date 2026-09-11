@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer A { float alpha[]; };
+layout(std430, binding = 1) readonly buffer B { float beta[]; };
+layout(std430, binding = 2) readonly buffer D { float dt[]; };
+layout(std430, binding = 3) readonly buffer S { float ssm_a[]; };
+layout(std430, binding = 4) writeonly buffer G { float gb[]; };
+layout(push_constant) uniform PC { uint heads; } pc;
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.heads) return;
+    float v = alpha[h] + dt[h];
+    gb[h] = ssm_a[h] * (v > 20.0 ? v : log(1.0 + exp(v)));
+    gb[pc.heads+h] = 1.0 / (1.0 + exp(-beta[h]));
+}

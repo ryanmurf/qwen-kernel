@@ -1,0 +1,3 @@
+#version 460
+#define SHARED_DOWN 1
+#include "moe_down_q5_1_impl.glsl"

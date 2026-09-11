@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Single-sequence causal depthwise conv4, dilation3. Nine-frame circular
+// history avoids shifting the 10240-channel history on every decoded token.
+layout(local_size_x = 256) in;
+layout(std430,binding=0) readonly buffer X { float x[]; };
+layout(std430,binding=1) readonly buffer W { float16_t w[]; };
+layout(std430,binding=2) buffer History { float hist[]; };
+layout(std430,binding=3) readonly buffer Gated { float gated[]; };
+layout(std430,binding=4) buffer Residual { float residual[]; };
+layout(push_constant) uniform PC { uint channels; uint position; } pc;
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.channels) return;
+    uint slot = pc.position % 9u;
+    float value = hist[slot*pc.channels+ch] * float(w[4u*ch]);
+    value += hist[((slot+3u)%9u)*pc.channels+ch] * float(w[4u*ch+1u]);
+    value += hist[((slot+6u)%9u)*pc.channels+ch] * float(w[4u*ch+2u]);
+    value += x[ch] * float(w[4u*ch+3u]);
+    hist[slot*pc.channels+ch] = x[ch];
+    residual[ch] += gated[ch] + value / (1.0 + exp(-value));
+}

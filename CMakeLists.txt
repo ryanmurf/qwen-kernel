@@ -48,7 +48,25 @@ endif()
 find_package(Vulkan REQUIRED)
 find_program(GLSLC glslc REQUIRED)
 
-set(SHADERS moe_gateup_q5k moe_shared_q5k moe_down_q8_routed qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
+# Explicitly opt-in correctness oracle; never linked into qk or the server.
+set(QK_LLAMA_REFERENCE_ROOT "" CACHE PATH "Separately built Flash Next llama.cpp reference checkout")
+set(QK_LLAMA_REFERENCE_BUILD "build-vulkan" CACHE STRING "Reference build directory relative to checkout")
+if(BUILD_TESTING AND QK_LLAMA_REFERENCE_ROOT)
+    find_package(OpenMP REQUIRED)
+    set(REFERENCE_BUILD "${QK_LLAMA_REFERENCE_ROOT}/${QK_LLAMA_REFERENCE_BUILD}")
+    add_executable(flash-reference tests/flash_reference.cpp)
+    target_include_directories(flash-reference PRIVATE
+        "${QK_LLAMA_REFERENCE_ROOT}/include" "${QK_LLAMA_REFERENCE_ROOT}/ggml/include")
+    target_link_libraries(flash-reference PRIVATE "-Wl,--start-group"
+        "${REFERENCE_BUILD}/src/libllama.a"
+        "${REFERENCE_BUILD}/ggml/src/libggml.a"
+        "${REFERENCE_BUILD}/ggml/src/libggml-base.a"
+        "${REFERENCE_BUILD}/ggml/src/libggml-cpu.a"
+        "${REFERENCE_BUILD}/ggml/src/ggml-vulkan/libggml-vulkan.a"
+        "-Wl,--end-group" Vulkan::Vulkan OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS} pthread)
+endif()
+
+set(SHADERS qwen4_ple_conv qwen4_silu qwen4_gdn_params moe_gateup_q5k moe_shared_q5k moe_down_q8_routed qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
     moe_route_select moe_route_select_hier moe_select moe_select_256 moe_group_pairs moe_gateup_iq3
     moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_iq3_grouped_rowtile moe_gateup_q8
     moe_gateup_q8_64 moe_down_iq4 moe_down_iq4_grouped moe_down_iq4_grouped_rowtile moe_down_q6k
@@ -72,12 +90,15 @@ set(SHADERS moe_gateup_q5k moe_shared_q5k moe_down_q8_routed qwen4_hc gemv_f16 g
     gemma4_cache_scatter_f16 gemma4_argmax gemm_q4_0 gemm_q4_0_bn32 gemm_q4_0_coopmat
     gemma4_moe_gateup_grouped_coopmat gemma4_moe_down_grouped_coopmat
 
-    moe_gateup_iq4 gemm_iq4_xs embed_q8_0)
+    moe_gateup_iq4 gemm_iq4_xs embed_q8_0 moe_down_q5_1 moe_down_shared_q5_1)
 set(SPV_FILES "")
 foreach(s ${SHADERS})
     set(EXTRA_SHADER_DEPS)
     if(s STREQUAL "moe_gateup_q5k" OR s STREQUAL "moe_shared_q5k")
         list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/moe_q5k_impl.glsl)
+    endif()
+    if(s STREQUAL "moe_down_q5_1" OR s STREQUAL "moe_down_shared_q5_1")
+        list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/moe_down_q5_1_impl.glsl)
     endif()
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/shaders/${s}.spv

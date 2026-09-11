@@ -7,6 +7,7 @@
 // dn_step_reg.comp and dn_gate.comp while preserving their arithmetic order.
 
 layout(local_size_x = 128) in;
+layout(constant_id = 0) const uint QWEN4_SIGMOID = 0u;
 
 layout(std430, binding = 0) readonly buffer BufC  { float conv[]; };
 layout(std430, binding = 1) readonly buffer BufGB { float gb[]; };
@@ -78,5 +79,5 @@ void main() {
     barrier();
     uint outIndex = rq * pc.hV * dS + h * dS + j;
     float zv = z[outIndex];
-    att[outIndex] = oj * gateScale * w[j] * (zv / (1.0 + exp(-zv)));
+    att[outIndex] = oj * gateScale * w[j] * ((QWEN4_SIGMOID != 0u ? 1.0 : zv) / (1.0 + exp(-zv)));
 }

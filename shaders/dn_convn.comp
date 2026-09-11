@@ -7,6 +7,7 @@
 // l2 normalization (q/k region), the v region passes through.
 
 layout(local_size_x = 128) in;
+layout(constant_id = 0) const uint QWEN4_L2 = 0u;
 
 layout(std430, binding = 0) buffer BufS          { float st[]; };
 layout(std430, binding = 1) readonly buffer BufI { float qkv[]; };
@@ -46,7 +47,7 @@ void main() {
         if (t == 0u) {
             float tot = 0.0;
             for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += red[i];
-            scale = 1.0 / max(sqrt(tot), pc.eps);
+            scale = QWEN4_L2 != 0u ? inversesqrt(tot + pc.eps) : 1.0 / max(sqrt(tot), pc.eps);
         }
         barrier();
         v *= scale;

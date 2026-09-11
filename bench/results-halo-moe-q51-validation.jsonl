@@ -1,0 +1,10 @@
+{"device":"STRIX_HALO","layer":6,"seed":7,"zero_input":false,"max_rel_error":0.0000503,"passed":true}
+{"device":"STRIX_HALO","layer":7,"seed":91,"zero_input":false,"max_rel_error":0.0000335,"passed":true}
+{"device":"STRIX_HALO","layer":30,"seed":1234,"zero_input":false,"max_rel_error":0.0000531,"passed":true}
+{"device":"STRIX_HALO","layer":40,"seed":55,"zero_input":false,"max_rel_error":0.0000522,"passed":true}
+{"device":"STRIX_HALO","layer":6,"seed":43,"zero_input":true,"max_rel_error":0,"passed":true}
+{"device":"NAVI31","layer":6,"seed":7,"zero_input":false,"max_rel_error":0.0000466,"passed":true}
+{"device":"NAVI31","layer":7,"seed":91,"zero_input":false,"max_rel_error":0.0000345,"passed":true}
+{"device":"NAVI31","layer":30,"seed":1234,"zero_input":false,"max_rel_error":0.000054,"passed":true}
+{"device":"NAVI31","layer":40,"seed":55,"zero_input":false,"max_rel_error":0.000054,"passed":true}
+{"device":"NAVI31","layer":6,"seed":43,"zero_input":true,"max_rel_error":0,"passed":true}
