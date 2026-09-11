@@ -1,0 +1,18 @@
+#version 450
+// Batched MoE tail: fold the routed partials in slot order, then add the
+// shared expert scaled by its sigmoid gate. out[t][i].
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer R { float routed[]; };   // [T][n_used][n]
+layout(std430, binding = 1) readonly buffer Sh { float shared_[]; };  // [T][n]
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
+layout(std430, binding = 2) readonly buffer S { SelT sel[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n; uint n_used; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x, t = gl_WorkGroupID.z;
+    if (i >= pc.n) return;
+    float v = 0.0;
+    for (uint k = 0u; k < pc.n_used; ++k) v += routed[(t * pc.n_used + k) * pc.n + i];
+    v += sel[t].wShared * shared_[t * pc.n + i];
+    o[t * pc.n + i] = v;
+}

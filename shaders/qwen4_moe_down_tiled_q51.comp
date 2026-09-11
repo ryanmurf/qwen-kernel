@@ -1,0 +1,3 @@
+#version 460
+#define DOWN_Q51 1
+#include "qwen4_moe_down_tiled_impl.glsl"

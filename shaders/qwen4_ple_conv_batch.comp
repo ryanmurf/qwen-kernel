@@ -1,0 +1,29 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Batched causal depthwise conv4, dilation 3, over T tokens starting at
+// position base. Each thread walks its channel through the nine-frame circular
+// history exactly as the serial kernel does, one token at a time.
+layout(local_size_x = 256) in;
+layout(std430,binding=0) readonly buffer X { float x[]; };
+layout(std430,binding=1) readonly buffer W { float16_t w[]; };
+layout(std430,binding=2) buffer History { float hist[]; };
+layout(std430,binding=3) readonly buffer Gated { float gated[]; };
+layout(std430,binding=4) buffer Residual { float residual[]; };
+layout(push_constant) uniform PC { uint channels; uint base; uint T; } pc;
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.channels) return;
+    float w0 = float(w[4u*ch]), w1 = float(w[4u*ch+1u]), w2 = float(w[4u*ch+2u]), w3 = float(w[4u*ch+3u]);
+    for (uint t = 0u; t < pc.T; ++t) {
+        uint slot = (pc.base + t) % 9u;
+        uint idx = t * pc.channels + ch;
+        float xin = x[idx];
+        float value = hist[slot*pc.channels+ch] * w0;
+        value += hist[((slot+3u)%9u)*pc.channels+ch] * w1;
+        value += hist[((slot+6u)%9u)*pc.channels+ch] * w2;
+        value += xin * w3;
+        hist[slot*pc.channels+ch] = xin;
+        residual[idx] += gated[idx] + value / (1.0 + exp(-value));
+    }
+}

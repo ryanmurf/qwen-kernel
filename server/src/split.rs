@@ -614,12 +614,14 @@ pub fn run_split_engine_thread(
     rx: mpsc::Receiver<Cmd>,
 ) {
     let n_slots = head.n_slots() as usize;
-    // The native Flash prefill is serial GEMV for now. A smaller explicit
-    // chunk keeps cancellation responsive without changing legacy defaults.
+    // QK_PREFILL_CHUNK bounds the tokens per prefill frame (1..=512, the
+    // worker's frame limit). The default keeps the legacy 128-token frames;
+    // the native Flash batched prefill benefits from wider frames, while a
+    // narrower one keeps cancellation responsive on slow paths.
     let prefill_cap = std::env::var("QK_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .filter(|n| (1..=128).contains(n))
+        .filter(|n| (1..=512).contains(n))
         .unwrap_or(CHUNK as u32);
     let eos = head.eos_token();
     let n_embd = link.as_ref().map_or(0, |l| l.n_embd);
@@ -747,7 +749,8 @@ pub fn run_split_engine_thread(
                             } else {
                                 np
                             };
-                            let n = chunk_cap(shared).min(prefill_cap).min(stop - p.done);
+                            let cap = if shared { chunk_cap(shared).min(prefill_cap) } else { prefill_cap };
+                            let n = cap.min(stop - p.done);
                             if n == 0 {
                                 break; // waiting on the snapshot barrier below
                             }

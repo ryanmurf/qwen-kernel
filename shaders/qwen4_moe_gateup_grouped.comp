@@ -1,0 +1,80 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Expert-major batched gate/up for Q5_K routed experts. One workgroup owns one
+// (expert, ff row), dequantizes that row of both matrices once into registers
+// (interleaved: thread tid holds elements j*128+tid) and applies it to every
+// token/slot pair in the expert's counting-sorted range. Host requires
+// n_embd == 128*KPT.
+
+layout(local_size_x = 128) in;
+const uint KPT = 20u;
+
+struct block_q5_K { float16_t d, dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; };
+layout(std430, binding = 0) readonly buffer G { block_q5_K gw[]; };
+layout(std430, binding = 1) readonly buffer U { block_q5_K uw[]; };
+layout(std430, binding = 2) readonly buffer X { float x[]; };
+layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 4) readonly buffer Pairs { uint pairs[]; };
+layout(std430, binding = 5) writeonly buffer H { float h[]; };
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+shared float pg[4], pu[4];
+
+uvec2 scale_min(block_q5_K b, uint g) {
+    return g < 4u ? uvec2(uint(b.scales[g]) & 63u, uint(b.scales[g+4u]) & 63u)
+        : uvec2((uint(b.scales[g+4u]) & 15u) | ((uint(b.scales[g-4u]) >> 6u) << 4u),
+                (uint(b.scales[g+4u]) >> 4u) | ((uint(b.scales[g]) >> 6u) << 4u));
+}
+uint quant(block_q5_K b, uint g, uint i) {
+    return ((uint(b.qs[(g/2u)*32u+i]) >> ((g%2u)*4u)) & 15u) |
+           (((uint(b.qh[i]) >> g) & 1u) << 4u);
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint eid = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (r >= pc.n_ff || eid >= pc.n_expert) return;
+    uint begin = offsets[eid], end = offsets[eid + 1u];
+    if (begin == end) return;
+
+    uint blocks = pc.n_embd / 256u;
+    uint base = (eid * pc.n_ff + r) * blocks;
+    float mg[KPT], mu[KPT];
+    [[unroll]] for (uint j = 0u; j < KPT; ++j) {
+        uint e = j * 128u + tid;
+        uint b = base + e / 256u, g = (e % 256u) / 32u, i = e % 32u;
+        uvec2 gs = scale_min(gw[b], g), us = scale_min(uw[b], g);
+        mg[j] = float(gw[b].d) * float(gs.x) * float(quant(gw[b], g, i)) - float(gw[b].dmin) * float(gs.y);
+        mu[j] = float(uw[b].d) * float(us.x) * float(quant(uw[b], g, i)) - float(uw[b].dmin) * float(us.y);
+    }
+
+    for (uint pi = begin; pi < end; ++pi) {
+        uint pair = pairs[pi];
+        uint rq = pair >> 4u;
+        uint s = pair & 15u;
+        uint xo = rq * pc.n_embd + tid;
+        float ag = 0.0, au = 0.0;
+        [[unroll]] for (uint j = 0u; j < KPT; ++j) {
+            float v = x[xo + j * 128u];
+            ag += mg[j] * v;
+            au += mu[j] * v;
+        }
+        float sg = subgroupAdd(ag), su = subgroupAdd(au);
+        if (gl_SubgroupInvocationID == 0u) { pg[gl_SubgroupID] = sg; pu[gl_SubgroupID] = su; }
+        barrier();
+        if (tid == 0u) {
+            float g = 0.0, u = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) { g += pg[i]; u += pu[i]; }
+            h[(rq * (pc.n_used + 1u) + s) * pc.n_ff + r] = (g / (1.0 + exp(-g))) * u;
+        }
+        barrier();
+    }
+}

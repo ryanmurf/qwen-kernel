@@ -1,0 +1,2 @@
+{"test": "proxy_8092_stream", "text": "READY", "events": 7, "result": "PASS"}
+{"test": "proxy_8092_xml_tool", "stop_reason": "tool_use", "calls": [{"type": "tool_use", "id": "toolu_fa7608fdddf048ebb1d597e2762c7e80", "name": "echo", "input": {"text": "READY"}}], "result": "PASS"}

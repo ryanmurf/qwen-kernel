@@ -90,7 +90,10 @@ set(SHADERS qwen4_ple_conv qwen4_silu qwen4_gdn_params moe_gateup_q5k moe_shared
     gemma4_cache_scatter_f16 gemma4_argmax gemm_q4_0 gemm_q4_0_bn32 gemm_q4_0_coopmat
     gemma4_moe_gateup_grouped_coopmat gemma4_moe_down_grouped_coopmat
 
-    moe_gateup_iq4 gemm_iq4_xs embed_q8_0 moe_down_q5_1 moe_down_shared_q5_1)
+    moe_gateup_iq4 gemm_iq4_xs embed_q8_0 moe_down_q5_1 moe_down_shared_q5_1
+    qwen4_gemm_q5k qwen4_gemm_q6k qwen4_gemm_q8_0 qwen4_gemm_q5_1 qwen4_gdn_conv_batch qwen4_gdn_step_batch
+    qwen4_ple_conv_batch qwen4_moe_gateup_grouped qwen4_moe_down_grouped_q8 qwen4_moe_down_grouped_q51
+    qwen4_moe_combine qwen4_silu_mul qwen4_argmax qwen4_moe_gateup_tiled qwen4_moe_down_tiled_q8 qwen4_moe_down_tiled_q51)
 set(SPV_FILES "")
 foreach(s ${SHADERS})
     set(EXTRA_SHADER_DEPS)
@@ -99,6 +102,15 @@ foreach(s ${SHADERS})
     endif()
     if(s STREQUAL "moe_down_q5_1" OR s STREQUAL "moe_down_shared_q5_1")
         list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/moe_down_q5_1_impl.glsl)
+    endif()
+    if(s MATCHES "^qwen4_gemm_")
+        list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/qwen4_gemm_impl.glsl)
+    endif()
+    if(s MATCHES "^qwen4_moe_down_grouped_")
+        list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/qwen4_moe_down_grouped_impl.glsl)
+    endif()
+    if(s MATCHES "^qwen4_moe_down_tiled_")
+        list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/qwen4_moe_down_tiled_impl.glsl)
     endif()
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/shaders/${s}.spv

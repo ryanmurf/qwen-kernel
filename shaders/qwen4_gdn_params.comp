@@ -1,15 +1,18 @@
 #version 450
+// Per-token decay/beta parameters; T rows of [heads] alpha/beta in, T rows of
+// [2*heads] out (decay log-space first, sigmoid(beta) second).
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer A { float alpha[]; };
 layout(std430, binding = 1) readonly buffer B { float beta[]; };
 layout(std430, binding = 2) readonly buffer D { float dt[]; };
 layout(std430, binding = 3) readonly buffer S { float ssm_a[]; };
 layout(std430, binding = 4) writeonly buffer G { float gb[]; };
-layout(push_constant) uniform PC { uint heads; } pc;
+layout(push_constant) uniform PC { uint heads; uint T; } pc;
 void main() {
-    uint h = gl_GlobalInvocationID.x;
-    if (h >= pc.heads) return;
-    float v = alpha[h] + dt[h];
-    gb[h] = ssm_a[h] * (v > 20.0 ? v : log(1.0 + exp(v)));
-    gb[pc.heads+h] = 1.0 / (1.0 + exp(-beta[h]));
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.heads * pc.T) return;
+    uint t = i / pc.heads, h = i % pc.heads;
+    float v = alpha[i] + dt[h];
+    gb[t * 2u * pc.heads + h] = ssm_a[h] * (v > 20.0 ? v : log(1.0 + exp(v)));
+    gb[t * 2u * pc.heads + pc.heads + h] = 1.0 / (1.0 + exp(-beta[i]));
 }

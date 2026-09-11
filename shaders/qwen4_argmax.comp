@@ -1,0 +1,28 @@
+#version 450
+// Per-row greedy argmax over [T][vocab] logits; the lowest index wins ties,
+// matching std::max_element on the host. ids[idOff + t].
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer L { float logits[]; };
+layout(std430, binding = 1) writeonly buffer I { uint ids[]; };
+layout(push_constant) uniform PC { uint vocab; uint T; uint idOff; } pc;
+shared float vals[256];
+shared uint idx[256];
+void main() {
+    uint t = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    if (t >= pc.T) return;
+    float best = -3.4e38; uint bi = 0xffffffffu;
+    for (uint i = tid; i < pc.vocab; i += 256u) {
+        float v = logits[t * pc.vocab + i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    vals[tid] = best; idx[tid] = bi;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float ov = vals[tid + s]; uint oi = idx[tid + s];
+            if (ov > vals[tid] || (ov == vals[tid] && oi < idx[tid])) { vals[tid] = ov; idx[tid] = oi; }
+        }
+        barrier();
+    }
+    if (tid == 0u) ids[pc.idOff + t] = idx[0];
+}

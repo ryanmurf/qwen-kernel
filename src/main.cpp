@@ -4134,7 +4134,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     if (arch == "qwen4exp") {
         const char* experimental=getenv("QK_NATIVE_FLASH");
         if (!experimental || strcmp(experimental,"1"))
-            return fail("qk_open: experimental native Flash graph requires QK_NATIVE_FLASH=1; MTP, batched prefill and snapshots are not implemented");
+            return fail("qk_open: experimental native Flash graph requires QK_NATIVE_FLASH=1; MTP and snapshots are not implemented");
         if (nSlots!=1) return fail("qk_open: native Flash currently supports exactly one sequence");
         nLayer=48; lFirst=0; lEnd=48; vocab=248320; nExp=512; nUsed=10; ffE=640;
         eosTok=(uint32_t)g.kvInt("tokenizer.ggml.eos_token_id",248044);
@@ -4151,7 +4151,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             qwen4=std::make_unique<Qwen4Graph>(c,g,lFirst,lEnd,nCtx,96ull<<30,lastStage());
             qwen4->open();
         } catch (const std::exception& error) { return fail(error.what()); }
-        fprintf(stderr,"native Flash experimental stage [%u,%u), context=%u, residual=10240, one sequence; MTP/prefill batching/snapshots disabled\n",lFirst,lEnd,nCtx);
+        fprintf(stderr,"native Flash experimental stage [%u,%u), context=%u, residual=10240, one sequence, batch rows %u; MTP/snapshots disabled\n",lFirst,lEnd,nCtx,qwen4->batchCapacity());
         return true;
     }
     initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
@@ -5876,13 +5876,23 @@ int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hidden
         if (firstStage()) for (uint32_t i=0; i<n; ++i) if (toks[i]>=vocab) return -5;
         lastRunRows=0;
         try {
-            for (uint32_t i=0; i<n; ++i) {
-                auto hidden=qwen4->forward(firstStage()?toks[i]:0,base+i==0,
-                    hiddenIn?hiddenIn+(size_t)i*10240:nullptr);
-                if (lastStage()) {
-                    const auto& logits=qwen4->lastLogits();
-                    idsOut[i]=(uint32_t)(std::max_element(logits.begin(),logits.end())-logits.begin());
-                } else memcpy(hiddenOut+(size_t)i*10240,hidden.data(),10240*4);
+            // Multi-token runs use the batched graph in chunks of its row
+            // capacity; single positions keep the replayable serial path.
+            const uint32_t cap=qwen4->batchCapacity();
+            for (uint32_t i=0; i<n;) {
+                const uint32_t cn=std::min(n-i,std::max(cap,1u));
+                if (cn>1) {
+                    qwen4->forwardBatch(firstStage()?toks+i:nullptr,hiddenIn?hiddenIn+(size_t)i*10240:nullptr,cn,base+i==0,
+                                        lastStage()?nullptr:hiddenOut+(size_t)i*10240,lastStage()?idsOut+i:nullptr);
+                } else {
+                    auto hidden=qwen4->forward(firstStage()?toks[i]:0,base+i==0,
+                        hiddenIn?hiddenIn+(size_t)i*10240:nullptr);
+                    if (lastStage()) {
+                        const auto& logits=qwen4->lastLogits();
+                        idsOut[i]=(uint32_t)(std::max_element(logits.begin(),logits.end())-logits.begin());
+                    } else memcpy(hiddenOut+(size_t)i*10240,hidden.data(),10240*4);
+                }
+                i+=cn;
             }
             lastRunRows=n;
             return 0;
@@ -7861,6 +7871,9 @@ int main(int argc, char** argv) {
         ok = caseQwen4Prefix(c, ggufPath(), argU(2,198), argc > 3 ? argv[3] : nullptr, argU(4,1));
     } else if (mode == "qwen4-prefix") {
         ok = caseQwen4Prefix(c, ggufPath(), argU(3,198), argc > 4 ? argv[4] : nullptr, argU(5,1), argU(2,1));
+    } else if (mode == "qwen4-batch") {
+        // qk qwen4-batch LAST_LAYER TOKEN STEPS: serial-vs-batched prefix check
+        ok = caseQwen4Batch(c, ggufPath(), argU(3,198), argU(4,16), argU(2,3));
     } else if (mode == "q5_k") {
         ok = caseQ5<block_q5_K, true>(c, argU(2, 640), argU(3, 2560), argU(4, 100));
     } else if (mode == "q5_1") {

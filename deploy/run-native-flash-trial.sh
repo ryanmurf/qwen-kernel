@@ -15,7 +15,7 @@ export QK_NATIVE_FLASH=1 QK_GGUF="$model" QK_SHADER_DIR="$project_root/build-hal
 # Do not inherit a stale device index/PCI override that defeats unique names.
 unset QK_DEVICE QK_DEVICE_PCI QK_LAYER_DUMP
 export QK_REASONING_EFFORT=${QK_REASONING_EFFORT:-xhigh}
-export QK_PREFILL_CHUNK=${QK_PREFILL_CHUNK:-16}
+export QK_PREFILL_CHUNK=${QK_PREFILL_CHUNK:-512}
 if [[ "$mode" == worker ]]; then
     export QK_DEVICE_NAME=NAVI31 QK_PIPE_HOST=127.0.0.1
     exec "$project_root/build-halo/qk" pipe-worker 8195 37:48 "$context" 1
