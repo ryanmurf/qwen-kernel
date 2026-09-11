@@ -65,9 +65,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let metadata = gguf::read_metadata(&cli.model)?;
+    if metadata.architecture.as_deref() == Some("qwen4exp") {
+        anyhow::ensure!(cli.slots == 1, "native Flash requires --slots 1");
+        anyhow::ensure!(
+            cli.local_driver || cli.split_next.is_some(),
+            "native Flash requires --local-driver or --split-next"
+        );
+        anyhow::ensure!(
+            matches!(cli.chat_template, CliTemplateMode::Auto),
+            "native Flash requires its GGUF chat template (--chat-template auto)"
+        );
+    }
     if !matches!(
         metadata.architecture.as_deref(),
-        Some("qwen35moe") | Some("qwen3next")
+        Some("qwen35moe") | Some("qwen3next") | Some("qwen4exp")
     ) {
         tracing::warn!("unexpected model architecture: {:?}", metadata.architecture);
     }
@@ -76,10 +87,15 @@ async fn main() -> anyhow::Result<()> {
         CliTemplateMode::Auto => TemplateMode::Auto,
         CliTemplateMode::Builtin => TemplateMode::Builtin,
     };
-    let chat_template = Arc::new(ChatTemplate::new(metadata.chat_template, template_mode));
+    let chat_template = Arc::new(
+        ChatTemplate::new(metadata.chat_template, template_mode)
+            .for_architecture(metadata.architecture.as_deref()),
+    );
     tracing::info!(
         "generation cue: {}",
-        if chat_template.gen_cue().contains("<think>") {
+        if chat_template.is_flash() {
+            "open reasoning (Flash Next)"
+        } else if chat_template.gen_cue().contains("<think>") {
             "think scaffold (Qwen3.6 shape)"
         } else {
             "plain assistant turn (instruct shape)"

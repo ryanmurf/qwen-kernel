@@ -133,7 +133,11 @@ impl serde_json::ser::Formatter for SpacedFormatter {
     where
         W: ?Sized + std::io::Write,
     {
-        if first { Ok(()) } else { writer.write_all(b", ") }
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
     }
 
     fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
@@ -147,7 +151,11 @@ impl serde_json::ser::Formatter for SpacedFormatter {
     where
         W: ?Sized + std::io::Write,
     {
-        if first { Ok(()) } else { writer.write_all(b", ") }
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
     }
 }
 
@@ -164,6 +172,7 @@ fn spaced_json(value: &Value) -> String {
 pub struct ToolSpec {
     name: String,
     keys: Vec<String>,
+    properties: Value,
 }
 
 fn tool_specs(tools: &[ToolDef]) -> Vec<ToolSpec> {
@@ -171,6 +180,12 @@ fn tool_specs(tools: &[ToolDef]) -> Vec<ToolSpec> {
         .iter()
         .map(|tool| ToolSpec {
             name: tool.name.clone(),
+            properties: tool
+                .input_schema
+                .as_ref()
+                .and_then(|schema| schema.get("properties"))
+                .cloned()
+                .unwrap_or(Value::Null),
             keys: tool
                 .input_schema
                 .as_ref()
@@ -297,6 +312,86 @@ fn render_prompt(req: &MessagesReq, gen_cue: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Flash's GGUF template owns the XML tool format and open reasoning cue.
+/// Preserve system priority when converting Claude's in-message reminders:
+/// this template accepts system content only in the initial turn.
+fn render_flash_prompt(
+    req: &MessagesReq,
+    template: &crate::template::ChatTemplate,
+) -> Result<String> {
+    let mut system = match &req.system {
+        None => String::new(),
+        Some(SystemField::Text(text)) => text.clone(),
+        Some(SystemField::Blocks(blocks)) => blocks
+            .iter()
+            .filter(|b| b.kind == "text")
+            .filter_map(|b| b.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    };
+    let mut messages = Vec::new();
+    let prefill = req.messages.last().is_some_and(|m| m.role == "assistant");
+    let count = req.messages.len() - usize::from(prefill);
+    for message in &req.messages[..count] {
+        match message.role.as_str() {
+            "system" => {
+                if !system.is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(&render_user_content(&message.content)?);
+            }
+            "user" => messages
+                .push(json!({"role":"user", "content":render_user_content(&message.content)?})),
+            "assistant" => {
+                let mut text = String::new();
+                let mut calls = Vec::new();
+                match &message.content {
+                    AnthropicContent::Text(value) => text.push_str(value),
+                    AnthropicContent::Blocks(blocks) => {
+                        for block in blocks {
+                            match block.kind.as_str() {
+                            "text" => text.push_str(block.text.as_deref().unwrap_or("")),
+                            "tool_use" => calls.push(json!({"type":"function", "function":{
+                                "name":block.name.as_ref().ok_or_else(|| ServerError::bad_request("tool_use is missing name"))?,
+                                "arguments":block.input.clone().unwrap_or_else(|| json!({}))
+                            }})),
+                            "image" => return Err(ServerError::bad_request("image content blocks are not supported")),
+                            _ => {}
+                        }
+                        }
+                    }
+                }
+                messages.push(json!({"role":"assistant", "content":text, "tool_calls":calls}));
+            }
+            role => {
+                return Err(ServerError::bad_request(format!(
+                    "unsupported message role: {role}"
+                )));
+            }
+        }
+    }
+    if !system.is_empty() {
+        messages.insert(0, json!({"role":"system","content":system}));
+    }
+    let tools: Vec<_> = req
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({"type":"function","function":{
+                "name":tool.name, "description":tool.description.as_deref().unwrap_or(""),
+                "parameters":tool.input_schema.clone().unwrap_or_else(|| json!({}))
+            }})
+        })
+        .collect();
+    let mut out = template.render_flash(json!(messages), json!(tools))?;
+    if prefill {
+        // An answer prefill is not a partial private reasoning block.
+        out.push_str("</think>\n\n");
+        out.push_str(render_assistant_content(&req.messages.last().unwrap().content)?.trim_end());
+    }
+    Ok(out)
+}
+
 // Cap any single rendered tool_result. A giant tool dump (whole POM, dependency
 // tree, tarball/file listing) is the usual cause of context overflow, and it is
 // safe to truncate to head+tail — the agent keeps its own earlier findings and
@@ -369,7 +464,11 @@ fn fit_to_context(state: &AppState, req: &mut MessagesReq) -> Result<String> {
     let target = (n_ctx as f32 * 0.72) as u32;
     let mut trimming = false;
     loop {
-        let prompt = render_prompt(req, state.chat_template.gen_cue())?;
+        let prompt = if state.chat_template.is_flash() {
+            render_flash_prompt(req, &state.chat_template)?
+        } else {
+            render_prompt(req, state.chat_template.gen_cue())?
+        };
         let len = state.tokenizer.tokenize(&prompt, true)?.len() as u32;
         let limit = if trimming { target } else { hard };
         if len <= limit {
@@ -515,15 +614,34 @@ impl OutputParser {
         }
     }
 
+    pub fn for_prompt(tools: &[ToolSpec], prompt: &str) -> Self {
+        let mut parser = Self::new(tools);
+        let tail = prompt
+            .rsplit("<|im_start|>assistant\n")
+            .next()
+            .unwrap_or("");
+        if let Some(open) = tail.rfind(THINK_OPEN) {
+            if tail.rfind(THINK_CLOSE).is_none_or(|close| close < open) {
+                parser.state = ParseState::Think;
+            }
+        }
+        parser
+    }
+
     pub fn push(&mut self, text: &str) -> Vec<ParsedEvent> {
         self.buf.push_str(text);
         let mut out = Vec::new();
         loop {
             match self.state {
                 ParseState::Text => {
-                    let tool = self.buf.find(TOOL_OPEN).map(|pos| (pos, TOOL_OPEN, ParseState::Tool));
-                    let think =
-                        self.buf.find(THINK_OPEN).map(|pos| (pos, THINK_OPEN, ParseState::Think));
+                    let tool = self
+                        .buf
+                        .find(TOOL_OPEN)
+                        .map(|pos| (pos, TOOL_OPEN, ParseState::Tool));
+                    let think = self
+                        .buf
+                        .find(THINK_OPEN)
+                        .map(|pos| (pos, THINK_OPEN, ParseState::Think));
                     let first = match (tool, think) {
                         (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
                         (a, b) => a.or(b),
@@ -550,6 +668,10 @@ impl OutputParser {
                         self.state = ParseState::Text;
                         continue;
                     }
+                    // Reasoning can be very long at xhigh. Retain only a
+                    // possible split closing tag, never the entire block.
+                    let ready = self.buf.len() - holdback_len(&self.buf, &[THINK_CLOSE]);
+                    self.buf.drain(..ready);
                     break;
                 }
                 ParseState::Tool => {
@@ -609,6 +731,15 @@ fn repair_tool_json(raw: &str) -> String {
 }
 
 fn parse_tool_call(raw: &str, tools: &[ToolSpec]) -> ParsedEvent {
+    if raw.starts_with("<function=") {
+        return match parse_xml_tool_call(raw, tools) {
+            Ok((name, input)) => ParsedEvent::ToolCall { name, input },
+            Err(error) => ParsedEvent::Malformed {
+                raw: raw.to_owned(),
+                error,
+            },
+        };
+    }
     #[derive(Deserialize)]
     struct Call {
         name: Option<String>,
@@ -646,6 +777,80 @@ fn parse_tool_call(raw: &str, tools: &[ToolSpec]) -> ParsedEvent {
             error: "the JSON object is missing the required \"name\" field".to_owned(),
         },
     }
+}
+
+/// Parse only Qwen's function/parameter wire syntax. This is not a general XML
+/// parser: no entities, DTDs, file references, or implicit tool-name inference.
+fn parse_xml_tool_call(
+    raw: &str,
+    tools: &[ToolSpec],
+) -> std::result::Result<(String, Value), String> {
+    fn header<'a>(text: &'a str, prefix: &str) -> std::result::Result<(&'a str, &'a str), String> {
+        let body = text
+            .strip_prefix(prefix)
+            .ok_or("expected XML tool header")?;
+        let (name, rest) = body.split_once('>').ok_or("unterminated XML tool header")?;
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '<' | '=' | '"' | '\''))
+        {
+            return Err("invalid XML tool identifier".into());
+        }
+        Ok((name, rest))
+    }
+    let (name, mut rest) = header(raw, "<function=")?;
+    let spec = tools.iter().find(|tool| tool.name == name);
+    if !tools.is_empty() && spec.is_none() {
+        return Err("unadvertised XML tool name".into());
+    }
+    let mut input = serde_json::Map::new();
+    loop {
+        rest = rest.trim_start();
+        if let Some(end) = rest.strip_prefix("</function>") {
+            if !end.trim().is_empty() {
+                return Err("trailing XML tool content".into());
+            }
+            break;
+        }
+        let (key, body) = header(rest, "<parameter=")?;
+        if input.contains_key(key) {
+            return Err("duplicate XML tool parameter".into());
+        }
+        let (value, tail) = body
+            .split_once("</parameter>")
+            .ok_or("unterminated XML tool parameter")?;
+        if value.contains("<parameter=") || value.contains("</function>") {
+            return Err("ambiguous nested XML tool delimiters".into());
+        }
+        // Remove exactly the template's wrapper newlines, not argument spaces.
+        let value = value.strip_prefix('\n').unwrap_or(value);
+        let value = value.strip_suffix('\n').unwrap_or(value);
+        let kind = spec
+            .and_then(|s| s.properties.get(key))
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str);
+        let parsed = if kind == Some("string") {
+            Value::String(value.into())
+        } else {
+            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into()))
+        };
+        let valid = match kind {
+            Some("integer") => parsed.is_i64() || parsed.is_u64(),
+            Some("number") => parsed.is_number(),
+            Some("boolean") => parsed.is_boolean(),
+            Some("object") => parsed.is_object(),
+            Some("array") => parsed.is_array(),
+            Some("null") => parsed.is_null(),
+            _ => true,
+        };
+        if !valid {
+            return Err(format!("invalid type for XML tool parameter {key}"));
+        }
+        input.insert(key.into(), parsed);
+        rest = tail;
+    }
+    Ok((name.into(), Value::Object(input)))
 }
 
 /// Last-resort passthrough when a malformed tool call cannot be retried.
@@ -701,11 +906,7 @@ fn anthropic_error(err: ServerError) -> Response {
         .into_response()
 }
 
-pub async fn messages(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+pub async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     match handle_messages(state, headers, body).await {
         Ok(response) => response,
         Err(err) => anthropic_error(err),
@@ -718,7 +919,10 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
     if req.messages.is_empty() {
         return Err(ServerError::bad_request("messages must not be empty"));
     }
-    let model = req.model.clone().unwrap_or_else(|| state.model_alias.clone());
+    let model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.model_alias.clone());
     let prompt = fit_to_context(&state, &mut req)?;
     let specs = tool_specs(&req.tools);
     let sampling = resolve_sampling(req.temperature, req.top_p, None);
@@ -756,7 +960,7 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
     let (finish, stopping_word) = loop {
         let completed = collect_generation(&state, rx, &req.stop_sequences).await?;
         output_tokens += completed.tokens.len();
-        let mut parser = OutputParser::new(&specs);
+        let mut parser = OutputParser::for_prompt(&specs, &prompt_text);
         let mut batch = parser.push(&completed.content);
         batch.extend(parser.finish());
         let has_tool_call = batch
@@ -784,7 +988,13 @@ async fn handle_messages(state: AppState, headers: HeaderMap, body: Bytes) -> Re
                 prepare_generation(&state, Prompt::Text(next_prompt.clone()), req.max_tokens)
                     .and_then(|mut next| {
                         next.snap_prefix = history_boundary(&state, &next_prompt);
-                        submit_generation(&state, &next.prompt_ids, next.max_gen, next.snap_prefix, sampling)
+                        submit_generation(
+                            &state,
+                            &next.prompt_ids,
+                            next.max_gen,
+                            next.snap_prefix,
+                            sampling,
+                        )
                     });
             if let Ok(next_rx) = resubmit {
                 tracing::warn!(
@@ -1034,7 +1244,7 @@ fn stream_messages(
         let mut leftover: Vec<String> = Vec::new();
         loop {
             let mut stop = StopDetector::new(&job.stops);
-            let mut parser = OutputParser::new(&job.specs);
+            let mut parser = OutputParser::for_prompt(&job.specs, &prompt_text);
             let mut raw_text = String::new();
             let mut malformed: Vec<(String, String)> = Vec::new();
             finish = FinishKind::Limit;
@@ -1210,7 +1420,9 @@ mod tests {
         }));
         let prompt = render_prompt(&req, CUE_THINK).expect("renders");
         assert!(prompt.starts_with("<|im_start|>system\nBe brief.\n\n# Tools"));
-        assert!(prompt.contains("<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""));
+        assert!(prompt.contains(
+            "<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""
+        ));
         assert!(prompt.contains("\n</tools>\n\nFor each function call"));
         assert!(prompt.contains(
             "<|im_start|>assistant\nChecking.\n<tool_call>\n\
@@ -1307,15 +1519,110 @@ mod tests {
     }
 
     #[test]
+    fn parser_honors_open_reasoning_and_bounds_discard_buffer() {
+        let prompt = crate::template::CUE_THINK_OPEN;
+        for split in 0..="hidden</think>answer".len() {
+            let output = "hidden</think>answer";
+            let mut parser = OutputParser::for_prompt(&[], prompt);
+            let mut events = parser.push(&output[..split]);
+            events.extend(parser.push(&output[split..]));
+            events.extend(parser.finish());
+            let text: String = collect(events).into_iter().map(|(_, text)| text).collect();
+            assert_eq!(text, "answer", "split {split}");
+        }
+        let mut parser = OutputParser::for_prompt(&[], prompt);
+        for _ in 0..100 {
+            assert!(parser.push(&"reasoning".repeat(1024)).is_empty());
+            assert!(parser.buf.len() < THINK_CLOSE.len());
+        }
+        assert_eq!(collect(parser.push("</think>done"))[0].1, "done");
+        let mut closed = OutputParser::for_prompt(&[], CUE_THINK);
+        assert_eq!(collect(closed.push("answer"))[0].1, "answer");
+    }
+
+    #[test]
+    fn parser_streams_flash_xml_and_preserves_argument_types() {
+        let tools: Vec<ToolDef> = serde_json::from_value(json!([{
+            "name":"Write", "input_schema":{"type":"object","properties":{
+                "content":{"type":"string"},"count":{"type":"integer"},
+                "enabled":{"type":"boolean"},"options":{"type":"object"}
+            }}
+        }]))
+        .unwrap();
+        let specs = tool_specs(&tools);
+        let output = "<tool_call>\n<function=Write>\n<parameter=content>\n  123\n\n</parameter>\n<parameter=count>\n3\n</parameter>\n<parameter=enabled>\nfalse\n</parameter>\n<parameter=options>\n{\"x\":1}\n</parameter>\n</function>\n</tool_call>";
+        for split in 0..=output.len() {
+            let mut parser = OutputParser::new(&specs);
+            let mut events = parser.push(&output[..split]);
+            events.extend(parser.push(&output[split..]));
+            events.extend(parser.finish());
+            assert_eq!(events.len(), 1, "split {split}");
+            let ParsedEvent::ToolCall { name, input } = &events[0] else {
+                panic!("not a call")
+            };
+            assert_eq!(name, "Write");
+            assert_eq!(
+                input,
+                &json!({"content":"  123\n","count":3,"enabled":false,"options":{"x":1}})
+            );
+        }
+        for bad in [
+            "<function=Unknown></function>",
+            "<function=Write><parameter=count>wrong</parameter></function>",
+            "<function=Write><parameter=count>1</parameter><parameter=count>2</parameter></function>",
+            "<function=Write><parameter=count>1</function>",
+            "<function=Write></function>junk",
+            "<function=Write><parameter=content>x<parameter=count>1</parameter></function>",
+        ] {
+            assert!(
+                matches!(parse_tool_call(bad, &specs), ParsedEvent::Malformed { .. }),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn flash_claude_history_uses_checkpoint_template() {
+        let Some(model) = std::env::var_os("QK_FLASH_GGUF") else {
+            return;
+        };
+        let meta = crate::gguf::read_metadata(std::path::Path::new(&model)).unwrap();
+        let template = crate::template::ChatTemplate::new(
+            meta.chat_template,
+            crate::template::TemplateMode::Auto,
+        )
+        .for_architecture(meta.architecture.as_deref());
+        let req = req_from_json(json!({"system":"global policy", "tools":[{
+            "name":"Read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}
+        }],"messages":[
+            {"role":"user","content":"read it"},
+            {"role":"system","content":"system reminder"},
+            {"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"path":"hi.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","content":"hello"}]}
+        ]}));
+        let prompt = render_flash_prompt(&req, &template).unwrap();
+        assert_eq!(prompt.matches("<|im_start|>system\n").count(), 1);
+        assert!(prompt.contains("global policy\n\nsystem reminder"));
+        assert!(
+            prompt.contains("<function=Read>\n<parameter=path>\nhi.txt\n</parameter>\n</function>")
+        );
+        assert!(prompt.contains("<tool_response>\nhello\n</tool_response>"));
+        assert!(prompt.ends_with(crate::template::CUE_THINK_OPEN));
+        let prefill = req_from_json(json!({"messages":[
+            {"role":"user","content":"say it"},{"role":"assistant","content":"The answer is"}
+        ]}));
+        let prompt = render_flash_prompt(&prefill, &template).unwrap();
+        assert!(prompt.ends_with("<think>\n</think>\n\nThe answer is"));
+        assert!(OutputParser::for_prompt(&[], &prompt).state == ParseState::Text);
+    }
+
+    #[test]
     fn parser_passes_plain_text() {
         let mut parser = OutputParser::new(&[]);
         let mut events = parser.push("hello ");
         events.extend(parser.push("world"));
         events.extend(parser.finish());
-        let text: String = collect(events)
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
+        let text: String = collect(events).into_iter().map(|(_, text)| text).collect();
         assert_eq!(text, "hello world");
     }
 

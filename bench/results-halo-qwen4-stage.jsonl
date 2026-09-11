@@ -1,0 +1,2 @@
+{"device":"STRIX_HALO","layers":"0:2","frames":16,"relative_rms":3.594837676665275e-7,"chunk_reset_exact":true,"invalid_input_slot_position_bounds":"rejected","scope":"actual C ABI; not full-model logits or TCP"}
+{"device":"STRIX_HALO","layers":"2:4","frames":16,"relative_rms":3.0580590587197715e-7,"chunk_reset_exact":true,"invalid_input_slot_position_bounds":"rejected","input":"F32 first-two-layer oracle","scope":"actual C ABI; not full-model logits or TCP"}

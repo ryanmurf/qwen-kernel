@@ -3,10 +3,12 @@
 ## Strix Halo / Flash Next branch
 
 This branch is bringing the native Vulkan engine to Strix Halo and the existing
-Qwen3.8 Flash Next Q5_K_M GGUF (`qwen4exp`). **The full Flash Next serving graph
-is not implemented yet.** The first four native layers pass multi-token
+Qwen3.8 Flash Next Q5_K_M GGUF (`qwen4exp`). **Full-model serving is not yet
+validated or enabled by default.** An experimental complete graph and split-stage
+adapter are implemented. The first four native layers pass multi-token
 reference comparisons, including HC, PLE, recurrent and full attention, and
-MoE. Q5_K/Q5_1 kernels and bounded disk-backed PLE lookup are also tested.
+MoE. Two bounded stages pass actual C-ABI chunk/reset tests. Q5_K/Q5_1 kernels,
+bounded disk-backed PLE lookup, and Flash's Claude tool formatting are also tested.
 The existing XTX engine and Anthropic/multi-device APIs are preserved.
 
 See [Halo port status and reproducible tests](docs/STRIX-HALO.md). The historical

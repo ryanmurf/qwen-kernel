@@ -1,0 +1,77 @@
+{
+  "tokenize": [
+    {
+      "text": "Hello world!",
+      "tokens": [
+        9419,
+        1814,
+        0
+      ]
+    },
+    {
+      "text": "Math: π ≈ 3.14159 — café 👋\n",
+      "tokens": [
+        8549,
+        25,
+        50003,
+        211614,
+        220,
+        18,
+        13,
+        16,
+        19,
+        16,
+        20,
+        24,
+        1892,
+        50203,
+        59720,
+        233,
+        198
+      ]
+    },
+    {
+      "text": "<|im_start|>assistant\n<think>\n",
+      "tokens": [
+        248045,
+        74455,
+        198,
+        248068,
+        198
+      ]
+    },
+    {
+      "text": "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"hello.txt\"}}\n</tool_call>",
+      "tokens": [
+        248058,
+        198,
+        4754,
+        591,
+        3147,
+        851,
+        2378,
+        2129,
+        15889,
+        21624,
+        2267,
+        3147,
+        14556,
+        3778,
+        29958,
+        198,
+        248059
+      ]
+    }
+  ],
+  "chat": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply with one word: hello."
+      }
+    ],
+    "prompt": {
+      "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nReply with one word: hello.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+  }
+}

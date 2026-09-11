@@ -92,6 +92,7 @@ struct VkCtx {
     uint32_t              cooperativeMatrixSubgroupSize = 0;
     uint32_t              subgroupSize = 64;
     bool                  externalMemoryHost = false;
+    bool                  memoryBudget = false;
     VkDeviceSize          importAlignment = 0;
 };
 
@@ -267,6 +268,8 @@ static void initVk(VkCtx& c, const char* argv0) {
         }
         if (!strcmp(extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
             c.externalMemoryHost = true;
+        if (!strcmp(extension.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME))
+            c.memoryBudget = true;
     }
     if (c.externalMemoryHost) {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps{
@@ -383,6 +386,7 @@ static void initVk(VkCtx& c, const char* argv0) {
     std::vector<const char*> enabledExtensions;
     if (c.cooperativeMatrix) enabledExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     if (c.externalMemoryHost) enabledExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (c.memoryBudget) enabledExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     dci.enabledExtensionCount = (uint32_t)enabledExtensions.size();
     dci.ppEnabledExtensionNames = enabledExtensions.data();
     VK_CHECK(vkCreateDevice(c.phys, &dci, nullptr, &c.dev));
@@ -1273,7 +1277,7 @@ static void destroyPipe(VkCtx& c, Pipe& pp) {
 }
 
 #include "qwen4_hc_test.h"
-#include "qwen4_prefix_test.h"
+#include "qwen4_graph.h"
 
 // QK_STATS_FILE: mirror per-request stat lines ([pcache], [spec]) to an
 // append-only file — pod logs reset on every restart, which kept wiping the
@@ -3627,6 +3631,7 @@ static bool caseToken(VkCtx& c, const char* idsFile, uint32_t nGen, uint32_t tma
 struct qk_engine {
     VkCtx c{};
     Gguf g;
+    std::unique_ptr<Qwen4Graph> qwen4;
     uint32_t nSlots = 0, nCtx = 0, chunkN = 0;
     bool shareFork = false;  // QK_FORK: cache each fresh prompt's prefill so same-prompt requests fork it
     uint32_t vocab = 0, eosTok = 248046, bosTok = 248044;
@@ -3917,6 +3922,7 @@ struct qk_engine {
 qk_engine::~qk_engine() {
     if (c.dev == VK_NULL_HANDLE) return;  // never fully opened
     vkDeviceWaitIdle(c.dev);
+    qwen4.reset(); // graph resources must die before the Vulkan device
     for (auto& L : layers)
         for (auto& b : L.bufs) destroyBuf(c, b);
     for (auto& e : pcache) destroyBuf(c, e.snap);
@@ -4125,8 +4131,29 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     // Model-shape KVs (arch-prefixed): 35B = qwen35moe 40/8, 80B = qwen3next 48/10.
     const std::string arch = g.kvStr("general.architecture", "");
-    if (arch == "qwen4exp")
-        return fail("qk_open: native qwen4exp graph is not implemented; Q5/HC operator tests do not enable serving. Use the existing Flash Next backend.");
+    if (arch == "qwen4exp") {
+        const char* experimental=getenv("QK_NATIVE_FLASH");
+        if (!experimental || strcmp(experimental,"1"))
+            return fail("qk_open: experimental native Flash graph requires QK_NATIVE_FLASH=1; full-model serving validation is pending");
+        if (nSlots!=1) return fail("qk_open: native Flash currently supports exactly one sequence");
+        nLayer=48; lFirst=0; lEnd=48; vocab=248320; nExp=512; nUsed=10; ffE=640;
+        eosTok=(uint32_t)g.kvInt("tokenizer.ggml.eos_token_id",248044);
+        bosTok=(uint32_t)g.kvInt("tokenizer.ggml.bos_token_id",248045);
+        if (const char* range=getenv("QK_LAYERS")) {
+            unsigned first=0,end=0; int consumed=0;
+            if (sscanf(range,"%u:%u%n",&first,&end,&consumed)!=2 || range[consumed] ||
+                first>=end || end>48 || first==1 || (first==0 && end<2))
+                return fail("qk_open: invalid Flash split; first stage must include PLE layer 1");
+            lFirst=first; lEnd=end;
+        }
+        try {
+            initVk(c,"libqk");
+            qwen4=std::make_unique<Qwen4Graph>(c,g,lFirst,lEnd,nCtx,96ull<<30,lastStage());
+            qwen4->open();
+        } catch (const std::exception& error) { return fail(error.what()); }
+        fprintf(stderr,"native Flash experimental stage [%u,%u), context=%u, residual=10240, one sequence; MTP/prefill batching/snapshots disabled\n",lFirst,lEnd,nCtx);
+        return true;
+    }
     initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
     nLayer = (uint32_t)g.kvInt(arch + ".block_count", nLayer);
     if (nLayer < 1 || nLayer > 256) return fail("qk_open: bad block_count");
@@ -5844,6 +5871,25 @@ int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hidden
     if (slot >= nSlots || n < 1 || (size_t)base + n > nCtx) return -1;
     if (firstStage() ? (!toks || hiddenIn != nullptr) : !hiddenIn) return -2;
     if (lastStage() ? !idsOut : !hiddenOut) return -3;
+    if (qwen4) {
+        if (base && base!=qwen4->currentPosition()) return -4;
+        if (firstStage()) for (uint32_t i=0; i<n; ++i) if (toks[i]>=vocab) return -5;
+        lastRunRows=0;
+        try {
+            for (uint32_t i=0; i<n; ++i) {
+                auto hidden=qwen4->forward(firstStage()?toks[i]:0,base+i==0,
+                    hiddenIn?hiddenIn+(size_t)i*10240:nullptr);
+                if (lastStage()) {
+                    const auto& logits=qwen4->lastLogits();
+                    idsOut[i]=(uint32_t)(std::max_element(logits.begin(),logits.end())-logits.begin());
+                } else memcpy(hiddenOut+(size_t)i*10240,hidden.data(),10240*4);
+            }
+            lastRunRows=n;
+            return 0;
+        } catch (const std::exception& error) {
+            fprintf(stderr,"native Flash stage failed: %s\n",error.what()); return -6;
+        }
+    }
     std::vector<float> dummy;
     for (uint32_t off = 0; off < n; off += maxB) {
         uint32_t cn = std::min(maxB, n - off);
@@ -5863,6 +5909,16 @@ int qk_engine::stageTopK(uint32_t k, uint32_t* idsOut, float* valsOut) {
     // the greedy path records nothing extra and stays bit-identical.
     if (!lastStage() || !idsOut || !valsOut || k < 1 || k > 256 || k > vocab) return -1;
     if (!lastRunRows) return -2;
+    if (qwen4) {
+        const auto& logits=qwen4->lastLogits();
+        std::vector<uint32_t> order(logits.size());
+        for (uint32_t i=0; i<order.size(); ++i) order[i]=i;
+        std::partial_sort(order.begin(),order.begin()+k,order.end(),[&](uint32_t a,uint32_t b) {
+            return logits[a]==logits[b] ? a<b : logits[a]>logits[b];
+        });
+        for (uint32_t i=0; i<k; ++i) { idsOut[i]=order[i]; valsOut[i]=logits[order[i]]; }
+        return 0;
+    }
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cb, &bi));
@@ -5961,7 +6017,7 @@ __attribute__((visibility("default"))) uint32_t qk_bos_token(const qk_engine* e)
 __attribute__((visibility("default"))) uint32_t qk_layer_first(const qk_engine* e) { return e->lFirst; }
 __attribute__((visibility("default"))) uint32_t qk_layer_end(const qk_engine* e) { return e->lEnd; }
 __attribute__((visibility("default"))) uint32_t qk_n_layer(const qk_engine* e) { return e->nLayer; }
-__attribute__((visibility("default"))) uint32_t qk_n_embd(const qk_engine* e) { return qk_engine::nEmbd; }
+__attribute__((visibility("default"))) uint32_t qk_n_embd(const qk_engine* e) { return e && e->qwen4 ? 10240 : qk_engine::nEmbd; }
 
 __attribute__((visibility("default")))
 int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float* hidden_in,
@@ -5997,6 +6053,7 @@ __attribute__((visibility("default")))
 int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t n_prompt,
                   uint32_t max_gen, uint32_t snap_prefix) {
     if (!e || slot >= e->nSlots) return -1;
+    if (e->qwen4) return -5; // use the split/local sampling driver
     if (e->splitStage()) return -5;  // split stages are driven via qk_stage_run
     if (e->slots[slot].active) return -2;
     if (!prompt || n_prompt < 1 || n_prompt + max_gen > e->nCtx) return -3;
@@ -6067,6 +6124,7 @@ int qk_slot_start(qk_engine* e, uint32_t slot, const uint32_t* prompt, uint32_t 
 
 __attribute__((visibility("default")))
 void qk_slot_cancel(qk_engine* e, uint32_t slot) {
+    if (e && e->qwen4) { e->lastRunRows=0; return; }
     if (e && slot < e->nSlots) {
         e->slots[slot].active = false;
         e->slots[slot].prompt.clear();
@@ -6076,6 +6134,7 @@ void qk_slot_cancel(qk_engine* e, uint32_t slot) {
 
 __attribute__((visibility("default")))
 int qk_step_chunk(qk_engine* e, uint32_t* out_tokens, uint32_t* out_counts, uint32_t* out_finished) {
+    if (e && e->qwen4) return -5;
     if (!e || !out_tokens || !out_counts || !out_finished) return -1;
     if (e->splitStage()) return -5;  // split stages are driven via qk_stage_run
     return e->stepChunk(out_tokens, out_counts, out_finished);
@@ -7143,14 +7202,16 @@ int main(int argc, char** argv) {
             return true;
         };
         struct PipeHdr { uint32_t op, slot, n, base, topk; };
-        const uint32_t nEmbd = qk_engine::nEmbd;
+        uint32_t nEmbd = qk_engine::nEmbd;
         // Layer count comes from the GGUF header (35B: 40, 80B: 48) — needed
         // before any engine exists to parse/validate the stage boundaries.
         uint32_t nLay = 40;
         {
             Gguf gh;
-            if (gh.open(ggufPath()))
+            if (gh.open(ggufPath())) {
                 nLay = (uint32_t)gh.kvInt(gh.kvStr("general.architecture", "") + ".block_count", 40);
+                if (gh.kvStr("general.architecture","")=="qwen4exp") nEmbd=10240;
+            }
         }
         // Connection hello: client sends the magic; worker replies
         // {magic, lFirst, lEnd, nLayer, nEmbd, nSlots, nCtx} so mismatched
@@ -7180,7 +7241,12 @@ int main(int argc, char** argv) {
             int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1;
             setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
             sockaddr_in sa{};
-            sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(port);
+            sa.sin_family = AF_INET; sa.sin_port = htons(port);
+            const char* bindHost=getenv("QK_PIPE_HOST");
+            if (!bindHost) bindHost=e->qwen4 ? "127.0.0.1" : "0.0.0.0";
+            if (inet_pton(AF_INET,bindHost,&sa.sin_addr)!=1) {
+                fprintf(stderr,"invalid QK_PIPE_HOST IPv4 address\n"); qk_close(e); close(ls); return 1;
+            }
             if (bind(ls, (sockaddr*)&sa, sizeof sa) || listen(ls, 1)) { perror("bind/listen"); return 1; }
             fprintf(stderr, "[pipe-worker] layers [%u,%u) nCtx %u listening on :%u\n",
                     e->lFirst, e->lEnd, tmax, port);
@@ -7211,7 +7277,7 @@ int main(int argc, char** argv) {
                         if (!writeAll(fd, &rc, 4)) break;
                         continue;
                     }
-                    if (h.op != 1 || h.n < 1 || h.slot >= e->nSlots ||
+                    if (h.op != 1 || h.n < 1 || (e->qwen4 && h.n>512) || h.slot >= e->nSlots ||
                         (size_t)h.base + h.n > e->nCtx ||
                         h.topk > 256 || (h.topk && !e->lastStage()))
                         break;

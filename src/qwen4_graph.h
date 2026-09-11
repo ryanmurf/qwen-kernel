@@ -1,14 +1,18 @@
-// Native prefix forward harness. This deliberately does not expose the serving
-// ABI: the full model, output head and request lifecycle still need wiring.
+// Single-sequence native qwen4exp graph. Prefix correctness tests use the same
+// kernels as the experimental split-stage adapter, with a small weight budget.
 #include "qwen4_ple.h"
 #include <memory>
-class Qwen4PrefixTest {
+class Qwen4Graph {
     VkCtx& c;
     Gguf& g;
     std::map<std::string, Buf> buffers;
     std::map<std::string, Pipe> pipes;
     std::map<std::string, std::string> taps;
-    uint32_t lastLayer = 0, layer = 0, position = 0;
+    uint32_t firstLayer = 0, lastLayer = 0, layer = 0, position = 0, capacity = 32;
+    uint64_t weightLimit = 8ull<<30;
+    bool withHead = false;
+    bool servingBudget = false;
+    std::vector<float> logits;
     std::unique_ptr<Qwen4PleLookup> ple;
     std::vector<uint32_t> tokenHistory;
     VkDescriptorPool pool = VK_NULL_HANDLE;
@@ -41,6 +45,7 @@ class Qwen4PrefixTest {
         auto [it, inserted] = buffers.emplace(name, Buf{});
         if (inserted) it->second = createBuf(c, bytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        if (!it->second.deviceLocal) throw std::runtime_error("native graph refuses host-memory spill: " + name);
         if (it->second.size != bytes) throw std::runtime_error("buffer shape changed: " + name);
         return it->second;
     }
@@ -76,7 +81,10 @@ class Qwen4PrefixTest {
         vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.p);
         vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pl, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(c.cb, pipeline.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(c.cb, gx, 1, 1); barrier();
+        uint32_t nx=std::min(gx,c.props.limits.maxComputeWorkGroupCount[0]);
+        uint32_t ny=(gx+nx-1)/nx;
+        if (ny>c.props.limits.maxComputeWorkGroupCount[1]) throw std::runtime_error("dispatch exceeds device limits");
+        vkCmdDispatch(c.cb, nx, ny, 1); barrier();
     }
     void project(const std::string& weight, const std::string& input, const std::string& output) {
         const auto* tensor = g.find(weight);
@@ -117,16 +125,21 @@ class Qwen4PrefixTest {
         vkCmdCopyBuffer(c.cb,buffers.at(source).buf,buffers.at(target).buf,1,&copy);
         barrier(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     }
-    void hcMix(const std::string& kind, const std::string& residual) {
+    void hcMix(const std::string& kind, const std::string& residual, bool outputHead = false) {
+        const auto name = [&](const char* suffix) {
+            return outputHead ? std::string("output_hc_")+suffix : w("hc_"+kind+"_"+suffix);
+        };
         HcPC pc{n,hc,1,0,eps};
-        emit("qwen4_hc.spv", {residual,w("hc_"+kind+"_norm.weight"),"$dummy","$dummy","$norm"}, pc, hc);
+        emit("qwen4_hc.spv", {residual,name("norm.weight"),"$dummy","$dummy","$norm"}, pc, hc);
         tap(kind+".norm", "$norm");
-        project(w("hc_"+kind+"_down.weight"), "$norm", "$low");
+        project(name("down.weight"), "$norm", "$low");
         struct { uint32_t n; float scale; } silu{low,1.0f/hc};
         emit("qwen4_silu.spv", {"$low","$silu"}, silu, (low+255)/256);
-        project(w("hc_"+kind+"_up.weight"), "$silu", "$gate");
-        project(w("hc_"+kind+"_inject.weight"), "$norm", "$inject");
-        tap(kind+".inject", "$inject");
+        project(name("up.weight"), "$silu", "$gate");
+        if (!outputHead) {
+            project(name("inject.weight"), "$norm", "$inject");
+            tap(kind+".inject", "$inject");
+        }
         pc.mode = 1;
         emit("qwen4_hc.spv", {"$norm","$dummy","$gate","$dummy","$mixed"}, pc, (n+255)/256);
         tap(kind+".mixed", "$mixed");
@@ -153,10 +166,10 @@ class Qwen4PrefixTest {
         project(w("attn_q.weight"),"$mixed","$fa_qfull");
         project(w("attn_k.weight"),"$mixed","$fa_k");
         project(w("attn_v.weight"),"$mixed","$fa_v");
-        struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; } pc{position,32,256,64,24,2,eps,1e7f};
-        emit("fa_prep.spv",{"$fa_qfull","$fa_k","$fa_v",w("attn_q_norm.weight"),w("attn_k_norm.weight"),
-             "$fa_qhat",state("kcache"),state("vcache"),"$rope"},pc,28);
-        emit("fa_attn.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att"},pc,24);
+        struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; } pc{position,capacity,256,64,24,2,eps,1e7f};
+        emit("fa_prep_srv.spv",{"$fa_qfull","$fa_k","$fa_v",w("attn_q_norm.weight"),w("attn_k_norm.weight"),
+             "$fa_qhat",state("kcache"),state("vcache"),"$rope","$position"},pc,28);
+        emit("fa_attn_srv.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att","$position"},pc,24);
         tap("attn_gated","$att");
         project(w("attn_output.weight"),"$att","$block");
     }
@@ -192,8 +205,12 @@ class Qwen4PrefixTest {
             expect(w(std::string("ffn_")+kind+"_exps.weight"),{n,ff,experts},GGML_Q5_K);
             expect(w(std::string("ffn_")+kind+"_shexp.weight"),{n,ff},GGML_Q5_K);
         }
-        expect(w("ffn_down_exps.weight"),{ff,n,experts},GGML_Q8_0);
-        expect(w("ffn_down_shexp.weight"),{ff,n},GGML_Q8_0);
+        expect(w("ffn_down_exps.weight"),{ff,n,experts});
+        expect(w("ffn_down_shexp.weight"),{ff,n});
+        for (const auto& suffix : {"ffn_down_exps.weight","ffn_down_shexp.weight"}) {
+            auto type=g.find(w(suffix))->type;
+            if (type!=GGML_Q8_0 && type!=GGML_Q5_1) throw std::runtime_error("unsupported expert down type");
+        }
         if (layer == 1) {
             expect(w("ple_key.weight"),{n,n*hc}); expect(w("ple_value.weight"),{n,n});
             for (const auto& name : {"key","query","conv"}) expect(w(std::string("ple_norm_")+name+".weight"),{n*hc},GGML_F32);
@@ -201,8 +218,12 @@ class Qwen4PrefixTest {
         }
     }
 public:
-    Qwen4PrefixTest(VkCtx& context, Gguf& model, uint32_t endLayer) : c(context), g(model), lastLayer(endLayer) {}
-    ~Qwen4PrefixTest() {
+    Qwen4Graph(VkCtx& context, Gguf& model, uint32_t endLayer) : c(context), g(model), lastLayer(endLayer) {}
+    Qwen4Graph(VkCtx& context, Gguf& model, uint32_t first, uint32_t end, uint32_t ctx, uint64_t budget, bool head)
+        : c(context), g(model), firstLayer(first), lastLayer(end-1), capacity(ctx), weightLimit(budget), withHead(head), servingBudget(true) {}
+    uint32_t currentPosition() const { return position; }
+    const std::vector<float>& lastLogits() const { return logits; }
+    ~Qwen4Graph() {
         if (pool) vkDestroyDescriptorPool(c.dev, pool, nullptr);
         for (auto& [_, pipe] : pipes) destroyPipe(c, pipe);
         for (auto& [_, buf] : buffers) destroyBuf(c, buf);
@@ -210,9 +231,11 @@ public:
         destroyBuf(c, staging);
     }
     void open() {
-        if (lastLayer > 3) throw std::runtime_error("prefix harness limited to the first four layers");
+        if (firstLayer>lastLayer || lastLayer>=48 || !capacity || capacity>65536 ||
+            (firstLayer==1) || (withHead && lastLayer!=47))
+            throw std::runtime_error("unsupported native layer range/context; PLE must stay in the first stage");
         if (g.kvStr("general.architecture", "") != "qwen4exp" ||
-            g.kvInt("qwen4exp.embedding_length",0) != n ||
+            g.kvInt("qwen4exp.block_count",0) != 48 || g.kvInt("qwen4exp.embedding_length",0) != n ||
             g.kvInt("qwen4exp.expert_feed_forward_length",0) != ff ||
             g.kvInt("qwen4exp.hyper_connection.count",0) != hc ||
             g.kvInt("qwen4exp.expert_count",0) != experts ||
@@ -224,48 +247,80 @@ public:
         if (ratios.size() != g.kvInt("qwen4exp.block_count",0) ||
             std::any_of(ratios.begin(),ratios.end(),[](auto r) { return r != 0; }))
             throw std::runtime_error("compressed QSA attention is not supported");
-        if (lastLayer == 3 && (g.kvInt("qwen4exp.rope.dimension_count",0) != 64 ||
+        if (lastLayer >= 3 && (g.kvInt("qwen4exp.rope.dimension_count",0) != 64 ||
             g.kvFloat("qwen4exp.rope.freq_base",0) != 1e7 ||
             g.kvFloat("qwen4exp.attention.scale",0) != 0))
             throw std::runtime_error("unsupported attention/RoPE configuration");
-        for (layer=0; layer<=lastLayer; ++layer) validateLayer();
+        for (layer=firstLayer; layer<=lastLayer; ++layer) validateLayer();
+        if (withHead) {
+            expect("output_hc_norm.weight",{n*hc},GGML_F32);
+            expect("output_hc_down.weight",{n*hc,low}); expect("output_hc_up.weight",{low,n*hc});
+            expect("output.weight",{n,248320},GGML_Q6_K);
+            logits.resize(248320);
+        }
         size_t totalWeightBytes = 0;
-        for (layer=0; layer<=lastLayer; ++layer) for (const auto& [name,tensor] : g.tensors())
+        for (layer=firstLayer; layer<=lastLayer; ++layer) for (const auto& [name,tensor] : g.tensors())
             if (name.compare(0,w("").size(),w("")) == 0) {
-                if (tensor.nbytes > (8ull<<30)-totalWeightBytes)
-                    throw std::runtime_error("prefix harness weight budget exceeds 8 GiB");
+                if (tensor.nbytes > weightLimit-totalWeightBytes)
+                    throw std::runtime_error("native graph weight budget exceeded");
                 totalWeightBytes += tensor.nbytes;
             }
+        if (withHead) for (const auto& name : {"output_hc_norm.weight","output_hc_down.weight","output_hc_up.weight","output.weight"}) {
+            auto bytes=g.find(name)->nbytes;
+            if (bytes>weightLimit-totalWeightBytes) throw std::runtime_error("native head weight budget exceeded");
+            totalWeightBytes+=bytes;
+        }
+        if (servingBudget) {
+            if (!c.memoryBudget) throw std::runtime_error("native serving requires Vulkan memory-budget reporting");
+            uint64_t need=totalWeightBytes+(256ull<<20); // staging, scratch, descriptors and allocation padding
+            for (layer=firstLayer; layer<=lastLayer; ++layer)
+                need+=layer%4==3 ? 2ull*2*capacity*256*4 : (48ull*128*128+10240*3)*4;
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+            props.pNext=&budget; vkGetPhysicalDeviceMemoryProperties2(c.phys,&props);
+            uint32_t type=findMemType(c.mp,UINT32_MAX,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (type==UINT32_MAX) throw std::runtime_error("no device-local memory type");
+            uint32_t heap=c.mp.memoryTypes[type].heapIndex;
+            uint64_t free=budget.heapBudget[heap]>budget.heapUsage[heap] ? budget.heapBudget[heap]-budget.heapUsage[heap] : 0;
+            printf("native memory estimate %.3f GiB; reported heap headroom %.3f GiB\n",need/double(1ull<<30),free/double(1ull<<30));
+            if (need>free) throw std::runtime_error("insufficient device budget: unload the other model or reduce the native stage/context");
+        }
         printf("prefix weights: %.3f GiB; staging: 16 MiB; PLE table stays mapped\n",totalWeightBytes/double(1ull<<30));
         staging = createBuf(c, stageBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
         VK_CHECK(vkMapMemory(c.dev, staging.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
-        for (layer=0; layer<=lastLayer; ++layer) for (const auto& [name,tensor] : g.tensors()) if (name.compare(0,w("").size(),w("")) == 0) {
+        for (layer=firstLayer; layer<=lastLayer; ++layer) for (const auto& [name,tensor] : g.tensors()) if (name.compare(0,w("").size(),w("")) == 0) {
             if (!tensor.nbytes) throw std::runtime_error("unknown tensor layout: " + name);
             auto& b = allocate(name,tensor.nbytes); upload(b,tensor.data,tensor.nbytes);
+        }
+        if (withHead) {
+            for (const auto& name : {"output_hc_norm.weight","output_hc_down.weight","output_hc_up.weight","output.weight"}) {
+                const auto* tensor=g.find(name); auto& b=allocate(name,tensor->nbytes); upload(b,tensor->data,tensor->nbytes);
+            }
+            allocate("$output_logits",logits.size()*4);
         }
         for (const auto& name : {"$hidden","$residual","$norm","$gate","$qkv","$conv"}) allocate(name,n*hc*4);
         for (const auto& name : {"$mixed","$block","$ffout"}) allocate(name,n*4);
         allocate("$low",low*4); allocate("$silu",low*4); allocate("$inject",hc*4); allocate("$dummy",4);
         allocate("$alpha",48*4); allocate("$beta",48*4); allocate("$gb",96*4);
         allocate("$z",6144*4); allocate("$att",6144*4);
-        for (layer=0; layer<=lastLayer; ++layer) {
+        for (layer=firstLayer; layer<=lastLayer; ++layer) {
             if (layer % 4 != 3) {
                 allocate(state("convstate"),10240*3*4); allocate(state("state"),48*128*128*4);
             } else {
-                allocate(state("kcache"),2*32*256*4); allocate(state("vcache"),2*32*256*4);
+                allocate(state("kcache"),2ull*capacity*256*4); allocate(state("vcache"),2ull*capacity*256*4);
             }
         }
-        if (lastLayer == 3) {
+        if (lastLayer >= 3) {
             allocate("$fa_qfull",12288*4); allocate("$fa_k",512*4); allocate("$fa_v",512*4); allocate("$fa_qhat",6144*4);
-            auto& rope = allocate("$rope",32*64*4);
-            std::vector<float> values(32*64);
-            for (uint32_t pos=0; pos<32; ++pos) for (uint32_t j=0; j<32; ++j) {
+            auto& rope = allocate("$rope",capacity*64*4);
+            std::vector<float> values(capacity*64);
+            for (uint32_t pos=0; pos<capacity; ++pos) for (uint32_t j=0; j<32; ++j) {
                 double theta = pos*std::pow(1e7,-double(2*j)/64);
                 values[2*(pos*32+j)] = std::cos(theta); values[2*(pos*32+j)+1] = std::sin(theta);
             }
             upload(rope,values.data(),values.size()*4);
         }
-        if (lastLayer >= 1) {
+        if (firstLayer==0 && lastLayer>=1) {
             const auto* table = g.find("per_layer_token_embd.weight");
             if (!table) throw std::runtime_error("missing PLE table");
             ple = std::make_unique<Qwen4PleLookup>(*table,Qwen4PleConfig::read(g));
@@ -276,35 +331,61 @@ public:
             allocate("$ple_emb",n*4); allocate("$ple_value",n*4); allocate("$ple_history",9*n*hc*4);
         }
         allocate("$logits",experts*4); allocate("$sel",160); allocate("$ffh",(used+1)*ff*4);
-        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024};
+        allocate("$position",4);
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192};
         VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        info.maxSets = 256; info.poolSizeCount = 1; info.pPoolSizes = &size;
+        info.maxSets = 2048; info.poolSizeCount = 1; info.pPoolSizes = &size;
         VK_CHECK(vkCreateDescriptorPool(c.dev, &info, nullptr, &pool));
     }
-    std::vector<float> forward(uint32_t token, bool reset = true) {
+    std::vector<float> forward(uint32_t token, bool reset = true, const float* residualInput = nullptr) {
         if (reset) { position = 0; tokenHistory.clear(); }
-        if (position >= 32) throw std::runtime_error("prefix harness limited to 32 tokens");
+        if (position >= capacity) throw std::runtime_error("native graph context capacity exceeded");
         const auto* embedding = g.find("token_embd.weight");
         if (!embedding || embedding->type != GGML_Q5_K || embedding->ne[0] != n || token >= embedding->ne[1])
             throw std::runtime_error("unsupported embedding or token");
         std::vector<float> hidden(n*hc);
+        if (firstLayer==0) {
+        if (residualInput) throw std::runtime_error("first stage requires token input");
         dequant_row_q5_K((const block_q5_K*)(embedding->data + token*ggmlRowBytes(embedding->type,n)),hidden.data(),n);
         for (uint32_t s = 1; s < hc; ++s) memcpy(hidden.data()+s*n,hidden.data(),n*4);
-        upload(buffers.at("$hidden"),hidden.data(),hidden.size()*4);
+        } else {
+            if (!residualInput) throw std::runtime_error("later stage requires all HC streams");
+            std::copy(residualInput,residualInput+n*hc,hidden.begin());
+            for (float value:hidden) if (!std::isfinite(value)) throw std::runtime_error("nonfinite stage input");
+        }
+        // One submission per token: pack the small host inputs into a region
+        // disjoint from readback, then record their copies with the graph.
+        // Weight loading retains its bounded synchronous staging path.
+        const size_t inputOffset = 2 << 20;
+        const size_t positionOffset = inputOffset + hidden.size()*4;
+        const size_t pleOffset = positionOffset + 4;
+        memcpy((uint8_t*)mapped+inputOffset,hidden.data(),hidden.size()*4);
+        memcpy((uint8_t*)mapped+positionOffset,&position,4);
         if (ple) {
             std::vector<float> row(n);
             ple->gather(ple->config().rows(token,tokenHistory),row.data());
-            upload(buffers.at("$ple_emb"),row.data(),row.size()*4);
+            memcpy((uint8_t*)mapped+pleOffset,row.data(),row.size()*4);
         }
         VK_CHECK(vkResetDescriptorPool(c.dev,pool,0));
         begin();
+        VkBufferCopy hiddenCopy{inputOffset,0,hidden.size()*4};
+        vkCmdCopyBuffer(c.cb,staging.buf,buffers.at("$hidden").buf,1,&hiddenCopy);
+        VkBufferCopy positionCopy{positionOffset,0,4};
+        vkCmdCopyBuffer(c.cb,staging.buf,buffers.at("$position").buf,1,&positionCopy);
+        if (ple) {
+            VkBufferCopy pleCopy{pleOffset,0,n*4};
+            vkCmdCopyBuffer(c.cb,staging.buf,buffers.at("$ple_emb").buf,1,&pleCopy);
+        }
         if (reset) {
-            for (layer=0; layer<=lastLayer; ++layer) for (const auto& kind : {"convstate","state","kcache","vcache"})
+            // Attention reads only [0,position], and fa_prep overwrites the
+            // current row before it is read. Reset its logical length instead
+            // of clearing GiBs of unreachable KV. Recurrent state must clear.
+            for (layer=firstLayer; layer<=lastLayer; ++layer) for (const auto& kind : {"convstate","state"})
                 if (buffers.count(state(kind))) vkCmdFillBuffer(c.cb,buffers.at(state(kind)).buf,0,VK_WHOLE_SIZE,0);
             if (ple) vkCmdFillBuffer(c.cb,buffers.at("$ple_history").buf,0,VK_WHOLE_SIZE,0);
         }
         barrier(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-        for (layer=0; layer<=lastLayer; ++layer) {
+        for (layer=firstLayer; layer<=lastLayer; ++layer) {
         if (layer == 1) pleForward();
         hcMix("attn","$hidden");
         if (layer % 4 == 3) fullAttention();
@@ -330,23 +411,37 @@ public:
         hcMix("ffn","$residual");
         struct { uint32_t n,ff,experts,used; } moe{n,ff,experts,used};
         const bool halo = c.props.deviceID == 0x1586;
+        const bool downQ51 = g.find(w("ffn_down_exps.weight"))->type==GGML_Q5_1;
+        const bool sharedQ51 = g.find(w("ffn_down_shexp.weight"))->type==GGML_Q5_1;
         emit("moe_logits.spv",{w("ffn_gate_inp.weight"),"$mixed","$logits"},moe,experts);
         emit("moe_select_256.spv",{"$logits",w("ffn_gate_inp_shexp.weight"),"$mixed","$sel"},moe,1);
-        emit("moe_gateup_q5k.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$sel","$ffh"},moe,used*ff,halo?128:64);
-        emit("moe_shared_q5k.spv",{w("ffn_gate_shexp.weight"),w("ffn_up_shexp.weight"),"$mixed","$ffh"},moe,ff,halo?128:64);
-        emit("moe_down_q8_routed.spv",{w("ffn_down_exps.weight"),"$ffh","$sel","$block"},moe,n,halo?128:256);
-        emit("moe_down_q8.spv",{w("ffn_down_shexp.weight"),"$ffh","$sel","$block"},moe,n);
+        emit("moe_gateup_q5k.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$sel","$ffh"},moe,used*ff,halo&&!downQ51?128:64);
+        emit("moe_shared_q5k.spv",{w("ffn_gate_shexp.weight"),w("ffn_up_shexp.weight"),"$mixed","$ffh"},moe,ff,halo&&!downQ51?128:64);
+        emit(downQ51?"moe_down_q5_1.spv":"moe_down_q8_routed.spv",{w("ffn_down_exps.weight"),"$ffh","$sel","$block"},moe,n,halo?128:256);
+        emit(sharedQ51?"moe_down_shared_q5_1.spv":"moe_down_q8.spv",{w("ffn_down_shexp.weight"),"$ffh","$sel","$block"},moe,n,sharedQ51?64:0);
         tap("ffn_out", "$block");
         hcCombine("$residual","$hidden");
+        }
+        if (withHead) {
+            hcMix("head","$hidden",true);
+            project("output.weight","$mixed","$output_logits");
         }
         VkMemoryBarrier read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; read.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(c.cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&read,0,nullptr,0,nullptr);
         VkBufferCopy copy{0,0,hidden.size()*4};
         vkCmdCopyBuffer(c.cb,buffers.at("$hidden").buf,staging.buf,1,&copy);
+        if (withHead) {
+            VkBufferCopy headCopy{0,hidden.size()*4,logits.size()*4};
+            vkCmdCopyBuffer(c.cb,buffers.at("$output_logits").buf,staging.buf,1,&headCopy);
+        }
         read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         vkCmdPipelineBarrier(c.cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&read,0,nullptr,0,nullptr);
         submit(); memcpy(hidden.data(),mapped,hidden.size()*4);
+        if (withHead) {
+            memcpy(logits.data(),(uint8_t*)mapped+hidden.size()*4,logits.size()*4);
+            for (float value:logits) if (!std::isfinite(value)) throw std::runtime_error("nonfinite native logits");
+        }
         if (const char* prefix = getenv("QK_LAYER_DUMP")) for (const auto& [name,ref] : taps) {
             const auto& buffer = buffers.at(ref);
             if (buffer.size > stageBytes) throw std::runtime_error("debug tap too large");
@@ -371,11 +466,11 @@ public:
 };
 
 static bool caseQwen4Prefix(VkCtx& c, const char* path, uint32_t token, const char* reference, uint32_t steps, uint32_t lastLayer = 0) {
-    if (!steps || steps > 32 || token > UINT32_MAX-steps) return false;
+    if (!steps || steps > 32 || token > UINT32_MAX-steps || lastLayer>3) return false;
     Gguf model;
     if (!model.open(path)) return false;
     try {
-        Qwen4PrefixTest test(c,model,lastLayer); test.open();
+        Qwen4Graph test(c,model,lastLayer); test.open();
         std::vector<float> actual;
         for (uint32_t step = 0; step < steps; ++step) {
             auto frame = test.forward(token+step,step==0);

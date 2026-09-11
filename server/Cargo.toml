@@ -15,7 +15,7 @@ fancy-regex = "0.16"
 futures = "0.3"
 libloading = "0.8"
 memmap2 = "0.9"
-minijinja = { version = "2.12", features = ["builtins", "loader"] }
+minijinja = { version = "2.12", features = ["builtins", "loader", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 # preserve_order: tool-call arguments must round-trip through /v1/messages in
 # their original key order, or the model imitates the reordered history shape.

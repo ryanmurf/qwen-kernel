@@ -1,6 +1,7 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-10: first four native layers validated, not end-to-end serving.
+Status, 2026-09-10: first four native layers and bounded stage ABI validated;
+the experimental complete graph is implemented but not validated end-to-end.
 No production service or port has been changed by this branch. No Halogen
 binary has been installed or executed; its checkpoint is a reference download,
 not a format that this engine currently accepts.
@@ -49,8 +50,8 @@ PLE hashes use wrapping uint64 products and EOS-cut token history.
   (2686976 bytes at the default 4096 rows for this model). Actual-table smoke:
   80 misses, 112 hits, finite values and exact cached/uncached equality.
 - GGUF float/uint64-array metadata, bounds checks, mapped-file lifetime cleanup,
-  quantized payload sizing. The unsupported graph fails before initializing a
-  GPU. Dense GEMV on the enormous sparse PLE table is rejected.
+  quantized payload sizing. Native Flash serving is opt-in and rejects
+  unsupported shapes. Dense GEMV on the enormous sparse PLE table is rejected.
 - `QK_DEVICE_NAME` selects a unique device-name substring; PCI selection retains
   priority. Empty, missing, or ambiguous names fail instead of guessing a GPU.
 
@@ -130,7 +131,7 @@ token. The 35.763 GiB table stays disk-backed; only the selected rows are
 dequantized and uploaded. Reset clears both recurrent/convolution state and
 token history. The harness is limited to 32 tokens and 8 GiB of weights;
 the four-layer fixture holds 7.867 GiB of weights with 16 MiB staging. It is
-not exposed through `qk_open` or the serving endpoint.
+separate from the opt-in `qk_open` adapter described below. Production is unchanged.
 
 Actual-model checks (all require per-frame relative RMS < 1e-5):
 
@@ -197,6 +198,60 @@ carries all 10240 residual floats (40 KiB per token). This has not been loaded
 or benchmarked as a complete native model. Context, scratch, device budgets
 and any future MTP head still need to fit; these numbers are not free VRAM.
 
+## Experimental serving adapter (not deployed)
+
+`QK_NATIVE_FLASH=1` enables the native graph in `libqk`; without it, `qk_open`
+rejects this architecture before GPU initialization. The graph has all 48
+layers, both expert-down formats and the final HC/vocabulary head implemented.
+Full-model logits, generated text, and the complete dual-GPU split remain
+unvalidated. This is not a claim that the new backend can serve useful requests.
+
+The adapter requires one sequence, `QK_LAYERS=a:b`, and the Rust local/split
+driver. Stage boundaries carry 10240 floats, not the older 2048. Invalid tokens,
+slots, positions, context bounds and nonfinite residual input are rejected.
+Snapshot capacity is zero; MTP and batched prefill are not implemented. Ordinary
+prefill currently loops over tokens. It is not the old engine's fast GEMM path.
+
+Native per-token input copies, compute and readback share one queue submission;
+the PLE stage previously needed four. KV reset changes the logical length and
+does not clear unreachable cache rows; recurrence and convolution state still
+clear. The four-layer oracle/reset test passes unchanged after both changes.
+These reduce work, but a full-model throughput gain has not been measured.
+
+Actual C-ABI stage checks, each over 16 frames:
+
+| Stage | Relative RMS vs F32 oracle | Chunk/reset result |
+| --- | --- | --- |
+| Halo 0:2 | 3.59e-7 | 16 vs 5+1+7+3 frames bit-exact |
+| Halo 2:4, oracle residual input | 3.06e-7 | 16 vs 5+1+7+3 frames bit-exact |
+
+Run `tests/gpu_qwen4_stage.py MODEL.gguf reference-prefix.f32`; for the second
+stage use `reference-prefix4-f32.f32 --layers 2:4 --input reference-prefix.f32`.
+These exercise the actual `libqk` ABI, not the stub, but they do not include
+the vocabulary head or TCP transport. Records: `bench/results-halo-qwen4-stage.jsonl`.
+
+Serving allocations require Vulkan memory-budget reporting and reject host-memory
+spill. The 0:37 / 32768-context Halo stage estimates 68.855 GiB including KV,
+recurrence and scratch allowance. Its attempted open correctly refused the
+occupied device before uploading weights. A dedicated test window is required;
+the existing backend has not been stopped to make room.
+
+Flash uses its actual GGUF Jinja template, including string-method compatibility,
+JSON filters, open `<think>` cue and `xhigh` effort by default. Override effort
+with `QK_REASONING_EFFORT=low|medium|high|xhigh`. Template errors do not silently
+fall back to an older model format. The Anthropic adapter renders structured
+tool history through this template and parses both Flash XML function/parameter
+calls and legacy JSON calls. It preserves string arguments, checks declared
+primitive types, rejects malformed/duplicate XML parameters and does not interpret
+XML entities. Open reasoning is discarded with a bounded parser buffer, including
+fragmented closing tags. No generated tools are executed by this parser.
+
+The Rust suite has 42 tests; the actual Flash tokenizer/template/history checks
+were enabled with `QK_FLASH_GGUF` and passed. Other API/split engine integration
+tests remain stub-backed. The older real-vocabulary fixture is optional and was
+not enabled in this run. Native workers bind loopback by default; `QK_PIPE_HOST`
+can explicitly select another IPv4 interface, which needs firewall protection.
+
 ## Reproduce
 
 ```bash
@@ -223,8 +278,8 @@ reservation; final benchmarks need a dedicated window with the server drained.
 
 ## Remaining implementation and performance gates
 
-1. Extend the validated native prefix to the complete `qwen4exp` graph,
-   including the remaining expert formats and output head, then the serving ABI.
+1. Validate the implemented complete `qwen4exp` graph and vocabulary head,
+   then the complete dual-GPU serving ABI in a dedicated maintenance window.
 2. Compare intermediate activations and greedy token IDs against the pinned
    working reference on exactly the same GGUF and input IDs. Include multi-turn,
    reset, EOS, and chunk-boundary cases before exposing requests.
