@@ -1,0 +1,58 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+struct block_q5_1 {
+    float16_t d, m;
+    uint8_t qh[4];
+    uint8_t qs[16];
+};
+layout(std430, binding = 0) readonly buffer W { block_q5_1 w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+shared float partial[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, lane = tid % TPR;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row = wg * (256u / TPR) + tid / TPR;
+    uint batch = gl_WorkGroupID.z;
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint blocks = pc.K / 32u;
+        for (uint block = lane; block < blocks; block += TPR) {
+            uint b = row * blocks + block, xo = batch * pc.K + block * 32u;
+            float d = float(w[b].d), m = float(w[b].m);
+            for (uint i = 0u; i < 32u; ++i) {
+                uint lo = (uint(w[b].qs[i % 16u]) >> ((i / 16u) * 4u)) & 15u;
+                uint hi = (uint(w[b].qh[i / 8u]) >> (i % 8u)) & 1u;
+                acc += (d * float(lo + 16u * hi) + m) * x[xo + i];
+            }
+        }
+    }
+    if (TPR >= gl_SubgroupSize) {
+        float v = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u) partial[tid / gl_SubgroupSize] = v;
+        barrier();
+        if (lane == 0u && row < pc.M) {
+            float sum = 0.0;
+            uint waves = TPR / gl_SubgroupSize, base = (tid / TPR) * waves;
+            for (uint i = 0u; i < waves; ++i) sum += partial[base + i];
+            y[batch * pc.M + row] = sum;
+        }
+    } else {
+        // TPR is a power of two dividing the subgroup. XOR stays inside this
+        // row's lanes, so skinny rows need no workgroup-wide LDS reduction.
+        for (uint s = TPR / 2u; s > 0u; s >>= 1u) {
+            acc += subgroupShuffleXor(acc, s);
+        }
+        if (lane == 0u && row < pc.M) y[batch * pc.M + row] = acc;
+    }
+}

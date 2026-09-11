@@ -3,6 +3,17 @@ project(qwen-kernel CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(qk-model-audit src/model_audit.cpp)
+add_executable(qk-ple-smoke src/ple_smoke.cpp)
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test-q5-quants tests/test_q5_quants.cpp)
+    add_test(NAME q5-quants COMMAND test-q5-quants)
+    add_executable(test-qwen4-ple tests/test_qwen4_ple.cpp)
+    add_test(NAME qwen4-ple COMMAND test-qwen4-ple)
+    add_executable(test-gguf-metadata tests/test_gguf_metadata.cpp)
+    add_test(NAME gguf-metadata COMMAND test-gguf-metadata)
+endif()
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -37,7 +48,7 @@ endif()
 find_package(Vulkan REQUIRED)
 find_program(GLSLC glslc REQUIRED)
 
-set(SHADERS gemv_f16 gemv_q8_0 gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
+set(SHADERS qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
     moe_route_select moe_route_select_hier moe_select moe_select_256 moe_group_pairs moe_gateup_iq3
     moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_iq3_grouped_rowtile moe_gateup_q8
     moe_gateup_q8_64 moe_down_iq4 moe_down_iq4_grouped moe_down_iq4_grouped_rowtile moe_down_q6k

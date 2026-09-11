@@ -184,6 +184,8 @@ static void initVk(VkCtx& c, const char* argv0) {
     std::vector<VkPhysicalDevice> devs(ndev);
     VK_CHECK(vkEnumeratePhysicalDevices(c.inst, &ndev, devs.data()));
     const char* wantPci = getenv("QK_DEVICE_PCI"); // BDF suffix, "1a:00.0" ok
+    const char* wantName = getenv("QK_DEVICE_NAME");
+    uint32_t nameMatches = 0;
     int pick = -1;
     std::string pickBdf;
     for (uint32_t i = 0; i < ndev; i++) {
@@ -203,13 +205,22 @@ static void initVk(VkCtx& c, const char* argv0) {
         if (wantPci && !bdf.empty() && bdf.size() >= strlen(wantPci) &&
             bdf.compare(bdf.size() - strlen(wantPci), strlen(wantPci), wantPci) == 0)
             pick = (int)i;
-        if (!wantPci && pick < 0 && discrete) pick = (int)i;
+        if (!wantPci && wantName && strstr(p.deviceName, wantName)) {
+            pick = (int)i;
+            ++nameMatches;
+        }
+        if (!wantPci && !wantName && pick < 0 && discrete) pick = (int)i;
     }
     if (wantPci && pick < 0) {
         fprintf(stderr, "QK_DEVICE_PCI=%s matched no device\n", wantPci);
         exit(1);
     }
-    if (!wantPci)
+    if (!wantPci && wantName && (!*wantName || nameMatches != 1)) {
+        fprintf(stderr, "QK_DEVICE_NAME=%s must match exactly one Vulkan device (matched %u)\n",
+                wantName, nameMatches);
+        exit(1);
+    }
+    if (!wantPci && !wantName)
         if (const char* e = getenv("QK_DEVICE")) pick = atoi(e);
     if (pick < 0) pick = 0;
     if (pick >= (int)ndev) {
@@ -450,6 +461,13 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     // covers 256/TPR rows and stays fully occupied
     uint32_t tpr = 256;
     while (tpr > 4 && tpr / 2 >= unitsPerRow) tpr /= 2;
+    // Measured cache-rotating Halo Q5 shapes. Do not change XTX or unmeasured
+    // formats; explicit QK_TPR below remains authoritative for calibration.
+    if (c.props.vendorID == 0x1002 && c.props.deviceID == 0x1586 &&
+        strcmp(spvName, "gemv_q5_k.spv") == 0) {
+        if (M == 640 && K == 2560) tpr = 64;
+        if (M == 320 && K == 10240) tpr = 128;
+    }
     // QK_TPR overrides the derived value so the geometry can be swept during
     // format calibration; must divide 256 and stay within [4,256].
     if (const char* e = getenv("QK_TPR")) {
@@ -682,7 +700,7 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
         double denom = std::max(denomFloor, (double)std::fabs(yref[m]));
         double rel = std::fabs((double)ygpu[m] - yref[m]) / denom;
         maxRel = std::max(maxRel, rel);
-        if (rel > tol && bad++ < 5 && badShown++ < 5)
+        if ((!std::isfinite(ygpu[m]) || !std::isfinite(yref[m]) || rel > tol) && bad++ < 5 && badShown++ < 5)
             printf("  y[%u]: gpu=%g ref=%g\n", m, ygpu[m], yref[m]);
     }
     bool pass = bad == 0;
@@ -953,6 +971,43 @@ static bool caseQ6K(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
                    x, M, K, yref, iters, K / 16);
 }
 
+template<typename Block, bool Superblock>
+static bool caseQ5(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
+    constexpr uint32_t width = Superblock ? 256 : 32;
+    if (!M || !K || K % width || !iters) {
+        fprintf(stderr, "Q5 GEMV needs positive M/K/iterations and K divisible by %u\n", width);
+        return false;
+    }
+    std::vector<Block> blocks((size_t)M * K / width);
+    std::mt19937 rng(42);
+    for (auto& b : blocks) {
+        b.d = qk_f32_to_f16(0.002f + 0.004f * (rng() & 0xffff) / 65536.f);
+        if constexpr (Superblock) {
+            b.dmin = qk_f32_to_f16(0.003f);
+            for (auto& v : b.scales) v = (uint8_t)rng();
+        } else {
+            b.m = qk_f32_to_f16(-0.06f);
+        }
+        for (auto& v : b.qh) v = (uint8_t)rng();
+        for (auto& v : b.qs) v = (uint8_t)rng();
+    }
+    auto x = randomX(K);
+    std::vector<float> reference(M), decoded(K);
+    for (uint32_t row = 0; row < M; ++row) {
+        if constexpr (Superblock)
+            dequant_row_q5_K(&blocks[(size_t)row * K / width], decoded.data(), K);
+        else
+            dequant_row_q5_1(&blocks[(size_t)row * K / width], decoded.data(), K);
+        double sum = 0;
+        for (uint32_t i = 0; i < K; ++i) sum += double(decoded[i]) * x[i];
+        reference[row] = (float)sum;
+    }
+    printf("\n== %s GEMV M=%u K=%u ==\n", Superblock ? "Q5_K" : "Q5_1", M, K);
+    return runGemv(c, Superblock ? "gemv_q5_k.spv" : "gemv_q5_1.spv",
+                   blocks.data(), blocks.size() * sizeof(Block), x, M, K,
+                   reference, iters, K / 32);
+}
+
 static bool caseIQ4XS(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
     printf("\n== iq4_xs GEMV  M=%u K=%u (W %.1f MiB) ==\n", M, K,
            (double)M * K / 256 * 136 / (1 << 20));
@@ -1112,6 +1167,8 @@ static void destroyPipe(VkCtx& c, Pipe& pp) {
     vkDestroyDescriptorSetLayout(c.dev, pp.dsl, nullptr);
 }
 
+#include "qwen4_hc_test.h"
+
 // QK_STATS_FILE: mirror per-request stat lines ([pcache], [spec]) to an
 // append-only file — pod logs reset on every restart, which kept wiping the
 // tuning data these lines exist to accumulate.
@@ -1149,6 +1206,10 @@ static bool caseGgufTensor(VkCtx& c, const GgufTensor* t,
                            const std::string& tensorName, uint32_t iters,
                            bool checkArgmax = false) {
     if (!t) return false;
+    if (tensorName == "per_layer_token_embd.weight") {
+        fprintf(stderr, "PLE is a sparse row lookup, not a dense GEMV; refusing a multi-GiB allocation\n");
+        return false;
+    }
     uint32_t K = (uint32_t)t->ne[0];
     uint32_t M = (uint32_t)t->ne[1];
     size_t rowBytes = ggmlRowBytes(t->type, K);
@@ -1170,6 +1231,8 @@ static bool caseGgufTensor(VkCtx& c, const GgufTensor* t,
         const uint8_t* row = t->data + (size_t)m * rowBytes;
         switch (t->type) {
             case GGML_Q4_0: dequant_row_q4_0((const block_q4_0*)row, tmp.data(), K); break;
+            case GGML_Q5_1: dequant_row_q5_1((const block_q5_1*)row, tmp.data(), K); break;
+            case GGML_Q5_K: dequant_row_q5_K((const block_q5_K*)row, tmp.data(), K); break;
             case GGML_Q8_0: dequant_row_q8_0((const block_q8_0*)row, tmp.data(), K); break;
             case GGML_Q6_K: dequant_row_q6_K((const block_q6_K*)row, tmp.data(), K); break;
             case GGML_IQ4_XS: dequant_row_iq4_xs((const block_iq4_xs*)row, tmp.data(), K); break;
@@ -1190,6 +1253,8 @@ static bool caseGgufTensor(VkCtx& c, const GgufTensor* t,
     uint32_t units = K;
     switch (t->type) {
         case GGML_Q4_0:    spv = "gemv_q4_0.spv";    units = K / 32; break;
+        case GGML_Q5_1:    spv = "gemv_q5_1.spv";    units = K / 32; break;
+        case GGML_Q5_K:    spv = "gemv_q5_k.spv";    units = K / 32; break;
         case GGML_Q8_0:    spv = "gemv_q8_0.spv";    units = K / 32; break;
         case GGML_Q6_K:    spv = "gemv_q6_k.spv";    units = K / 16; break;
         case GGML_IQ4_XS:  spv = "gemv_iq4_xs.spv";  units = K / 32; break;
@@ -3913,10 +3978,12 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     // deployment config (measured VRAM fit on the 20 GB card).
     if (nSlots < 1 || nSlots > 16 || nCtx < 64 || nCtx > 65536 || chunkN < 1 || chunkN > 32)
         return fail("qk_open: bad config");
-    initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
     if (!g.open(path)) return fail("qk_open: cannot open GGUF");
     // Model-shape KVs (arch-prefixed): 35B = qwen35moe 40/8, 80B = qwen3next 48/10.
     const std::string arch = g.kvStr("general.architecture", "");
+    if (arch == "qwen4exp")
+        return fail("qk_open: native qwen4exp graph is not implemented; Q5/HC operator tests do not enable serving. Use the existing Flash Next backend.");
+    initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR
     nLayer = (uint32_t)g.kvInt(arch + ".block_count", nLayer);
     if (nLayer < 1 || nLayer > 256) return fail("qk_open: bad block_count");
     nUsed = (uint32_t)g.kvInt(arch + ".expert_used_count", nUsed);
@@ -7548,6 +7615,10 @@ int main(int argc, char** argv) {
 
     bool ok = true;
     if (mode == "counters") {
+        printf("device_id: vendor=0x%04x device=0x%04x\n", c.props.vendorID, c.props.deviceID);
+        printf("subgroup_size: %u\n", c.subgroupSize);
+        printf("max_workgroup_invocations: %u\n", c.props.limits.maxComputeWorkGroupInvocations);
+        printf("max_shared_memory_bytes: %u\n", c.props.limits.maxComputeSharedMemorySize);
         printf("vulkan timestamps: %s\n", c.hasTimestamps ? "supported" : "unsupported");
         printf("queue_family: %u\n", c.qfi);
         printf("timestamp_valid_bits: %u\n", c.timestampValidBits);
@@ -7562,6 +7633,12 @@ int main(int argc, char** argv) {
         printf("\nreal-weight mode: qk gguf <tensor>   (see: qk list blk.0)\n");
     } else if (mode == "f16") {
         ok = caseF16(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
+    } else if (mode == "qwen4-hc") {
+        ok = caseQwen4Hc(c, argU(2, 2560), argU(3, 4), argU(4, 1));
+    } else if (mode == "q5_k") {
+        ok = caseQ5<block_q5_K, true>(c, argU(2, 640), argU(3, 2560), argU(4, 100));
+    } else if (mode == "q5_1") {
+        ok = caseQ5<block_q5_1, false>(c, argU(2, 320), argU(3, 160), argU(4, 100));
     } else if (mode == "q8_0") {
         ok = caseQ80(c, argU(2, 16384), argU(3, 8192), argU(4, 100));
     } else if (mode == "q4_0") {

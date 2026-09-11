@@ -64,6 +64,54 @@ struct block_q8_0 {
 static_assert(sizeof(block_q8_0) == 34, "q8_0 block size");
 
 #define QK_K 256
+struct block_q5_1 {
+    uint16_t d, m;
+    uint8_t qh[4];
+    uint8_t qs[16];
+};
+static_assert(sizeof(block_q5_1) == 24, "q5_1 block size");
+
+struct block_q5_K {
+    uint16_t d, dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];
+    uint8_t qs[128];
+};
+static_assert(sizeof(block_q5_K) == 176, "q5_K block size");
+
+static inline void dequant_row_q5_1(const block_q5_1* blocks, float* out, int64_t k) {
+    assert(k % 32 == 0);
+    for (int64_t b = 0; b < k / 32; ++b) {
+        const auto& w = blocks[b];
+        const float d = qk_f16_to_f32(w.d), m = qk_f16_to_f32(w.m);
+        for (uint32_t i = 0; i < 32; ++i) {
+            const uint32_t lo = (w.qs[i % 16] >> (4 * (i / 16))) & 15;
+            const uint32_t hi = (w.qh[i / 8] >> (i % 8)) & 1;
+            out[b * 32 + i] = d * (lo + 16 * hi) + m;
+        }
+    }
+}
+
+static inline void dequant_row_q5_K(const block_q5_K* blocks, float* out, int64_t k) {
+    assert(k % 256 == 0);
+    for (int64_t b = 0; b < k / 256; ++b) {
+        const auto& w = blocks[b];
+        const float d = qk_f16_to_f32(w.d), dm = qk_f16_to_f32(w.dmin);
+        for (uint32_t g = 0; g < 8; ++g) {
+            const uint32_t sc = g < 4 ? w.scales[g] & 63
+                : (w.scales[g + 4] & 15) | ((w.scales[g - 4] >> 6) << 4);
+            const uint32_t mn = g < 4 ? w.scales[g + 4] & 63
+                : (w.scales[g + 4] >> 4) | ((w.scales[g] >> 6) << 4);
+            const float scale = d * sc, offset = dm * mn;
+            for (uint32_t i = 0; i < 32; ++i) {
+                const uint32_t lo = (w.qs[(g / 2) * 32 + i] >> ((g % 2) * 4)) & 15;
+                const uint32_t hi = (w.qh[i] >> g) & 1;
+                out[b * 256 + g * 32 + i] = scale * (lo + 16 * hi) - offset;
+            }
+        }
+    }
+}
+
 struct block_q6_K {
     uint8_t  ql[QK_K / 2];      // lower 4 bits
     uint8_t  qh[QK_K / 4];      // upper 2 bits

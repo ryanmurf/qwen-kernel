@@ -1,5 +1,16 @@
 # qwen-kernel
 
+## Strix Halo / Flash Next branch
+
+This branch is bringing the native Vulkan engine to Strix Halo and the existing
+Qwen3.8 Flash Next Q5_K_M GGUF (`qwen4exp`). **The full Flash Next serving graph
+is not implemented yet.** Q5_K/Q5_1 GEMV, hyper-connection elementwise operators,
+and bounded disk-backed PLE lookup have correctness tests on this branch.
+The existing XTX engine and Anthropic/multi-device APIs are preserved.
+
+See [Halo port status and reproducible tests](docs/STRIX-HALO.md). The historical
+benchmarks below are for other models/cards, not Flash Next on Halo.
+
 A from-scratch Vulkan inference engine + serving stack for **Qwen3.6-35B-A3B**
 on RDNA3 (Radeon RX 7900 XT). One model, fully specialized: hand-written
 compute kernels for every weight format in the GGUF, the whole hybrid
