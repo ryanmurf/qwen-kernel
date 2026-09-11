@@ -1,0 +1,15 @@
+# OPTIONAL: pin the discrete Navi31 (RX 7900 XTX) to its highest DPM level.
+#
+# Measured 2026-09-11 on Max with the native Flash split (Halo 0:37, XTX 37:48
+# + head): the XTX stage of one decode token fell from 6.4 ms to 4.2 ms
+# (33.2 -> 34.8 tok/s end to end) because its memory clock idles at 96 MHz
+# between the ~6 ms bursts it gets per token. The same setting on the Strix
+# Halo iGPU changed nothing, so it stays on auto. "high" is a stock DPM level
+# (no voltage or clock offsets); the cost is higher idle power on the XTX.
+#
+# Runtime (no reboot, reversible with "auto"):
+#   sudo sh -c 'echo high > /sys/bus/pci/devices/0000:68:00.0/power_dpm_force_performance_level'
+# Install to persist:  sudo cp deploy/91-amdgpu-navi31-perf-high.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger -s pci
+# Rollback: remove the rule and write "auto" to the same sysfs file.
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:68:00.0", DRIVER=="amdgpu", ATTR{power_dpm_force_performance_level}="high"

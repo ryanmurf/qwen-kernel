@@ -1,0 +1,2 @@
+{"test": "claude_proxy_8092_stream", "result": "PASS", "seconds": 1.207, "events": 7}
+{"test": "claude_proxy_8092_tool", "result": "PASS", "seconds": 4.971, "usage": {"input_tokens": 306, "output_tokens": 105}}

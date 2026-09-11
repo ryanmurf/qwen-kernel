@@ -1,7 +1,11 @@
 // Single-sequence native qwen4exp graph. Prefix correctness tests use the same
 // kernels as the experimental split-stage adapter, with a small weight budget.
 #include "qwen4_ple.h"
+#include <atomic>
 #include <memory>
+#include <thread>
+#include <sys/mman.h>
+#include <unistd.h>
 class Qwen4Graph {
     VkCtx& c;
     Gguf& g;
@@ -16,6 +20,10 @@ class Qwen4Graph {
     std::vector<float> logits;
     std::unique_ptr<Qwen4PleLookup> ple;
     std::vector<uint32_t> tokenHistory;
+    // Background page-cache prefetch of the disk-mapped PLE table (rows are
+    // hash-random, so a cold table costs one NVMe page fault per row).
+    std::thread pleThread;
+    std::atomic<bool> pleStop{false};
     // Batched prefill: every activation buffer holds batchCap rows so the
     // serial path (row 0) and the batched path share names and descriptors.
     // rowBytes keeps the single-token size for the debug taps.
@@ -58,9 +66,11 @@ class Qwen4Graph {
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
             const uint32_t bits = c.timestampValidBits;
             const uint64_t mask = bits >= 64 ? UINT64_MAX : ((uint64_t{1} << bits) - 1u);
+            static const bool raw = [] { const char* v = getenv("QK_FLASH_PROFILE"); return v && !strcmp(v,"2"); }();
             for (size_t i = 1; i < ts.size(); ++i) {
                 double ms = double((ts[i]-ts[i-1]) & mask) * c.props.limits.timestampPeriod * 1e-6;
                 auto& agg = profileMs[profileLabels[i]]; agg.first += ms; agg.second++;
+                if (raw) fprintf(stderr,"[flash raw] %04zu %-34s %8.1f us\n",i,profileLabels[i].c_str(),ms*1000);
             }
             profileLabels.clear();
         }
@@ -71,7 +81,7 @@ class Qwen4Graph {
         std::vector<std::pair<std::string,std::pair<double,uint32_t>>> rows(profileMs.begin(),profileMs.end());
         std::sort(rows.begin(),rows.end(),[](const auto& a,const auto& b) { return a.second.first > b.second.first; });
         double total = 0; for (const auto& r : rows) total += r.second.first;
-        fprintf(stderr,"[flash profile] %s: %.3f ms GPU\n",what,total);
+        fprintf(stderr,"[flash profile] %s: %.3f ms GPU%s\n",what,total,ple ? (" (PLE hits " + std::to_string(ple->hits) + ", misses " + std::to_string(ple->misses) + ")").c_str() : "");
         for (const auto& r : rows)
             fprintf(stderr,"[flash profile]   %-34s %9.3f ms %5.1f%% (%u dispatches, %.1f us each)\n",r.first.c_str(),
                     r.second.first,100*r.second.first/std::max(total,1e-9),r.second.second,1000*r.second.first/r.second.second);
@@ -98,6 +108,23 @@ class Qwen4Graph {
             begin(); VkBufferCopy copy{0, offset, chunk};
             vkCmdCopyBuffer(c.cb, staging.buf, dst.buf, 1, &copy); submit();
         }
+    }
+    Buf createHostCachedBuf(VkDeviceSize size) {
+        Buf b; b.size = size;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = size; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VK_CHECK(vkCreateBuffer(c.dev, &bci, nullptr, &b.buf));
+        VkMemoryRequirements req; vkGetBufferMemoryRequirements(c.dev, b.buf, &req);
+        const VkMemoryPropertyFlags cached = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        uint32_t type = findMemType(c.mp, req.memoryTypeBits, cached);
+        if (type == UINT32_MAX) type = findMemType(c.mp, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (type == UINT32_MAX) throw std::runtime_error("no host-visible memory type for staging");
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size; mai.memoryTypeIndex = type;
+        VK_CHECK(vkAllocateMemory(c.dev, &mai, nullptr, &b.mem));
+        VK_CHECK(vkBindBufferMemory(c.dev, b.buf, b.mem, 0));
+        return b;
     }
     Buf& allocateRows(const std::string& name, size_t bytesPerRow, uint32_t rows) {
         rowBytes[name] = bytesPerRow;
@@ -133,8 +160,11 @@ class Qwen4Graph {
         vkCmdCopyBuffer(c.cb,buffers.at(src).buf,buffers.at(dst).buf,1,&copy);
         barrier(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
     }
+    // fence=false skips the barrier after a dispatch whose outputs are not
+    // read before the next fenced dispatch, letting independent projections
+    // overlap instead of draining the GPU between them.
     template<class PC> void launch(const char* shader, std::initializer_list<std::string> refs,
-                                    const PC& pc, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t spec) {
+                                    const PC& pc, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t spec, bool fence = true) {
         const std::string key = std::string(shader) + "/" + std::to_string(spec);
         auto it = pipes.find(key);
         if (it == pipes.end()) it = pipes.emplace(key, makePipe(c, shader, refs.size(), sizeof(pc), spec)).first;
@@ -159,18 +189,18 @@ class Qwen4Graph {
         vkCmdPushConstants(c.cb, pipeline.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         if (gx>c.props.limits.maxComputeWorkGroupCount[0] || gy>c.props.limits.maxComputeWorkGroupCount[1] ||
             gz>c.props.limits.maxComputeWorkGroupCount[2]) throw std::runtime_error("dispatch exceeds device limits");
-        vkCmdDispatch(c.cb, gx, gy, gz); barrier();
-        stamp(shader);
+        vkCmdDispatch(c.cb, gx, gy, gz);
+        if (fence) { barrier(); stamp(shader); }
     }
     // Folded one-dimensional launch (kernels index wg = y*numX + x) with an
     // optional z batch of tokens.
     template<class PC> void emit(const char* shader, std::initializer_list<std::string> refs,
-                                  const PC& pc, uint32_t gx, uint32_t spec = 0, uint32_t gz = 1) {
+                                  const PC& pc, uint32_t gx, uint32_t spec = 0, uint32_t gz = 1, bool fence = true) {
         uint32_t nx=std::min(gx,c.props.limits.maxComputeWorkGroupCount[0]);
         uint32_t ny=(gx+nx-1)/nx;
-        launch(shader, refs, pc, nx, ny, gz, spec);
+        launch(shader, refs, pc, nx, ny, gz, spec, fence);
     }
-    void project(const std::string& weight, const std::string& input, const std::string& output) {
+    void project(const std::string& weight, const std::string& input, const std::string& output, bool fence = true) {
         const auto* tensor = g.find(weight);
         if (!tensor || tensor->nDims != 2) throw std::runtime_error("bad projection: " + weight);
         const uint32_t k = tensor->ne[0], m = tensor->ne[1];
@@ -181,7 +211,7 @@ class Qwen4Graph {
         switch (tensor->type) {
             case GGML_Q5_K: shader = "gemv_q5_k.spv"; units = k/32; break;
             case GGML_Q5_1: shader = "gemv_q5_1.spv"; units = k/32; break;
-            case GGML_Q6_K: shader = "gemv_q6_k.spv"; units = k/16; break;
+            case GGML_Q6_K: shader = "gemv_q6_k.spv"; units = k/32; break;
             case GGML_Q8_0: shader = "gemv_q8_0.spv"; units = k/32; break;
             default: throw std::runtime_error("unsupported projection format: " + weight);
         }
@@ -191,8 +221,12 @@ class Qwen4Graph {
             if (m == 640 && k == 2560) tpr = 64;
             if (m == 320 && k == 10240) tpr = 128;
         }
+        // Measured Q6_K geometry: the 16-element work units of gemv_q6_k are
+        // counted as 32-wide above (K=2560 -> 128 lanes), and NAVI31 prefers
+        // 64 lanes for the 2560-wide rows (the 248320-row head: 596 vs 714 us).
+        if (tensor->type == GGML_Q6_K && k == 2560 && c.props.deviceID == 0x744c) tpr = 64;
         struct { uint32_t m,k; } pc{m,k};
-        emit(shader, {weight,input,output}, pc, (m + 256/tpr - 1) / (256/tpr), tpr);
+        emit(shader, {weight,input,output}, pc, (m + 256/tpr - 1) / (256/tpr), tpr, 1, fence);
     }
     // Batched projection over T activation rows. Wide outputs use the tiled
     // GEMM (weights read once per 64-token tile); skinny outputs (M < 128)
@@ -200,7 +234,7 @@ class Qwen4Graph {
     // offsets (in floats) let a projection read or write a slice of a wider
     // buffer; they are only supported on the GEMM path.
     void projectBatch(const std::string& weight, const std::string& input, const std::string& output,
-                      uint32_t T, uint32_t xStride = 0, uint32_t xOff = 0, uint32_t yStride = 0, uint32_t yOff = 0) {
+                      uint32_t T, uint32_t xStride = 0, uint32_t xOff = 0, uint32_t yStride = 0, uint32_t yOff = 0, bool fence = true) {
         const auto* tensor = g.find(weight);
         if (!tensor || tensor->nDims != 2) throw std::runtime_error("bad projection: " + weight);
         const uint32_t k = tensor->ne[0], m = tensor->ne[1];
@@ -217,14 +251,14 @@ class Qwen4Graph {
             switch (tensor->type) {
                 case GGML_Q5_K: shader = "gemv_q5_k.spv"; units = k/32; break;
                 case GGML_Q5_1: shader = "gemv_q5_1.spv"; units = k/32; break;
-                case GGML_Q6_K: shader = "gemv_q6_k.spv"; units = k/16; break;
+                case GGML_Q6_K: shader = "gemv_q6_k.spv"; units = k/32; break;
                 case GGML_Q8_0: shader = "gemv_q8_0.spv"; units = k/32; break;
                 default: throw std::runtime_error("unsupported projection format: " + weight);
             }
             uint32_t tpr = 256;
             while (tpr > 4 && tpr/2 >= units) tpr /= 2;
             struct { uint32_t m,k; } pc{m,k};
-            emit(shader, {weight,input,output}, pc, (m + 256/tpr - 1) / (256/tpr), tpr, T);
+            emit(shader, {weight,input,output}, pc, (m + 256/tpr - 1) / (256/tpr), tpr, T, fence);
             return;
         }
         const char* shader;
@@ -238,7 +272,7 @@ class Qwen4Graph {
         if (k % 64 || ((tensor->type == GGML_Q5_K || tensor->type == GGML_Q6_K) && k % 256))
             throw std::runtime_error("batched projection needs K%64 (K%256 for K-quants): " + weight);
         struct { uint32_t m,k,n,xs,xo,ys,yo; } pc{m,k,T,xStride,xOff,yStride,yOff};
-        launch(shader, {weight,input,output}, pc, (m + 127) / 128, 1, (T + 63) / 64, 0);
+        launch(shader, {weight,input,output}, pc, (m + 127) / 128, 1, (T + 63) / 64, 0, fence);
     }
     struct HcPC { uint32_t n,h,t,mode; float eps; };
     void tap(const std::string& name, const std::string& source) {
@@ -265,7 +299,7 @@ class Qwen4Graph {
         project(name("down.weight"), "$norm", "$low");
         struct { uint32_t n; float scale; } silu{low,1.0f/hc};
         emit("qwen4_silu.spv", {"$low","$silu"}, silu, (low+255)/256);
-        project(name("up.weight"), "$silu", "$gate");
+        project(name("up.weight"), "$silu", "$gate", outputHead);
         if (!outputHead) {
             project(name("inject.weight"), "$norm", "$inject");
             tap(kind+".inject", "$inject");
@@ -279,10 +313,10 @@ class Qwen4Graph {
         emit("qwen4_hc.spv", {residual,"$dummy","$inject","$block",out}, pc, (n*hc+255)/256);
     }
     void pleForward() {
-        project(w("ple_key.weight"),"$ple_emb","$ple_key");
+        project(w("ple_key.weight"),"$ple_emb","$ple_key",false);
         project(w("ple_value.weight"),"$ple_emb","$ple_value");
         HcPC pc{n,hc,1,0,eps};
-        emit("qwen4_hc.spv",{"$ple_key",w("ple_norm_key.weight"),"$dummy","$dummy","$ple_keynorm"},pc,hc);
+        emit("qwen4_hc.spv",{"$ple_key",w("ple_norm_key.weight"),"$dummy","$dummy","$ple_keynorm"},pc,hc,0,1,false);
         emit("qwen4_hc.spv",{"$hidden",w("ple_norm_query.weight"),"$dummy","$dummy","$ple_query"},pc,hc);
         pc.mode = 4;
         emit("qwen4_hc.spv",{"$ple_keynorm","$dummy","$ple_query","$ple_value","$ple_gated"},pc,hc);
@@ -293,8 +327,8 @@ class Qwen4Graph {
         tap("ple.output","$hidden");
     }
     void fullAttention() {
-        project(w("attn_q.weight"),"$mixed","$fa_qfull");
-        project(w("attn_k.weight"),"$mixed","$fa_k");
+        project(w("attn_q.weight"),"$mixed","$fa_qfull",false);
+        project(w("attn_k.weight"),"$mixed","$fa_k",false);
         project(w("attn_v.weight"),"$mixed","$fa_v");
         struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; } pc{0,capacity,256,64,24,2,eps,1e7f};
         emit("fa_prep_srv.spv",{"$fa_qfull","$fa_k","$fa_v",w("attn_q_norm.weight"),w("attn_k_norm.weight"),
@@ -313,7 +347,7 @@ class Qwen4Graph {
         projectBatch(name("down.weight"), "$norm", "$low", T);
         struct { uint32_t n; float scale; } silu{low*T,1.0f/hc};
         emit("qwen4_silu.spv", {"$low","$silu"}, silu, (low*T+255)/256);
-        projectBatch(name("up.weight"), "$silu", "$gate", T);
+        projectBatch(name("up.weight"), "$silu", "$gate", T, 0, 0, 0, 0, outputHead);
         if (!outputHead) projectBatch(name("inject.weight"), "$norm", "$inject", T);
         pc.mode = 1;
         emit("qwen4_hc.spv", {"$norm","$dummy","$gate","$dummy","$mixed"}, pc, (n+255)/256, 0, T);
@@ -323,10 +357,10 @@ class Qwen4Graph {
         emit("qwen4_hc.spv", {residual,"$dummy","$inject","$block",out}, pc, (n*hc+255)/256, 0, T);
     }
     void pleForwardBatch(uint32_t T, uint32_t base) {
-        projectBatch(w("ple_key.weight"),"$ple_emb","$ple_key",T);
+        projectBatch(w("ple_key.weight"),"$ple_emb","$ple_key",T,0,0,0,0,false);
         projectBatch(w("ple_value.weight"),"$ple_emb","$ple_value",T);
         HcPC pc{n,hc,T,0,eps};
-        emit("qwen4_hc.spv",{"$ple_key",w("ple_norm_key.weight"),"$dummy","$dummy","$ple_keynorm"},pc,hc,0,T);
+        emit("qwen4_hc.spv",{"$ple_key",w("ple_norm_key.weight"),"$dummy","$dummy","$ple_keynorm"},pc,hc,0,T,false);
         emit("qwen4_hc.spv",{"$hidden",w("ple_norm_query.weight"),"$dummy","$dummy","$ple_query"},pc,hc,0,T);
         pc.mode = 4;
         emit("qwen4_hc.spv",{"$ple_keynorm","$dummy","$ple_query","$ple_value","$ple_gated"},pc,hc,0,T);
@@ -336,8 +370,8 @@ class Qwen4Graph {
         emit("qwen4_ple_conv_batch.spv",{"$ple_normalized",w("ple_conv1d.weight"),"$ple_history","$ple_gated","$hidden"},conv,(n*hc+255)/256);
     }
     void fullAttentionBatch(uint32_t T, uint32_t base) {
-        projectBatch(w("attn_q.weight"),"$mixed","$fa_qfull",T);
-        projectBatch(w("attn_k.weight"),"$mixed","$fa_k",T);
+        projectBatch(w("attn_q.weight"),"$mixed","$fa_qfull",T,0,0,0,0,false);
+        projectBatch(w("attn_k.weight"),"$mixed","$fa_k",T,0,0,0,0,false);
         projectBatch(w("attn_v.weight"),"$mixed","$fa_v",T);
         struct { uint32_t tmax,dh,nrot,hq,hkv; float eps,base_; uint32_t base,Tn,qbase; } pc{capacity,256,64,24,2,eps,1e7f,base,T,0};
         emit("fa_prep_batch.spv",{"$fa_qfull","$fa_k","$fa_v",w("attn_q_norm.weight"),w("attn_k_norm.weight"),
@@ -358,9 +392,9 @@ class Qwen4Graph {
         projectBatch(w("attn_output.weight"),"$att","$block",T);
     }
     void gdnBatch(uint32_t T) {
-        projectBatch(w("attn_qkv.weight"),"$mixed","$qkv",T);
-        projectBatch(w("attn_gate.weight"),"$mixed","$z",T);
-        projectBatch(w("ssm_alpha.weight"),"$mixed","$alpha",T);
+        projectBatch(w("attn_qkv.weight"),"$mixed","$qkv",T,0,0,0,0,false);
+        projectBatch(w("attn_gate.weight"),"$mixed","$z",T,0,0,0,0,false);
+        projectBatch(w("ssm_alpha.weight"),"$mixed","$alpha",T,0,0,0,0,false);
         projectBatch(w("ssm_beta.weight"),"$mixed","$beta",T);
         struct { uint32_t heads,T; } params{48,T};
         emit("qwen4_gdn_params.spv",{"$alpha","$beta",w("ssm_dt.bias"),w("ssm_a"),"$gb"},params,(48*T+63)/64);
@@ -386,7 +420,7 @@ class Qwen4Graph {
         static const bool pairKernels = [] { const char* v = getenv("QK_MOE_GROUPED"); return v && !strcmp(v,"pairs"); }();
         if (pairKernels) launch("qwen4_moe_gateup_grouped.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$offsets","$pairs","$ffh"},moe,ff,experts,1,0);
         else launch("qwen4_moe_gateup_tiled.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$offsets","$pairs","$ffh"},moe,ff/128,experts,1,0);
-        projectBatch(w("ffn_gate_shexp.weight"),"$mixed","$sg",T);
+        projectBatch(w("ffn_gate_shexp.weight"),"$mixed","$sg",T,0,0,0,0,false);
         projectBatch(w("ffn_up_shexp.weight"),"$mixed","$su",T);
         struct { uint32_t n; } sm{ff*T};
         emit("qwen4_silu_mul.spv",{"$sg","$su","$sh"},sm,(ff*T+255)/256);
@@ -467,6 +501,8 @@ public:
     uint32_t batchCapacity() const { return batchCap; }
     const std::vector<float>& lastLogits() const { return logits; }
     ~Qwen4Graph() {
+        pleStop = true;
+        if (pleThread.joinable()) pleThread.join();
         if (profileQuery) vkDestroyQueryPool(c.dev, profileQuery, nullptr);
         if (pool) vkDestroyDescriptorPool(c.dev, pool, nullptr);
         for (auto& [_, pipe] : pipes) destroyPipe(c, pipe);
@@ -544,7 +580,9 @@ public:
             if (need>free) throw std::runtime_error("insufficient device budget: unload the other model or reduce the native stage/context");
         }
         printf("prefix weights: %.3f GiB; staging: 16 MiB; PLE table stays mapped\n",totalWeightBytes/double(1ull<<30));
-        staging = createBuf(c, stageBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+        // Readback goes through this buffer: a host-cached type keeps the CPU
+        // copies fast (uncached write-combined memory reads at ~0.3 GB/s).
+        staging = createHostCachedBuf(stageBytes);
         VK_CHECK(vkMapMemory(c.dev, staging.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
         for (layer=firstLayer; layer<=lastLayer; ++layer) for (const auto& [name,tensor] : g.tensors()) if (name.compare(0,w("").size(),w("")) == 0) {
             if (!tensor.nbytes) throw std::runtime_error("unknown tensor layout: " + name);
@@ -594,6 +632,44 @@ public:
             for (const auto& name : {"$ple_key","$ple_keynorm","$ple_query","$ple_gated","$ple_normalized"}) allocateRows(name,n*hc*4,rows);
             allocateRows("$ple_emb",n*4,rows); allocateRows("$ple_value",n*4,rows); allocate("$ple_history",9*n*hc*4);
         }
+        // Page-cache plan: the uploaded weights are never read from the host
+        // again, so their file pages are reclaimed (MADV_PAGEOUT) to make room
+        // for the tables the CPU reads per token: the 35.763 GiB PLE table and
+        // the token embedding, which are then read ahead and touched so every
+        // per-token row lookup is a memory read instead of an NVMe page fault.
+        // QK_PLE_PREFETCH=0 disables this; the service memory limit must leave
+        // room for those tables' page cache.
+        if (const char* v = getenv("QK_PLE_PREFETCH"); !v || strcmp(v,"0")) {
+            struct Range { uintptr_t start; size_t bytes; };
+            std::vector<Range> release, keep;
+            const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            auto range = [&](const GgufTensor& t) {
+                uintptr_t start = (uintptr_t)t.data & ~(uintptr_t)(page-1);
+                return Range{start, ((uintptr_t)t.data + t.nbytes + page-1 & ~(uintptr_t)(page-1)) - start};
+            };
+            for (const auto& [name,tensor] : g.tensors()) {
+                if (!tensor.data || !tensor.nbytes) continue;
+                if (name == "token_embd.weight" || (ple && name == "per_layer_token_embd.weight")) keep.push_back(range(tensor));
+                else if (buffers.count(name)) release.push_back(range(tensor));
+            }
+            pleThread = std::thread([this,release,keep,page] {
+                const auto began = std::chrono::steady_clock::now();
+                size_t released = 0, kept = 0;
+                for (const auto& r : release) { if (pleStop) return; madvise((void*)r.start, r.bytes, MADV_PAGEOUT); released += r.bytes; }
+                // The kernel clamps each WILLNEED call to the device readahead
+                // window, so issue small chunks, then touch every page.
+                const size_t chunk = 512u<<10;
+                volatile uint8_t sink = 0;
+                for (const auto& r : keep) {
+                    for (size_t off = 0; off < r.bytes && !pleStop; off += chunk)
+                        madvise((void*)(r.start+off), std::min(chunk,r.bytes-off), MADV_WILLNEED);
+                    for (size_t off = 0; off < r.bytes && !pleStop; off += page) sink += *(const volatile uint8_t*)(r.start+off);
+                    kept += r.bytes;
+                }
+                if (!pleStop) fprintf(stderr,"[flash] page cache: released %.3f GiB of uploaded weights, %.3f GiB of lookup tables resident after %.1f s\n",
+                    released/double(1ull<<30),kept/double(1ull<<30),std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count());
+            });
+        }
         allocateRows("$logits",experts*4,rows); allocateRows("$sel",160,rows); allocateRows("$ffh",(used+1)*ff*4,rows);
         allocate("$position",4);
         VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384};
@@ -606,7 +682,12 @@ public:
             VK_CHECK(vkCreateQueryPool(c.dev, &q, nullptr, &profileQuery));
         }
     }
+    // QK_FLASH_TIMING=1: host-side phase timing of the serial forward.
+    struct Timing { double prep = 0, ple = 0, gpu = 0, post = 0; uint32_t tokens = 0; } timing;
+    static double nowMs() { return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     std::vector<float> forward(uint32_t token, bool reset = true, const float* residualInput = nullptr) {
+        static const bool timed = [] { const char* v = getenv("QK_FLASH_TIMING"); return v && strcmp(v,"0"); }();
+        double t0 = timed ? nowMs() : 0;
         if (reset) { position = 0; tokenHistory.clear(); }
         if (position >= capacity) throw std::runtime_error("native graph context capacity exceeded");
         const auto* embedding = g.find("token_embd.weight");
@@ -630,11 +711,13 @@ public:
         const size_t pleOffset = positionOffset + 4;
         memcpy((uint8_t*)mapped+inputOffset,hidden.data(),hidden.size()*4);
         memcpy((uint8_t*)mapped+positionOffset,&position,4);
+        double t1 = timed ? nowMs() : 0;
         if (ple) {
             std::vector<float> row(n);
             ple->gather(ple->config().rows(token,tokenHistory),row.data());
             memcpy((uint8_t*)mapped+pleOffset,row.data(),row.size()*4);
         }
+        double t2 = timed ? nowMs() : 0;
         const char* replayEnv=getenv("QK_FLASH_REPLAY");
         const bool replayEnabled=(!replayEnv || strcmp(replayEnv,"0")) && !getenv("QK_LAYER_DUMP");
         const bool reuse=replayReady && replayEnabled && !reset;
@@ -664,18 +747,21 @@ public:
         hcMix("attn","$hidden");
         if (layer % 4 == 3) fullAttention();
         else {
-        project(w("attn_qkv.weight"),"$mixed","$qkv");
-        project(w("attn_gate.weight"),"$mixed","$z");
-        project(w("ssm_alpha.weight"),"$mixed","$alpha");
+        project(w("attn_qkv.weight"),"$mixed","$qkv",false);
+        project(w("attn_gate.weight"),"$mixed","$z",false);
+        project(w("ssm_alpha.weight"),"$mixed","$alpha",false);
         project(w("ssm_beta.weight"),"$mixed","$beta");
         tap("qkv", "$qkv"); tap("z", "$z"); tap("alpha", "$alpha"); tap("beta", "$beta");
         struct { uint32_t heads,T; } params{48,1};
-        emit("qwen4_gdn_params.spv",{"$alpha","$beta",w("ssm_dt.bias"),w("ssm_a"),"$gb"},params,1);
+        emit("qwen4_gdn_params.spv",{"$alpha","$beta",w("ssm_dt.bias"),w("ssm_a"),"$gb"},params,1,0,1,false);
         struct { uint32_t channels,ds,qk; float eps; } conv{10240,128,4096,eps};
         emit("dn_convn.spv",{state("convstate"),"$qkv",w("ssm_conv1d.weight"),"$conv"},conv,80,1);
         tap("conv", "$conv");
         struct { uint32_t ds,hk,hv,kdiv; float eps; } step{128,16,48,0,eps};
-        emit("dn_step_gate.spv",{"$conv","$gb",state("state"),w("ssm_norm.weight"),"$z","$att"},step,48,1);
+        // QK_GDN_STEP=v1 keeps the 128-thread dn_step_gate kernel for A/B.
+        static const bool stepV1 = [] { const char* v = getenv("QK_GDN_STEP"); return v && !strcmp(v,"v1"); }();
+        if (stepV1) emit("dn_step_gate.spv",{"$conv","$gb",state("state"),w("ssm_norm.weight"),"$z","$att"},step,48,1);
+        else emit("qwen4_gdn_step.spv",{"$conv","$gb",state("state"),w("ssm_norm.weight"),"$z","$att"},step,48);
         tap("final_output", "$att");
         project(w("ssm_out.weight"),"$att","$block");
         tap("linear_attn_out", "$block");
@@ -689,7 +775,7 @@ public:
         const bool sharedQ51 = g.find(w("ffn_down_shexp.weight"))->type==GGML_Q5_1;
         emit("moe_logits.spv",{w("ffn_gate_inp.weight"),"$mixed","$logits"},moe,experts);
         emit("moe_select_256.spv",{"$logits",w("ffn_gate_inp_shexp.weight"),"$mixed","$sel"},moe,1);
-        emit("moe_gateup_q5k.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$sel","$ffh"},moe,used*ff,halo&&!downQ51?128:64);
+        emit("moe_gateup_q5k.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$sel","$ffh"},moe,used*ff,halo&&!downQ51?128:64,1,false);
         emit("moe_shared_q5k.spv",{w("ffn_gate_shexp.weight"),w("ffn_up_shexp.weight"),"$mixed","$ffh"},moe,ff,halo&&!downQ51?128:64);
         emit(downQ51?"moe_down_q5_1.spv":"moe_down_q8_routed.spv",{w("ffn_down_exps.weight"),"$ffh","$sel","$block"},moe,n,halo?128:256);
         emit(sharedQ51?"moe_down_shared_q5_1.spv":"moe_down_q8.spv",{w("ffn_down_shexp.weight"),"$ffh","$sel","$block"},moe,n,sharedQ51?64:0);
@@ -712,6 +798,7 @@ public:
         vkCmdPipelineBarrier(c.cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&read,0,nullptr,0,nullptr);
         submit();
         } else submit(false);
+        double t3 = timed ? nowMs() : 0;
         replayReady=replayEnabled && !reset;
         if (profileQuery && !reuse) printProfile("serial forward, 1 token");
         memcpy(hidden.data(),mapped,hidden.size()*4);
@@ -738,6 +825,15 @@ public:
         }
         ++position; tokenHistory.push_back(token);
         if (tokenHistory.size() > 2) tokenHistory.erase(tokenHistory.begin());
+        if (timed) {
+            double t4 = nowMs();
+            timing.prep += t1-t0; timing.ple += t2-t1; timing.gpu += t3-t2; timing.post += t4-t3; ++timing.tokens;
+            if (timing.tokens % 16 == 0) {
+                fprintf(stderr,"[flash timing] stage %u:%u avg over %u tokens: prep %.2f ms, ple %.2f ms, submit+wait %.2f ms, post %.2f ms\n",
+                        firstLayer,lastLayer+1,timing.tokens,timing.prep/timing.tokens,timing.ple/timing.tokens,timing.gpu/timing.tokens,timing.post/timing.tokens);
+                timing = Timing{};
+            }
+        }
         return hidden;
     }
     // Batched prefill of T consecutive positions. The first stage takes token

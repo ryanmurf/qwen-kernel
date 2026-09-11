@@ -1,12 +1,14 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-10: full-model F32 logit/greedy/reset parity and real native
-dual-GPU HTTP/Claude tests pass. MTP, batched prefill and prefix snapshots
-remain unimplemented. Production was stopped with user approval for testing;
-the native trial now serves port 8091, with the old configuration preserved.
-This is a runtime-only test cutover, not a persistent deployment. No Halogen
-binary has been installed or executed; its checkpoint is a reference download,
-not a format that this engine currently accepts.
+Status, 2026-09-11: full-model F32 logit/greedy/reset parity and real native
+dual-GPU HTTP/Claude tests pass. Batched prefill is implemented and validated
+(512-token prompt 15.95 s -> 2.45 s); decode rose from 26.4 to 35.5 tok/s
+through the same HTTP path (see "Batched prefill and decode campaign" below).
+MTP and prefix snapshots remain unimplemented. Production was stopped with user
+approval for testing; the native trial serves port 8091, with the old
+configuration preserved. This is a runtime-only test cutover, not a persistent
+deployment. No Halogen binary has been installed or executed; its checkpoint is
+a reference download, not a format that this engine currently accepts.
 
 ## Current target
 
@@ -448,3 +450,132 @@ SHA-256 verification passed for all four manifest entries at 19:35 MDT on
 2026-09-10. Total on-disk download is approximately 119 GiB. The initial transfer
 unit exited before verification, so the successful separate check is the
 verification evidence—not the transfer unit's exit status.
+
+## Batched prefill and decode campaign (2026-09-11)
+
+All numbers below are client-side timings from `tests/native_flash_http.py`
+against the 32768-context native split (Halo layers 0:37 on 8194, XTX 37:48
+plus head via the loopback worker), measured in one session on the same
+hardware and checkpoint. The counting prompt has 35 tokens and streams 96;
+"diverse" prefill prompts use 512 or 2048 distinct token ids, which defeats the
+PLE row cache the way real text does. Raw records:
+`bench/results-halo-native-batched-*.jsonl` and
+`bench/results-halo-native-decodeopt-*.jsonl`.
+
+| Build | Decode tok/s | First token | 512-token prefill | 2048-token prefill |
+| --- | --- | --- | --- | --- |
+| Serial baseline (4314808) | 26.4 | 1.08 s | 15.95 s (32 tok/s) | not measured |
+| Batched prefill (3d87ba4) | 23.7-26.8 | 0.58-0.87 s | 2.53 s (202 tok/s) | 10.08 s (203 tok/s) |
+| Decode campaign (this commit) | 35.5 (36.0 via 8091) | 0.54 s | 2.45 s uniform, 2.48 s diverse (206-209 tok/s) | 9.95 s diverse (206 tok/s) |
+
+The complete API suite passed on 8194 (cancellation 3.29 s at the 512-token
+chunk), on 8091 (`--skip-cancel`) and through the 8092 proxy (streaming READY
+1.2 s, echo tool call 5.0 s versus 12.6 s before) after each of the two commits.
+
+### Batched prefill
+
+Multi-token `qk_stage_run` calls now run `Qwen4Graph::forwardBatch`; single
+positions keep the replayable serial path and continue exactly from a batch.
+The batched graph reuses every activation buffer with `QK_FLASH_BATCH` rows
+(default 512, rounded to 64-row tiles, halved automatically while the device
+budget is short; 0 disables batching). Kernels, all F32 accumulation:
+
+- `qwen4_gemm_{q5k,q6k,q8_0,q5_1}`: 128x64 tiled GEMM with per-thread 32-block
+  dequantization into LDS (Y[N][M] = X[N][K] W^T), strided/offset activation
+  rows so slices of wider buffers are usable; skinny outputs (M < 128) keep the
+  z-batched GEMV. Measured about 3.7 TFLOPS scalar F32 on Halo.
+- `qwen4_gdn_conv_batch` / `qwen4_gdn_step_batch`: causal conv seeded from the
+  serial conv window and the register-carried delta rule with the Flash
+  sigmoid gate and shared-gamma RMS, one workgroup per head across the chunk.
+- `qwen4_ple_conv_batch`: dilated conv over the nine-frame circular history,
+  one thread per channel walking the chunk, so a batch leaves the history
+  exactly as serial decoding would.
+- `fa_prep_batch` / `fa_attn_batch` (existing kernels) for full attention,
+  query-tiled under `QK_ATTN_BUDGET` (default 2M query*key pairs).
+- MoE: `moe_logits_gemm` (32-row multiples) or `moe_logits`, `moe_select_256`,
+  `moe_group_pairs`, then `qwen4_moe_gateup_tiled` (Q5_K) and
+  `qwen4_moe_down_tiled_{q8,q51}`: one workgroup per (expert, 128-row tile)
+  walks that expert's pairs in 16-token groups with LDS-dequantized weights,
+  so expert weights are read once per 16 tokens. Shared experts run as dense
+  GEMMs plus `qwen4_silu_mul`; `qwen4_moe_combine` folds routed partials in
+  slot order. `QK_MOE_GROUPED=pairs` keeps the per-pair reduction kernels
+  (44 ms per layer at 512 tokens versus 18.7 ms tiled; rejected default).
+- Head: 64-row output tiles with `qwen4_argmax` per position; the final
+  position's full logits stay available to `qk_stage_logits`/`qk_stage_topk`.
+
+Validation: `qk qwen4-batch 3 198 N` compares serial and batched prefix
+outputs for whole, mixed (5+1+7+3) and batch-then-serial chunking at 16 to
+512 tokens (worst frame relative RMS 5e-7 to 2.5e-6, all PASS);
+`tests/gpu_qwen4_batch.py` repeats this on the full dual-GPU split against the
+F32 oracle (every greedy id matches over 16 positions, boundary rows within
+2.5e-6, final logits within 1.3e-6, reset bit-exact). Records:
+`bench/results-halo-native-batch-parity.jsonl` and the decodeopt parity file.
+Prefill GPU time at 512 tokens is about 57 ms per Halo layer (2.1 s per chunk),
+dominated by expert gate/up (18.7 ms), dense GEMMs (about 24 ms) and expert
+down (8.5 ms); the Rust head now accepts `QK_PREFILL_CHUNK` up to 512 (default
+frame 128 unchanged) and the trial script sets 512.
+
+### Decode findings and changes
+
+`QK_FLASH_PROFILE=1` (per-shader GPU time, `2` for every dispatch) and
+`QK_FLASH_TIMING=1` (host phases of the serial forward) were added. On Halo,
+the large projections already stream at 205-225 GB/s (the measured memory
+roofline), so the GPU spends about 24 ms per token in 37 layers; the two
+largest costs were outside the kernels:
+
+- PLE row gathering took 8.5 ms per token: the 35.763 GiB table is
+  disk-mapped and its rows are hash-random, so most lookups were NVMe page
+  faults under the 16 GiB service memory limit. The first stage now releases
+  the uploaded weights' page cache (`MADV_PAGEOUT`, 67.4 GiB) and reads ahead
+  and touches the PLE table and the token embedding (36.17 GiB, about 60-110 s
+  in the background after load; `QK_PLE_PREFETCH=0` disables it). A diverse
+  64-token prefill fell from 1.06 s to 0.69 s and the per-token gather to well
+  under 1 ms once resident.
+- The XTX head stage spent 3.8 ms per token copying logits out of uncached
+  write-combined staging memory; the staging buffer is now host-cached
+  (0.13 ms), which also speeds batched hidden-row readback.
+- `gemv_q5_k` reads blocks as 32-bit words (2-12% faster per shape; the old
+  kernel remains as `gemv_q5_k_v1.comp`, `QK_Q5K_SHADER` selects it in `qk
+  q5_k`). Q6_K threads per row now derive from 32-wide units, with 64 lanes on
+  NAVI31 for 2560-wide rows (head GEMV 714 -> 596 us in isolation).
+- `qwen4_gdn_step`: 256-thread delta step (two lanes per state row);
+  `QK_GDN_STEP=v1` keeps `dn_step_gate`. Independent projections (GDN qkv/gate/
+  alpha/beta, attention q/k/v, HC up/inject, PLE key/value, routed/shared
+  gate-up) no longer drain the GPU between them.
+- Rejected after measurement: 16-bit-word Q6_K and routed Q8_0 kernels (596 ->
+  725 us and 241 -> 254 us; the byte-addressed originals stay), and forcing the
+  Halo iGPU performance level (no change).
+- XTX DPM: `power_dpm_force_performance_level=high` on 0000:68:00.0 cut its
+  stage from 6.4 to 4.2 ms per token (33.2 -> 34.8 tok/s in the
+  `tests/gpu_qwen4_timing.py` loop; four alternating rounds). It is a stock
+  DPM level, set at runtime for this trial, reversible with `auto`;
+  `deploy/91-amdgpu-navi31-perf-high.rules` is an optional, uninstalled rule.
+
+Serial full-model parity and replay bit-equality were re-run after these
+changes (`bench/results-halo-native-decodeopt-parity.jsonl`); the hot
+16-token loop measured 34-35 tok/s (26-27.5 before).
+
+### Memory plan and runtime state
+
+Transient units (recreate with `systemd-run` after a reboot; nothing enabled):
+`qwen-native-flash-worker32` (XTX, MemoryHigh 12G / MemoryMax 20G),
+`qwen-native-flash-server32` (Halo, MemoryHigh 52G / MemoryMax 58G so the
+36.17 GiB of lookup tables stay resident; MemoryCurrent settles near 47 GiB),
+`qwen-native-flash-router` (8091, unchanged), each with `NoNewPrivileges`,
+512 MiB swap limits and no core dumps. With everything running the node shows
+121 GiB total, about 73 GiB used (the Halo weights live in system memory),
+45 GiB cache and 48 GiB available. The XTX performance level is `high` until
+reboot or `echo auto`. The old enabled boot configuration is unchanged.
+
+### Remaining limits
+
+- No cooperative-matrix path: all batched GEMMs are scalar F32 (about 3.7
+  TFLOPS), which caps prefill near 210 tok/s; an F16 coopmat tier would need
+  its own labeled quality evidence.
+- Decode is bandwidth-bound on Halo at about 24 ms of GPU time per token
+  against a 15.5 ms roofline; the rest is many small dispatches, the F32
+  router logits and expert gate/up at 186 GB/s.
+- Batched attention cost grows with the key count (query tiles bounded by
+  `QK_ATTN_BUDGET`); long-context prefill throughput was not measured.
+- PLE residency needs about 36 GiB of page cache on the first stage's node.
+- MTP, prefix snapshots and multi-sequence serving remain unimplemented.

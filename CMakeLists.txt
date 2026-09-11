@@ -93,7 +93,7 @@ set(SHADERS qwen4_ple_conv qwen4_silu qwen4_gdn_params moe_gateup_q5k moe_shared
     moe_gateup_iq4 gemm_iq4_xs embed_q8_0 moe_down_q5_1 moe_down_shared_q5_1
     qwen4_gemm_q5k qwen4_gemm_q6k qwen4_gemm_q8_0 qwen4_gemm_q5_1 qwen4_gdn_conv_batch qwen4_gdn_step_batch
     qwen4_ple_conv_batch qwen4_moe_gateup_grouped qwen4_moe_down_grouped_q8 qwen4_moe_down_grouped_q51
-    qwen4_moe_combine qwen4_silu_mul qwen4_argmax qwen4_moe_gateup_tiled qwen4_moe_down_tiled_q8 qwen4_moe_down_tiled_q51)
+    qwen4_moe_combine qwen4_silu_mul qwen4_argmax qwen4_moe_gateup_tiled qwen4_moe_down_tiled_q8 qwen4_moe_down_tiled_q51 gemv_q5_k_v1 qwen4_gdn_step)
 set(SPV_FILES "")
 foreach(s ${SHADERS})
     set(EXTRA_SHADER_DEPS)

@@ -1076,8 +1076,10 @@ static bool caseQ6K(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
         for (uint32_t k = 0; k < K; k++) acc += (double)tmp[k] * x[k];
         yref[m] = (float)acc;
     }
-    return runGemv(c, "gemv_q6_k.spv", blocks.data(), nb * sizeof(block_q6_K),
-                   x, M, K, yref, iters, K / 16);
+    // QK_Q6K_SHADER=gemv_q6_k_v1.spv benchmarks the byte-addressed original.
+    const char* q6kShader = getenv("QK_Q6K_SHADER");
+    return runGemv(c, q6kShader ? q6kShader : "gemv_q6_k.spv", blocks.data(), nb * sizeof(block_q6_K),
+                   x, M, K, yref, iters, K / 32);
 }
 
 template<typename Block, bool Superblock>
@@ -1112,7 +1114,9 @@ static bool caseQ5(VkCtx& c, uint32_t M, uint32_t K, uint32_t iters) {
         reference[row] = (float)sum;
     }
     printf("\n== %s GEMV M=%u K=%u ==\n", Superblock ? "Q5_K" : "Q5_1", M, K);
-    return runGemv(c, Superblock ? "gemv_q5_k.spv" : "gemv_q5_1.spv",
+    // QK_Q5K_SHADER=gemv_q5_k_v1.spv benchmarks the byte-addressed original.
+    const char* q5kShader = getenv("QK_Q5K_SHADER");
+    return runGemv(c, Superblock ? (q5kShader ? q5kShader : "gemv_q5_k.spv") : "gemv_q5_1.spv",
                    blocks.data(), blocks.size() * sizeof(Block), x, M, K,
                    reference, iters, K / 32);
 }
@@ -1587,7 +1591,8 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     Pipe pGuIq3  = makePipe(c, guQ5 ? "moe_gateup_q5k.spv" : (guIq4 ? "moe_gateup_iq4.spv" : "moe_gateup_iq3.spv"),
                            5, 16, guQ5 ? q5Wg : 0);
     Pipe pGuQ8   = makePipe(c, sharedQ5 ? "moe_shared_q5k.spv" : "moe_gateup_q8.spv", 4, 16, sharedQ5 ? q5Wg : 0);
-    Pipe pDnIq4  = makePipe(c, downQ51 ? "moe_down_q5_1.spv" : (downQ8 ? "moe_down_q8_routed.spv" : (downQ6 ? "moe_down_q6k.spv" : "moe_down_iq4.spv")),
+    const char* downQ8Shader = getenv("QK_MOE_DOWN_SHADER");  // A/B: moe_down_q8_routed_v1.spv
+    Pipe pDnIq4  = makePipe(c, downQ51 ? "moe_down_q5_1.spv" : (downQ8 ? (downQ8Shader ? downQ8Shader : "moe_down_q8_routed.spv") : (downQ6 ? "moe_down_q6k.spv" : "moe_down_iq4.spv")),
                            4, 16, downQ8 || downQ51 ? q8Wg : (downQ6 ? 0 : 256));
     Pipe pDnQ8   = makePipe(c, sharedDownQ51 ? "moe_down_shared_q5_1.spv" : "moe_down_q8.spv", 4, 16, sharedDownQ51 ? 64 : 0);
 

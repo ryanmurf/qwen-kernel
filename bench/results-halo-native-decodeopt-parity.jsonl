@@ -1,0 +1,14 @@
+{"full_model_parity": "PASS", "frames": 16, "reset_exact": true}
+{"replay_vs_record": "bit-exact", "frames": 16}
+{"trial": 0, "replay": 0, "tokens": 16, "seconds": 0.46504415600793436, "tokens_per_second": 34.40533504893031}
+{"trial": 1, "replay": 1, "tokens": 16, "seconds": 0.45619834202807397, "tokens_per_second": 35.07246415861673}
+{"trial": 2, "replay": 1, "tokens": 16, "seconds": 0.45405733498046175, "tokens_per_second": 35.237840614750745}
+{"trial": 3, "replay": 0, "tokens": 16, "seconds": 0.4733853829675354, "tokens_per_second": 33.79910021661416}
+{"trial": 4, "replay": 0, "tokens": 16, "seconds": 0.4700393470120616, "tokens_per_second": 34.03970348803464}
+{"trial": 5, "replay": 1, "tokens": 16, "seconds": 0.45639177499106154, "tokens_per_second": 35.057599362550654}
+{"scenario": "serial", "chunks": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "worst_boundary_relative_rms": 1.8680841945229253e-06, "final_logit_relative_rms": 9.270159156275544e-07, "final_logit_max_abs": 1.481175422668457e-05, "argmax_mismatches": [], 
+{"scenario": "batched_whole", "chunks": [16], "worst_boundary_relative_rms": 2.2952869114381303e-06, "final_logit_relative_rms": 1.243800201182509e-06, "final_logit_max_abs": 1.901388168334961e-05, "argmax_mismatches": [], "seconds": 0.34428871603449807, "toke
+{"scenario": "batched_mixed", "chunks": [5, 1, 7, 3, 16], "worst_boundary_relative_rms": 2.2648304252131555e-06, "final_logit_relative_rms": 1.2323584691134576e-06, "final_logit_max_abs": 1.817941665649414e-05, "argmax_mismatches": [], "seconds": 0.97241407301
+{"scenario": "batch_then_serial", "chunks": [8, 1, 1, 1, 1, 1, 1, 1, 1], "worst_boundary_relative_rms": 2.2952869114381303e-06, "final_logit_relative_rms": 9.146793158326647e-07, "final_logit_max_abs": 1.33514404296875e-05, "argmax_mismatches": [], "seconds": 
+{"scenario": "batched_vs_serial", "worst_boundary_relative_rms": 2.5742712606938623e-06, "final_logit_relative_rms": 1.303179445641769e-06, "mixed_vs_whole_logit_relative_rms": 1.2169842817088406e-06, "half_vs_whole_logit_relative_rms": 1.1960652280075036e-06}
+{"batched_parity": "PASS", "frames": 16, "reset_exact": true}

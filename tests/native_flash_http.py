@@ -17,6 +17,7 @@ def main():
     p.add_argument("--cancel-only",action="store_true")
     p.add_argument("--skip-cancel",action="store_true",help="skip direct-engine disconnect check when testing a buffering proxy")
     p.add_argument("--prefill-tokens",type=int,default=0,help="optional one-output-token prompt-processing timing")
+    p.add_argument("--prefill-diverse",action="store_true",help="use distinct token ids for the prefill benchmark (defeats the PLE row cache like real text)")
     args=p.parse_args()
     def open_request(path,body):
         req=urllib.request.Request(args.url+path,data=json.dumps(body).encode(),
@@ -80,11 +81,12 @@ def main():
            content="".join(chunks),reported_timings=final.get("timings"))
     if args.prefill_tokens:
         assert 1<=args.prefill_tokens<=4096
+        prompt_ids=[1000+i for i in range(args.prefill_tokens)] if args.prefill_diverse else [9419]*args.prefill_tokens
         start=time.monotonic()
-        out=post("/completion",{"prompt":[9419]*args.prefill_tokens,"n_predict":1,
+        out=post("/completion",{"prompt":prompt_ids,"n_predict":1,
                  "temperature":0,"return_tokens":True,"cache_prompt":False})
         elapsed=time.monotonic()-start
-        record("prefill_benchmark",prompt_tokens=args.prefill_tokens,seconds=elapsed,
+        record("prefill_benchmark",prompt_tokens=args.prefill_tokens,diverse=args.prefill_diverse,seconds=elapsed,
                prompt_tokens_per_second=args.prefill_tokens/elapsed,
                reported_timings=out.get("timings"),output_tokens=out.get("tokens"))
     if args.benchmark_only: return

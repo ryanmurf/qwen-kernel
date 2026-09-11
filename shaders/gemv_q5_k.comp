@@ -1,21 +1,20 @@
 #version 460
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_shader_8bit_storage : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// y[M] = W[M,K] . x[K], W in raw ggml Q5_K super-blocks (176 B = 44 dwords).
+// Each lane owns one 32-element sub-block and reads it as whole dwords: the
+// scale/min words, eight qh words and eight qs words, plus eight vec4 x loads,
+// instead of one byte load per nibble. Same bindings, push constants, TPR
+// specialization, grid and batch (z) semantics as the byte-addressed original
+// (kept as gemv_q5_k_v1.comp for A/B checks).
 
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint TPR = 256u;
-struct block_q5_K {
-    float16_t d, dmin;
-    uint8_t scales[12];
-    uint8_t qh[32];
-    uint8_t qs[128];
-};
-layout(std430, binding = 0) readonly buffer W { block_q5_K w[]; };
-layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 0) readonly buffer W { uint w32[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform PC { uint M; uint K; } pc;
 shared float partial[256];
@@ -29,18 +28,34 @@ void main() {
     if (row < pc.M) {
         uint blocks = pc.K / 256u;
         for (uint sub = lane; sub < blocks * 8u; sub += TPR) {
-            uint g = sub % 8u, b = row * blocks + sub / 8u;
-            uint sc = g < 4u ? uint(w[b].scales[g]) & 63u
-                : (uint(w[b].scales[g + 4u]) & 15u) | ((uint(w[b].scales[g - 4u]) >> 6u) << 4u);
-            uint mn = g < 4u ? uint(w[b].scales[g + 4u]) & 63u
-                : (uint(w[b].scales[g + 4u]) >> 4u) | ((uint(w[b].scales[g]) >> 6u) << 4u);
-            float d = float(w[b].d) * float(sc), m = float(w[b].dmin) * float(mn);
-            uint xo = batch * pc.K + sub * 32u;
-            for (uint i = 0u; i < 32u; ++i) {
-                uint lo = (uint(w[b].qs[(g / 2u) * 32u + i]) >> ((g % 2u) * 4u)) & 15u;
-                uint hi = (uint(w[b].qh[i]) >> g) & 1u;
-                acc += (d * float(lo + 16u * hi) - m) * x[xo + i];
+            uint g = sub & 7u, base = (row * blocks + (sub >> 3u)) * 44u;
+            vec2 dm = unpackHalf2x16(w32[base]);
+            uint s0 = w32[base + 1u], s1 = w32[base + 2u], s2 = w32[base + 3u];
+            uint sc, mn;
+            if (g < 4u) {
+                sc = (s0 >> (8u * g)) & 63u;
+                mn = (s1 >> (8u * g)) & 63u;
+            } else {
+                uint j = 8u * (g - 4u);
+                uint a = (s2 >> j) & 255u;
+                sc = (a & 15u) | ((((s0 >> j) & 255u) >> 6u) << 4u);
+                mn = (a >> 4u) | ((((s1 >> j) & 255u) >> 6u) << 4u);
             }
+            float d = dm.x * float(sc), m = dm.y * float(mn);
+            uint qsBase = base + 12u + (g >> 1u) * 8u, shift = (g & 1u) * 4u;
+            uint xo = (batch * pc.K + sub * 32u) / 4u;
+            float s = 0.0, xs = 0.0;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                uint qs = w32[qsBase + j] >> shift, qh = w32[base + 4u + j] >> g;
+                vec4 xv = x4[xo + j];
+                vec4 q = vec4(float((qs & 15u) | ((qh & 1u) << 4u)),
+                              float(((qs >> 8u) & 15u) | (((qh >> 8u) & 1u) << 4u)),
+                              float(((qs >> 16u) & 15u) | (((qh >> 16u) & 1u) << 4u)),
+                              float(((qs >> 24u) & 15u) | (((qh >> 24u) & 1u) << 4u)));
+                s += dot(q, xv);
+                xs += xv.x + xv.y + xv.z + xv.w;
+            }
+            acc += d * s - m * xs;
         }
     }
     if (TPR >= gl_SubgroupSize) {
@@ -54,10 +69,7 @@ void main() {
             y[batch * pc.M + row] = sum;
         }
     } else {
-        // TPR is a power of two dividing the subgroup; XOR cannot cross rows.
-        for (uint s = TPR / 2u; s > 0u; s >>= 1u) {
-            acc += subgroupShuffleXor(acc, s);
-        }
+        for (uint s = TPR / 2u; s > 0u; s >>= 1u) acc += subgroupShuffleXor(acc, s);
         if (lane == 0u && row < pc.M) y[batch * pc.M + row] = acc;
     }
 }
