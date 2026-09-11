@@ -77,7 +77,8 @@ int qk_step_chunk(qk_engine *e, uint32_t *out_tokens, uint32_t *out_counts,
  *
  * A split engine is driven ONLY through qk_stage_run below — qk_slot_start /
  * qk_step_chunk return an error on it. The caller (one driver per sequence)
- * carries the ~8 KB/token hidden row between stages. An unsplit engine also
+ * carries qk_n_embd()*4 bytes/token between stages (~8 KiB on the older models,
+ * 40 KiB for Flash's four HC streams). An unsplit engine also
  * accepts qk_stage_run (toks in, ids out), which is the same forward pass. */
 
 uint32_t qk_layer_first(const qk_engine *e); /* a (0 when unsplit)          */
@@ -107,6 +108,11 @@ int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
  * the greedy path stays bit-identical.
  * Returns 0 on success, negative on bad args / non-last stage / no run yet. */
 int qk_stage_topk(qk_engine *e, uint32_t k, uint32_t *ids, float *vals);
+
+/* Diagnostic full-logit copy for native Flash: FINAL position after stage_run.
+ * out must hold n_vocab floats. Returns -5 on older architectures. This is
+ * for parity tests; normal serving uses the much smaller top-k interface. */
+int qk_stage_logits(qk_engine *e, float *out, uint32_t n);
 
 /* Driver-managed state snapshots (split serving's cross-turn reuse): copy a
  * slot's full recurrent state (KV + DeltaNet + conv, this stage's layers) to

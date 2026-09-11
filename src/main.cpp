@@ -4134,7 +4134,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
     if (arch == "qwen4exp") {
         const char* experimental=getenv("QK_NATIVE_FLASH");
         if (!experimental || strcmp(experimental,"1"))
-            return fail("qk_open: experimental native Flash graph requires QK_NATIVE_FLASH=1; full-model serving validation is pending");
+            return fail("qk_open: experimental native Flash graph requires QK_NATIVE_FLASH=1; MTP, batched prefill and snapshots are not implemented");
         if (nSlots!=1) return fail("qk_open: native Flash currently supports exactly one sequence");
         nLayer=48; lFirst=0; lEnd=48; vocab=248320; nExp=512; nUsed=10; ffE=640;
         eosTok=(uint32_t)g.kvInt("tokenizer.ggml.eos_token_id",248044);
@@ -6033,6 +6033,16 @@ int qk_stage_topk(qk_engine* e, uint32_t k, uint32_t* ids, float* vals) {
 }
 
 __attribute__((visibility("default")))
+int qk_stage_logits(qk_engine* e, float* out, uint32_t n) {
+    if (!e || !out || !e->lastStage() || n<e->vocab) return -1;
+    if (!e->lastRunRows) return -2;
+    if (!e->qwen4) return -5;
+    const auto& logits=e->qwen4->lastLogits();
+    memcpy(out,logits.data(),logits.size()*sizeof(float));
+    return 0;
+}
+
+__attribute__((visibility("default")))
 uint32_t qk_state_n(const qk_engine* e) { return (uint32_t)e->pcache.size(); }
 
 __attribute__((visibility("default")))
@@ -6840,7 +6850,7 @@ int main(int argc, char** argv) {
             qk_close(e);
             return 1;
         }
-        const size_t width = qk_engine::nEmbd;
+        const size_t width = qk_n_embd(e);
         std::vector<float> prefillOut(prompt.size() * width);
         auto p0 = std::chrono::steady_clock::now();
         int rc = e->stageRun(0, prompt.data(), nullptr, (uint32_t)prompt.size(), 0,

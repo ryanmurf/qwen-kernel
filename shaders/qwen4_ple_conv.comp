@@ -9,11 +9,12 @@ layout(std430,binding=1) readonly buffer W { float16_t w[]; };
 layout(std430,binding=2) buffer History { float hist[]; };
 layout(std430,binding=3) readonly buffer Gated { float gated[]; };
 layout(std430,binding=4) buffer Residual { float residual[]; };
+layout(std430,binding=5) readonly buffer Position { uint position[]; };
 layout(push_constant) uniform PC { uint channels; uint position; } pc;
 void main() {
     uint ch = gl_GlobalInvocationID.x;
     if (ch >= pc.channels) return;
-    uint slot = pc.position % 9u;
+    uint slot = position[0] % 9u;
     float value = hist[slot*pc.channels+ch] * float(w[4u*ch]);
     value += hist[((slot+3u)%9u)*pc.channels+ch] * float(w[4u*ch+1u]);
     value += hist[((slot+6u)%9u)*pc.channels+ch] * float(w[4u*ch+2u]);

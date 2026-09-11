@@ -1,0 +1,1 @@
+{"test":"prefill_cancel_then_request","result":"PASS","seconds":0.8115823810221627,"context_capacity":32768,"prefill_chunk":16,"cancelled_prompt_tokens":768,"followup_prompt_tokens":1}

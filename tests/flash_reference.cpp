@@ -14,6 +14,7 @@ struct Capture {
     std::string target, output;
     bool found = false, written = false;
     bool dump = false;
+    bool layers = false;
     unsigned step = 0;
     std::map<std::string, unsigned> occurrences;
 };
@@ -21,8 +22,9 @@ static bool capture(ggml_tensor* tensor, bool ask, void* opaque) {
     auto& c = *static_cast<Capture*>(opaque);
     const std::string name = ggml_get_name(tensor);
     const bool target = name == c.target;
-    const bool inspect = c.dump && (name == "model.input_embed" ||
-        (name.size() > 2 && name.substr(name.size()-2) == "-0"));
+    const bool inspect = (c.dump && (name == "model.input_embed" ||
+        (name.size() > 2 && name.substr(name.size()-2) == "-0"))) ||
+        (c.layers && (name.rfind("l_last-",0)==0 || name=="result_norm"));
     if (!target && !inspect) return ask ? false : true;
     if (ask) return true;
     if (target) c.found = true;
@@ -39,21 +41,28 @@ static bool capture(ggml_tensor* tensor, bool ask, void* opaque) {
     return !target;  // Intentional early cancellation after the requested layer.
 }
 int main(int argc, char** argv) {
+    std::setvbuf(stdout,nullptr,_IOLBF,0);
     if (argc < 3 || argc > 6) {
         std::fprintf(stderr, "usage: flash-reference MODEL.gguf OUT.f32 [token=198] [tensor=l_last-0] [steps=1]\n");
         return 2;
     }
     Capture state{argc > 4 ? argv[4] : "l_last-0", argv[2]};
     state.dump = std::getenv("QK_REFERENCE_DUMP") != nullptr;
+    state.layers = std::getenv("QK_REFERENCE_LAYERS") != nullptr;
     llama_log_set([](ggml_log_level level, const char* message, void*) {
         if (level == GGML_LOG_LEVEL_ERROR) std::fputs(message, stderr);
     }, nullptr);
     ggml_backend_load_all(); llama_backend_init();
-    ggml_backend_dev_t selected[] = {nullptr, nullptr};
+    ggml_backend_dev_t selected[] = {nullptr, nullptr, nullptr};
     const char* prefix = std::getenv("QK_REFERENCE_GPU_PREFIX");
+    const char* fullSplit = std::getenv("QK_REFERENCE_FULL_SPLIT");
+    const unsigned split = fullSplit ? std::atoi(fullSplit) : 0;
+    if (fullSplit && (prefix || split<34 || split>38)) {
+        std::fputs("full reference split must be 34..38 and excludes prefix mode\n",stderr); return 2;
+    }
     const unsigned lastLayer = prefix ? std::atoi(prefix) : 0;
     if (lastLayer > 3) { std::fputs("reference prefix limited to the first four layers\n",stderr); return 2; }
-    const bool gpu = prefix || std::getenv("QK_REFERENCE_GPU_LAYER0");
+    const bool gpu = fullSplit || prefix || std::getenv("QK_REFERENCE_GPU_LAYER0");
     if (gpu) {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto dev = ggml_backend_dev_get(i);
@@ -62,17 +71,37 @@ int main(int argc, char** argv) {
             selected[0] = dev;
         }
         if (!selected[0]) { std::fputs("Halo device not found\n", stderr); return 2; }
-        std::printf("reference: ONLY layers 0:%u weights on %s; all other weights CPU-mapped\n",
-                    lastLayer+1,ggml_backend_dev_description(selected[0]));
+        if (fullSplit) {
+            for (size_t i=0;i<ggml_backend_dev_count();++i) {
+                auto dev=ggml_backend_dev_get(i);
+                if (!std::strstr(ggml_backend_dev_description(dev),"NAVI31")) continue;
+                if (selected[1]) { std::fputs("ambiguous XTX device\n",stderr); return 2; }
+                selected[1]=dev;
+            }
+            if (!selected[1]) { std::fputs("XTX device not found\n",stderr); return 2; }
+            std::printf("reference full graph: Halo 0:%u, XTX %u:48 plus head; token/PLE embeddings CPU-mapped\n",split,split);
+        } else std::printf("reference: ONLY layers 0:%u weights on %s; all other weights CPU-mapped\n",
+                          lastLayer+1,ggml_backend_dev_description(selected[0]));
     }
-    const std::string layerPattern = "^blk\\.[0-"+std::to_string(lastLayer)+"]\\.";
-    llama_model_tensor_buft_override overrides[] = {
-        {layerPattern.c_str(), gpu ? ggml_backend_dev_buffer_type(selected[0]) : nullptr},
-        {".*", ggml_backend_cpu_buffer_type()}, {nullptr, nullptr}
-    };
+    std::string layerPattern="^blk\\.(";
+    for (unsigned i=0;i<(fullSplit?split:lastLayer+1);++i) layerPattern+=(i?"|":"")+std::to_string(i);
+    layerPattern+=")\\.";
+    std::vector<llama_model_tensor_buft_override> overrides;
+    if (gpu) overrides.push_back({layerPattern.c_str(),ggml_backend_dev_buffer_type(selected[0])});
+    if (fullSplit) {
+        overrides.push_back({"^blk\\.",ggml_backend_dev_buffer_type(selected[1])});
+        overrides.push_back({"^output",ggml_backend_dev_buffer_type(selected[1])});
+    }
+    overrides.push_back({".*",ggml_backend_cpu_buffer_type()});
+    overrides.push_back({nullptr,nullptr});
     auto mp = llama_model_default_params();
     mp.devices = selected; mp.n_gpu_layers = gpu ? -1 : 0;
-    mp.tensor_buft_overrides = gpu ? overrides : nullptr;
+    mp.tensor_buft_overrides = gpu ? overrides.data() : nullptr;
+    std::vector<float> proportions(llama_max_devices(),0);
+    if (fullSplit) {
+        proportions[0]=split; proportions[1]=49-split;
+        mp.tensor_split=proportions.data(); mp.split_mode=LLAMA_SPLIT_MODE_LAYER;
+    }
     mp.load_mode = LLAMA_LOAD_MODE_MMAP;
     mp.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;
     mp.use_extra_bufts = false; mp.no_host = false; mp.load_mtp = false;

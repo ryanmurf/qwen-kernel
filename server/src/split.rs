@@ -163,7 +163,11 @@ impl WorkerLink {
     /// Receive the oldest in-flight frame's reply (FIFO order): `n` ids into
     /// `ids_out`, and the frame's `topk` candidates into `cands_out` (cleared
     /// — so it holds candidates only right after a topk frame's reply).
-    pub fn recv_ids(&mut self, ids_out: &mut Vec<u32>, cands_out: &mut Vec<(u32, f32)>) -> Result<()> {
+    pub fn recv_ids(
+        &mut self,
+        ids_out: &mut Vec<u32>,
+        cands_out: &mut Vec<(u32, f32)>,
+    ) -> Result<()> {
         let Some((n, topk)) = self.pending.front().copied() else {
             anyhow::bail!("split worker recv with nothing in flight");
         };
@@ -232,7 +236,9 @@ impl WorkerLink {
             {
                 frame[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
             }
-            stream.write_all(&frame).context("split worker state write")?;
+            stream
+                .write_all(&frame)
+                .context("split worker state write")?;
             let mut status = [0u8; 4];
             stream
                 .read_exact(&mut status)
@@ -378,7 +384,6 @@ fn apply_sample(state: &mut SlotState, id: u32, eos: u32) -> bool {
     true
 }
 
-
 /// What sits downstream of the engine this driver holds.
 ///
 /// `Remote` is split serving: the engine owns layers [0,S) and forwards hidden
@@ -423,7 +428,14 @@ impl Downstream {
             Self::Remote(link) => {
                 hidden.clear();
                 hidden.resize(toks.len() * n_embd, 0.0);
-                engine.stage_run(slot, Some(toks), None, base, Some(hidden.as_mut_slice()), None)?;
+                engine.stage_run(
+                    slot,
+                    Some(toks),
+                    None,
+                    base,
+                    Some(hidden.as_mut_slice()),
+                    None,
+                )?;
                 link.send_run(slot, base, hidden, topk)
             }
             Self::Local(pipe) => {
@@ -602,6 +614,13 @@ pub fn run_split_engine_thread(
     rx: mpsc::Receiver<Cmd>,
 ) {
     let n_slots = head.n_slots() as usize;
+    // The native Flash prefill is serial GEMV for now. A smaller explicit
+    // chunk keeps cancellation responsive without changing legacy defaults.
+    let prefill_cap = std::env::var("QK_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| (1..=128).contains(n))
+        .unwrap_or(CHUNK as u32);
     let eos = head.eos_token();
     let n_embd = link.as_ref().map_or(0, |l| l.n_embd);
     let mut down = match link {
@@ -723,8 +742,12 @@ pub fn run_split_engine_thread(
                         let np = p.prompt.len() as u32;
                         let bursts = if shared { 1 } else { 2 };
                         for _ in 0..bursts {
-                            let stop = if p.snap_at > 0 && !p.snapped { p.snap_at } else { np };
-                            let n = chunk_cap(shared).min(stop - p.done);
+                            let stop = if p.snap_at > 0 && !p.snapped {
+                                p.snap_at
+                            } else {
+                                np
+                            };
+                            let n = chunk_cap(shared).min(prefill_cap).min(stop - p.done);
                             if n == 0 {
                                 break; // waiting on the snapshot barrier below
                             }
@@ -811,7 +834,9 @@ pub fn run_split_engine_thread(
                     let Some((slot_state, phase)) = state.as_mut() else {
                         continue;
                     };
-                    let Phase::Prefilling(p) = phase else { continue };
+                    let Phase::Prefilling(p) = phase else {
+                        continue;
+                    };
                     let np = p.prompt.len() as u32;
                     if p.snap_at > 0 && !p.snapped && p.done == p.snap_at {
                         let idx = pick_entry(&snaps);

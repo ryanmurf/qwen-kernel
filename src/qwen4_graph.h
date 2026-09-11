@@ -12,6 +12,7 @@ class Qwen4Graph {
     uint64_t weightLimit = 8ull<<30;
     bool withHead = false;
     bool servingBudget = false;
+    bool replayReady = false;
     std::vector<float> logits;
     std::unique_ptr<Qwen4PleLookup> ple;
     std::vector<uint32_t> tokenHistory;
@@ -28,8 +29,8 @@ class Qwen4Graph {
         VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VK_CHECK(vkBeginCommandBuffer(c.cb, &info));
     }
-    void submit() {
-        VK_CHECK(vkEndCommandBuffer(c.cb));
+    void submit(bool endRecording = true) {
+        if (endRecording) VK_CHECK(vkEndCommandBuffer(c.cb));
         VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         info.commandBufferCount = 1; info.pCommandBuffers = &c.cb;
         VK_CHECK(vkQueueSubmit(c.queue, 1, &info, VK_NULL_HANDLE));
@@ -158,15 +159,15 @@ class Qwen4Graph {
         emit("qwen4_hc.spv",{"$ple_keynorm","$dummy","$ple_query","$ple_value","$ple_gated"},pc,hc);
         pc.mode = 0;
         emit("qwen4_hc.spv",{"$ple_gated",w("ple_norm_conv.weight"),"$dummy","$dummy","$ple_normalized"},pc,hc);
-        struct { uint32_t channels,position; } conv{n*hc,position};
-        emit("qwen4_ple_conv.spv",{"$ple_normalized",w("ple_conv1d.weight"),"$ple_history","$ple_gated","$hidden"},conv,(n*hc+255)/256);
+        struct { uint32_t channels,position; } conv{n*hc,0};
+        emit("qwen4_ple_conv.spv",{"$ple_normalized",w("ple_conv1d.weight"),"$ple_history","$ple_gated","$hidden","$position"},conv,(n*hc+255)/256);
         tap("ple.output","$hidden");
     }
     void fullAttention() {
         project(w("attn_q.weight"),"$mixed","$fa_qfull");
         project(w("attn_k.weight"),"$mixed","$fa_k");
         project(w("attn_v.weight"),"$mixed","$fa_v");
-        struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; } pc{position,capacity,256,64,24,2,eps,1e7f};
+        struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; } pc{0,capacity,256,64,24,2,eps,1e7f};
         emit("fa_prep_srv.spv",{"$fa_qfull","$fa_k","$fa_v",w("attn_q_norm.weight"),w("attn_k_norm.weight"),
              "$fa_qhat",state("kcache"),state("vcache"),"$rope","$position"},pc,28);
         emit("fa_attn_srv.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att","$position"},pc,24);
@@ -366,6 +367,11 @@ public:
             ple->gather(ple->config().rows(token,tokenHistory),row.data());
             memcpy((uint8_t*)mapped+pleOffset,row.data(),row.size()*4);
         }
+        const char* replayEnv=getenv("QK_FLASH_REPLAY");
+        const bool replayEnabled=(!replayEnv || strcmp(replayEnv,"0")) && !getenv("QK_LAYER_DUMP");
+        const bool reuse=replayReady && replayEnabled && !reset;
+        VkMemoryBarrier read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        if (!reuse) {
         VK_CHECK(vkResetDescriptorPool(c.dev,pool,0));
         begin();
         VkBufferCopy hiddenCopy{inputOffset,0,hidden.size()*4};
@@ -426,7 +432,6 @@ public:
             hcMix("head","$hidden",true);
             project("output.weight","$mixed","$output_logits");
         }
-        VkMemoryBarrier read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; read.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(c.cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&read,0,nullptr,0,nullptr);
         VkBufferCopy copy{0,0,hidden.size()*4};
@@ -437,7 +442,10 @@ public:
         }
         read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         vkCmdPipelineBarrier(c.cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&read,0,nullptr,0,nullptr);
-        submit(); memcpy(hidden.data(),mapped,hidden.size()*4);
+        submit();
+        } else submit(false);
+        replayReady=replayEnabled && !reset;
+        memcpy(hidden.data(),mapped,hidden.size()*4);
         if (withHead) {
             memcpy(logits.data(),(uint8_t*)mapped+hidden.size()*4,logits.size()*4);
             for (float value:logits) if (!std::isfinite(value)) throw std::runtime_error("nonfinite native logits");

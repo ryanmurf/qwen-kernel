@@ -122,6 +122,11 @@ pub(crate) enum FlushOutcome {
 // thread. On a full channel we stop and try again next tick.
 pub(crate) fn flush_slot(state: &mut SlotState) -> FlushOutcome {
     use tokio_mpsc::error::TrySendError;
+    // Prefill produces no pending output. Detect disconnect even then,
+    // otherwise the abandoned prompt runs all the way to its first token.
+    if state.events.is_closed() {
+        return FlushOutcome::Closed;
+    }
     while let Some(ev) = state.pending.pop_front() {
         match state.events.try_send(ev) {
             Ok(()) => {}
@@ -218,7 +223,9 @@ impl EngineThread {
         let local_driver = local_driver && split.is_none();
         if local_driver {
             if engine.stage_info().is_none() {
-                bail!("--local-driver requires an engine library with the stage ABI (qk_stage_run)");
+                bail!(
+                    "--local-driver requires an engine library with the stage ABI (qk_stage_run)"
+                );
             }
             if !engine.has_topk() {
                 bail!(
@@ -427,5 +434,38 @@ fn handle_step(engine: &mut Engine, out: &StepOut, slots: &mut [Option<SlotState
                 *state = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn disconnected_prefill_is_cancelled_without_pending_tokens() {
+        let (tx, rx) = tokio_mpsc::channel(1);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut slot = SlotState::new(tx, 100, permit);
+        assert!(matches!(flush_slot(&mut slot), FlushOutcome::Live));
+        assert!(slot.pending.is_empty());
+        drop(rx);
+        assert!(matches!(flush_slot(&mut slot), FlushOutcome::Closed));
+    }
+
+    #[test]
+    fn full_channel_retains_output_until_consumer_drains() {
+        let (tx, mut rx) = tokio_mpsc::channel(1);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut slot = SlotState::new(tx, 100, permit);
+        slot.pending.push_back(SlotEvent::Tokens(vec![1]));
+        slot.pending.push_back(SlotEvent::Tokens(vec![2]));
+        assert!(matches!(flush_slot(&mut slot), FlushOutcome::Live));
+        assert_eq!(slot.pending.len(), 1);
+        assert!(matches!(rx.try_recv(),Ok(SlotEvent::Tokens(ids)) if ids==vec![1]));
+        slot.finished = true;
+        assert!(matches!(flush_slot(&mut slot), FlushOutcome::Drained));
+        assert!(matches!(rx.try_recv(),Ok(SlotEvent::Tokens(ids)) if ids==vec![2]));
     }
 }
