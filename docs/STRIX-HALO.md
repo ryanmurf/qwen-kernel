@@ -1,18 +1,32 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-11 (01:30 MDT): full-model F32 logit/greedy/reset parity and
-real native dual-GPU HTTP/Claude tests pass on commit 05091e2. Batched prefill
-is implemented and validated (512-token prompt 15.95 s -> 2.45 s); decode rose
-from 26.4 to 35.5 tok/s through the same HTTP path (see "Batched prefill and
-decode campaign" below). An opt-in cooperative-matrix tier is implemented but
-only partially validated. **The native endpoint is currently DOWN**: a Halo GPU
-driver out-of-memory during tier testing left 62 GiB of GPU memory pinned to an
-unkillable process and ended the GNOME session; the node needs a reboot before
-the trial units can be recreated (see "Incident 2026-09-11" below). MTP and
-prefix snapshots remain unimplemented. Production was stopped with user
-approval for testing; the runtime-only trial units are not enabled at boot.
-No Halogen binary has been installed or executed; its checkpoint is a reference
-download, not a format that this engine currently accepts.
+Status, 2026-09-11 (15:05 MDT): the native exact-tier split is serving port
+8091 again after the reboot (commit 1b1e0a0 plus this update). Full-model F32
+logit/greedy/reset parity, batched-prefill parity and the real dual-GPU
+HTTP/Claude tests pass. Measured through the HTTP path with the lookup tables
+warm and the XTX at DPM level `high`: decode 34.3-35.1 tok/s, first token
+0.55 s, 512 distinct-token prompt 2.55 s (201 tok/s), 2048 tokens 10.3 s.
+With the tables cold (`QK_PLE_PREFETCH=0`, the script default) the same build
+measured 27.7-32.8 tok/s and 6.75 s for 512 tokens. The cooperative-matrix
+tier stays opt-in and only partially validated. MTP and prefix snapshots
+remain unimplemented. The trial units are runtime-only (not enabled at boot);
+the old boot stack was stopped by the operator after the reboot and its unit
+files are unchanged. No Halogen binary has been installed or executed.
+
+Recovery on 2026-09-11 followed the incident notes below: safety fixes first
+(fail-closed prefetch guard, validated floor, bounded tier harness; commit
+263f58a), then the 4-layer prefix oracle and batch checks, then the XTX
+worker and the Halo server loaded one at a time with prefetch off and
+VRAM/GTT/MemAvailable checked before and after each load (Halo GTT 69.1 GiB,
+no driver errors), then the API suites on 8194/8091/8092. Table warming was
+then enabled by restarting only the Halo server (worker still loaded, no
+other GPU work) under a 52G/58G unit: 36.170 GiB touched in 87 s, MemFree
+42 -> 4.9 GiB, MemAvailable steady near 46 GiB, cgroup 43 GiB, no driver
+errors. The floor guard uses MemAvailable, which counts the warmed cache as
+reclaimable, so it only catches gross exhaustion; the operating rule that
+prevents the incident is that no other GPU load may start while a stage
+holds the resident tables, and every load is preceded by a drain check
+(GTT/VRAM back near idle, tables paged out by the closing stage).
 
 ## Current target
 
