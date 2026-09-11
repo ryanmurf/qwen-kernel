@@ -86,12 +86,15 @@ def main():
             rc = lib.qk_stage_logits(engines[1], logits, VOCAB)
             if rc != 0: raise RuntimeError(f"qk_stage_logits rc={rc}")
             return array("f", logits)
-        # 1. serial greedy generation from the seed -> n-token sequence
+        # 1. serial greedy generation from the seed -> n-token sequence, keeping
+        #    the serial per-position logit rows (the reference for both tiers).
         seq = list(range(198, 198+args.seed_tokens))
+        serial_rows = []
         for pos in range(n):
             tok = (u32*1)(seq[pos])
             stage(engines[0], tok, None, 1, pos, hidden, None)
             stage(engines[1], None, hidden, 1, pos, None, ids)
+            serial_rows.append(take_logits())
             if pos+1 < n and pos+1 >= len(seq): seq.append(int(ids[0]))
         seq = seq[:n]
         if any(not (0 <= t < VOCAB) for t in seq): raise AssertionError("generated id out of vocabulary")
@@ -122,15 +125,21 @@ def main():
             return rows
         exact_rows = head_rows(False)
         coop_rows = head_rows(True)
+        def kl_of(ps, pq): return sum(math.exp(a)*(a-b) for a, b in zip(ps, pq))
+        def argmax(p): return max(range(VOCAB), key=p.__getitem__)
         kl = array("d"); dlogp = array("d"); agree_rows = 0
+        kl_exact = array("d"); agree_exact_rows = 0; first_exact_divergence = None
         for i in range(n):
-            pe = logsoftmax(exact_rows[i]); pc_ = logsoftmax(coop_rows[i])
-            kl.append(sum(math.exp(a)*(a-b) for a, b in zip(pe, pc_)))
+            ps = logsoftmax(serial_rows[i]); pe = logsoftmax(exact_rows[i]); pc_ = logsoftmax(coop_rows[i])
+            kl.append(kl_of(pe, pc_))
+            kl_exact.append(kl_of(ps, pe))
+            if kl_exact[-1] > 1e-4 and first_exact_divergence is None: first_exact_divergence = i
             if i+1 < n: dlogp.append(pc_[seq[i+1]] - pe[seq[i+1]])
-            agree_rows += int(max(range(VOCAB), key=pe.__getitem__) == max(range(VOCAB), key=pc_.__getitem__))
-            exact_rows[i] = coop_rows[i] = None  # release as we go
-            pe = pc_ = None
-        del exact_rows, coop_rows
+            agree_rows += int(argmax(pe) == argmax(pc_))
+            agree_exact_rows += int(argmax(ps) == argmax(pe))
+            serial_rows[i] = exact_rows[i] = coop_rows[i] = None  # release as we go
+            ps = pe = pc_ = None
+        del serial_rows, exact_rows, coop_rows
         # 3. end-to-end greedy agreement of the three paths
         serial_ids, serial_logits, serial_s = run(False, [1]*n)
         f32_ids, f32_logits, f32_s = run(False, [n])
@@ -148,6 +157,10 @@ def main():
                   "first_stage_kl_p99_nats": kl_sorted[int(0.99*(n-1))], "first_stage_kl_max_nats": kl_sorted[-1],
                   "first_stage_next_token_mean_logprob_delta": sum(dlogp)/len(dlogp),
                   "first_stage_argmax_agree_rows": agree_rows,
+                  "exact_batched_vs_serial_kl_mean_nats": sum(kl_exact)/n,
+                  "exact_batched_vs_serial_kl_max_nats": max(kl_exact),
+                  "exact_batched_vs_serial_first_position_kl_above_1e-4": first_exact_divergence,
+                  "exact_batched_vs_serial_argmax_agree_rows": agree_exact_rows,
                   "exact_tier_batched_matches_serial": agree(f32_ids, serial_ids) == n}
         print(json.dumps(record), flush=True)
         if agree(f32_ids, serial_ids) != n:

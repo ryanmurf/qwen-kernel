@@ -283,7 +283,11 @@ class Qwen4Graph {
             emit("qwen4_gemm_reduce.spv", {"$partial",output}, pcr, (m*T + 255) / 256, 0, 1, fence);
             return;
         }
-        if (m < 128) {
+        // Skinny outputs (M < 128) at narrow batches keep the packed GEMV; at
+        // T >= 64 the masked scalar GEMM tile (rows >= M are dropped on store)
+        // is used instead. QK_FLASH_SKINNY=gemv forces the GEMV for A/B.
+        static const bool skinnyGemv = [] { const char* v = getenv("QK_FLASH_SKINNY"); return v && !strcmp(v,"gemv"); }();
+        if (m < 128 && (T < 64 || skinnyGemv)) {
             if (xStride != k || xOff || yStride != m || yOff)
                 throw std::runtime_error("skinny batched projection needs natural strides: " + weight);
             const char* shader;

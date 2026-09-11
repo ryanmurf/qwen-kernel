@@ -1,11 +1,15 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-11 (15:05 MDT): the native exact-tier split is serving port
-8091 again after the reboot (commit 1b1e0a0 plus this update). Full-model F32
-logit/greedy/reset parity, batched-prefill parity and the real dual-GPU
-HTTP/Claude tests pass. Measured through the HTTP path with the lookup tables
-warm and the XTX at DPM level `high`: decode 34.3-35.1 tok/s, first token
-0.55 s, 512 distinct-token prompt 2.55 s (201 tok/s), 2048 tokens 10.3 s.
+Status, 2026-09-11 (15:25 MDT): the native F32-tier split is serving port
+8091 after the reboot, started by `deploy/restore-native-flash.sh` with table
+warming. Full-model F32 logit/greedy/reset parity, batched-prefill parity and
+the real dual-GPU HTTP/Claude tests pass (8194, 8091, 8092). Measured through
+the HTTP path with the lookup tables warm and the XTX at DPM level `high`
+across the two restarts of this session: decode 34.1-37.9 tok/s, first token
+0.55-0.70 s, 512 distinct-token prompt 2.55-2.67 s (191-201 tok/s), 2048
+tokens 10.3-10.7 s; while the tables are still paging in, 512 tokens take
+4.3 s. The cooperative-matrix tier is opt-in with measured quality (see
+"Cooperative-matrix tier").
 With the tables cold (`QK_PLE_PREFETCH=0`, the script default) the same build
 measured 27.7-32.8 tok/s and 6.75 s for 512 tokens. The cooperative-matrix
 tier stays opt-in and only partially validated. MTP and prefix snapshots
@@ -598,7 +602,7 @@ reboot or `echo auto`. The old enabled boot configuration is unchanged.
 - PLE residency needs about 36 GiB of page cache on the first stage's node.
 - MTP, prefix snapshots and multi-sequence serving remain unimplemented.
 
-## Cooperative-matrix tier (opt-in, partially validated)
+## Cooperative-matrix tier (opt-in, measured)
 
 `QK_FLASH_COOPMAT=1` switches the batched path to f16-input, F32-accumulate
 16x16x16 KHR cooperative-matrix kernels: `qwen4_gemm_coop_{q5k,q6k,q8_0,q5_1}`
@@ -608,31 +612,66 @@ through `qwen4_gemm_dequant.glsl`), `qwen4_moe_gateup_coop` and
 groups, silu(gate)*up on the accumulator elements, scattered through LDS) and
 the existing `fa_attn_batch_coopmat` for full attention.
 `QK_FLASH_COOPMAT_MOE=0` keeps the scalar expert tiles under the tier. The HC
-low-rank rows now use a 384-float stride so the 320-row down projection fills
-complete tiles in either tier. The exact tier (scalar F32) stays the default
-and the parity harnesses force it.
+low-rank rows use a 384-float stride so the 320-row down projection fills
+complete tiles in either tier. The F32 tier stays the default; the trial
+script pins `QK_FLASH_COOPMAT=0` unless the operator overrides it, and the
+oracle harness (`tests/gpu_qwen4_batch.py`) forces the F32 tier.
 
-Measured on the 4-layer prefix graph at 512 tokens (Halo): GPU time 218 ms
-exact -> 118 ms coopmat; warm batch wall 0.230 s -> 0.138 s. Per-kernel:
-dense Q5_K GEMM 35 -> 10 ms, Q6_K 14.8 -> 2.7 ms, expert gate/up 72.6 ->
-49 ms, expert down 33.7 -> 18.5 ms, attention 5.8 -> 2.7 ms. The remaining
-exact-tier cost in that profile is the skinny 4/48-row projections (14 ms per
-4 layers through the z-batched GEMV); `QK_FLASH_SKINNY=splitk` selects a
-split-K kernel (`qwen4_gemm_skinny_*` + `qwen4_gemm_reduce`) that compiles and
-is wired but has not been run on the GPU yet.
+Quality and speed, measured 2026-09-11 with `tests/gpu_qwen4_tier.py` on the
+full 0:37/37:48 split (dedicated window, prefetch off, 256 positions of a
+model-generated sequence, two identical runs; records in
+`bench/results-halo-native-coopmat-tier.jsonl`):
 
-Quality evidence so far (reduced precision, not F32 parity): the synthetic
-`qk qwen4-gemm` check gives 2.7e-4 relative RMS for the coopmat GEMM (f16
-input rounding); `qk qwen4-batch` in the tier reports a median frame relative
-RMS of 1.3e-3 against serial with about 6% of frames above 1e-2, consistent
-with near-tie expert-routing flips; `tests/gpu_qwen4_tier.py` on a 256-token
-model-generated sequence (dense coopmat only, before the expert kernels)
-agreed with serial on 255/256 greedy ids (`bench/results-halo-native-coopmat-tier.jsonl`),
-batched 1.15 s versus 1.47 s exact and 7.17 s serial for the two stages. The
-extended KL/next-token log-probability run of that harness (which now also
-covers the expert and attention coopmat kernels) was interrupted by the
-incident below and has not produced a result. The tier therefore remains
-opt-in and unmeasured end-to-end over HTTP.
+| Metric (256 positions) | F32 batched vs serial | coopmat batched vs serial |
+| --- | --- | --- |
+| Greedy id agreement | 256/256 | 254/256 (positions 28, 55) |
+| Per-position KL, mean / median / p99 / max (nats) | 7.9e-6 / - / - / 5.6e-4 | 6.4e-4 / 1.7e-5 / 8.9e-3 / 2.9e-2 |
+| Next-token mean log-prob delta | - | +3.9e-4 |
+| Both stages, 256 tokens | 1.66 s (serial 7.22 s) | 0.94 s |
+
+The KL rows compare the head re-run one position at a time on each tier's
+batched hidden rows against the serial rows. The F32 batched tier is not
+bit-identical to serial: it agrees to F32 rounding (KL below 1e-4) for the
+first 182 positions of this sequence and then deviates slightly (max KL
+5.6e-4, greedy unchanged), which is consistent with one near-tie expert
+routing flip under a different F32 summation order (batched attention and
+the router GEMM reduce in a different order than the serial kernels). The
+16-position F32-oracle parity (`tests/gpu_qwen4_batch.py`) is unaffected.
+The coopmat tier trades a mean 6.4e-4 nats of divergence and 2/256 greedy
+flips for 1.76x faster prefill on this split; it remains opt-in and has not
+been exercised through the HTTP suite.
+
+Prefix-graph timings (4 layers, 512 tokens, GPU time from `QK_FLASH_PROFILE`):
+Halo 253-256 ms F32 tier in the 15:00 session (218 ms in the 00:30 session,
+same code; the difference tracks the day's device state and is why A/B
+numbers are only compared within one session), coopmat 118 ms (00:30
+session); XTX 58 ms coopmat. In the prefix batch check the coopmat tier shows
+a median frame relative RMS of 1.6e-3 against serial with 6-9% of frames
+above 1e-2 (expert-routing flips inside four layers), so `qk qwen4-batch`
+reports the tier as FAIL against its reduced-precision budget; the
+token-level harness above is the evidence that counts for serving.
+
+Rejected after measurement (Halo, 512 tokens, F32 tier, same session):
+a split-K kernel for the 4/48-row projections (`QK_FLASH_SKINNY=splitk`,
+256.4 ms total versus 256.0 ms with the z-batched GEMV) and the masked
+128-row GEMM tile for them (`QK_FLASH_SKINNY=gemm`, 252.9 ms); neither
+changes the total, so the packed GEMV stays. Note for readers of the
+profile: dispatches recorded with `fence=false` carry no timestamp, so their
+GPU time is attributed to the next fenced dispatch (the "gemv_q5_k" row at
+512 tokens mostly contains the unfenced GDN qkv/gate/alpha GEMMs).
+
+### Page-cache hygiene (added 2026-09-11)
+
+`systemctl stop` sends SIGTERM; the Rust server previously exited without
+closing the engine, so the warmed tables stayed in the page cache after the
+stage was gone (observed: 42 GiB cached, 5 GiB free with all units stopped).
+The server now shuts the engine down on SIGTERM as well as SIGINT, which
+runs the stage's page-out on close. `deploy/release-model-cache.py` drops the
+model shards' page cache with a targeted `POSIX_FADV_DONTNEED` for the case
+where a process died without it, and `deploy/restore-native-flash.sh` runs
+the whole safe start sequence: refuse while GPU memory is not drained or a
+GPU process is stuck, release the shard cache, XTX worker, Halo server
+(warming only after both are up, under 52G/58G limits), then the router.
 
 ## Incident 2026-09-11 (00:41-01:20 MDT): Halo driver out of memory
 

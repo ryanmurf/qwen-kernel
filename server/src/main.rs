@@ -129,11 +129,29 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("qk-server listening on http://{}", listener.local_addr()?);
     let app = router(state);
+    // SIGINT (ctrl-c) and SIGTERM (systemctl stop) both drain the HTTP server
+    // and then shut the engine thread down, which drops the engine and runs
+    // qk_close: the native Flash stage pages its warmed lookup tables out of
+    // the page cache there, so a later GPU load starts from a drained node.
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = ctrl_c.await;
+            }
         })
         .await?;
+    tracing::info!("shutting down: closing the engine");
     engine_thread.shutdown();
     Ok(())
 }
