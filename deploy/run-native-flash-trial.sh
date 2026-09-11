@@ -16,9 +16,12 @@ export QK_NATIVE_FLASH=1 QK_GGUF="$model" QK_SHADER_DIR="$project_root/build-hal
 unset QK_DEVICE QK_DEVICE_PCI QK_LAYER_DUMP
 export QK_REASONING_EFFORT=${QK_REASONING_EFFORT:-xhigh}
 export QK_PREFILL_CHUNK=${QK_PREFILL_CHUNK:-512}
-# The first stage keeps the 35.763 GiB PLE table and the token embedding in
-# page cache (see docs/STRIX-HALO.md, memory plan): launch the server unit with
-# MemoryHigh>=52G (MemoryMax 58G on Max) or set QK_PLE_PREFETCH=0.
+# Page-cache warming of the 35.763 GiB PLE table is OFF unless the operator
+# sets QK_PLE_PREFETCH=1 (needs MemoryHigh>=52G on the server unit and no
+# other GPU loads; see docs/STRIX-HALO.md, memory plan and incident notes).
+export QK_PLE_PREFETCH=${QK_PLE_PREFETCH:-0}
+# The cooperative-matrix prefill tier stays opt-in (QK_FLASH_COOPMAT=1).
+export QK_FLASH_COOPMAT=${QK_FLASH_COOPMAT:-0}
 if [[ "$mode" == worker ]]; then
     export QK_DEVICE_NAME=NAVI31 QK_PIPE_HOST=127.0.0.1
     exec "$project_root/build-halo/qk" pipe-worker 8195 37:48 "$context" 1
