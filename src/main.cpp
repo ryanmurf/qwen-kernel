@@ -7876,6 +7876,8 @@ int main(int argc, char** argv) {
         ok = caseQwen4Prefix(c, ggufPath(), argU(2,198), argc > 3 ? argv[3] : nullptr, argU(4,1));
     } else if (mode == "qwen4-prefix") {
         ok = caseQwen4Prefix(c, ggufPath(), argU(3,198), argc > 4 ? argv[4] : nullptr, argU(5,1), argU(2,1));
+    } else if (mode == "qwen4-gemm") {
+        ok = caseQwen4Gemm(c, argU(2,256), argU(3,256), argU(4,64));
     } else if (mode == "qwen4-batch") {
         // qk qwen4-batch LAST_LAYER TOKEN STEPS: serial-vs-batched prefix check
         ok = caseQwen4Batch(c, ggufPath(), argU(3,198), argU(4,16), argU(2,3));

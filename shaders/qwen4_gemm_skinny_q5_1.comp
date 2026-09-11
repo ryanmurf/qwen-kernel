@@ -1,0 +1,3 @@
+#version 460
+#define QFMT 3
+#include "qwen4_gemm_skinny_impl.glsl"

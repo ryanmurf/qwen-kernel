@@ -1,0 +1,15 @@
+#version 460
+// Fold split-K partials in split order: y[yOff + t*yStride + r] =
+// sum_s partial[(s*N + t)*M + r].
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufP { float partial[]; };
+layout(std430, binding = 1) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { uint M; uint N; uint splits; uint yStride; uint yOff; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.M * pc.N) return;
+    uint t = i / pc.M, r = i - t * pc.M;
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.splits; ++s) acc += partial[(s * pc.N + t) * pc.M + r];
+    y[pc.yOff + t * pc.yStride + r] = acc;
+}

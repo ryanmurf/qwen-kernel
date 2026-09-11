@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Full native dual-GPU batched-prefill parity versus the F32 oracle and the serial path.
-Requires a dedicated GPU window (both stages loaded)."""
+Runs the exact tier (scalar F32 GEMMs, QK_FLASH_COOPMAT=0); the reduced-precision
+coopmat tier is measured by tests/gpu_qwen4_tier.py. Requires a dedicated GPU window."""
 import argparse
 import ctypes as C
 import json
@@ -46,7 +47,9 @@ def main():
     reference_ids = [max(range(248320), key=expected[s*248320:(s+1)*248320].__getitem__) for s in range(args.steps)]
     for key in ("QK_DEVICE_PCI", "QK_DEVICE", "QK_LAYER_DUMP"):
         os.environ.pop(key, None)
-    os.environ.update(QK_NATIVE_FLASH="1", QK_SHADER_DIR=os.path.abspath("build-halo/shaders"))
+    # This harness gates on the F32 oracle: force the exact tier (scalar F32 GEMMs).
+    # The reduced-precision coopmat tier is measured by tests/gpu_qwen4_tier.py.
+    os.environ.update(QK_NATIVE_FLASH="1", QK_SHADER_DIR=os.path.abspath("build-halo/shaders"), QK_FLASH_COOPMAT="0")
     lib = C.CDLL(os.path.abspath(args.library))
     u32, f32 = C.c_uint32, C.c_float
     lib.qk_open.argtypes = [C.c_char_p, C.POINTER(Config), C.c_void_p, C.c_size_t]

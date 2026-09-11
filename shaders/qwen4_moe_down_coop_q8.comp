@@ -1,0 +1,3 @@
+#version 460
+#define DOWN_Q51 0
+#include "qwen4_moe_down_coop_impl.glsl"

@@ -24,6 +24,14 @@ class Qwen4Graph {
     // hash-random, so a cold table costs one NVMe page fault per row).
     std::thread pleThread;
     std::atomic<bool> pleStop{false};
+    struct PageRange { uintptr_t start; size_t bytes; };
+    std::vector<PageRange> pleKeep;  // table ranges made resident; paged out on close
+    static size_t memAvailableBytes() {
+        FILE* f = fopen("/proc/meminfo","r"); if (!f) return SIZE_MAX;
+        char line[256]; size_t kb = SIZE_MAX;
+        while (fgets(line,sizeof line,f)) if (sscanf(line,"MemAvailable: %zu kB",&kb) == 1) break;
+        fclose(f); return kb == SIZE_MAX ? SIZE_MAX : kb*1024;
+    }
     // Batched prefill: every activation buffer holds batchCap rows so the
     // serial path (row 0) and the batched path share names and descriptors.
     // rowBytes keeps the single-token size for the debug taps.
@@ -39,7 +47,7 @@ class Qwen4Graph {
     Buf staging;
     void* mapped = nullptr;
     static constexpr size_t stageBytes = 16 << 20;
-    const uint32_t n = 2560, hc = 4, low = 320, ff = 640, experts = 512, used = 10;
+    const uint32_t n = 2560, hc = 4, low = 320, lowPad = 384, ff = 640, experts = 512, used = 10;
     float eps = 1e-6f;
     std::string w(const std::string& suffix) const { return "blk." + std::to_string(layer) + "." + suffix; }
     std::string state(const std::string& kind) const { return "$" + kind + "." + std::to_string(layer); }
@@ -243,6 +251,33 @@ class Qwen4Graph {
         if (T < 1 || buffers.at(input).size < (size_t(xOff) + size_t(T-1)*xStride + k)*4ull ||
             buffers.at(output).size < (size_t(yOff) + size_t(T-1)*yStride + m)*4ull)
             throw std::runtime_error("batched projection activation shape mismatch: " + weight);
+        // Skinny outputs (M <= 64: HC inject, GDN alpha/beta). The z-batched
+        // GEMV re-reads the small weights per token (1.3 ms per dispatch at 512
+        // tokens), so wide batches use the split-K kernel below instead.
+        // QK_FLASH_SKINNY=splitk enables the split-K kernel (compiled and
+        // wired, not yet measured or parity-checked on the GPU).
+        static const bool splitK = [] { const char* v = getenv("QK_FLASH_SKINNY"); return v && !strcmp(v,"splitk"); }();
+        if (splitK && m <= 64 && T >= 64 && batchCap && buffers.count("$partial")) {
+            // Split-K skinny projection: partials per 64-wide K split, folded
+            // in order by the reduce kernel (deterministic).
+            const char* shader;
+            switch (tensor->type) {
+                case GGML_Q5_K: shader = "qwen4_gemm_skinny_q5k.spv"; break;
+                case GGML_Q6_K: shader = "qwen4_gemm_skinny_q6k.spv"; break;
+                case GGML_Q8_0: shader = "qwen4_gemm_skinny_q8_0.spv"; break;
+                case GGML_Q5_1: shader = "qwen4_gemm_skinny_q5_1.spv"; break;
+                default: throw std::runtime_error("unsupported batched projection format: " + weight);
+            }
+            if (k % 64 || ((tensor->type == GGML_Q5_K || tensor->type == GGML_Q6_K) && k % 256))
+                throw std::runtime_error("batched projection needs K%64 (K%256 for K-quants): " + weight);
+            const uint32_t splits = k / 64;
+            if (buffers.at("$partial").size < size_t(splits)*T*m*4) throw std::runtime_error("skinny partial buffer too small: " + weight);
+            struct { uint32_t m,k,n,xs,xo; } pcs{m,k,T,xStride,xOff};
+            launch(shader, {weight,input,"$partial"}, pcs, (T + 63) / 64, splits, 1, 0);
+            struct { uint32_t m,n,splits,ys,yo; } pcr{m,T,splits,yStride,yOff};
+            emit("qwen4_gemm_reduce.spv", {"$partial",output}, pcr, (m*T + 255) / 256, 0, 1, fence);
+            return;
+        }
         if (m < 128) {
             if (xStride != k || xOff || yStride != m || yOff)
                 throw std::runtime_error("skinny batched projection needs natural strides: " + weight);
@@ -255,18 +290,32 @@ class Qwen4Graph {
                 case GGML_Q8_0: shader = "gemv_q8_0.spv"; units = k/32; break;
                 default: throw std::runtime_error("unsupported projection format: " + weight);
             }
-            uint32_t tpr = 256;
+            // Pack up to 16 output rows per workgroup so each token's activation
+            // row is read once per workgroup instead of once per output row
+            // (4-row inject: 1 workgroup per token; 48-row alpha/beta: 3).
+            uint32_t rowsPerWg = 1;
+            while (rowsPerWg < 16 && rowsPerWg < m) rowsPerWg *= 2;
+            uint32_t tpr = 256 / rowsPerWg;
             while (tpr > 4 && tpr/2 >= units) tpr /= 2;
             struct { uint32_t m,k; } pc{m,k};
             emit(shader, {weight,input,output}, pc, (m + 256/tpr - 1) / (256/tpr), tpr, T, fence);
             return;
         }
+        // QK_FLASH_COOPMAT=1 selects the f16-input cooperative-matrix tier for
+        // complete 128-row tiles (reduced precision, measured separately); the
+        // scalar F32 GEMM remains the reference path and the fallback.
+        const char* coopEnv = getenv("QK_FLASH_COOPMAT");  // read per call so tests can switch tiers in-process
+        const bool coopWanted = coopEnv && strcmp(coopEnv,"0");
+        const uint32_t mPad = (m + 127) / 128 * 128;
+        const bool coop = coopWanted && c.cooperativeMatrix && c.cooperativeMatrixF32Acc && c.subgroupSize == 64 &&
+                          (m % 128 == 0 || yStride >= mPad) &&
+                          buffers.at(output).size >= (size_t(yOff) + size_t((T + 63) / 64 * 64 - 1)*yStride + mPad)*4ull;
         const char* shader;
         switch (tensor->type) {
-            case GGML_Q5_K: shader = "qwen4_gemm_q5k.spv"; break;
-            case GGML_Q6_K: shader = "qwen4_gemm_q6k.spv"; break;
-            case GGML_Q8_0: shader = "qwen4_gemm_q8_0.spv"; break;
-            case GGML_Q5_1: shader = "qwen4_gemm_q5_1.spv"; break;
+            case GGML_Q5_K: shader = coop ? "qwen4_gemm_coop_q5k.spv" : "qwen4_gemm_q5k.spv"; break;
+            case GGML_Q6_K: shader = coop ? "qwen4_gemm_coop_q6k.spv" : "qwen4_gemm_q6k.spv"; break;
+            case GGML_Q8_0: shader = coop ? "qwen4_gemm_coop_q8_0.spv" : "qwen4_gemm_q8_0.spv"; break;
+            case GGML_Q5_1: shader = coop ? "qwen4_gemm_coop_q5_1.spv" : "qwen4_gemm_q5_1.spv"; break;
             default: throw std::runtime_error("unsupported batched projection format: " + weight);
         }
         if (k % 64 || ((tensor->type == GGML_Q5_K || tensor->type == GGML_Q6_K) && k % 256))
@@ -344,10 +393,13 @@ class Qwen4Graph {
         };
         HcPC pc{n,hc,T,0,eps};
         emit("qwen4_hc.spv", {residual,name("norm.weight"),"$dummy","$dummy","$norm"}, pc, hc, 0, T);
-        projectBatch(name("down.weight"), "$norm", "$low", T);
-        struct { uint32_t n; float scale; } silu{low*T,1.0f/hc};
-        emit("qwen4_silu.spv", {"$low","$silu"}, silu, (low*T+255)/256);
-        projectBatch(name("up.weight"), "$silu", "$gate", T, 0, 0, 0, 0, outputHead);
+        // The low-rank rows are stored with a 384-float stride so the 320-row
+        // down projection fills complete 128-row tiles; silu covers the padding
+        // (unused) and the up projection reads only the first 320 columns.
+        projectBatch(name("down.weight"), "$norm", "$low", T, 0, 0, lowPad, 0);
+        struct { uint32_t n; float scale; } silu{lowPad*T,1.0f/hc};
+        emit("qwen4_silu.spv", {"$low","$silu"}, silu, (lowPad*T+255)/256);
+        projectBatch(name("up.weight"), "$silu", "$gate", T, lowPad, 0, 0, 0, outputHead);
         if (!outputHead) projectBatch(name("inject.weight"), "$norm", "$inject", T);
         pc.mode = 1;
         emit("qwen4_hc.spv", {"$norm","$dummy","$gate","$dummy","$mixed"}, pc, (n+255)/256, 0, T);
@@ -384,10 +436,12 @@ class Qwen4Graph {
             return (uint64_t)(x < 4096 ? 4096 : x); }();
         uint32_t qt = (uint32_t)std::max<uint64_t>(1, attnBudget / (uint64_t)(base + T));
         qt = std::min(qt, T); qt = std::max(16u, qt - qt % 16u);
+        const char* coopEnv = getenv("QK_FLASH_COOPMAT");
+        const bool coopAttn = coopEnv && strcmp(coopEnv,"0") && c.cooperativeMatrix && c.cooperativeMatrixF32Acc && c.subgroupSize == 64;
         for (uint32_t qo = 0; qo < T; qo += qt) {
             uint32_t tile = std::min(qt, T - qo);
             pc.qbase = qo;
-            emit("fa_attn_batch.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att"},pc,24,0,(tile+15)/16);
+            emit(coopAttn ? "fa_attn_batch_coopmat.spv" : "fa_attn_batch.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att"},pc,24,0,(tile+15)/16);
         }
         projectBatch(w("attn_output.weight"),"$att","$block",T);
     }
@@ -418,8 +472,12 @@ class Qwen4Graph {
         // QK_MOE_GROUPED=pairs keeps the per-pair reduction kernels for A/B
         // checks; the default tiles each expert's tokens in groups of 16.
         static const bool pairKernels = [] { const char* v = getenv("QK_MOE_GROUPED"); return v && !strcmp(v,"pairs"); }();
+        const char* coopEnv = getenv("QK_FLASH_COOPMAT");
+        const char* coopMoeEnv = getenv("QK_FLASH_COOPMAT_MOE");  // =0 keeps the scalar expert tiles under the coopmat tier
+        const bool coop = coopEnv && strcmp(coopEnv,"0") && !(coopMoeEnv && !strcmp(coopMoeEnv,"0")) &&
+                          c.cooperativeMatrix && c.cooperativeMatrixF32Acc && c.subgroupSize == 64;
         if (pairKernels) launch("qwen4_moe_gateup_grouped.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$offsets","$pairs","$ffh"},moe,ff,experts,1,0);
-        else launch("qwen4_moe_gateup_tiled.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$offsets","$pairs","$ffh"},moe,ff/128,experts,1,0);
+        else launch(coop?"qwen4_moe_gateup_coop.spv":"qwen4_moe_gateup_tiled.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$offsets","$pairs","$ffh"},moe,ff/128,experts,1,0);
         projectBatch(w("ffn_gate_shexp.weight"),"$mixed","$sg",T,0,0,0,0,false);
         projectBatch(w("ffn_up_shexp.weight"),"$mixed","$su",T);
         struct { uint32_t n; } sm{ff*T};
@@ -427,7 +485,8 @@ class Qwen4Graph {
         projectBatch(w("ffn_down_shexp.weight"),"$sh","$shared_out",T);
         if (pairKernels) launch(downQ51?"qwen4_moe_down_grouped_q51.spv":"qwen4_moe_down_grouped_q8.spv",
                {w("ffn_down_exps.weight"),"$ffh","$sel","$offsets","$pairs","$routed"},moe,n,experts,1,0);
-        else launch(downQ51?"qwen4_moe_down_tiled_q51.spv":"qwen4_moe_down_tiled_q8.spv",
+        else launch(coop ? (downQ51?"qwen4_moe_down_coop_q51.spv":"qwen4_moe_down_coop_q8.spv")
+                         : (downQ51?"qwen4_moe_down_tiled_q51.spv":"qwen4_moe_down_tiled_q8.spv"),
                {w("ffn_down_exps.weight"),"$ffh","$sel","$offsets","$pairs","$routed"},moe,n/128,experts,1,0);
         struct { uint32_t n,used; } comb{n,used};
         emit("qwen4_moe_combine.spv",{"$routed","$shared_out","$sel","$block"},comb,(n+255)/256,0,T);
@@ -442,12 +501,12 @@ class Qwen4Graph {
         }
     }
     size_t batchBytes(uint32_t rows) const {
-        size_t per = size_t(n)*hc*4*6 + size_t(n)*4*3 + (low*2 + hc + 48*2 + 96)*4 + 6144ull*4*2;
+        size_t per = size_t(n)*hc*4*6 + size_t(n)*4*3 + (lowPad*2 + hc + 48*2 + 96)*4 + 6144ull*4*2;
         if (lastLayer >= 3) per += (12288ull+512+512+6144)*4;
         if (firstLayer==0 && lastLayer>=1) per += size_t(n)*hc*4*5 + size_t(n)*4*2;
         per += experts*4 + 160 + size_t(used+1)*ff*4;
         per += size_t(used)*n*4 + size_t(ff)*4*3 + size_t(n)*4 + 4 + size_t(used)*4;
-        return per*rows + (experts+1)*4 + 10240ull*3*4 + (withHead ? size_t(headTile)*248320*4 : 0);
+        return per*rows + size_t(10240/64)*rows*64*4 + (experts+1)*4 + 10240ull*3*4 + (withHead ? size_t(headTile)*248320*4 : 0);
     }
     void expect(const std::string& name, std::initializer_list<uint64_t> shape, int type = -1) {
         const auto* tensor = g.find(name);
@@ -503,6 +562,9 @@ public:
     ~Qwen4Graph() {
         pleStop = true;
         if (pleThread.joinable()) pleThread.join();
+        // Return the lookup tables' page cache when the stage closes so the
+        // next model load starts with the memory this stage held.
+        for (const auto& r : pleKeep) madvise((void*)r.start, r.bytes, MADV_PAGEOUT);
         if (profileQuery) vkDestroyQueryPool(c.dev, profileQuery, nullptr);
         if (pool) vkDestroyDescriptorPool(c.dev, pool, nullptr);
         for (auto& [_, pipe] : pipes) destroyPipe(c, pipe);
@@ -597,10 +659,11 @@ public:
         const uint32_t rows = std::max(batchCap,1u);
         for (const auto& name : {"$hidden","$residual","$norm","$gate","$qkv","$conv"}) allocateRows(name,n*hc*4,rows);
         for (const auto& name : {"$mixed","$block","$ffout"}) allocateRows(name,n*4,rows);
-        allocateRows("$low",low*4,rows); allocateRows("$silu",low*4,rows); allocateRows("$inject",hc*4,rows); allocate("$dummy",4);
+        allocateRows("$low",lowPad*4,rows); allocateRows("$silu",lowPad*4,rows); allocateRows("$inject",hc*4,rows); allocate("$dummy",4);
         allocateRows("$alpha",48*4,rows); allocateRows("$beta",48*4,rows); allocateRows("$gb",96*4,rows);
         allocateRows("$z",6144*4,rows); allocateRows("$att",6144*4,rows);
         if (batchCap) {
+            allocate("$partial",size_t(10240/64)*rows*64*4);  // split-K partials: 160 splits x rows x 64 outputs
             allocate("$carry",10240*3*4); allocate("$offsets",(experts+1)*4); allocate("$pairs",size_t(rows)*used*4);
             allocateRows("$routed",size_t(used)*n*4,rows); allocateRows("$shared_out",n*4,rows); allocate("$ids",size_t(rows)*4);
             for (const auto& name : {"$sg","$su","$sh"}) allocateRows(name,ff*4,rows);
@@ -639,35 +702,51 @@ public:
         // per-token row lookup is a memory read instead of an NVMe page fault.
         // QK_PLE_PREFETCH=0 disables this; the service memory limit must leave
         // room for those tables' page cache.
+        // QK_PLE_PREFETCH_FLOOR_GIB (default 16) stops the readahead while
+        // MemAvailable is below that floor: the GPU driver allocates system
+        // memory for the Halo stage and fails outright (not by reclaiming
+        // cache) when the node runs out, which took down the display session
+        // once on 2026-09-11 during concurrent GPU testing.
         if (const char* v = getenv("QK_PLE_PREFETCH"); !v || strcmp(v,"0")) {
-            struct Range { uintptr_t start; size_t bytes; };
-            std::vector<Range> release, keep;
+            std::vector<PageRange> release, keep;
             const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             auto range = [&](const GgufTensor& t) {
                 uintptr_t start = (uintptr_t)t.data & ~(uintptr_t)(page-1);
-                return Range{start, ((uintptr_t)t.data + t.nbytes + page-1 & ~(uintptr_t)(page-1)) - start};
+                return PageRange{start, ((uintptr_t)t.data + t.nbytes + page-1 & ~(uintptr_t)(page-1)) - start};
             };
             for (const auto& [name,tensor] : g.tensors()) {
                 if (!tensor.data || !tensor.nbytes) continue;
                 if (name == "token_embd.weight" || (ple && name == "per_layer_token_embd.weight")) keep.push_back(range(tensor));
                 else if (buffers.count(name)) release.push_back(range(tensor));
             }
-            pleThread = std::thread([this,release,keep,page] {
+            pleKeep = keep;
+            const char* floorEnv = getenv("QK_PLE_PREFETCH_FLOOR_GIB");
+            const size_t floorBytes = (size_t)(floorEnv ? atof(floorEnv) : 16.0) * (1ull<<30);
+            pleThread = std::thread([this,release,keep,page,floorBytes] {
                 const auto began = std::chrono::steady_clock::now();
                 size_t released = 0, kept = 0;
+                bool floored = false;
                 for (const auto& r : release) { if (pleStop) return; madvise((void*)r.start, r.bytes, MADV_PAGEOUT); released += r.bytes; }
                 // The kernel clamps each WILLNEED call to the device readahead
-                // window, so issue small chunks, then touch every page.
-                const size_t chunk = 512u<<10;
+                // window, so issue small chunks, then touch every page; check
+                // the free-memory floor every 64 MiB.
+                const size_t chunk = 512u<<10, check = 64u<<20;
                 volatile uint8_t sink = 0;
                 for (const auto& r : keep) {
-                    for (size_t off = 0; off < r.bytes && !pleStop; off += chunk)
+                    for (size_t off = 0; off < r.bytes && !pleStop && !floored; off += chunk) {
+                        if (off % check == 0 && memAvailableBytes() < floorBytes) { floored = true; break; }
                         madvise((void*)(r.start+off), std::min(chunk,r.bytes-off), MADV_WILLNEED);
-                    for (size_t off = 0; off < r.bytes && !pleStop; off += page) sink += *(const volatile uint8_t*)(r.start+off);
-                    kept += r.bytes;
+                    }
+                    for (size_t off = 0; off < r.bytes && !pleStop && !floored; off += page) {
+                        if (off % check == 0 && memAvailableBytes() < floorBytes) { floored = true; break; }
+                        sink += *(const volatile uint8_t*)(r.start+off);
+                        kept = std::max(kept, off + page);
+                    }
+                    if (!floored) kept += r.bytes;
                 }
-                if (!pleStop) fprintf(stderr,"[flash] page cache: released %.3f GiB of uploaded weights, %.3f GiB of lookup tables resident after %.1f s\n",
-                    released/double(1ull<<30),kept/double(1ull<<30),std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count());
+                if (!pleStop) fprintf(stderr,"[flash] page cache: released %.3f GiB of uploaded weights, %.3f GiB of lookup tables resident after %.1f s%s\n",
+                    released/double(1ull<<30),kept/double(1ull<<30),std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count(),
+                    floored ? " (stopped at the MemAvailable floor)" : "");
             });
         }
         allocateRows("$logits",experts*4,rows); allocateRows("$sel",160,rows); allocateRows("$ffh",(used+1)*ff*4,rows);
@@ -932,8 +1011,15 @@ static bool caseQwen4Batch(VkCtx& c, const char* path, uint32_t token, uint32_t 
             auto frame = test.forward(tokens[step],step==0);
             serial.insert(serial.end(),frame.begin(),frame.end());
         }
+        // Exact tier (F32 GEMMs): every frame within 1e-5 of serial. The
+        // coopmat tier rounds inputs to f16, so near-tie expert routing can
+        // flip on a few tokens; it is judged on the median frame and the
+        // number of flipped frames, and labeled as reduced precision.
+        const char* coopEnv = getenv("QK_FLASH_COOPMAT");
+        const bool reducedTier = coopEnv && strcmp(coopEnv,"0");
         auto compare = [&](const char* label, const std::vector<float>& actual) {
-            double worst = 0, maxAbs = 0; bool exact = true;
+            std::vector<double> frames(steps);
+            double maxAbs = 0; bool exact = true;
             for (uint32_t step = 0; step < steps; ++step) {
                 double err = 0, ref = 0;
                 for (size_t i = size_t(step)*10240; i < size_t(step+1)*10240; ++i) {
@@ -943,11 +1029,14 @@ static bool caseQwen4Batch(VkCtx& c, const char* path, uint32_t token, uint32_t 
                     maxAbs = std::max(maxAbs,std::fabs(delta));
                     exact = exact && actual[i]==serial[i];
                 }
-                worst = std::max(worst,std::sqrt(err/std::max(ref,1e-20)));
+                frames[step] = std::sqrt(err/std::max(ref,1e-20));
             }
-            bool ok = worst < 1e-5;
-            printf("batch check %-16s frames=%u worst_frame_relative_rms=%.3g max_abs=%.3g%s -> %s\n",
-                   label,steps,worst,maxAbs,exact?" (bit-exact)":"",ok?"PASS":"FAIL");
+            std::vector<double> sorted(frames); std::sort(sorted.begin(),sorted.end());
+            const double worst = sorted.back(), median = sorted[steps/2];
+            const uint32_t flipped = (uint32_t)std::count_if(frames.begin(),frames.end(),[](double f) { return f > 1e-2; });
+            bool ok = reducedTier ? (median < 5e-3 && flipped <= std::max(1u,steps/50)) : worst < 1e-5;
+            printf("batch check %-16s frames=%u worst_frame_relative_rms=%.3g median=%.3g frames>1e-2=%u max_abs=%.3g%s%s -> %s\n",
+                   label,steps,worst,median,flipped,maxAbs,exact?" (bit-exact)":"",reducedTier?" [coopmat f16 tier]":"",ok?"PASS":"FAIL");
             return ok;
         };
         std::vector<float> rows(serial.size());
@@ -1039,4 +1128,67 @@ static bool caseQwen4Prefix(VkCtx& c, const char* path, uint32_t token, const ch
         printf("worst frame relative_rms=%.6g; reset exact\n",worstFrame);
         return ok;
     } catch (const std::exception& error) { fprintf(stderr,"%s\n",error.what()); return false; }
+}
+
+// Synthetic check of the batched GEMM tiers: random Q8_0 weights [M][K] and
+// activations [N][K] against a double-precision reference, scalar and coopmat.
+static bool caseQwen4Gemm(VkCtx& c, uint32_t M, uint32_t K, uint32_t N) {
+    if (!M || !K || !N || K % 64 || M % 128 || N > 4096) { fprintf(stderr,"qwen4-gemm needs M%%128==0, K%%64==0\n"); return false; }
+    std::mt19937 rng(7);
+    std::vector<block_q8_0> blocks((size_t)M*K/32);
+    for (auto& b : blocks) { b.d = qk_f32_to_f16(0.001f + 0.003f*(rng()&0xffff)/65536.f); for (auto& q : b.qs) q = (int8_t)(rng()%255-127); }
+    std::vector<float> x((size_t)N*K), dq(K);
+    for (auto& v : x) v = ((rng()&0xffff)/65536.f - 0.5f)*4.f;
+    std::vector<double> ref((size_t)N*M);
+    for (uint32_t r = 0; r < M; ++r) {
+        dequant_row_q8_0(&blocks[(size_t)r*K/32], dq.data(), K);
+        for (uint32_t t = 0; t < N; ++t) { double acc = 0; for (uint32_t k = 0; k < K; ++k) acc += double(dq[k])*x[(size_t)t*K+k]; ref[(size_t)t*M+r] = acc; }
+    }
+    auto host = [&](size_t bytes) { return createBuf(c, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false); };
+    Buf bw = host(blocks.size()*sizeof(block_q8_0)), bx = host(x.size()*4), by = host((size_t)N*M*4);
+    auto fill = [&](Buf& b, const void* src, size_t bytes) { void* p; VK_CHECK(vkMapMemory(c.dev,b.mem,0,VK_WHOLE_SIZE,0,&p)); memcpy(p,src,bytes); vkUnmapMemory(c.dev,b.mem); };
+    fill(bw, blocks.data(), blocks.size()*sizeof(block_q8_0)); fill(bx, x.data(), x.size()*4);
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16};
+    VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    info.maxSets = 4; info.poolSizeCount = 1; info.pPoolSizes = &size;
+    VkDescriptorPool pool; VK_CHECK(vkCreateDescriptorPool(c.dev,&info,nullptr,&pool));
+    bool ok = true;
+    for (const char* shader : {"qwen4_gemm_q8_0.spv","qwen4_gemm_coop_q8_0.spv"}) {
+        std::vector<float> zero((size_t)N*M, 0.f); fill(by, zero.data(), zero.size()*4);
+        Pipe pipe = makePipe(c, shader, 3, 28, 0);
+        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = pool; alloc.descriptorSetCount = 1; alloc.pSetLayouts = &pipe.dsl;
+        VkDescriptorSet set; VK_CHECK(vkAllocateDescriptorSets(c.dev,&alloc,&set));
+        Buf* bufs[3] = {&bw,&bx,&by};
+        VkDescriptorBufferInfo bi[3]; VkWriteDescriptorSet wr[3];
+        for (uint32_t i = 0; i < 3; ++i) { bi[i] = {bufs[i]->buf,0,bufs[i]->size}; wr[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstSet = set; wr[i].dstBinding = i; wr[i].descriptorCount = 1; wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &bi[i]; }
+        vkUpdateDescriptorSets(c.dev,3,wr,0,nullptr);
+        VK_CHECK(vkResetCommandBuffer(c.cb,0));
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; VK_CHECK(vkBeginCommandBuffer(c.cb,&begin));
+        struct { uint32_t m,k,n,xs,xo,ys,yo; } pc{M,K,N,K,0,M,0};
+        vkCmdBindPipeline(c.cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipe.p);
+        vkCmdBindDescriptorSets(c.cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipe.pl,0,1,&set,0,nullptr);
+        vkCmdPushConstants(c.cb,pipe.pl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);
+        vkCmdDispatch(c.cb,M/128,1,(N+63)/64);
+        VK_CHECK(vkEndCommandBuffer(c.cb));
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &c.cb;
+        VK_CHECK(vkQueueSubmit(c.queue,1,&si,VK_NULL_HANDLE)); VK_CHECK(vkQueueWaitIdle(c.queue));
+        float* out; VK_CHECK(vkMapMemory(c.dev,by.mem,0,VK_WHOLE_SIZE,0,(void**)&out));
+        double err = 0, energy = 0, worst = 0; size_t bad = 0; uint32_t firstBadRow = 0, firstBadTok = 0;
+        for (uint32_t t = 0; t < N; ++t) for (uint32_t r = 0; r < M; ++r) {
+            double v = out[(size_t)t*M+r], e = ref[(size_t)t*M+r], d = v-e;
+            err += d*d; energy += e*e;
+            double rel = std::fabs(d)/std::max(std::fabs(e),1e-3);
+            if (rel > worst) worst = rel;
+            if (rel > 0.05) { if (!bad) { firstBadRow = r; firstBadTok = t; } ++bad; }
+        }
+        vkUnmapMemory(c.dev,by.mem);
+        printf("%-28s M=%u K=%u N=%u relative_rms=%.3g worst_rel=%.3g bad(>5%%)=%zu/%zu first_bad=(row %u, token %u)\n",
+               shader,M,K,N,std::sqrt(err/std::max(energy,1e-20)),worst,bad,(size_t)N*M,firstBadRow,firstBadTok);
+        ok &= bad == 0;
+        destroyPipe(c,pipe);
+    }
+    vkDestroyDescriptorPool(c.dev,pool,nullptr);
+    destroyBuf(c,bw); destroyBuf(c,bx); destroyBuf(c,by);
+    return ok;
 }

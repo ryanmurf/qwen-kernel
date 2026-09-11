@@ -1,0 +1,121 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// Cooperative-matrix twin of qwen4_moe_gateup_tiled.comp (reduced-precision
+// tier: f16 inputs, F32 accumulation). One workgroup owns a 128-row tile of
+// one expert and walks its counting-sorted pairs in 16-token groups; each of
+// the four 64-wide subgroups owns two 16-row tiles of both matrices. The
+// silu(gate)*up epilogue runs on the accumulator elements and the tile is
+// scattered to the pairs' token/slot rows through LDS. Host requires
+// n_ff % 128 == 0, n_embd % 32 == 0 and a 64-wide subgroup.
+
+layout(local_size_x = 256) in;
+
+struct block_q5_K { float16_t d, dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; };
+layout(std430, binding = 0) readonly buffer G { block_q5_K gw[]; };
+layout(std430, binding = 1) readonly buffer U { block_q5_K uw[]; };
+layout(std430, binding = 2) readonly buffer X { float x[]; };
+layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 4) readonly buffer Pairs { uint pairs[]; };
+layout(std430, binding = 5) writeonly buffer H { float h[]; };
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+const uint TILE = 16u, BM = 128u, TN = 16u, BK = 64u, SK = BK + 8u, SO = TN + 4u;
+shared float16_t Gsh[BM * SK];
+shared float16_t Ush[BM * SK];
+shared float16_t Xsh[TN * SK];
+shared float Osh[BM * SO];
+shared uint tokTable[TN];
+shared uint slotTable[TN];
+
+// Both matrices are dequantized by the same thread (row, 32-block half), so
+// no wave-divergent buffer select is needed.
+#define DEQUANT32(BUF, OUT) { \
+    uint sc = g < 4u ? uint(BUF[b].scales[g]) & 63u \
+        : (uint(BUF[b].scales[g + 4u]) & 15u) | ((uint(BUF[b].scales[g - 4u]) >> 6u) << 4u); \
+    uint mn = g < 4u ? uint(BUF[b].scales[g + 4u]) & 63u \
+        : (uint(BUF[b].scales[g + 4u]) >> 4u) | ((uint(BUF[b].scales[g]) >> 6u) << 4u); \
+    float d = float(BUF[b].d) * float(sc), m = float(BUF[b].dmin) * float(mn); \
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) { \
+        uint lo = (uint(BUF[b].qs[(g / 2u) * 32u + i]) >> ((g % 2u) * 4u)) & 15u; \
+        uint hi = (uint(BUF[b].qh[i]) >> g) & 1u; \
+        OUT[dst + i] = float16_t(d * float(lo + 16u * hi) - m); \
+    } }
+
+void main() {
+    uint tile = gl_WorkGroupID.x;
+    uint eid = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint wave = gl_SubgroupID;
+    if (tile * BM >= pc.n_ff || eid >= pc.n_expert) return;
+    uint begin = offsets[eid], end = offsets[eid + 1u];
+    if (begin == end) return;
+
+    uint blocks = pc.n_embd / 256u;
+    uint rowLocal = tid & 127u;
+    uint blockSel = tid >> 7;
+    uint rowBlockBase = (eid * pc.n_ff + tile * BM + rowLocal) * blocks;
+
+    for (uint p0 = begin; p0 < end; p0 += TN) {
+        uint np = min(TN, end - p0);
+        if (tid < TN) {
+            uint pair = tid < np ? pairs[p0 + tid] : 0u;
+            tokTable[tid] = pair >> 4u;
+            slotTable[tid] = pair & 15u;
+        }
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+            g0 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+            g1 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+            u0 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0),
+            u1 = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+        barrier();
+        for (uint k0 = 0u; k0 < pc.n_embd; k0 += BK) {
+            {
+                uint c = k0 / 32u + blockSel;
+                uint b = rowBlockBase + c / 8u, g = c % 8u, dst = rowLocal * SK + blockSel * 32u;
+                DEQUANT32(gw, Gsh)
+                DEQUANT32(uw, Ush)
+            }
+            for (uint idx = tid; idx < TN * BK; idx += 256u) {
+                uint tt = idx / BK, kk = idx - tt * BK;
+                Xsh[tt * SK + kk] = float16_t(tt < np ? x[tokTable[tt] * pc.n_embd + k0 + kk] : 0.0);
+            }
+            barrier();
+            [[unroll]] for (uint kt = 0u; kt < BK; kt += TILE) {
+                coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> bx;
+                coopMatLoad(bx, Xsh, kt, SK, gl_CooperativeMatrixLayoutColumnMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> a;
+                coopMatLoad(a, Gsh, (wave * 2u) * TILE * SK + kt, SK, gl_CooperativeMatrixLayoutRowMajor);
+                g0 = coopMatMulAdd(a, bx, g0);
+                coopMatLoad(a, Gsh, (wave * 2u + 1u) * TILE * SK + kt, SK, gl_CooperativeMatrixLayoutRowMajor);
+                g1 = coopMatMulAdd(a, bx, g1);
+                coopMatLoad(a, Ush, (wave * 2u) * TILE * SK + kt, SK, gl_CooperativeMatrixLayoutRowMajor);
+                u0 = coopMatMulAdd(a, bx, u0);
+                coopMatLoad(a, Ush, (wave * 2u + 1u) * TILE * SK + kt, SK, gl_CooperativeMatrixLayoutRowMajor);
+                u1 = coopMatMulAdd(a, bx, u1);
+            }
+            barrier();
+        }
+        // silu(gate) * up on matching accumulator elements, then tile -> LDS
+        // (rows x tokens) -> scattered pair rows.
+        for (uint i = 0u; i < u0.length(); ++i) {
+            float gv = g0[i]; u0[i] = (gv / (1.0 + exp(-gv))) * u0[i];
+            gv = g1[i]; u1[i] = (gv / (1.0 + exp(-gv))) * u1[i];
+        }
+        coopMatStore(u0, Osh, (wave * 2u) * TILE * SO, SO, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(u1, Osh, (wave * 2u + 1u) * TILE * SO, SO, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (uint idx = tid; idx < BM * TN; idx += 256u) {
+            uint r = idx / TN, tt = idx - r * TN;
+            if (tt < np) h[(tokTable[tt] * (pc.n_used + 1u) + slotTable[tt]) * pc.n_ff + tile * BM + r] = Osh[r * SO + tt];
+        }
+        barrier();
+    }
+}

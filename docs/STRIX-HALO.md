@@ -1,14 +1,18 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-11: full-model F32 logit/greedy/reset parity and real native
-dual-GPU HTTP/Claude tests pass. Batched prefill is implemented and validated
-(512-token prompt 15.95 s -> 2.45 s); decode rose from 26.4 to 35.5 tok/s
-through the same HTTP path (see "Batched prefill and decode campaign" below).
-MTP and prefix snapshots remain unimplemented. Production was stopped with user
-approval for testing; the native trial serves port 8091, with the old
-configuration preserved. This is a runtime-only test cutover, not a persistent
-deployment. No Halogen binary has been installed or executed; its checkpoint is
-a reference download, not a format that this engine currently accepts.
+Status, 2026-09-11 (01:30 MDT): full-model F32 logit/greedy/reset parity and
+real native dual-GPU HTTP/Claude tests pass on commit 05091e2. Batched prefill
+is implemented and validated (512-token prompt 15.95 s -> 2.45 s); decode rose
+from 26.4 to 35.5 tok/s through the same HTTP path (see "Batched prefill and
+decode campaign" below). An opt-in cooperative-matrix tier is implemented but
+only partially validated. **The native endpoint is currently DOWN**: a Halo GPU
+driver out-of-memory during tier testing left 62 GiB of GPU memory pinned to an
+unkillable process and ended the GNOME session; the node needs a reboot before
+the trial units can be recreated (see "Incident 2026-09-11" below). MTP and
+prefix snapshots remain unimplemented. Production was stopped with user
+approval for testing; the runtime-only trial units are not enabled at boot.
+No Halogen binary has been installed or executed; its checkpoint is a reference
+download, not a format that this engine currently accepts.
 
 ## Current target
 
@@ -579,3 +583,73 @@ reboot or `echo auto`. The old enabled boot configuration is unchanged.
   `QK_ATTN_BUDGET`); long-context prefill throughput was not measured.
 - PLE residency needs about 36 GiB of page cache on the first stage's node.
 - MTP, prefix snapshots and multi-sequence serving remain unimplemented.
+
+## Cooperative-matrix tier (opt-in, partially validated)
+
+`QK_FLASH_COOPMAT=1` switches the batched path to f16-input, F32-accumulate
+16x16x16 KHR cooperative-matrix kernels: `qwen4_gemm_coop_{q5k,q6k,q8_0,q5_1}`
+(dense projections, 128x64 tiles, the same dequantization as the scalar GEMM
+through `qwen4_gemm_dequant.glsl`), `qwen4_moe_gateup_coop` and
+`qwen4_moe_down_coop_{q8,q51}` (per-expert 128-row tiles over 16-token pair
+groups, silu(gate)*up on the accumulator elements, scattered through LDS) and
+the existing `fa_attn_batch_coopmat` for full attention.
+`QK_FLASH_COOPMAT_MOE=0` keeps the scalar expert tiles under the tier. The HC
+low-rank rows now use a 384-float stride so the 320-row down projection fills
+complete tiles in either tier. The exact tier (scalar F32) stays the default
+and the parity harnesses force it.
+
+Measured on the 4-layer prefix graph at 512 tokens (Halo): GPU time 218 ms
+exact -> 118 ms coopmat; warm batch wall 0.230 s -> 0.138 s. Per-kernel:
+dense Q5_K GEMM 35 -> 10 ms, Q6_K 14.8 -> 2.7 ms, expert gate/up 72.6 ->
+49 ms, expert down 33.7 -> 18.5 ms, attention 5.8 -> 2.7 ms. The remaining
+exact-tier cost in that profile is the skinny 4/48-row projections (14 ms per
+4 layers through the z-batched GEMV); `QK_FLASH_SKINNY=splitk` selects a
+split-K kernel (`qwen4_gemm_skinny_*` + `qwen4_gemm_reduce`) that compiles and
+is wired but has not been run on the GPU yet.
+
+Quality evidence so far (reduced precision, not F32 parity): the synthetic
+`qk qwen4-gemm` check gives 2.7e-4 relative RMS for the coopmat GEMM (f16
+input rounding); `qk qwen4-batch` in the tier reports a median frame relative
+RMS of 1.3e-3 against serial with about 6% of frames above 1e-2, consistent
+with near-tie expert-routing flips; `tests/gpu_qwen4_tier.py` on a 256-token
+model-generated sequence (dense coopmat only, before the expert kernels)
+agreed with serial on 255/256 greedy ids (`bench/results-halo-native-coopmat-tier.jsonl`),
+batched 1.15 s versus 1.47 s exact and 7.17 s serial for the two stages. The
+extended KL/next-token log-probability run of that harness (which now also
+covers the expert and attention coopmat kernels) was interrupted by the
+incident below and has not produced a result. The tier therefore remains
+opt-in and unmeasured end-to-end over HTTP.
+
+## Incident 2026-09-11 (00:41-01:20 MDT): Halo driver out of memory
+
+While the serving units were stopped for the coopmat window, repeated GPU
+test loads (the 8 GiB prefix graph, then the full 67 GiB Halo stage for the
+tier harness) ran with about 53 GiB of page cache still resident from the
+PLE readahead of earlier runs and with the driver's retained TTM pages. The
+kernel log shows `amdgpu 0000:c1:00.0` failing page-table updates with -12
+at 00:41:40 and 00:45:21, then "Not enough memory for command submission" at
+00:46:06. gnome-shell's submission was rejected with -12 at 00:46:00 and the
+user's GNOME session (running since 2026-09-05) ended at 00:46:05; GDM's
+greeter is on seat0 now, so the desktop must be logged into again. The tier
+harness (`python3 tests/gpu_qwen4_tier.py`, PID 497595) has been in
+uninterruptible sleep in `drm_suballoc_new` inside a command submission since
+00:46, and a systemd close helper is stuck in the same allocator while freeing
+another DRM file. All GPU rings show last emitted == last signaled and a
+debugfs `amdgpu_gpu_recover` at 01:19:44 succeeded ("device wedged, but
+recovered through reset") without unblocking either task; the leaked IB
+sub-allocations from the failed submissions apparently survive the reset.
+The Halo GTT still reports 61.7 GiB in use by the stuck process, so a full
+native stage (68.9 GiB estimate) cannot load until the node reboots. No
+reboot was performed: it affects other sessions on the machine and is the
+operator's decision.
+
+Recovery steps after the reboot (the old enabled units will start first;
+stop them, then recreate the trial units as in "Memory plan and runtime
+state", with the server unit at MemoryHigh 52G / MemoryMax 58G, set the XTX
+performance level to `high` if wanted, and run `tests/native_flash_http.py`
+against 8194 and 8091). Two guards were added for the page-cache plan and
+compiled but not yet exercised: the readahead stops while `MemAvailable` is
+below `QK_PLE_PREFETCH_FLOOR_GIB` (default 16), and the tables are paged out
+when the stage closes. GPU experiments must not run beside a stage that holds
+the resident tables; a dedicated window means stopping the units and waiting
+for their memory to return.
