@@ -22,7 +22,8 @@ def main():
             for tpr in (4, 8, 16, 32, 64, 128, 256)]
     jobs += [(["qwen4-hc", str(n), str(h), str(t)], None)
              for n, h, t in ((1, 1, 1), (65, 4, 3), (2560, 4, 1),
-                              (2560, 4, 8), (257, 3, 2), (2560, 4, 32))]
+                              (2560, 4, 8), (257, 3, 2), (2560, 4, 32),
+                              (128, 48, 1), (128, 48, 32))]
     for command, tpr in jobs:
         if args.status_url:
             with urllib.request.urlopen(args.status_url, timeout=5) as r:
@@ -33,6 +34,8 @@ def main():
                                 text=True, timeout=120)
         output = result.stdout + result.stderr
         assert result.returncode == 0 and "PASS" in output and "FAIL" not in output, output
+        if command[0] == "qwen4-hc":
+            assert output.count(": PASS") == 5, output
         print(json.dumps({"device": args.device, "args": command, "tpr": tpr,
                           "passed": True}), flush=True)
 

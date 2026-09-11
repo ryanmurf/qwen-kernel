@@ -1,0 +1,8 @@
+{"device": "STRIX_HALO", "layer": 0, "seed": 7, "zero": false, "gpu_us": 243.7, "max_rel_error": 2.9e-05}
+{"device": "STRIX_HALO", "layer": 17, "seed": 99, "zero": false, "gpu_us": 247.3, "max_rel_error": 2.49e-05}
+{"device": "STRIX_HALO", "layer": 47, "seed": 1234, "zero": false, "gpu_us": 249.8, "max_rel_error": 4.57e-05}
+{"device": "STRIX_HALO", "layer": 0, "seed": 43, "zero": true, "gpu_us": 249.2, "max_rel_error": 0.0}
+{"device": "NAVI31", "layer": 0, "seed": 7, "zero": false, "gpu_us": 72.9, "max_rel_error": 6.59e-05}
+{"device": "NAVI31", "layer": 17, "seed": 99, "zero": false, "gpu_us": 126.6, "max_rel_error": 2.22e-05}
+{"device": "NAVI31", "layer": 47, "seed": 1234, "zero": false, "gpu_us": 126.0, "max_rel_error": 4.78e-05}
+{"device": "NAVI31", "layer": 0, "seed": 43, "zero": true, "gpu_us": 125.7, "max_rel_error": 0.0}

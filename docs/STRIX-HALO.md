@@ -40,6 +40,11 @@ PLE hashes use wrapping uint64 products and EOS-cut token history.
 - Subgroup-shuffle skinny-row reductions avoid workgroup shared-memory barriers.
 - Native HC per-stream RMSNorm, sigmoid/mean collapse, and residual injection,
   with token batching. These elementwise operators are not the whole HC module.
+- GDN sigmoid-gated RMSNorm and PLE signed-square-root dot gating, checked at
+  the actual 48x128 GDN shape as well as HC shapes and zero-input streams.
+- Complete native Q5_K/Q8_0 MoE operator chain, including shared experts and
+  deterministic top-10 routing. One-layer weight uploads use a bounded 16 MiB
+  staging buffer instead of a staging allocation as large as an expert tensor.
 - PLE row hashing, disk-backed CPU row gathering, bounded four-way cache
   (2686976 bytes at the default 4096 rows for this model). Actual-table smoke:
   80 misses, 112 hits, finite values and exact cached/uncached equality.
@@ -81,6 +86,37 @@ down 14.3 us, HC attention up 13.6 us; all within the CPU-reference tolerance.
 Raw synthetic sweep data: `bench/results-halo-q5-{baseline,shuffle}.jsonl`.
 GPU smoke records: `bench/results-halo-qwen4-smoke.jsonl`.
 
+### Native MoE sweep and rejected host-import path
+
+The actual layer-0 expert chain passes the CPU reference for all 27 randomized
+geometry trials (three repetitions of nine gate/down workgroup combinations).
+The median with 128/128 threads is 235.9 us, versus 259.9 us with the initial
+64/256 choice: about 9.2% lower operator time. This becomes a Halo-only default;
+`QK_MOE_Q5_WG` and `QK_MOE_Q8_WG` retain 64/128/256 overrides. Layers 0, 17 and 47
+pass with different random inputs on both devices, and all-zero input passes
+including deterministic tie routing. The active footprint is reused between
+iterations; these results are not full-model throughput or a DRAM-only benchmark.
+Raw results: `bench/results-halo-moe-q5.jsonl` and
+`bench/results-halo-moe-validation.jsonl`.
+
+The expanded GPU harness checks 70 Q5 cases plus five elementwise operators
+over eight shapes on each of two devices (150 operator checks). Records:
+`bench/results-halo-qwen4-expanded.jsonl`. The unchanged Rust server also passes
+all 38 tests, including stub-backed Anthropic and split-stage tests. These are
+protocol regressions, not proof that Flash Next is serving through that server.
+
+`QK_IMPORT_WEIGHTS=1` in `qk gguf` probes direct immutable GGUF host import.
+The local driver rejects that allocation with VkResult -13; there is no silent
+copy fallback. Mode 2 makes one aligned host copy and shares it with Vulkan;
+that is **not** zero-copy file mapping. It passes correctness but is slower and
+variable on this node (three-trial medians 23.8/39.0/49.4 us for the expert gate,
+HC down and HC up, versus 4.7/7.6/6.6 us for device-local hot-cache tests).
+Both import modes remain off by default. They require `QK_COLD_MIB=0`; import
+benchmarks do not clone the mapped weights. Raw data: `bench/results-halo-import.jsonl`.
+The test allocator requires host-visible/coherent memory and keeps the imported
+payload alive until Vulkan releases it, as required by the
+[Vulkan host-import contract](https://docs.vulkan.org/refpages/latest/refpages/source/VkImportMemoryHostPointerInfoEXT.html).
+
 ## Reproduce
 
 ```bash
@@ -92,6 +128,7 @@ QK_DEVICE_NAME=STRIX_HALO build-halo/qk counters
 python3 tests/gpu_qwen4_smoke.py --device STRIX_HALO
 python3 tests/gpu_qwen4_smoke.py --device NAVI31
 python3 bench/halo_q5_sweep.py
+python3 bench/halo_moe_sweep.py /path/to/model-00001-of-00003.gguf
 
 build-halo/qk-model-audit /path/to/model-00001-of-00003.gguf
 build-halo/qk-ple-smoke /path/to/model-00001-of-00003.gguf
@@ -107,14 +144,14 @@ reservation; final benchmarks need a dedicated window with the server drained.
 ## Remaining implementation and performance gates
 
 1. Wire the native `qwen4exp` graph: complete HC modules, PLE projection/gate/
-   dilated convolution, corrected GDN, MoE Q5 gate/up and Q8 down, and output head.
+   dilated convolution, corrected GDN recurrence, the tested MoE chain, and output head.
 2. Compare intermediate activations and greedy token IDs against the pinned
    working reference on exactly the same GGUF and input IDs. Include multi-turn,
    reset, EOS, and chunk-boundary cases before exposing requests.
 3. Establish a memory plan from measured device budgets. Do not upload the PLE
    table, blindly reserve 262144 contexts, or confuse system RAM with Vulkan's
-   advertised device-local budget. Evaluate zero-copy Halo weights before
-   duplicating file-backed pages and staging allocations.
+   advertised device-local budget. The direct-host-import experiment above did
+   not produce a usable fast path; retain device-local weights and bounded staging.
 4. Preserve the native Anthropic API and pipeline split. Transfer all four HC
    streams at stage boundaries; do not reuse the old model's hidden-vector size.
 5. Benchmark and fuse decode operations; add cooperative-matrix batched prefill,

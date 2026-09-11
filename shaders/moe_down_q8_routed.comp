@@ -1,0 +1,41 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0) in;
+struct block_q8_0 { float16_t d; int8_t qs[32]; };
+layout(std430, binding = 0) readonly buffer W { block_q8_0 dw[]; };
+layout(std430, binding = 1) readonly buffer H { float h[]; };
+struct SelT { uint ids[16]; float w[16]; float wShared; float pad[7]; };
+layout(std430, binding = 2) readonly buffer S { SelT sel[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+shared float partial[256];
+void main() {
+    uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x, rq = gl_WorkGroupID.z;
+    uint blocks = pc.n_ff / 32u;
+    float acc = 0.0;
+    if (row < pc.n_embd) {
+        for (uint task = tid; task < pc.n_used * blocks; task += gl_WorkGroupSize.x) {
+            uint s = task / blocks, b = task % blocks;
+            uint expert = min(sel[rq].ids[s], pc.n_expert - 1u);
+            uint bi = (expert * pc.n_embd + row) * blocks + b;
+            uint hi = (rq * (pc.n_used + 1u) + s) * pc.n_ff + b * 32u;
+            float sum = 0.0;
+            for (uint i = 0u; i < 32u; ++i) sum += float(dw[bi].qs[i]) * h[hi+i];
+            acc += sel[rq].w[s] * float(dw[bi].d) * sum;
+        }
+    }
+    float wave = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) partial[gl_SubgroupID] = wave;
+    barrier();
+    if (tid == 0u && row < pc.n_embd) {
+        float sum = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) sum += partial[i];
+        y[rq * pc.n_embd + row] = sum;
+    }
+}

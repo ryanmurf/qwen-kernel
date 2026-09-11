@@ -48,7 +48,7 @@ endif()
 find_package(Vulkan REQUIRED)
 find_program(GLSLC glslc REQUIRED)
 
-set(SHADERS qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
+set(SHADERS moe_gateup_q5k moe_shared_q5k moe_down_q8_routed qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
     moe_route_select moe_route_select_hier moe_select moe_select_256 moe_group_pairs moe_gateup_iq3
     moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_iq3_grouped_rowtile moe_gateup_q8
     moe_gateup_q8_64 moe_down_iq4 moe_down_iq4_grouped moe_down_iq4_grouped_rowtile moe_down_q6k
@@ -75,6 +75,10 @@ set(SHADERS qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_x
     moe_gateup_iq4 gemm_iq4_xs embed_q8_0)
 set(SPV_FILES "")
 foreach(s ${SHADERS})
+    set(EXTRA_SHADER_DEPS)
+    if(s STREQUAL "moe_gateup_q5k" OR s STREQUAL "moe_shared_q5k")
+        list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/moe_q5k_impl.glsl)
+    endif()
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/shaders/${s}.spv
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
@@ -86,6 +90,7 @@ foreach(s ${SHADERS})
                 ${CMAKE_SOURCE_DIR}/shaders/q4_0.glsl
                 ${CMAKE_SOURCE_DIR}/shaders/q8_1.glsl
                 ${CMAKE_SOURCE_DIR}/shaders/gemm_q4_0_impl.glsl
+                ${EXTRA_SHADER_DEPS}
         COMMENT "glslc ${s}.comp")
     list(APPEND SPV_FILES ${CMAKE_BINARY_DIR}/shaders/${s}.spv)
 endforeach()

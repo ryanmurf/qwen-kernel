@@ -91,6 +91,8 @@ struct VkCtx {
     uint32_t              cooperativeMatrixK = 0;
     uint32_t              cooperativeMatrixSubgroupSize = 0;
     uint32_t              subgroupSize = 64;
+    bool                  externalMemoryHost = false;
+    VkDeviceSize          importAlignment = 0;
 };
 
 static uint32_t findMemType(const VkPhysicalDeviceMemoryProperties& mp,
@@ -262,8 +264,17 @@ static void initVk(VkCtx& c, const char* argv0) {
         if (!strcmp(extension.extensionName,
                     VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
             c.cooperativeMatrix = true;
-            break;
         }
+        if (!strcmp(extension.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+            c.externalMemoryHost = true;
+    }
+    if (c.externalMemoryHost) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props.pNext = &hostProps;
+        vkGetPhysicalDeviceProperties2(c.phys, &props);
+        c.importAlignment = hostProps.minImportedHostPointerAlignment;
     }
 
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR haveCoop{
@@ -369,13 +380,11 @@ static void initVk(VkCtx& c, const char* argv0) {
     dci.pNext = &en11;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    const char* enabledExtensions[] = {
-        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
-    };
-    if (c.cooperativeMatrix) {
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = enabledExtensions;
-    }
+    std::vector<const char*> enabledExtensions;
+    if (c.cooperativeMatrix) enabledExtensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    if (c.externalMemoryHost) enabledExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    dci.enabledExtensionCount = (uint32_t)enabledExtensions.size();
+    dci.ppEnabledExtensionNames = enabledExtensions.data();
     VK_CHECK(vkCreateDevice(c.phys, &dci, nullptr, &c.dev));
     vkGetDeviceQueue(c.dev, c.qfi, 0, &c.queue);
 
@@ -441,11 +450,73 @@ static std::vector<uint32_t> loadSpv(const char* argv0, const char* name) {
 
 // ---------- generic GEMV run: upload, verify, benchmark ----------
 
+// The caller owns the page-aligned mapped range until this Buf is destroyed.
+// Require host-visible/coherent memory: non-host-visible imports have undefined
+// initial contents and cannot safely share read-only GGUF mappings with the CPU.
+static bool importMappedBuf(VkCtx& c, const void* aligned, size_t bytes, Buf& out) {
+    if (!c.externalMemoryHost || !c.importAlignment ||
+        (uintptr_t)aligned % c.importAlignment || bytes % c.importAlignment) return false;
+    VkPhysicalDeviceExternalBufferInfo query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+    query.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    query.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkExternalBufferProperties props{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+    vkGetPhysicalDeviceExternalBufferProperties(c.phys, &query, &props);
+    if (!(props.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT))
+        return false;
+    VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    external.handleTypes = query.handleType;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.pNext = &external; info.size = bytes; info.usage = query.usage;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(c.dev, &info, nullptr, &out.buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(c.dev, out.buf, &requirements);
+    auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(
+        c.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (!getProps || requirements.size > bytes ||
+        getProps(c.dev, query.handleType, aligned, &host) != VK_SUCCESS) {
+        destroyBuf(c, out); return false;
+    }
+    const uint32_t allowedTypes = host.memoryTypeBits & requirements.memoryTypeBits;
+    const VkMemoryPropertyFlags hostFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = findMemType(c.mp, allowedTypes, hostFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (type == UINT32_MAX) type = findMemType(c.mp, allowedTypes, hostFlags);
+    if (const char* overrideType = getenv("QK_IMPORT_MEMORY_TYPE")) {
+        uint32_t requested = (uint32_t)atoi(overrideType);
+        if (requested >= c.mp.memoryTypeCount || !(allowedTypes & (1u << requested)) ||
+            (c.mp.memoryTypes[requested].propertyFlags & hostFlags) != hostFlags) {
+            destroyBuf(c, out); return false;
+        }
+        type = requested;
+    }
+    if (type == UINT32_MAX) { destroyBuf(c, out); return false; }
+    printf("import memory: allowed_types=0x%x selected=%u flags=0x%x\n",
+           allowedTypes, type, c.mp.memoryTypes[type].propertyFlags);
+    VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicated.buffer = out.buf;
+    VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+    import.handleType = query.handleType; import.pHostPointer = const_cast<void*>(aligned);
+    if (props.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT)
+        import.pNext = &dedicated;
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.pNext = &import; alloc.allocationSize = bytes; alloc.memoryTypeIndex = type;
+    VkResult result = vkAllocateMemory(c.dev, &alloc, nullptr, &out.mem);
+    if (result == VK_SUCCESS) result = vkBindBufferMemory(c.dev, out.buf, out.mem, 0);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "read-only host import failed (%d); no implicit weight copy\n", result);
+        destroyBuf(c, out); return false;
+    }
+    out.size = bytes;
+    out.deviceLocal = (c.mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    return true;
+}
+
 static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
                     size_t wSize, const std::vector<float>& x, uint32_t M,
                     uint32_t K, const std::vector<float>& yref, uint32_t iters,
                     uint32_t unitsPerRow, double tol = 1e-2,
-                    bool checkArgmax = false) {
+                    bool checkArgmax = false, uint32_t importWeights = 0) {
     size_t sizeX = (size_t)K * 4, sizeY = (size_t)M * 4;
     uint32_t weightCopies = 1;
     if (const char* value = getenv("QK_COLD_MIB")) {
@@ -456,6 +527,11 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
                 512, (target + wSize - 1) / wSize);
     }
     const size_t residentWSize = wSize * (size_t)weightCopies;
+    if (importWeights > 2) return false;
+    if (importWeights && weightCopies != 1) {
+        fprintf(stderr, "host import test needs QK_COLD_MIB=0 (does not clone mapped weights)\n");
+        return false;
+    }
 
     // threads-per-row spec constant: shrink for skinny rows so a workgroup
     // covers 256/TPR rows and stays fully occupied
@@ -477,13 +553,39 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     }
     uint32_t rowsPerWg = 256 / tpr;
 
-    Buf bW = createBuf(c, residentWSize,
+    Buf bW;
+    VkDeviceSize weightOffset = 0;
+    void* importedCopy = nullptr;
+    if (importWeights) {
+        if (!c.importAlignment) return false;
+        uintptr_t aligned = (uintptr_t)wBytes / c.importAlignment * c.importAlignment;
+        weightOffset = (uintptr_t)wBytes - aligned;
+        if (weightOffset % c.props.limits.minStorageBufferOffsetAlignment) return false;
+        size_t bytes = (weightOffset + wSize + c.importAlignment - 1) / c.importAlignment * c.importAlignment;
+        if (importWeights == 2) {
+            bytes = (wSize + c.importAlignment - 1) / c.importAlignment * c.importAlignment;
+            importedCopy = std::aligned_alloc(c.importAlignment, bytes);
+            if (!importedCopy) return false;
+            memcpy(importedCopy, wBytes, wSize);
+            aligned = (uintptr_t)importedCopy;
+            weightOffset = 0;
+        }
+        if (!importMappedBuf(c, (const void*)aligned, bytes, bW)) {
+            std::free(importedCopy); return false;
+        }
+        printf("%s: %.3f MiB, offset=%llu, alignment=%llu\n",
+               importWeights == 2 ? "shared host copy (NOT zero-copy file import)" : "zero-copy GGUF import",
+               bytes / double(1 << 20), (unsigned long long)weightOffset,
+               (unsigned long long)c.importAlignment);
+    } else {
+        bW = createBuf(c, residentWSize,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    }
     Buf bX = createBuf(c, sizeX,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     Buf bY = createBuf(c, sizeY,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    Buf stage = createBuf(c, std::max(residentWSize, std::max(sizeX, sizeY)),
+    Buf stage = createBuf(c, std::max(importWeights ? size_t(0) : residentWSize, std::max(sizeX, sizeY)),
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                           false);
 
@@ -510,7 +612,9 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
         vkCmdCopyBuffer(c.cb, stage.buf, dst.buf, 1, &cp);
         submitWait();
     };
-    if (weightCopies == 1) {
+    if (importWeights) {
+        // Mapped immutable weights are already the shader's input; no staging.
+    } else if (weightCopies == 1) {
         upload(bW, wBytes, wSize);
     } else {
         for (uint32_t copy = 0; copy < weightCopies; ++copy)
@@ -576,7 +680,7 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
     std::vector<VkDescriptorBufferInfo> dbi((size_t)weightCopies * 3);
     std::vector<VkWriteDescriptorSet> wr((size_t)weightCopies * 3);
     for (uint32_t copy = 0; copy < weightCopies; ++copy) {
-        VkDeviceSize offset = (VkDeviceSize)copy * wSize;
+        VkDeviceSize offset = weightOffset + (VkDeviceSize)copy * wSize;
         dbi[(size_t)copy * 3 + 0] = {bW.buf, offset, wSize};
         dbi[(size_t)copy * 3 + 1] = {bX.buf, 0, VK_WHOLE_SIZE};
         dbi[(size_t)copy * 3 + 2] = {bY.buf, 0, VK_WHOLE_SIZE};
@@ -842,6 +946,7 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
         destroyBuf(c, bArgTok);
     }
     destroyBuf(c, bW);
+    std::free(importedCopy);  // imported payload must outlive its VkDeviceMemory
     destroyBuf(c, bX);
     destroyBuf(c, bY);
     destroyBuf(c, stage);
@@ -1265,7 +1370,8 @@ static bool caseGgufTensor(VkCtx& c, const GgufTensor* t,
             return false;
     }
     return runGemv(c, spv, t->data, (size_t)M * rowBytes, x, M, K, yref, iters,
-                   units, 1e-2, checkArgmax);
+                   units, 1e-2, checkArgmax,
+                   getenv("QK_IMPORT_WEIGHTS") ? (uint32_t)atoi(getenv("QK_IMPORT_WEIGHTS")) : 0);
 }
 
 static bool caseGguf(VkCtx& c, const std::string& tensorName, uint32_t iters) {
@@ -1342,31 +1448,46 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     if (!tGI || !tGIS || !tGE || !tUE || !tDE || !tGS || !tUS || !tDS) return false;
     const bool guIq4 = tGE->type == GGML_IQ4_XS && tUE->type == GGML_IQ4_XS;
     const bool guIq3 = tGE->type == GGML_IQ3_XXS && tUE->type == GGML_IQ3_XXS;
+    const bool guQ5 = tGE->type == GGML_Q5_K && tUE->type == GGML_Q5_K;
+    const bool sharedQ5 = tGS->type == GGML_Q5_K && tUS->type == GGML_Q5_K;
     if (tGI->type != GGML_F32 || tGIS->type != GGML_F32 ||
-        (!guIq3 && !guIq4) ||
-        (tDE->type != GGML_IQ4_XS && tDE->type != GGML_Q6_K) ||
-        tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0 || tDS->type != GGML_Q8_0) {
+        (!guIq3 && !guIq4 && !guQ5) ||
+        (tDE->type != GGML_IQ4_XS && tDE->type != GGML_Q6_K && tDE->type != GGML_Q8_0) ||
+        (!sharedQ5 && (tGS->type != GGML_Q8_0 || tUS->type != GGML_Q8_0)) || tDS->type != GGML_Q8_0) {
         fprintf(stderr, "layer %u tensor types don't match the compiled kernels\n", layer);
         return false;
     }
     const bool downQ6 = tDE->type == GGML_Q6_K;  // deep layers in the 35B GGUF
+    const bool downQ8 = tDE->type == GGML_Q8_0;
 
     const uint32_t nEmbd = (uint32_t)tGE->ne[0];
     const uint32_t nFf   = (uint32_t)tGE->ne[1];
     const uint32_t nExp  = (uint32_t)tGE->ne[2];
     const uint32_t nUsed =
         (uint32_t)g.kvInt(g.kvStr("general.architecture", "") + ".expert_used_count", 8);
-    if (nExp > 512 || nUsed > 16) {
+    if (!nExp || nExp > 512 || !nUsed || nUsed > 16 || nUsed > nExp ||
+        !nEmbd || nEmbd % 256 || !nFf || nFf % (downQ8 ? 32 : 256)) {
         fprintf(stderr, "n_expert %u / top-%u exceeds moe_select limits (512/16)\n", nExp, nUsed);
         return false;
     }
     printf("\n== moe blk.%u  n_embd=%u n_ff=%u experts=%u top-%u + shared  gate/up=%s ==\n",
-           layer, nEmbd, nFf, nExp, nUsed, guIq4 ? "IQ4_XS" : "IQ3_XXS");
+           layer, nEmbd, nFf, nExp, nUsed, ggmlTypeName(tGE->type));
 
-    auto x = randomX(nEmbd);
+    auto shape = [](const GgufTensor* t, std::initializer_list<uint64_t> dims) {
+        return t->nDims == dims.size() && std::equal(dims.begin(), dims.end(), t->ne);
+    };
+    if (!shape(tGI, {nEmbd,nExp}) || !shape(tGIS, {nEmbd}) ||
+        !shape(tGE, {nEmbd,nFf,nExp}) || !shape(tUE, {nEmbd,nFf,nExp}) ||
+        !shape(tDE, {nFf,nEmbd,nExp}) || !shape(tGS, {nEmbd,nFf}) ||
+        !shape(tUS, {nEmbd,nFf}) || !shape(tDS, {nFf,nEmbd})) {
+        fprintf(stderr, "MoE tensor dimensions are inconsistent\n"); return false;
+    }
+    uint32_t seed = getenv("QK_MOE_SEED") ? (uint32_t)atoi(getenv("QK_MOE_SEED")) : 43;
+    auto x = randomX(nEmbd, seed);
+    if (getenv("QK_MOE_ZERO_INPUT")) std::fill(x.begin(), x.end(), 0.0f);
     const size_t rbGE = ggmlRowBytes(tGE->type, nEmbd);
     const size_t rbDE = ggmlRowBytes(tDE->type, nFf);
-    const size_t rbGS = ggmlRowBytes(GGML_Q8_0, nEmbd);
+    const size_t rbGS = ggmlRowBytes(tGS->type, nEmbd);
     const size_t rbDS = ggmlRowBytes(GGML_Q8_0, nFf);
 
     // ---- CPU reference (mirrors llama.cpp build_moe_ffn semantics) ----
@@ -1385,7 +1506,7 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
         std::vector<uint32_t> order(nExp);
         for (uint32_t e = 0; e < nExp; e++) order[e] = e;
         std::partial_sort(order.begin(), order.begin() + nUsed, order.end(),
-                          [&](uint32_t a, uint32_t b) { return logit[a] > logit[b]; });
+                          [&](uint32_t a, uint32_t b) { return logit[a] == logit[b] ? a < b : logit[a] > logit[b]; });
         double m = logit[order[0]], sum = 0;
         for (uint32_t i = 0; i < nUsed; i++) {
             ids[i] = order[i];
@@ -1402,7 +1523,8 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     std::vector<float> yref(nEmbd, 0.f), tmpE(nEmbd), tmpF(nFf), hrow(nFf);
     auto dqGU = [&](const GgufTensor* t, uint32_t e, uint32_t r, float* out) {
         const uint8_t* row = t->data + ((size_t)e * nFf + r) * rbGE;
-        if (guIq4) dequant_row_iq4_xs((const block_iq4_xs*)row, out, nEmbd);
+        if (guQ5) dequant_row_q5_K((const block_q5_K*)row, out, nEmbd);
+        else if (guIq4) dequant_row_iq4_xs((const block_iq4_xs*)row, out, nEmbd);
         else       dequant_row_iq3_xxs((const block_iq3_xxs*)row, out, nEmbd);
     };
     for (uint32_t s = 0; s < nUsed; s++) {
@@ -1418,7 +1540,8 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
         }
         for (uint32_t o = 0; o < nEmbd; o++) {
             const uint8_t* drow = tDE->data + ((size_t)e * nEmbd + o) * rbDE;
-            if (downQ6) dequant_row_q6_K((const block_q6_K*)drow, tmpF.data(), nFf);
+            if (downQ8) dequant_row_q8_0((const block_q8_0*)drow, tmpF.data(), nFf);
+            else if (downQ6) dequant_row_q6_K((const block_q6_K*)drow, tmpF.data(), nFf);
             else        dequant_row_iq4_xs((const block_iq4_xs*)drow, tmpF.data(), nFf);
             double a = 0;
             for (uint32_t k = 0; k < nFf; k++) a += (double)tmpF[k] * hrow[k];
@@ -1426,10 +1549,12 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
         }
     }
     for (uint32_t r = 0; r < nFf; r++) {
-        dequant_row_q8_0((const block_q8_0*)(tGS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
+        if (sharedQ5) dequant_row_q5_K((const block_q5_K*)(tGS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
+        else dequant_row_q8_0((const block_q8_0*)(tGS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
         double ga = 0;
         for (uint32_t k = 0; k < nEmbd; k++) ga += (double)tmpE[k] * x[k];
-        dequant_row_q8_0((const block_q8_0*)(tUS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
+        if (sharedQ5) dequant_row_q5_K((const block_q5_K*)(tUS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
+        else dequant_row_q8_0((const block_q8_0*)(tUS->data + (size_t)r * rbGS), tmpE.data(), nEmbd);
         double ua = 0;
         for (uint32_t k = 0; k < nEmbd; k++) ua += (double)tmpE[k] * x[k];
         hrow[r] = (float)(silu(ga) * ua);
@@ -1442,12 +1567,18 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     }
 
     // ---- GPU setup ----
+    bool halo = c.props.vendorID == 0x1002 && c.props.deviceID == 0x1586;
+    uint32_t q5Wg = halo && guQ5 ? 128 : 64, q8Wg = halo && downQ8 ? 128 : 256;
+    if (const char* v = getenv("QK_MOE_Q5_WG")) q5Wg = (uint32_t)atoi(v);
+    if (const char* v = getenv("QK_MOE_Q8_WG")) q8Wg = (uint32_t)atoi(v);
+    for (auto wg : {q5Wg, q8Wg}) if (wg != 64 && wg != 128 && wg != 256) return false;
     Pipe pLogits = makePipe(c, "moe_logits.spv", 3, 16);
-    Pipe pSelect = makePipe(c, "moe_select.spv", 4, 16);
-    Pipe pGuIq3  = makePipe(c, guIq4 ? "moe_gateup_iq4.spv" : "moe_gateup_iq3.spv", 5, 16);
-    Pipe pGuQ8   = makePipe(c, "moe_gateup_q8.spv", 4, 16);
-    Pipe pDnIq4  = makePipe(c, downQ6 ? "moe_down_q6k.spv" : "moe_down_iq4.spv", 4, 16,
-                            downQ6 ? 0 : 256);
+    Pipe pSelect = makePipe(c, guQ5 ? "moe_select_256.spv" : "moe_select.spv", 4, 16);
+    Pipe pGuIq3  = makePipe(c, guQ5 ? "moe_gateup_q5k.spv" : (guIq4 ? "moe_gateup_iq4.spv" : "moe_gateup_iq3.spv"),
+                           5, 16, guQ5 ? q5Wg : 0);
+    Pipe pGuQ8   = makePipe(c, sharedQ5 ? "moe_shared_q5k.spv" : "moe_gateup_q8.spv", 4, 16, sharedQ5 ? q5Wg : 0);
+    Pipe pDnIq4  = makePipe(c, downQ8 ? "moe_down_q8_routed.spv" : (downQ6 ? "moe_down_q6k.spv" : "moe_down_iq4.spv"),
+                           4, 16, downQ8 ? q8Wg : (downQ6 ? 0 : 256));
     Pipe pDnQ8   = makePipe(c, "moe_down_q8.spv", 4, 16);
 
     const size_t szGI = (size_t)nExp * nEmbd * 4, szGIS = (size_t)nEmbd * 4;
@@ -1466,7 +1597,8 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     Buf bL = createBuf(c, szL, stor, true), bH = createBuf(c, szH, stor, true);
     Buf bSel = createBuf(c, szSel, stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     Buf bY = createBuf(c, szY, stor | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    Buf stage = createBuf(c, std::max(szGE, szDE),
+    const size_t stageBytes = std::max(std::max(szX, szY + szSel), std::min(std::max(szGE, szDE), size_t(16 << 20)));
+    Buf stage = createBuf(c, stageBytes,
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
 
     auto begin = [&]() {
@@ -1485,11 +1617,14 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
     void* mapped;
     VK_CHECK(vkMapMemory(c.dev, stage.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
     auto upload = [&](Buf& dst, const void* src, size_t n) {
-        memcpy(mapped, src, n);
-        begin();
-        VkBufferCopy cp{0, 0, n};
-        vkCmdCopyBuffer(c.cb, stage.buf, dst.buf, 1, &cp);
-        submitWait();
+        for (size_t off = 0; off < n; off += stageBytes) {
+            size_t bytes = std::min(stageBytes, n - off);
+            memcpy(mapped, (const uint8_t*)src + off, bytes);
+            begin();
+            VkBufferCopy cp{0, off, bytes};
+            vkCmdCopyBuffer(c.cb, stage.buf, dst.buf, 1, &cp);
+            submitWait();
+        }
     };
     upload(bGI, tGI->data, szGI);
     upload(bGIS, tGIS->data, szGIS);
@@ -1610,7 +1745,8 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
         double rel = std::fabs((double)ygpu[o] - yref[o]) /
                      std::max(denomFloor, (double)std::fabs(yref[o]));
         maxRel = std::max(maxRel, rel);
-        if (rel > 1e-2 && bad++ < 5) printf("  y[%u]: gpu=%g ref=%g\n", o, ygpu[o], yref[o]);
+        if ((!std::isfinite(ygpu[o]) || !std::isfinite(yref[o]) || rel > 1e-2) && bad++ < 5)
+            printf("  y[%u]: gpu=%g ref=%g\n", o, ygpu[o], yref[o]);
     }
     bool pass = selOk && bad == 0;
     printf("correctness: max_rel_err = %.3g  ->  %s\n", maxRel, pass ? "PASS" : "FAIL");
@@ -1645,7 +1781,9 @@ static bool caseMoe(VkCtx& c, uint32_t layer, uint32_t iters) {
                        2.0 * (double)nFf * rbGS + (double)nEmbd * rbDS;
         printf("gpu: %8.1f µs/layer-moe | %6.1f GB/s (active weights %.1f MiB) | 6 dispatches, 1 submit\n",
                ns / 1e3, bytes / ns, bytes / (1 << 20));
-        printf("     40 layers -> %.2f ms/token MoE-FFN share\n", ns * 40 / 1e6);
+        uint32_t layers = g.kvInt(g.kvStr("general.architecture", "") + ".block_count", 0);
+        printf("     %u x this block = %.2f ms (arithmetic projection, NOT end-to-end timing)\n",
+               layers, ns * layers / 1e6);
         vkDestroyQueryPool(c.dev, qp, nullptr);
     }
 
@@ -7617,6 +7755,8 @@ int main(int argc, char** argv) {
     if (mode == "counters") {
         printf("device_id: vendor=0x%04x device=0x%04x\n", c.props.vendorID, c.props.deviceID);
         printf("subgroup_size: %u\n", c.subgroupSize);
+        printf("external_memory_host: %s, alignment=%llu\n", c.externalMemoryHost ? "yes" : "no",
+               (unsigned long long)c.importAlignment);
         printf("max_workgroup_invocations: %u\n", c.props.limits.maxComputeWorkGroupInvocations);
         printf("max_shared_memory_bytes: %u\n", c.props.limits.maxComputeSharedMemorySize);
         printf("vulkan timestamps: %s\n", c.hasTimestamps ? "supported" : "unsupported");
