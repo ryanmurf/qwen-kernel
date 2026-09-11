@@ -3,6 +3,7 @@
 #include "qwen4_ple.h"
 #include <atomic>
 #include <memory>
+#include <numeric>
 #include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -26,11 +27,15 @@ class Qwen4Graph {
     std::atomic<bool> pleStop{false};
     struct PageRange { uintptr_t start; size_t bytes; };
     std::vector<PageRange> pleKeep;  // table ranges made resident; paged out on close
+    // Fails CLOSED: an unreadable or unparsable /proc/meminfo reports 0 bytes
+    // available, which stops the readahead rather than letting it run blind.
     static size_t memAvailableBytes() {
-        FILE* f = fopen("/proc/meminfo","r"); if (!f) return SIZE_MAX;
-        char line[256]; size_t kb = SIZE_MAX;
-        while (fgets(line,sizeof line,f)) if (sscanf(line,"MemAvailable: %zu kB",&kb) == 1) break;
-        fclose(f); return kb == SIZE_MAX ? SIZE_MAX : kb*1024;
+        FILE* f = fopen("/proc/meminfo","r"); if (!f) return 0;
+        char line[256]; unsigned long long kb = 0; bool found = false;
+        while (fgets(line,sizeof line,f)) if (sscanf(line,"MemAvailable: %llu kB",&kb) == 1) { found = true; break; }
+        fclose(f);
+        if (!found || kb > SIZE_MAX/1024) return 0;
+        return (size_t)kb*1024;
     }
     // Batched prefill: every activation buffer holds batchCap rows so the
     // serial path (row 0) and the batched path share names and descriptors.
@@ -612,6 +617,14 @@ public:
             if (bytes>weightLimit-totalWeightBytes) throw std::runtime_error("native head weight budget exceeded");
             totalWeightBytes+=bytes;
         }
+        // Fail fast on bad prefetch settings before any weight upload.
+        if (const char* v = getenv("QK_PLE_PREFETCH"); v && strcmp(v,"0") && strcmp(v,"1"))
+            throw std::runtime_error("QK_PLE_PREFETCH must be 0 or 1");
+        if (const char* floorEnv = getenv("QK_PLE_PREFETCH_FLOOR_GIB")) {
+            char* end = nullptr; double f = strtod(floorEnv,&end);
+            if (end == floorEnv || *end || !std::isfinite(f) || f < 1.0 || f > 1024.0)
+                throw std::runtime_error("QK_PLE_PREFETCH_FLOOR_GIB must be a number in 1..1024");
+        }
         // Batched prefill rows: QK_FLASH_BATCH (default 512, 0 disables), rounded
         // up to whole 64-token tiles; halved while the device budget is short.
         if (servingBudget) {
@@ -720,8 +733,15 @@ public:
                 else if (buffers.count(name)) release.push_back(range(tensor));
             }
             pleKeep = keep;
-            const char* floorEnv = getenv("QK_PLE_PREFETCH_FLOOR_GIB");
-            const size_t floorBytes = (size_t)(floorEnv ? atof(floorEnv) : 16.0) * (1ull<<30);
+            // Floor in GiB: default 16, accepted range 1..1024; anything else
+            // (empty, non-numeric, out of range) is an error, not a silent 0.
+            double floorGib = 16.0;
+            if (const char* floorEnv = getenv("QK_PLE_PREFETCH_FLOOR_GIB")) {
+                char* end = nullptr; floorGib = strtod(floorEnv,&end);
+                if (end == floorEnv || *end || !std::isfinite(floorGib) || floorGib < 1.0 || floorGib > 1024.0)
+                    throw std::runtime_error("QK_PLE_PREFETCH_FLOOR_GIB must be a number in 1..1024");
+            }
+            const size_t floorBytes = (size_t)(floorGib * double(1ull<<30));
             pleThread = std::thread([this,release,keep,page,floorBytes] {
                 const auto began = std::chrono::steady_clock::now();
                 size_t released = 0, kept = 0;
@@ -730,6 +750,11 @@ public:
                 // The kernel clamps each WILLNEED call to the device readahead
                 // window, so issue small chunks, then touch every page; check
                 // the free-memory floor every 64 MiB.
+                // `kept` counts only bytes actually touched (one page at a
+                // time), so the resident figure is exact for the pages this
+                // thread referenced; the floor is checked every 64 MiB of both
+                // the readahead and the touch passes. Readahead alone does not
+                // count as resident.
                 const size_t chunk = 512u<<10, check = 64u<<20;
                 volatile uint8_t sink = 0;
                 for (const auto& r : keep) {
@@ -740,12 +765,13 @@ public:
                     for (size_t off = 0; off < r.bytes && !pleStop && !floored; off += page) {
                         if (off % check == 0 && memAvailableBytes() < floorBytes) { floored = true; break; }
                         sink += *(const volatile uint8_t*)(r.start+off);
-                        kept = std::max(kept, off + page);
+                        kept += std::min(page, r.bytes-off);
                     }
-                    if (!floored) kept += r.bytes;
                 }
-                if (!pleStop) fprintf(stderr,"[flash] page cache: released %.3f GiB of uploaded weights, %.3f GiB of lookup tables resident after %.1f s%s\n",
-                    released/double(1ull<<30),kept/double(1ull<<30),std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count(),
+                if (!pleStop) fprintf(stderr,"[flash] page cache: released %.3f GiB of uploaded weights; %.3f GiB of %.3f GiB of lookup tables touched after %.1f s%s\n",
+                    released/double(1ull<<30),kept/double(1ull<<30),
+                    std::accumulate(keep.begin(),keep.end(),size_t(0),[](size_t a,const PageRange& r) { return a+r.bytes; })/double(1ull<<30),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count(),
                     floored ? " (stopped at the MemAvailable floor)" : "");
             });
         }
