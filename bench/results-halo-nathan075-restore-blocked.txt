@@ -1,0 +1,4 @@
+pre-load: MemFree=11G MemAvailable=20G Cached=10G halo_gtt=148MiB halo_vram=252MiB
+total 124.897 GiB advised
+after cache release: MemFree=17G MemAvailable=20G Cached=3G halo_gtt=148MiB halo_vram=252MiB
+{"admitted": false, "reasons": ["insufficient MemAvailable; inspect host workloads and unused GPU pools"], "available_kib": 21992456, "anonymous_kib": 1440576, "shared_kib": 64, "swap_used_kib": 2624072, "anonymous_shared_and_swap_kib": 4064712, "minimum_available_gib": 24, "maximum_other_memory_gib": 12}
