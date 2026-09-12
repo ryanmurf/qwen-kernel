@@ -1,16 +1,18 @@
 # Native Flash: opt-in last-output prefill
 
-Update, September 12 at 21:55 UTC: the [full-model exact-logit gate](results-halo-last-head-full-gate.json)
-has now passed all 498 cross-policy/reset comparisons. HTTP A/B is in
-progress; no end-to-end speedup or serving promotion is claimed yet. The
-earlier admission block below is historical; resource cleanup was approved.
+Update, September 12: the [complete full-model campaign](RESULTS-halo-last-head-full.md)
+passed all 498 exact-logit comparisons and matched HTTP/Claude checks.
+Median whole-model first-token latency fell 2.8–5.0%; see the report for
+the 16K decode tradeoff and full ranges. Serving is restored with the flag
+explicitly enabled; the source-level default remains off. The earlier
+admission block below is historical; resource cleanup was approved.
 
 The original September 12, 2026 experiment on Max, documented below, used
 the **last two layers plus output head**, not the entire model. At that
 point, the unchanged 24 GiB admission guard rejected approximately 20.6 GiB
 available RAM and unused-TTM cleanup was awaiting approval. That historical
-block is resolved; the full-model validation above supersedes it. Serving
-remains paused specifically for the exclusive HTTP comparison.
+block is resolved; the full-model validation and restored serving above
+supersede it.
 
 ## Change
 
@@ -107,9 +109,10 @@ New native library SHA256:
 `068369b87806608ed7d00efb2b72d3bd3e0f19abfd0ed67d7f452b8e952d8931`.
 New release server SHA256:
 `10bf29d115627fdf35a9305e0e2e1a9de1dea5a6bd8357627aad0c051fa1925a`.
-Both are private experiment builds; `build-halo` baseline binaries remain
-untouched. The new server is now being tested with the complete native model
-in the separate full-model HTTP campaign.
+Those exact tested library/server bytes are now installed in `build-halo`
+after the full-model campaign. Verified original backups remain in
+`/home/ryan/qk-last-head-full-VjRrMt/rollback`; owner-only permissions were
+preserved. The private experiment builds remain available as evidence.
 
 Offline check, no GPU or model load:
 
@@ -130,7 +133,7 @@ this approximately 5 GiB partial-stage load; the harness enforces these
 conditions. Run `--reference-only` against the preserved library separately,
 and `--profile-only` with `QK_FLASH_PROFILE=2` separately. Never overlap them.
 
-Remaining gate before promotion: finish the matched full-model HTTP campaign
-on both policies, including Claude/tool streaming, seeded sampling, cancellation,
-isolation and the fresh-KV prefill matrix. Full 48-layer logit/reset parity
-has passed; it is not by itself an HTTP performance result.
+The full-model and HTTP gates above are complete. Last-output prefill is
+enabled for the current prefill-focused testing configuration, not made a
+universal default. Longer-output throughput and reverse-order repeats remain
+useful follow-ups; the source default and explicit flag retain rollback.

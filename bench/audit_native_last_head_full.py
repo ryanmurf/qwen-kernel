@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import statistics
@@ -38,7 +39,8 @@ def validate_gate(records):
     for rec in records:
         if rec['type'] == 'row':
             observed.append(tuple(rec[k] for k in ('type','prompt_rows','iteration','last_only','row','base','width')))
-            require(0 <= rec['greedy'] < 248320 and rec['seconds'] > 0, 'invalid row')
+            require(0 <= rec['greedy'] < 248320 and math.isfinite(rec['seconds'])
+                    and rec['seconds'] > 0, 'invalid row')
             key = (rec['prompt_rows'], rec['row'])
             if key not in greedy:
                 greedy[key] = rec['greedy']
@@ -72,7 +74,16 @@ def validate_http(all_rows, last_rows):
                 and first['requested_output_tokens'] == 128, 'wrong HTTP matrix')
         metadata = first['metadata']
         require(metadata['mode'] == mode and metadata['http_returncode'] == 0, 'HTTP compatibility failed')
-        require(metadata['actual_environment']['QK_FLASH_PREFILL_LAST'] == ('1' if mode == 'last' else '0'), 'wrong last-output flag')
+        require(metadata['experiment'] == 'native-last-head-http-v1' and metadata['context'] == 32768
+                and metadata['precision'] == 'native F32' and metadata['mtp'] is False
+                and metadata['slots'] == 1 and metadata['prefill_chunk'] == 512
+                and metadata['default_promotion'] is False, 'wrong HTTP experiment/precision configuration')
+        env = metadata['actual_environment']
+        require(env == {**ENV, 'QK_SHADER_DIR': env.get('QK_SHADER_DIR'), 'QK_PREFILL_CHUNK': '512',
+                        'QK_REASONING_EFFORT': 'xhigh', 'QK_FLASH_PREFILL_LAST': '1' if mode == 'last' else '0'}
+                and Path(env['QK_SHADER_DIR']).is_absolute(), 'wrong HTTP runtime environment')
+        require(re.fullmatch('[0-9a-f]{64}', metadata['sampled_token_sha256']) is not None,
+                'invalid sampled-output hash')
         expected = [(kind, size, repetition) for size in sizes for repetition in (1,2,3) for kind in ('prefill','decode')]
         require([(r['type'],r['prompt_tokens'],r['repetition']) for r in rows[1:-1]] == expected, 'HTTP cells incomplete/reordered')
         for rec in rows:
@@ -83,9 +94,12 @@ def validate_http(all_rows, last_rows):
             if rec['type'] == 'decode':
                 require(rec['exact_output_length'] and rec['complete_chunk_token_counts'] and
                         rec['coherent_counting_prefix'] and rec['streamed_tokens'] == 128 and
-                        rec['ttft_seconds'] > 0 and rec['decode_tokens_per_second'] > 0, 'invalid decode cell')
+                        all(math.isfinite(rec[k]) and rec[k] > 0 for k in
+                            ('ttft_seconds','decode_tokens_per_second','stream_total_seconds'))
+                        and rec['stream_total_seconds'] >= rec['ttft_seconds'], 'invalid decode cell')
             else:
-                require(rec['output_tokens'] == [16] and rec['prefill_plus_one_token_seconds'] > 0, 'invalid prefill probe')
+                require(rec['output_tokens'] == [16] and math.isfinite(rec['prefill_plus_one_token_seconds'])
+                        and rec['prefill_plus_one_token_seconds'] > 0, 'invalid prefill probe')
     a, b = all_rows[0], last_rows[0]
     for key in ('fixture_sha256','model_id','context','requested_output_tokens'):
         require(a[key] == b[key], 'pair workload differs')
@@ -101,7 +115,8 @@ def validate_http(all_rows, last_rows):
                     x['output_text_sha256'] == y['output_text_sha256'], 'paired output differs')
     for size in sizes:
         item = {'prompt_tokens':size}
-        for kind, metric in [('prefill','prefill_plus_one_token_seconds'),('decode','ttft_seconds'),('decode','decode_tokens_per_second')]:
+        for kind, metric in [('prefill','prefill_plus_one_token_seconds'),('decode','ttft_seconds'),
+                             ('decode','decode_tokens_per_second'),('decode','stream_total_seconds')]:
             for label, rows in [('all',all_rows),('last',last_rows)]:
                 values = [r[metric] for r in rows if r['type'] == kind and r['prompt_tokens'] == size]
                 item[label+'_'+metric] = {'median':statistics.median(values),'min':min(values),'max':max(values)}

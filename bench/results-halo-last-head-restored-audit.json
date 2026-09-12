@@ -1,0 +1,139 @@
+{
+  "result": "PASS",
+  "checked_utc": "2026-09-12T23:16:38.089710+00:00",
+  "units": {
+    "qwen-native-flash-server32": {
+      "ActiveState": "active",
+      "SubState": "running",
+      "FragmentPath": "/run/user/1000/systemd/transient/qwen-native-flash-server32.service",
+      "InvocationID": "22892f53c6124a97ae550c470389116a",
+      "MainPID": "3581319",
+      "MemoryPeak": "1427230720",
+      "MemorySwapPeak": "0",
+      "MemoryHigh": "25769803776",
+      "MemoryMax": "34359738368",
+      "MemorySwapMax": "536870912",
+      "LimitCORE": "0",
+      "NoNewPrivileges": "yes"
+    },
+    "qwen-native-flash-router": {
+      "ActiveState": "active",
+      "SubState": "running",
+      "FragmentPath": "/run/user/1000/systemd/transient/qwen-native-flash-router.service",
+      "InvocationID": "18fede1c236346379c40587631853250",
+      "MainPID": "3585289",
+      "MemoryPeak": "22753280",
+      "MemorySwapPeak": "0",
+      "MemoryHigh": "805306368",
+      "MemoryMax": "1073741824",
+      "MemorySwapMax": "infinity",
+      "LimitCORE": "0",
+      "NoNewPrivileges": "yes"
+    },
+    "claude-qwen-proxy": {
+      "ActiveState": "active",
+      "SubState": "running",
+      "FragmentPath": "/home/ryan/.config/systemd/user/claude-qwen-proxy.service",
+      "InvocationID": "5843b7a396a2483da370896f675f3535",
+      "MainPID": "3146",
+      "MemoryPeak": "15212544",
+      "MemorySwapPeak": "12242944",
+      "MemoryHigh": "infinity",
+      "MemoryMax": "infinity",
+      "MemorySwapMax": "infinity",
+      "LimitCORE": "infinity",
+      "NoNewPrivileges": "yes"
+    }
+  },
+  "actual_environment": {
+    "QK_FLASH_PREFILL_LAST": "1",
+    "QK_PREFILL_CHUNK": "512",
+    "QK_FLASH_BATCH": "512",
+    "QK_SHADER_DIR": "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/shaders",
+    "QK_FLASH_GEMM": "baseline",
+    "QK_FLASH_ATTN_BATCH": "baseline",
+    "QK_NATIVE_FLASH": "1",
+    "QK_REASONING_EFFORT": "xhigh",
+    "QK_PLE_PREFETCH": "0",
+    "QK_ATTN_DECODE": "serial",
+    "QK_FLASH_COOPMAT": "0",
+    "QK_DEVICE_NAME": "STRIX_HALO",
+    "QK_GGUF": "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf"
+  },
+  "server_command": [
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/rust/release/server",
+    "--model",
+    "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "--engine-lib",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/libqk.so",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8194",
+    "--slots",
+    "1",
+    "--ctx",
+    "32768",
+    "--chunk",
+    "1",
+    "--queue",
+    "4",
+    "--local-driver",
+    "--chat-template",
+    "auto"
+  ],
+  "library_sha256": "068369b87806608ed7d00efb2b72d3bd3e0f19abfd0ed67d7f452b8e952d8931",
+  "server_sha256": "10bf29d115627fdf35a9305e0e2e1a9de1dea5a6bd8357627aad0c051fa1925a",
+  "rollback_sha256": {
+    "libqk.so": "0b3efa4732d1dad9b2ebdbc7fc2688a6501a32672a146953654739ad3cd3bdd3",
+    "server": "aa497bdb0e6b8a70c8d9abe34f6956c91c04cc1ecd5bace53d9e493ce273ef9c"
+  },
+  "source_default_off": true,
+  "active_last_output_opt_in": true,
+  "http_smoke": {
+    "8194": {
+      "result": "PASS",
+      "records": 9,
+      "sha256": "89d105dda364e92ddb27424fe2ed861ca6c4849ae185ec8528dc4f70b27b6694"
+    },
+    "8091": {
+      "result": "PASS",
+      "records": 8,
+      "sha256": "70df266273f34c22950b141ee99d0ba69bedeadb93598573f0946a2aff616f5c"
+    },
+    "8092": {
+      "result": "PASS",
+      "records": 2,
+      "sha256": "e8fb4172e9d0e501e3f0932d97fa567daff461824571579d0f75b43ac251194f"
+    }
+  },
+  "resource_observation": {
+    "samples": 100,
+    "seconds": 297.8582146090048,
+    "minimum_available_gib": 26.19792938232422,
+    "maximum_gpu_temperature_c": 55.0,
+    "swap_peak_bytes": 0,
+    "memory_events_all_zero": true,
+    "external_gpu": {
+      "vram_peak_bytes": 12288,
+      "gtt_peak_bytes": 2097152
+    },
+    "sha256": "38562311b05ed90360059b4562f1c74a3c50307ead7fb4dbb4bda5caa4d2b2d5",
+    "observer_sha256": "1dabbb7cc54a1ede111934fac0b9cbbadbc45f9e93005f1a8a61fab23834e878"
+  },
+  "restore_cleanup": {
+    "before": {
+      "available_kib": 28406112,
+      "pool_pages": 23352487
+    },
+    "after": {
+      "available_kib": 29362624,
+      "pool_pages": 23112707
+    },
+    "calls": 334,
+    "reported_pages_freed": 239780,
+    "seconds": 0.024778386010439135,
+    "target_reached": true
+  },
+  "caveat": "Smoke checks, not benchmark cells; cgroup memory omits some GPU allocations."
+}

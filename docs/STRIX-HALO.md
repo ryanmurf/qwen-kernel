@@ -1,16 +1,20 @@
 # Strix Halo native Flash Next port
 
-September 12 status: `QK_FLASH_PREFILL_LAST=1` is still opt-in, but its
-[full 48-layer exact-logit gate now passes](../bench/results-halo-last-head-full-gate.json):
-498 cross-policy/reset comparisons, including long-context continuations.
-The same-final-tile optimization preserves the existing all-ID ABI. The
-[earlier two-layer result](../bench/RESULTS-halo-last-head.md) is not a
-whole-model speedup claim. Matched full-model HTTP benchmarks are in
-progress; no serving-default promotion has happened. Production routing on
-8091 remains paused for exclusive tests on loopback8194. Bounded unused-TTM
-cleanup has now been explicitly approved; the 24 GiB launch guard remains
-unchanged. Initial available memory had already recovered enough to admit
-the full-model gate without any shrink calls.
+September 12 status: **Halo-only serving is restored on 8091**, with
+`QK_FLASH_PREFILL_LAST=1` explicitly enabled in the current transient server.
+The source-level default remains off. The [full-model campaign](../bench/RESULTS-halo-last-head-full.md)
+passes 498 exact-logit cross-policy/reset comparisons and all matched HTTP,
+Claude/tool and seeded-output checks. Median first-token latency is 2.8–5.0%
+lower across 128–16384 prompt tokens. At 16K, median decode is 2.7% lower
+with overlapping ranges; this is not a universal throughput claim. The
+same-final-tile optimization preserves the all-ID ABI, F32 precision and
+state processing. Direct 8194, gateway 8091 and proxy 8092 restoration checks
+pass, with zero model cgroup swap or pressure during the observation window.
+The approved bounded unused-TTM cleanup did not lower the 24 GiB launch
+guard. Separate [attention LDS probes](../bench/RESULTS-halo-attention-lds.md)
+passed operator correctness but did not justify a new serving path. Their
+experimental shaders remain unintegrated. The [earlier two-layer result](../bench/RESULTS-halo-last-head.md)
+is not a whole-model speedup claim. Nothing was enabled at boot.
 
 Validated milestone `0453754`, 2026-09-11: **the native engine served port
 8091 from the Strix Halo iGPU alone** (all 48 layers plus the
@@ -51,8 +55,8 @@ for reference; they are not Halo-only results.
   marking features, and shadow-weight eligibility/cleanup fixes worth
   reviewing before reuse. Inspect the actual implementation and test any
   candidate with our correctness gates and matched full-model benchmarks.
-  No code from this fork has been imported or run for this entry; the ongoing
-  last-output prefill A/B remains unchanged.
+  No code from this fork was imported or run for this entry; the source
+  review did not change the completed last-output prefill A/B.
 
 ## Current target
 

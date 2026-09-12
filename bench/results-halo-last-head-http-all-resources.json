@@ -1,0 +1,61 @@
+{
+  "result": "PASS",
+  "mode": "all",
+  "unit": "qk-last-head-http-all-VjRrMt",
+  "start_utc": "2026-09-12T21:55:51.395622+00:00",
+  "end_utc": "2026-09-12T22:29:37.490813+00:00",
+  "samples": 674,
+  "observed_seconds": 2025.7751288410072,
+  "maximum_sample_gap_seconds": 3.036102915997617,
+  "minimum_available_gib": 26.022319793701172,
+  "maximum_gpu_temperature_c": 76.0,
+  "cgroup_memory_peak_bytes": 1417867264,
+  "cgroup_swap_peak_bytes": 0,
+  "memory_event_maxima": {
+    "low": 0,
+    "high": 0,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0,
+    "oom_group_kill": 0,
+    "sock_throttled": 0
+  },
+  "external_gpu_observations": {
+    "0000:68:00.0": {
+      "vram_peak_bytes": 12288,
+      "gtt_peak_bytes": 2097152
+    }
+  },
+  "cleanup": {
+    "before": {
+      "available_kib": 28389800,
+      "pool_pages": 23352485
+    },
+    "after": {
+      "available_kib": 29362696,
+      "pool_pages": 23110232
+    },
+    "calls": 338,
+    "reported_pages_freed": 242253,
+    "seconds": 0.027551569990464486,
+    "target_reached": true
+  },
+  "admission": {
+    "admitted": true,
+    "reasons": [],
+    "available_kib": 29369460,
+    "anonymous_kib": 1844716,
+    "shared_kib": 648,
+    "swap_used_kib": 2307724,
+    "anonymous_shared_and_swap_kib": 4153088,
+    "minimum_available_gib": 24,
+    "maximum_other_memory_gib": 12
+  },
+  "identities_unchanged": true,
+  "controlled_stop": true,
+  "caveat": "Sampled server fdinfo only; cgroup memory excludes some GPU allocations.",
+  "source_sha256": {
+    "http-all.controller.json": "0c22d2b5e329ae58c4644ea908e0702719bf7ebd40943314a0f28550772cc2bf",
+    "http-all.observer.jsonl": "16cb081d09ee20519f5f901725078e3e4dfc17e8cbbfecfbd04e0ee61b70d492"
+  }
+}
