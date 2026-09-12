@@ -235,7 +235,69 @@ class Qwen4Graph {
         if (gx>c.props.limits.maxComputeWorkGroupCount[0] || gy>c.props.limits.maxComputeWorkGroupCount[1] ||
             gz>c.props.limits.maxComputeWorkGroupCount[2]) throw std::runtime_error("dispatch exceeds device limits");
         vkCmdDispatch(c.cb, gx, gy, gz);
-        if (fence) { barrier(); stamp(shader); }
+        // Profiling fences every dispatch so each timestamp interval is one
+        // kernel (exclusive attribution); this removes the small overlap the
+        // unfenced projections normally get, so profiled totals run slightly
+        // above production totals.
+        if (fence || profileQuery) { barrier(); stamp(shader); }
+    }
+    // Launch with a full specialization-constant vector (constant ids 0..n-1,
+    // 4 bytes each; floats passed as their bit patterns).
+    template<class PC> void launchSpecs(const char* shader, std::initializer_list<std::string> refs,
+                                         const PC& pc, uint32_t gx, uint32_t gy, uint32_t gz,
+                                         const std::vector<uint32_t>& specs, bool fence = true) {
+        std::string key = std::string(shader) + "/s";
+        for (uint32_t v : specs) key += ":" + std::to_string(v);
+        auto it = pipes.find(key);
+        if (it == pipes.end()) it = pipes.emplace(key, makePipeSpecs(c, shader, refs.size(), sizeof(pc), specs)).first;
+        Pipe& pipeline = it->second;
+        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = pool; alloc.descriptorSetCount = 1; alloc.pSetLayouts = &pipeline.dsl;
+        VkDescriptorSet set;
+        VK_CHECK(vkAllocateDescriptorSets(c.dev, &alloc, &set));
+        std::vector<VkDescriptorBufferInfo> info(refs.size());
+        std::vector<VkWriteDescriptorSet> writes(refs.size());
+        size_t i = 0;
+        for (const auto& ref : refs) {
+            const auto& b = buffers.at(ref);
+            info[i] = {b.buf, 0, b.size};
+            writes[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstSet = set; writes[i].dstBinding = i; writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[i].pBufferInfo = &info[i]; ++i;
+        }
+        vkUpdateDescriptorSets(c.dev, writes.size(), writes.data(), 0, nullptr);
+        vkCmdBindPipeline(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.p);
+        vkCmdBindDescriptorSets(c.cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pl, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(c.cb, pipeline.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        if (gx>c.props.limits.maxComputeWorkGroupCount[0] || gy>c.props.limits.maxComputeWorkGroupCount[1] ||
+            gz>c.props.limits.maxComputeWorkGroupCount[2]) throw std::runtime_error("dispatch exceeds device limits");
+        vkCmdDispatch(c.cb, gx, gy, gz);
+        if (fence || profileQuery) { barrier(); stamp(shader); }
+    }
+    static uint32_t floatBits(float v) { uint32_t u; memcpy(&u, &v, 4); return u; }
+    // Decode-path fusions (QK_FLASH_FUSE=0 restores the separate dispatches
+    // for A/B): HC down projection with the silu epilogue, and the GDN step
+    // with its per-head parameters computed in place.
+    bool fuseEnabled() const { static const bool f = [] { const char* v = getenv("QK_FLASH_FUSE"); return !v || strcmp(v,"0"); }(); return f; }
+    // Word-addressed routed/shared expert gate-up kernels (QK_MOE_GU=v1 keeps
+    // the byte-addressed originals for A/B).
+    bool expertV1() const { static const bool v1 = [] { const char* v = getenv("QK_MOE_GU"); return v && !strcmp(v,"v1"); }(); return v1; }
+    // HC down projection writing silu(sum/scale) directly: returns false when
+    // the weight format has no fused variant (caller then takes the two-dispatch path).
+    bool projectSilu(const std::string& weight, const std::string& input, const std::string& output, float scale) {
+        const auto* tensor = g.find(weight);
+        if (!tensor || tensor->nDims != 2) throw std::runtime_error("bad projection: " + weight);
+        const uint32_t k = tensor->ne[0], m = tensor->ne[1];
+        if (buffers.at(input).size < k*4ull || buffers.at(output).size < m*4ull)
+            throw std::runtime_error("projection activation shape mismatch: " + weight);
+        uint32_t units = k/32, tpr = 256;
+        while (tpr > 4 && tpr/2 >= units) tpr /= 2;
+        if (tensor->type == GGML_Q5_K && c.props.deviceID == 0x1586 && m == 320 && k == 10240) tpr = 128;
+        struct { uint32_t m,k; } pc{m,k};
+        const uint32_t groups = (m + 256/tpr - 1) / (256/tpr);
+        if (tensor->type == GGML_Q5_K) { launchSpecs("gemv_q5_k.spv", {weight,input,output}, pc, groups, 1, 1, {tpr, 1u, floatBits(scale)}); return true; }
+        if (tensor->type == GGML_Q6_K) { launchSpecs("gemv_q6_k.spv", {weight,input,output}, pc, groups, 1, 1, {tpr, 0u, 1u, floatBits(scale)}); return true; }
+        return false;
     }
     // Folded one-dimensional launch (kernels index wg = y*numX + x) with an
     // optional z batch of tokens.
@@ -386,9 +448,11 @@ class Qwen4Graph {
         HcPC pc{n,hc,1,0,eps};
         emit("qwen4_hc.spv", {residual,name("norm.weight"),"$dummy","$dummy","$norm"}, pc, hc);
         tap(kind+".norm", "$norm");
-        project(name("down.weight"), "$norm", "$low");
-        struct { uint32_t n; float scale; } silu{low,1.0f/hc};
-        emit("qwen4_silu.spv", {"$low","$silu"}, silu, (low+255)/256);
+        if (!(fuseEnabled() && !getenv("QK_LAYER_DUMP") && projectSilu(name("down.weight"), "$norm", "$silu", 1.0f/hc))) {
+            project(name("down.weight"), "$norm", "$low");
+            struct { uint32_t n; float scale; } silu{low,1.0f/hc};
+            emit("qwen4_silu.spv", {"$low","$silu"}, silu, (low+255)/256);
+        }
         project(name("up.weight"), "$silu", "$gate", outputHead);
         if (!outputHead) {
             project(name("inject.weight"), "$norm", "$inject");
@@ -978,15 +1042,17 @@ public:
         project(w("ssm_alpha.weight"),"$mixed","$alpha",false);
         project(w("ssm_beta.weight"),"$mixed","$beta");
         tap("qkv", "$qkv"); tap("z", "$z"); tap("alpha", "$alpha"); tap("beta", "$beta");
+        // QK_GDN_STEP=v1 keeps the 128-thread dn_step_gate kernel for A/B.
+        static const bool stepV1 = [] { const char* v = getenv("QK_GDN_STEP"); return v && !strcmp(v,"v1"); }();
+        const bool fusedStep = fuseEnabled() && !stepV1;
         struct { uint32_t heads,T; } params{48,1};
-        emit("qwen4_gdn_params.spv",{"$alpha","$beta",w("ssm_dt.bias"),w("ssm_a"),"$gb"},params,1,0,1,false);
+        if (!fusedStep) emit("qwen4_gdn_params.spv",{"$alpha","$beta",w("ssm_dt.bias"),w("ssm_a"),"$gb"},params,1,0,1,false);
         struct { uint32_t channels,ds,qk; float eps; } conv{10240,128,4096,eps};
         emit("dn_convn.spv",{state("convstate"),"$qkv",w("ssm_conv1d.weight"),"$conv"},conv,80,1);
         tap("conv", "$conv");
         struct { uint32_t ds,hk,hv,kdiv; float eps; } step{128,16,48,0,eps};
-        // QK_GDN_STEP=v1 keeps the 128-thread dn_step_gate kernel for A/B.
-        static const bool stepV1 = [] { const char* v = getenv("QK_GDN_STEP"); return v && !strcmp(v,"v1"); }();
         if (stepV1) emit("dn_step_gate.spv",{"$conv","$gb",state("state"),w("ssm_norm.weight"),"$z","$att"},step,48,1);
+        else if (fusedStep) emit("qwen4_gdn_step_p.spv",{"$conv","$alpha","$beta",w("ssm_dt.bias"),w("ssm_a"),state("state"),w("ssm_norm.weight"),"$z","$att"},step,48);
         else emit("qwen4_gdn_step.spv",{"$conv","$gb",state("state"),w("ssm_norm.weight"),"$z","$att"},step,48);
         tap("final_output", "$att");
         project(w("ssm_out.weight"),"$att","$block");
@@ -1001,8 +1067,8 @@ public:
         const bool sharedQ51 = g.find(w("ffn_down_shexp.weight"))->type==GGML_Q5_1;
         emit("moe_logits.spv",{w("ffn_gate_inp.weight"),"$mixed","$logits"},moe,experts);
         emit("moe_select_256.spv",{"$logits",w("ffn_gate_inp_shexp.weight"),"$mixed","$sel"},moe,1);
-        emit("moe_gateup_q5k.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$sel","$ffh"},moe,used*ff,halo&&!downQ51?128:64,1,false);
-        emit("moe_shared_q5k.spv",{w("ffn_gate_shexp.weight"),w("ffn_up_shexp.weight"),"$mixed","$ffh"},moe,ff,halo&&!downQ51?128:64);
+        emit(expertV1() ? "moe_gateup_q5k.spv" : "moe_gateup_q5k_v2.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$sel","$ffh"},moe,used*ff,halo&&!downQ51?128:64,1,false);
+        emit(expertV1() ? "moe_shared_q5k.spv" : "moe_shared_q5k_v2.spv",{w("ffn_gate_shexp.weight"),w("ffn_up_shexp.weight"),"$mixed","$ffh"},moe,ff,halo&&!downQ51?128:64);
         emit(downQ51?"moe_down_q5_1.spv":"moe_down_q8_routed.spv",{w("ffn_down_exps.weight"),"$ffh","$sel","$block"},moe,n,halo?128:256);
         emit(sharedQ51?"moe_down_shared_q5_1.spv":"moe_down_q8.spv",{w("ffn_down_shexp.weight"),"$ffh","$sel","$block"},moe,n,sharedQ51?64:0);
         tap("ffn_out", "$block");

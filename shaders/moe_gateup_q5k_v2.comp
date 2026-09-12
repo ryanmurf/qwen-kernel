@@ -1,0 +1,3 @@
+#version 460
+#define Q5_SHARED 0
+#include "moe_q5k_impl_v2.glsl"

@@ -28,7 +28,9 @@ model=${1:-}; [[ -n "$model" ]] || usage
 context=${2:-32768}
 warm=${3:-0}
 mode=${4:-single}
-[[ "$context" =~ ^[0-9]+$ ]] && (( context >= 64 && context <= 32768 )) || { echo 'CONTEXT must be an integer 64..32768' >&2; exit 2; }
+if ! [[ "$context" =~ ^[0-9]+$ ]] || (( context < 64 || context > 32768 )); then
+    echo 'CONTEXT must be an integer 64..32768' >&2; exit 2
+fi
 [[ "$warm" == 0 || "$warm" == 1 ]] || { echo 'WARM must be 0 or 1' >&2; exit 2; }
 [[ "$mode" == split || "$mode" == single ]] || { echo 'MODE must be single or split' >&2; exit 2; }
 if [[ "$mode" == single && "$warm" == 1 ]]; then echo 'WARM=1 is not supported in single mode' >&2; exit 2; fi
@@ -69,9 +71,23 @@ health_ok() { curl -sf -m 3 "$1" 2>/dev/null | grep -q '"status":"ok"'; }
 for unit in qwen-native-flash-router qwen-native-flash-server32 qwen-native-flash-worker32; do
     if systemctl --user is-active --quiet "$unit"; then echo "$unit is already active; stop it first" >&2; exit 1; fi
 done
-if pgrep -f 'build-halo/(qk|rust/release/server)' >/dev/null; then echo "a qk/server process is still running" >&2; exit 1; fi
-if ps -eo stat,comm | awk '$1 ~ /D/ && $2 ~ /qk|server|python3/' | grep -q .; then
-    echo "a GPU process is stuck in uninterruptible sleep; do not load" >&2; exit 1
+# Live native processes are identified by executable identity (/proc/PID/exe),
+# never by command-line text, so a shell whose arguments mention the binaries
+# (a test chain, an editor) cannot trip this guard.
+live=""
+for p in /proc/[0-9]*; do
+    exe=$(readlink "$p/exe" 2>/dev/null) || continue
+    case "$exe" in
+        "$root/build-halo/qk"|"$root/build-halo/qk (deleted)"|"$root/build-halo/rust/release/server"|"$root/build-halo/rust/release/server (deleted)")
+            live+="${p#/proc/} ";;
+    esac
+done
+if [[ -n "$live" ]]; then echo "a native qk/server process is still running (pid $live); stop it first" >&2; exit 1; fi
+# Only OUR GPU processes count as stuck (a python3 anywhere in D state for
+# ordinary I/O must not block a restart): match by command line.
+stuck=$(ps -eo pid,stat,args | awk '$2 ~ /D/ && ($0 ~ /build-halo\/(qk|rust\/release\/server)/ || $0 ~ /tests\/gpu_qwen4_/) {print $1}')
+if [[ -n "$stuck" ]]; then
+    echo "a native GPU process is in uninterruptible sleep (pid $stuck): still loading or stuck; do not load beside it" >&2; exit 1
 fi
 if (( $(mib $halo/mem_info_gtt_used) > 2048 )); then echo "Halo memory not drained: $(state)" >&2; exit 1; fi
 if [[ "$mode" == split ]] && (( $(mib $xtx/mem_info_vram_used) > 2048 )); then echo "XTX memory not drained: $(state)" >&2; exit 1; fi
@@ -102,11 +118,14 @@ fi
 if [[ "$mode" == single ]]; then high=24G; max=32G;
 elif [[ "$warm" == 1 ]]; then high=52G; max=58G; else high=16G; max=24G; fi
 server_started=$(date +%s)
-# Optional A/B knobs forwarded into the unit when set in the caller's
-# environment (systemd units do not inherit it): QK_FLASH_BATCH (0 = serial
-# prefill), QK_PLE_ROW_PREFETCH (0 = no per-row prefetch), QK_FLASH_COOPMAT.
+# Optional A/B and rollback knobs forwarded into the unit when set in the
+# caller's environment (systemd units do not inherit it): QK_FLASH_BATCH (0 =
+# serial prefill), QK_PLE_ROW_PREFETCH (0 = no per-row prefetch),
+# QK_FLASH_COOPMAT, QK_FLASH_FUSE (0 = separate dispatches), QK_MOE_GU (v1 =
+# byte-addressed expert kernels), QK_GDN_STEP (v1). Profiling variables are
+# deliberately NOT forwarded: HTTP measurements run with profiling off.
 extra=()
-for knob in QK_FLASH_BATCH QK_PLE_ROW_PREFETCH QK_FLASH_COOPMAT; do
+for knob in QK_FLASH_BATCH QK_PLE_ROW_PREFETCH QK_FLASH_COOPMAT QK_FLASH_FUSE QK_MOE_GU QK_GDN_STEP; do
     if [[ -n "${!knob:-}" ]]; then extra+=("--setenv=$knob=${!knob}"); fi
 done
 start_unit qwen-native-flash-server32 -p MemoryHigh=$high -p MemoryMax=$max -p MemorySwapMax=512M \

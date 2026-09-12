@@ -19,6 +19,10 @@ layout(constant_id = 0) const uint TPR = 256u;
 // Zero keeps the generic Qwen path dynamic; the Gemma Stage-1 head supplies
 // 11 so the 2816-wide trip count is specialized at pipeline creation.
 layout(constant_id = 1) const uint Q6_SUPERBLOCKS_PER_ROW = 0u;
+// Optional fused epilogue (HC low-rank path): y = silu(sum * SILU_SCALE).
+layout(constant_id = 2) const uint SILU_EPILOGUE = 0u;
+layout(constant_id = 3) const float SILU_SCALE = 1.0;
+float epilogue(float v) { if (SILU_EPILOGUE != 0u) { v *= SILU_SCALE; return v / (1.0 + exp(-v)); } return v; }
 
 struct block_q6_K {
     uint8_t   ql[128];
@@ -86,7 +90,7 @@ void main() {
             uint base = (tid / TPR) * waves;
             float s2 = 0.0;
             for (uint i = 0u; i < waves; ++i) s2 += partial[base + i];
-            y[rq * pc.M + row] = s2;
+            y[rq * pc.M + row] = epilogue(s2);
         }
     } else {
         partial[tid] = acc;
@@ -95,6 +99,6 @@ void main() {
             if (lane < s2) partial[tid] += partial[tid + s2];
             barrier();
         }
-        if (lane == 0u && row < pc.M) y[rq * pc.M + row] = partial[tid];
+        if (lane == 0u && row < pc.M) y[rq * pc.M + row] = epilogue(partial[tid]);
     }
 }

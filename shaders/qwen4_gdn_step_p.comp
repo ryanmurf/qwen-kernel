@@ -1,0 +1,94 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// qwen4_gdn_step with the per-head decay/beta parameters computed in place
+// (the qwen4_gdn_params dispatch folded in): decay = exp(a * softplus(alpha +
+// dt)), beta = sigmoid(beta), using the same expressions as
+// qwen4_gdn_params.comp so the values are identical. Bindings: conv, alpha,
+// beta, dt, a, state, w, z, att.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufC  { float conv[]; };
+layout(std430, binding = 1) readonly buffer BufAl { float alpha[]; };
+layout(std430, binding = 2) readonly buffer BufBe { float betaIn[]; };
+layout(std430, binding = 3) readonly buffer BufDt { float dt[]; };
+layout(std430, binding = 4) readonly buffer BufA  { float ssm_a[]; };
+layout(std430, binding = 5) buffer BufS           { vec4 s4[]; };
+layout(std430, binding = 6) readonly buffer BufW  { float w[]; };
+layout(std430, binding = 7) readonly buffer BufZ  { float z[]; };
+layout(std430, binding = 8) writeonly buffer BufO { float att[]; };
+
+layout(push_constant) uniform PC {
+    uint dState; uint hK; uint hV; uint kDiv; float eps;
+} pc;
+
+shared vec4 qs4[32];
+shared vec4 ks4[32];
+shared float red[4];
+shared float gateScale;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint j = t >> 1u, half_ = t & 1u;
+    uint rq = gl_WorkGroupID.z;
+    const uint dS = 128u, nv = 32u, nvh = 16u;
+
+    uint kh = pc.kDiv != 0u ? h / pc.kDiv : h % pc.hK;
+    uint co = rq * (2u * pc.hK + pc.hV) * dS;
+    uint qBase = co + kh * dS;
+    uint kBase = co + pc.hK * dS + kh * dS;
+    uint vBase = co + 2u * pc.hK * dS + h * dS;
+
+    float qScale = inversesqrt(float(dS));
+    if (t < nv) {
+        qs4[t] = vec4(conv[qBase + 4u*t], conv[qBase + 4u*t + 1u],
+                      conv[qBase + 4u*t + 2u], conv[qBase + 4u*t + 3u]) * qScale;
+        ks4[t] = vec4(conv[kBase + 4u*t], conv[kBase + 4u*t + 1u],
+                      conv[kBase + 4u*t + 2u], conv[kBase + 4u*t + 3u]);
+    }
+    barrier();
+
+    float v = alpha[rq * pc.hV + h] + dt[h];
+    float decay = exp(ssm_a[h] * (v > 20.0 ? v : log(1.0 + exp(v))));
+    float beta = 1.0 / (1.0 + exp(-betaIn[rq * pc.hV + h]));
+    float vj = conv[vBase + j];
+    uint row = rq * pc.hV * dS * nv + (h * dS + j) * nv + half_ * nvh;
+    uint kq = half_ * nvh;
+
+    vec4 state[16];
+    float sk = 0.0;
+    for (uint i = 0u; i < nvh; ++i) {
+        state[i] = s4[row + i];
+        sk += dot(state[i], ks4[kq + i]);
+    }
+    sk += subgroupShuffleXor(sk, 1u);
+    sk *= decay;
+    float dj = beta * (vj - sk);
+
+    float oj = 0.0;
+    for (uint i = 0u; i < nvh; ++i) {
+        vec4 sn = state[i] * decay + ks4[kq + i] * dj;
+        s4[row + i] = sn;
+        oj += dot(sn, qs4[kq + i]);
+    }
+    oj += subgroupShuffleXor(oj, 1u);
+
+    float sg = subgroupAdd(half_ == 0u ? oj * oj : 0.0);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = sg;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) total += red[i];
+        gateScale = 1.0 / sqrt(total / float(dS) + pc.eps);
+    }
+    barrier();
+    if (half_ == 0u) {
+        uint outIndex = rq * pc.hV * dS + h * dS + j;
+        float zv = z[outIndex];
+        att[outIndex] = oj * gateScale * w[j] * (1.0 / (1.0 + exp(-zv)));
+    }
+}

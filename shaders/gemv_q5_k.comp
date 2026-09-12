@@ -13,6 +13,10 @@
 
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const uint TPR = 256u;
+// Optional fused epilogue (HC low-rank path): y = silu(sum * SILU_SCALE).
+layout(constant_id = 1) const uint SILU_EPILOGUE = 0u;
+layout(constant_id = 2) const float SILU_SCALE = 1.0;
+float epilogue(float v) { if (SILU_EPILOGUE != 0u) { v *= SILU_SCALE; return v / (1.0 + exp(-v)); } return v; }
 layout(std430, binding = 0) readonly buffer W { uint w32[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
@@ -66,10 +70,10 @@ void main() {
             float sum = 0.0;
             uint waves = TPR / gl_SubgroupSize, base = (tid / TPR) * waves;
             for (uint i = 0u; i < waves; ++i) sum += partial[base + i];
-            y[batch * pc.M + row] = sum;
+            y[batch * pc.M + row] = epilogue(sum);
         }
     } else {
         for (uint s = TPR / 2u; s > 0u; s >>= 1u) acc += subgroupShuffleXor(acc, s);
-        if (lane == 0u && row < pc.M) y[batch * pc.M + row] = acc;
+        if (lane == 0u && row < pc.M) y[batch * pc.M + row] = epilogue(acc);
     }
 }

@@ -1,8 +1,11 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-11 (20:40 MDT): **the native engine now serves port 8091
-from the Strix Halo iGPU alone** (all 48 layers plus the head; the XTX is not
-used, not loaded and not probed). Commit bd8b87f added the two-heap placement
+Status, 2026-09-11 (endpoint verified 20:33 MDT; later edits are dated in their sections): **the native engine
+now serves port 8091 from the Strix Halo iGPU alone** (all 48 layers plus the
+head on 0000:c1:00.0; the XTX holds no weights and does no compute; Vulkan
+device enumeration still opens tiny bookkeeping handles on it, as root's
+fdinfo check showed, and the single-mode restore helper does not need or
+probe it). Commit bd8b87f added the two-heap placement
 that makes the 88.7 GiB of GPU weights fit a 70.7 GiB device-local heap plus
 20.8 GiB of the host-visible heap with fail-closed per-heap and physical
 budgets; this update adds request-scoped PLE row prefetch, a hardened restore
@@ -699,11 +702,14 @@ for their memory to return.
 Configuration: `deploy/restore-native-flash.sh MODEL 32768 0 single` (the
 default mode) starts one server unit (`run-native-flash-trial.sh single`,
 `--local-driver`, HTTP loopback 8194, 24G/32G unit limits) and the trusted-LAN
-router on 8091. Placement printed by the engine: device-local 69.10 GiB
-(weights 67.92 + KV/state 0.74 + batch rows 0.45; heap headroom 69.4 after a
-1 GiB margin), host heap 20.80 GiB in 34 routed-expert tensors (type 2, heap 0,
-HOST_VISIBLE|HOST_COHERENT; headroom 34.2), MemTotal 121.2 GiB, reserve 12
-GiB. Load takes 73-105 s; Halo GTT reads 91.4 GiB afterwards and the unit's
+router on 8091. Placement printed by the serving engine at context 32768:
+device-local 69.15 GiB (weights 66.84 + KV/state 1.86 + batch rows 0.45; heap
+headroom 69.4 after a 1 GiB margin), host heap 21.88 GiB in 36 routed-expert
+tensors (type 2, heap 0, HOST_VISIBLE|HOST_COHERENT; headroom 34.2), MemTotal
+121.2 GiB, reserve 12 GiB. (The parity harnesses load at context 8192, where
+the KV allowance is smaller: 67.92 GiB of weights stay device-local and 20.80
+GiB in 34 tensors spill.) Load takes 73-105 s; Halo GTT reads 91.4 GiB
+afterwards and the unit's
 own cgroup stays under 1 GiB because each uploaded tensor's file pages are
 dropped as it goes. The driver's retained page pool (67.5 GiB before the
 first load, read from `ttm_page_pool` by root) is reused by the allocations,
@@ -714,7 +720,11 @@ GPU reads from the host heap cost 2-7% more than device-local on this part
 Q5_K 2560x6144 51.5 -> 54.9 us, Q6_K 10240x2560 92.7 -> 94.5 us at 64 MiB
 rotation), so only expert tensors (10 of 512 read per token) are placed there.
 
-Correctness on the single device (Q5_K_M, ctx 8192, F32 tier, prefetch 0):
+Correctness on the single device (Q5_K_M, ctx 8192, F32 tier, prefetch 0).
+The two harness records below were produced by the bd8b87f build, before the
+PLE row-prefetch and batched row-history precompute changes of 7d34606; the
+current build's own prefix, full-model, chunk and reset results are listed in
+"Current-build verification" further down:
 
 - `tests/gpu_qwen4_full.py --single`: 16 positions against the F32 oracle,
   worst logit relative RMS 1.33e-6, every greedy id, reset exact, replay
@@ -727,25 +737,37 @@ Correctness on the single device (Q5_K_M, ctx 8192, F32 tier, prefetch 0):
 - `tests/native_flash_http.py` on 8194 (all eight checks, cancellation 4.6 s),
   on 8091 and the 8092 proxy stream/tool checks.
 
-Measured through HTTP on the final stack, Halo only, ctx 32768, F32 tier,
-tables cold (no warming; the 36 GiB table cannot fit beside the model), two
-repetitions where marked (`bench/results-halo-only-ab-bench32.jsonl`):
+Measured through HTTP, Halo only, ctx 32768, F32 tier, no table warming (the
+36 GiB table cannot fit beside the model). Cache condition per row: every
+configuration ran in a fresh server process after the helper released the
+shards' page cache, and each ran the 512-distinct prompt first, so "first
+touch" means those PLE rows had not been read by that process or the page
+cache; the 2048 prompt shares its first 512 ids with the 512 prompt, so its
+first quarter was already resident; the second repetition of the default
+configuration re-used the working set (page-cache warm, beyond the 4096-row
+in-process cache). Records: `bench/results-halo-only-ab-bench32.jsonl`.
 
-| Halo-only configuration | Decode tok/s | 512 distinct tokens | 2048 distinct tokens | 512 uniform |
-| --- | --- | --- | --- | --- |
-| Serial prefill (`QK_FLASH_BATCH=0`), row prefetch on | 32.7-32.9 | 16.6 s (31 tok/s) | 77.5 s (26 tok/s) | 16.1 s |
-| Batched 512, row prefetch off (`QK_PLE_ROW_PREFETCH=0`) | 27.3-32.9 | 7.27 s (70 tok/s) | 24.9 s (82 tok/s) | 3.06 s |
-| Batched 512, row prefetch on (default), 2 reps | 32.85-32.92 | 3.03-3.07 s (167-169 tok/s) | 12.9-13.3 s (154-159 tok/s) | 2.94-2.96 s (173-174 tok/s) |
+| Halo-only configuration | Cache condition | Decode tok/s | 512 distinct tokens | 2048 distinct tokens | 512 uniform |
+| --- | --- | --- | --- | --- | --- |
+| Serial prefill (`QK_FLASH_BATCH=0`), row prefetch on | first touch | 32.7-32.9 | 16.6 s (31 tok/s) | 77.5 s (26 tok/s) | 16.1 s |
+| Batched 512, row prefetch off (`QK_PLE_ROW_PREFETCH=0`) | first touch | 27.3-32.9 | 7.27 s (70 tok/s) | 24.9 s (82 tok/s) | 3.06 s |
+| Batched 512, row prefetch on (default), rep 1 | first touch | 32.85-32.92 | 3.07 s (167 tok/s) | 13.3 s (154 tok/s) | 2.94 s (174 tok/s) |
+| Batched 512, row prefetch on (default), rep 2 | repeated working set | 32.87-32.92 | 3.03 s (169 tok/s) | 12.9 s (159 tok/s) | 2.96 s (173 tok/s) |
 
-Batched prefill is 5.4x the serial path on this device. The PLE row prefetch
-(`MADV_RANDOM` on the disk-mapped table plus one asynchronous `MADV_WILLNEED`
-per uncached row of a request before the serial gather) removes most of the
-cold-table penalty: 7.27 -> 3.05 s at 512 distinct tokens and 24.9 -> 13.1 s
-at 2048, without any table warming or unbounded memory. The remaining gap to
-uniform prompts (2.95 s) is the residual fault cost. Decode is unchanged by
-the prefill configuration; at 32.9 tok/s the single device is within 15% of
-the split stack's 35-38 tok/s, which had the XTX running 11 layers plus the
-head in parallel.
+Batched prefill is 5.4x the serial path on this device. At matched first-touch
+conditions the PLE row prefetch (`MADV_RANDOM` on the disk-mapped table plus
+one asynchronous `MADV_WILLNEED` per uncached row of a request before the
+serial gather) cuts 512 distinct tokens from 7.27 to 3.07 s and 2048 from
+24.9 to 13.3 s, without table warming or unbounded memory; the repeated
+working set (rep 2) is only 1-3% faster, so first-touch prefill is now close
+to page-cache-warm prefill. The remaining difference between distinct and
+uniform prompts (3.07 versus 2.94 s) has not been attributed by phase
+measurement: uniform prompts also route to the same experts every token, so
+expert grouping and the routed-expert working set differ, not only PLE
+faults. Decode is unchanged by the prefill configuration; at 32.9 tok/s the
+single device is within 15% of the split stack's 35-38 tok/s, where the XTX
+ran the last 11 layers and the head as a successive pipeline stage (not in
+parallel for single-token decode) with warm tables.
 
 For comparison with the earlier split figures, first-token latency on the
 35-token counting prompt is 0.59 s and the 512-token prefill of the split
@@ -772,9 +794,14 @@ reversible and backed up in `~/.config/systemd/user/backup-halo-only-2026-09-11/
 (originals, enablement list, rollback commands): the three legacy unit names
 (`qwen-kernel-prefill-router`, `qwen-kernel-prefill-xtx`,
 `qwen-kernel-decode-halo`) are masked with their files moved to the backup;
-`qwen-kernel-next-router` is linked but no longer enabled; a proxy drop-in
-documents the removed dependency. Reboot behavior now: the proxy starts
-alone, no model starts; the operator runs the restore helper.
+`qwen-kernel-next-router` is linked but no longer enabled. A proxy drop-in
+(`claude-qwen-proxy.service.d/10-halo-only.conf`) was added to reset the
+`Wants=`/`After=` lists, but `systemctl show` still reports the original
+`Wants=qwen-kernel-prefill-router.service` on the loaded unit, so the drop-in
+is documentation only: the masks are what make that dependency inert (a
+masked unit cannot be started by `Wants=`, and the proxy still starts
+normally). Reboot behavior now: the proxy starts alone, no model starts; the
+operator runs the restore helper.
 
 ### Restore helper
 
@@ -800,3 +827,68 @@ model, active units). `QK_FLASH_BATCH`, `QK_PLE_ROW_PREFETCH` and
 - The plan leaves about 1.3 GiB of device-local headroom at 32768 context and
   512 batch rows; longer contexts need the KV allowance re-checked.
 - Coopmat tier, MTP, prefix snapshots and multi-sequence serving are unchanged.
+
+## Current-build verification and decode fusions (2026-09-11, 20:45-21:12 MDT)
+
+Build: 7d34606 plus the changes committed with this section (decode fusions,
+word-addressed expert gate/up, profiling fences, helper fixes). Every check
+below ran on the Strix Halo alone in dedicated windows with the serving units
+stopped; 8091 was restored afterwards and the fused build is what serves now.
+
+Numerical checks on this build (`bench/results-halo-only-fused-parity.jsonl`,
+`bench/results-halo-native-prefix-study-2026-09-11.log` for the prefix lines):
+
+- 4-layer prefix oracle: relative RMS 4.77e-7 (fused) and 4.80e-7 (control),
+  both PASS; prefix batch check at 128 tokens PASS for whole, mixed and
+  batch-then-serial chunking.
+- Full model, 16 positions against the F32 oracle: PASS (all greedy ids, reset
+  exact, replay bit-exact); batched parity with the strong reset check: PASS.
+- Cross-build teacher-forced comparison (`tests/gpu_qwen4_teacher.py`, 256
+  deterministic positions, control `QK_FLASH_FUSE=0 QK_MOE_GU=v1` versus the
+  fused defaults): 256/256 greedy agreement, KL mean 3.7e-12 nats, max
+  2.4e-11, largest logit relative RMS 2.2e-6
+  (`bench/results-halo-only-teacher-control-vs-fused.json`).
+
+Changes measured: the HC low-rank down projection now applies the silu
+epilogue in the GEMV (specialization constants on `gemv_q5_k`/`gemv_q6_k`,
+two dispatches per HC module removed), the GDN step computes its per-head
+decay/beta in place (`qwen4_gdn_step_p`, one dispatch per GDN layer removed),
+and the routed and shared expert gate/up kernels read their Q5_K blocks as
+32-bit words with vec4 activations (`moe_gateup_q5k_v2`, `moe_shared_q5k_v2`).
+Rollback knobs: `QK_FLASH_FUSE=0`, `QK_MOE_GU=v1`, `QK_GDN_STEP=v1`; the
+restore helper forwards them.
+
+Prefix-level serial GPU time per token (4 layers, every dispatch fenced,
+alternating runs): fused+v2 2.474/2.478 ms, control 2.522/2.523 ms, fusions
+alone 2.511 ms, v2 alone 2.501 ms.
+
+Matched production A/B (HTTP, profiling off, fresh server per configuration,
+two repetitions each; `bench/results-halo-only-fusion-ab-bench32.jsonl`):
+
+| Configuration | Decode tok/s (35-token prompt / after 512) | 512 distinct | 2048 distinct | 512 uniform |
+| --- | --- | --- | --- | --- |
+| Controls (`QK_FLASH_FUSE=0 QK_MOE_GU=v1`) rep 1 / rep 2 | 32.3 / 32.9 and 32.9 / 33.0 | 3.09 / 3.10 s | 13.19 / 12.90 s | 2.99 / 2.90 s |
+| Fused defaults rep 1 / rep 2 | 32.9 / 33.2 and 33.4 / 33.3 | 3.03 / 3.03 s | 13.23 / 12.98 s | 2.99 / 2.98 s |
+
+The fused build is 1-2% faster on decode and 512-token prefill and
+indistinguishable elsewhere; with identical logits to 2.2e-6 it stays the
+default, labeled as a small gain. The exclusive decode profile of the fused
+build (every dispatch fenced, so about 0.5 ms above production; 24 tokens,
+`bench/results-halo-only-decode-profile-fused.txt`) is 31.1 ms GPU per token:
+dense Q5_K GEMVs 9.4 ms (375 dispatches), routed expert gate/up 5.4 ms,
+Q6_K GEMVs 4.5 ms (49 dispatches, byte loads), routed Q8_0 down 2.3 ms, Q5_1
+down 1.6 ms, router logits 1.4 ms, HC-up Q5_1 GEMVs 1.4 ms, GDN step 1.2 ms,
+HC elementwise 1.2 ms (294 dispatches), shared experts 0.8 ms, expert select
+0.6 ms, attention 0.6 ms. Next measurable candidates, each to be gated by an
+actual-weight microbench and the full-model checks before becoming a
+default: word-addressed Q6_K GEMV (210-byte blocks, 2-byte alignment), routed
+Q8_0 and Q5_1 down kernels (34- and 24-byte blocks), and folding the HC
+combine into the following norm.
+
+API verification on the served fused build: all eight checks on 8194
+(`bench/results-halo-only-fused-http32.jsonl`), the gateway suite on 8091 and
+the 8092 proxy stream/tool checks. Separately: when the upstream 8091 is
+down, the loopback proxy on 8092 returns a malformed HTTP status line
+(`BadStatusLine` in the client) instead of a clean 502; that is an existing
+error-path protocol issue of the proxy, not a model result, and it is not
+counted as passed API verification.
