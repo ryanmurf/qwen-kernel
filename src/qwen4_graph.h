@@ -938,7 +938,9 @@ public:
         double t1 = timed ? nowMs() : 0;
         if (ple) {
             std::vector<float> row(n);
-            ple->gather(ple->config().rows(token,tokenHistory),row.data());
+            const auto rows = ple->config().rows(token,tokenHistory);
+            ple->prefetch(rows);
+            ple->gather(rows,row.data());
             memcpy((uint8_t*)mapped+pleOffset,row.data(),row.size()*4);
         }
         double t2 = timed ? nowMs() : 0;
@@ -1093,10 +1095,23 @@ public:
         auto history = tokenHistory;
         std::vector<float> pleRows;
         if (ple) pleRows.resize(size_t(T)*n);
-        for (uint32_t t = 0; t < T; ++t) {
-            const uint32_t token = tokens ? tokens[t] : 0;
-            if (ple) ple->gather(ple->config().rows(token,history),pleRows.data()+size_t(t)*n);
-            history.push_back(token);
+        // All rows of the batch are known up front: issue their asynchronous
+        // prefetches first so the disk faults overlap, then gather serially.
+        std::vector<std::vector<uint32_t>> rowsPerToken;
+        if (ple) {
+            rowsPerToken.reserve(T);
+            std::vector<uint32_t> all;
+            for (uint32_t t = 0; t < T; ++t) {
+                const uint32_t token = tokens ? tokens[t] : 0;
+                rowsPerToken.push_back(ple->config().rows(token,history));
+                all.insert(all.end(),rowsPerToken.back().begin(),rowsPerToken.back().end());
+                history.push_back(token);
+                if (history.size() > 2) history.erase(history.begin());
+            }
+            ple->prefetch(all);
+            for (uint32_t t = 0; t < T; ++t) ple->gather(rowsPerToken[t],pleRows.data()+size_t(t)*n);
+        } else for (uint32_t t = 0; t < T; ++t) {
+            history.push_back(tokens ? tokens[t] : 0);
             if (history.size() > 2) history.erase(history.begin());
         }
         upload(buffers.at("$hidden"),hidden.data(),hidden.size()*4);

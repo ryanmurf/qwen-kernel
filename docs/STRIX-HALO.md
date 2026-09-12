@@ -1,36 +1,23 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-11 (15:25 MDT): the native F32-tier split is serving port
-8091 after the reboot, started by `deploy/restore-native-flash.sh` with table
-warming. Full-model F32 logit/greedy/reset parity, batched-prefill parity and
-the real dual-GPU HTTP/Claude tests pass (8194, 8091, 8092). Measured through
-the HTTP path with the lookup tables warm and the XTX at DPM level `high`
-across the two restarts of this session: decode 34.1-37.9 tok/s, first token
-0.55-0.70 s, 512 distinct-token prompt 2.55-2.67 s (191-201 tok/s), 2048
-tokens 10.3-10.7 s; while the tables are still paging in, 512 tokens take
-4.3 s. The cooperative-matrix tier is opt-in with measured quality (see
-"Cooperative-matrix tier").
-With the tables cold (`QK_PLE_PREFETCH=0`, the script default) the same build
-measured 27.7-32.8 tok/s and 6.75 s for 512 tokens. The cooperative-matrix
-tier stays opt-in and only partially validated. MTP and prefix snapshots
-remain unimplemented. The trial units are runtime-only (not enabled at boot);
-the old boot stack was stopped by the operator after the reboot and its unit
-files are unchanged. No Halogen binary has been installed or executed.
+Status, 2026-09-11 (20:40 MDT): **the native engine now serves port 8091
+from the Strix Halo iGPU alone** (all 48 layers plus the head; the XTX is not
+used, not loaded and not probed). Commit bd8b87f added the two-heap placement
+that makes the 88.7 GiB of GPU weights fit a 70.7 GiB device-local heap plus
+20.8 GiB of the host-visible heap with fail-closed per-heap and physical
+budgets; this update adds request-scoped PLE row prefetch, a hardened restore
+helper and the measurements below. Full-model F32-oracle parity, batched
+parity with a stronger reset check and the real HTTP/Claude suites all pass on
+the single device. See "Halo-only serving" for numbers and limits. The
+cooperative-matrix tier stays opt-in. MTP and prefix snapshots remain
+unimplemented. The native units are transient (not started at boot); the
+legacy two-GPU boot stack can no longer start (its three unit names are
+masked with backups, see "Legacy stack containment"). No Halogen binary has
+been installed or executed.
 
-Recovery on 2026-09-11 followed the incident notes below: safety fixes first
-(fail-closed prefetch guard, validated floor, bounded tier harness; commit
-263f58a), then the 4-layer prefix oracle and batch checks, then the XTX
-worker and the Halo server loaded one at a time with prefetch off and
-VRAM/GTT/MemAvailable checked before and after each load (Halo GTT 69.1 GiB,
-no driver errors), then the API suites on 8194/8091/8092. Table warming was
-then enabled by restarting only the Halo server (worker still loaded, no
-other GPU work) under a 52G/58G unit: 36.170 GiB touched in 87 s, MemFree
-42 -> 4.9 GiB, MemAvailable steady near 46 GiB, cgroup 43 GiB, no driver
-errors. The floor guard uses MemAvailable, which counts the warmed cache as
-reclaimable, so it only catches gross exhaustion; the operating rule that
-prevents the incident is that no other GPU load may start while a stage
-holds the resident tables, and every load is preceded by a drain check
-(GTT/VRAM back near idle, tables paged out by the closing stage).
+The earlier two-GPU split (Halo 0:37 + XTX 37:48) remains available as an
+explicit `MODE=split` of the restore helper and its measurements stay below
+for reference; they are not Halo-only results.
 
 ## Current target
 
@@ -706,3 +693,110 @@ below `QK_PLE_PREFETCH_FLOOR_GIB` (default 16), and the tables are paged out
 when the stage closes. GPU experiments must not run beside a stage that holds
 the resident tables; a dedicated window means stopping the units and waiting
 for their memory to return.
+
+## Halo-only serving (2026-09-11)
+
+Configuration: `deploy/restore-native-flash.sh MODEL 32768 0 single` (the
+default mode) starts one server unit (`run-native-flash-trial.sh single`,
+`--local-driver`, HTTP loopback 8194, 24G/32G unit limits) and the trusted-LAN
+router on 8091. Placement printed by the engine: device-local 69.10 GiB
+(weights 67.92 + KV/state 0.74 + batch rows 0.45; heap headroom 69.4 after a
+1 GiB margin), host heap 20.80 GiB in 34 routed-expert tensors (type 2, heap 0,
+HOST_VISIBLE|HOST_COHERENT; headroom 34.2), MemTotal 121.2 GiB, reserve 12
+GiB. Load takes 73-105 s; Halo GTT reads 91.4 GiB afterwards and the unit's
+own cgroup stays under 1 GiB because each uploaded tensor's file pages are
+dropped as it goes. The driver's retained page pool (67.5 GiB before the
+first load, read from `ttm_page_pool` by root) is reused by the allocations,
+which is why MemFree only moves a few GiB per load.
+
+GPU reads from the host heap cost 2-7% more than device-local on this part
+(operator probe with the actual type/heap/flags printed, no fallback:
+Q5_K 2560x6144 51.5 -> 54.9 us, Q6_K 10240x2560 92.7 -> 94.5 us at 64 MiB
+rotation), so only expert tensors (10 of 512 read per token) are placed there.
+
+Correctness on the single device (Q5_K_M, ctx 8192, F32 tier, prefetch 0):
+
+- `tests/gpu_qwen4_full.py --single`: 16 positions against the F32 oracle,
+  worst logit relative RMS 1.33e-6, every greedy id, reset exact, replay
+  bit-exact (`bench/results-halo-only-full-parity.jsonl`).
+- `tests/gpu_qwen4_batch.py --single`: serial, whole-batch, mixed 5+1+7+3
+  and batch-then-serial chunking all within 1.3e-6 of the oracle; the reset
+  check now requires the clean first row captured before any batched work to
+  equal, bit for bit, the first row after a different prompt fed whole and in
+  mixed chunks (`bench/results-halo-only-batch-parity.jsonl`).
+- `tests/native_flash_http.py` on 8194 (all eight checks, cancellation 4.6 s),
+  on 8091 and the 8092 proxy stream/tool checks.
+
+Measured through HTTP on the final stack, Halo only, ctx 32768, F32 tier,
+tables cold (no warming; the 36 GiB table cannot fit beside the model), two
+repetitions where marked (`bench/results-halo-only-ab-bench32.jsonl`):
+
+| Halo-only configuration | Decode tok/s | 512 distinct tokens | 2048 distinct tokens | 512 uniform |
+| --- | --- | --- | --- | --- |
+| Serial prefill (`QK_FLASH_BATCH=0`), row prefetch on | 32.7-32.9 | 16.6 s (31 tok/s) | 77.5 s (26 tok/s) | 16.1 s |
+| Batched 512, row prefetch off (`QK_PLE_ROW_PREFETCH=0`) | 27.3-32.9 | 7.27 s (70 tok/s) | 24.9 s (82 tok/s) | 3.06 s |
+| Batched 512, row prefetch on (default), 2 reps | 32.85-32.92 | 3.03-3.07 s (167-169 tok/s) | 12.9-13.3 s (154-159 tok/s) | 2.94-2.96 s (173-174 tok/s) |
+
+Batched prefill is 5.4x the serial path on this device. The PLE row prefetch
+(`MADV_RANDOM` on the disk-mapped table plus one asynchronous `MADV_WILLNEED`
+per uncached row of a request before the serial gather) removes most of the
+cold-table penalty: 7.27 -> 3.05 s at 512 distinct tokens and 24.9 -> 13.1 s
+at 2048, without any table warming or unbounded memory. The remaining gap to
+uniform prompts (2.95 s) is the residual fault cost. Decode is unchanged by
+the prefill configuration; at 32.9 tok/s the single device is within 15% of
+the split stack's 35-38 tok/s, which had the XTX running 11 layers plus the
+head in parallel.
+
+For comparison with the earlier split figures, first-token latency on the
+35-token counting prompt is 0.59 s and the 512-token prefill of the split
+stack was 2.55-2.67 s with warm tables (not comparable: different device set
+and warm tables).
+
+Rejected or discarded in this campaign: the 20:19 measurement of the default
+configuration (a legacy-unit start test overlapped it for 4 s; see below), and
+the earlier idea of warming the whole table on the single device (libqk now
+rejects `QK_PLE_PREFETCH=1` when the tables cannot fit beside the plan).
+
+### Legacy stack containment (2026-09-11)
+
+`claude-qwen-proxy.service` carried `Wants=qwen-kernel-prefill-router.service`,
+and that router `Requires` the legacy Halo decode worker and `Wants` the XTX
+prefill worker: a proxy restart or a reboot would have loaded the old two-GPU
+llama.cpp stack beside the 91 GiB native model. During this work a start test
+of the router, run before its mask was actually in place (the real unit file
+had made `mask` refuse), pulled the legacy loaders for about ten seconds
+(20:20:09-20:20:19 MDT) before they were stopped; the kernel log shows no
+amdgpu error, but measurements overlapping that interval were discarded and
+legacy units must never be tested by starting them again. Containment,
+reversible and backed up in `~/.config/systemd/user/backup-halo-only-2026-09-11/`
+(originals, enablement list, rollback commands): the three legacy unit names
+(`qwen-kernel-prefill-router`, `qwen-kernel-prefill-xtx`,
+`qwen-kernel-decode-halo`) are masked with their files moved to the backup;
+`qwen-kernel-next-router` is linked but no longer enabled; a proxy drop-in
+documents the removed dependency. Reboot behavior now: the proxy starts
+alone, no model starts; the operator runs the restore helper.
+
+### Restore helper
+
+`deploy/restore-native-flash.sh MODEL [CONTEXT=32768] [WARM=0] [MODE=single]`
+validates its arguments first, refuses while a native unit is active, a qk or
+server process runs, a GPU process is stuck, or the Halo (and in split mode
+the XTX) still holds memory; releases the model shards' page cache; starts
+the server (and, in split mode only, the XTX worker first) and fails
+explicitly, stopping only the units it started, if a readiness deadline
+passes; requires an HTTP 200 `{"status":"ok"}` from 8194 and 8091. Its
+failure paths were exercised without GPU loads (bad arguments, missing
+model, active units). `QK_FLASH_BATCH`, `QK_PLE_ROW_PREFETCH` and
+`QK_FLASH_COOPMAT` are forwarded into the unit when set.
+
+### Remaining limits (Halo-only)
+
+- Decode is at 32.9 tok/s against a bandwidth roofline near 40 tok/s for
+  the 5.3 GB read per token; the gap is dispatch overhead and small kernels
+  (next: profile the 48-layer serial forward and fuse).
+- Distinct-token prefill still pays about 0.2 ms per token of PLE faults on
+  top of the 5.7 ms of GPU time; a bounded row cache larger than the current
+  4096 entries would help repeated conversations without warming the table.
+- The plan leaves about 1.3 GiB of device-local headroom at 32768 context and
+  512 batch rows; longer contexts need the KV allowance re-checked.
+- Coopmat tier, MTP, prefix snapshots and multi-sequence serving are unchanged.

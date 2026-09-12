@@ -1,0 +1,9 @@
+{"test": "teacher_forced_http", "result": "PASS"}
+{"test": "stream_benchmark", "prompt_tokens": 35, "events": 96, "first_token_seconds": 0.5939688880025642, "total_seconds": 3.558397064000019, "inter_event_per_second": 32.04956300959289, "streamed_tokens": 96, "decode_tokens_per_second": 32.04956300959289, "coherent_counting_prefix": true, "content": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 2", "reported_timings": {"prompt_n": 35, "prompt_ms": 0.0, "predicted_n": 96, "predicted_ms": 3557.713701, "predicted_per_second": 26.98362152441226}}
+{"test": "claude_text", "result": "PASS", "usage": {"input_tokens": 60, "output_tokens": 18}}
+{"test": "claude_xml_tool", "result": "PASS", "call": {"type": "tool_use", "id": "toolu_d5dbfa2b3915461a96d6147c5196038f", "name": "echo", "input": {"text": "READY"}}, "usage": {"input_tokens": 309, "output_tokens": 92}}
+{"test": "claude_tool_roundtrip", "result": "PASS", "usage": {"input_tokens": 349, "output_tokens": 34}}
+{"test": "claude_stream", "result": "PASS", "events": 7}
+{"test": "prefill_cancel_then_request", "result": "PASS", "seconds": 4.5436046040049405}
+{"test": "concurrent_isolation", "result": "PASS"}
+{"test": "invalid_token", "result": "PASS"}
