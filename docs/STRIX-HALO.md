@@ -1,15 +1,16 @@
 # Strix Halo native Flash Next port
 
-Status, 2026-09-11 (endpoint verified 20:33 MDT; later edits are dated in their sections): **the native engine
-now serves port 8091 from the Strix Halo iGPU alone** (all 48 layers plus the
+Validated milestone `0453754`, 2026-09-11: **the native engine served port
+8091 from the Strix Halo iGPU alone** (all 48 layers plus the
 head on 0000:c1:00.0; the XTX holds no weights and does no compute; Vulkan
 device enumeration still opens tiny bookkeeping handles on it, as root's
 fdinfo check showed, and the single-mode restore helper does not need or
 probe it). Commit bd8b87f added the two-heap placement
-that makes the 88.7 GiB of GPU weights fit a 70.7 GiB device-local heap plus
-20.8 GiB of the host-visible heap with fail-closed per-heap and physical
-budgets; this update adds request-scoped PLE row prefetch, a hardened restore
-helper and the measurements below. Full-model F32-oracle parity, batched
+that makes the 88.7 GiB of GPU weights fit across the 70.7 GiB device-local
+heap and the host-visible heap (21.9 GiB in the host heap at 32768 context),
+with fail-closed per-heap and physical budgets. The later milestones add
+request-scoped PLE row prefetch, decode fusions, a hardened restore helper
+and the measurements below. Full-model F32-oracle parity, batched
 parity with a stronger reset check and the real HTTP/Claude suites all pass on
 the single device. See "Halo-only serving" for numbers and limits. The
 cooperative-matrix tier stays opt-in. MTP and prefix snapshots remain
@@ -645,10 +646,15 @@ Rejected after measurement (Halo, 512 tokens, F32 tier, same session):
 a split-K kernel for the 4/48-row projections (`QK_FLASH_SKINNY=splitk`,
 256.4 ms total versus 256.0 ms with the z-batched GEMV) and the masked
 128-row GEMM tile for them (`QK_FLASH_SKINNY=gemm`, 252.9 ms); neither
-changes the total, so the packed GEMV stays. Note for readers of the
-profile: dispatches recorded with `fence=false` carry no timestamp, so their
+changed the total in that experiment. The current `projectBatch` path uses
+masked scalar GEMM for skinny projections at T >= 64, unless
+`QK_FLASH_SKINNY=gemv` is set; do not infer the current default from this
+historical comparison. Note for readers of that older
+profile: dispatches recorded with `fence=false` carried no timestamp, so their
 GPU time is attributed to the next fenced dispatch (the "gemv_q5_k" row at
-512 tokens mostly contains the unfenced GDN qkv/gate/alpha GEMMs).
+512 tokens mostly contains the unfenced GDN qkv/gate/alpha GEMMs). Since
+`0453754`, profiling fences every dispatch; the older result is not an
+exclusive per-shader profile.
 
 ### Page-cache hygiene (added 2026-09-11)
 
@@ -659,11 +665,17 @@ The server now shuts the engine down on SIGTERM as well as SIGINT, which
 runs the stage's page-out on close. `deploy/release-model-cache.py` drops the
 model shards' page cache with a targeted `POSIX_FADV_DONTNEED` for the case
 where a process died without it, and `deploy/restore-native-flash.sh` runs
-the whole safe start sequence: refuse while GPU memory is not drained or a
-GPU process is stuck, release the shard cache, XTX worker, Halo server
-(warming only after both are up, under 52G/58G limits), then the router.
+the guarded start sequence. Its current default is Halo-only, with no full
+table warming; only explicit `MODE=split` starts an XTX worker before the
+Halo server. See "Restore helper" for the current behavior and limits.
 
 ## Incident 2026-09-11 (00:41-01:20 MDT): Halo driver out of memory
+
+Historical incident, resolved by the user-authorized reboot at 07:12:46 on
+2026-09-11. The account and recovery plan below describe the pre-reboot
+state, not a current stuck process or a recommendation to reset a GPU.
+For current operation, use the Halo-only restore procedure below; the old
+two-GPU unit names are now masked.
 
 While the serving units were stopped for the coopmat window, repeated GPU
 test loads (the 8 GiB prefix graph, then the full 67 GiB Halo stage for the
@@ -740,10 +752,11 @@ current build's own prefix, full-model, chunk and reset results are listed in
 
 Measured through HTTP, Halo only, ctx 32768, F32 tier, no table warming (the
 36 GiB table cannot fit beside the model). Cache condition per row: every
-configuration ran in a fresh server process after the helper released the
-shards' page cache, and each ran the 512-distinct prompt first, so "first
-touch" means those PLE rows had not been read by that process or the page
-cache; the 2048 prompt shares its first 512 ids with the 512 prompt, so its
+configuration ran in a fresh server process after the helper requested
+release of the shards' page cache, and each ran the 512-distinct prompt
+first. Here "first touch" identifies that first workload invocation after
+the cache-release procedure, not a census proving every PLE page was cold.
+The 2048 prompt shares its first 512 ids with the 512 prompt, so its
 first quarter was already resident; the second repetition of the default
 configuration re-used the working set (page-cache warm, beyond the 4096-row
 in-process cache). Records: `bench/results-halo-only-ab-bench32.jsonl`.
@@ -755,8 +768,9 @@ in-process cache). Records: `bench/results-halo-only-ab-bench32.jsonl`.
 | Batched 512, row prefetch on (default), rep 1 | first touch | 32.85-32.92 | 3.07 s (167 tok/s) | 13.3 s (154 tok/s) | 2.94 s (174 tok/s) |
 | Batched 512, row prefetch on (default), rep 2 | repeated working set | 32.87-32.92 | 3.03 s (169 tok/s) | 12.9 s (159 tok/s) | 2.96 s (173 tok/s) |
 
-Batched prefill is 5.4x the serial path on this device. At matched first-touch
-conditions the PLE row prefetch (`MADV_RANDOM` on the disk-mapped table plus
+Batched prefill is 5.4x the serial path on this device for the measured
+512-distinct prompt. With the same startup and first-workload procedure,
+the PLE row prefetch (`MADV_RANDOM` on the disk-mapped table plus
 one asynchronous `MADV_WILLNEED` per uncached row of a request before the
 serial gather) cuts 512 distinct tokens from 7.27 to 3.07 s and 2048 from
 24.9 to 13.3 s, without table warming or unbounded memory; the repeated
@@ -765,7 +779,8 @@ to page-cache-warm prefill. The remaining difference between distinct and
 uniform prompts (3.07 versus 2.94 s) has not been attributed by phase
 measurement: uniform prompts also route to the same experts every token, so
 expert grouping and the routed-expert working set differ, not only PLE
-faults. Decode is unchanged by the prefill configuration; at 32.9 tok/s the
+faults. Decode on the short counting prompt is unchanged by the prefill
+configuration; at 32.9 tok/s the
 single device is within 15% of the split stack's 35-38 tok/s, where the XTX
 ran the last 11 layers and the head as a successive pipeline stage (not in
 parallel for single-token decode) with warm tables.
@@ -814,45 +829,53 @@ the server (and, in split mode only, the XTX worker first) and fails
 explicitly, stopping only the units it started, if a readiness deadline
 passes; requires an HTTP 200 `{"status":"ok"}` from 8194 and 8091. Its
 failure paths were exercised without GPU loads (bad arguments, missing
-model, active units). `QK_FLASH_BATCH`, `QK_PLE_ROW_PREFETCH` and
-`QK_FLASH_COOPMAT` are forwarded into the unit when set.
+model, active units). `QK_FLASH_BATCH`, `QK_PLE_ROW_PREFETCH`,
+`QK_FLASH_COOPMAT`, `QK_FLASH_FUSE`, `QK_MOE_GU` and `QK_GDN_STEP` are
+forwarded into the unit when set in this milestone. The live-process guard
+checks executable identity rather than matching binary names anywhere in
+a shell command, so benchmark parent shells do not trigger false positives.
 
 ### Remaining limits (Halo-only)
 
-- Decode is at 32.9 tok/s against a bandwidth roofline near 40 tok/s for
-  the 5.3 GB read per token; the gap is dispatch overhead and small kernels
-  (next: profile the 48-layer serial forward and fuse).
-- Distinct-token prefill still pays about 0.2 ms per token of PLE faults on
-  top of the 5.7 ms of GPU time; a bounded row cache larger than the current
-  4096 entries would help repeated conversations without warming the table.
+- At `0453754`, warm decode is about 33.4 tok/s on the 35-token counting
+  prompt. The profile below identifies quantized projections and routed
+  experts as the main measured costs; an approximate bandwidth roofline is
+  not proof that all remaining time is dispatch overhead.
+- Distinct-token prefill still depends on the PLE page-cache working set and
+  expert grouping. Their separate contributions have not been measured by
+  an end-to-end phase breakdown. A larger bounded row cache is a hypothesis
+  for repeated conversations, not a verified gain.
 - The plan leaves about 1.3 GiB of device-local headroom at 32768 context and
   512 batch rows; longer contexts need the KV allowance re-checked.
 - Coopmat tier, MTP, prefix snapshots and multi-sequence serving are unchanged.
 
-## Current-build verification and decode fusions (2026-09-11, 20:45-21:12 MDT)
+## Current-build verification and decode fusions (`0453754`, 2026-09-11)
 
-Build: 7d34606 plus the changes committed with this section (decode fusions,
-word-addressed expert gate/up, profiling fences, helper fixes). Every check
-below ran on the Strix Halo alone in dedicated windows with the serving units
-stopped; 8091 was restored afterwards and the fused build is what serves now.
+Build: `0453754` (decode fusions, word-addressed expert gate/up, profiling
+fences and helper fixes). Standalone numerical tests and profiling ran on
+the Strix Halo alone with the serving units stopped. The production A/B and
+HTTP suites then ran against restored single-device servers; the candidate
+was left serving on 8091. Later tuning may temporarily stop that endpoint.
 
 Numerical checks on this build (`bench/results-halo-only-fused-parity.jsonl`,
-`bench/results-halo-native-prefix-study-2026-09-11.log` for the prefix lines):
+`bench/results-halo-only-fused-prefix.txt` for the prefix lines):
 
 - 4-layer prefix oracle: relative RMS 4.77e-7 (fused) and 4.80e-7 (control),
   both PASS; prefix batch check at 128 tokens PASS for whole, mixed and
   batch-then-serial chunking.
 - Full model, 16 positions against the F32 oracle: PASS (all greedy ids, reset
   exact, replay bit-exact); batched parity with the strong reset check: PASS.
-- Cross-build teacher-forced comparison (`tests/gpu_qwen4_teacher.py`, 256
-  deterministic positions, control `QK_FLASH_FUSE=0 QK_MOE_GU=v1` versus the
-  fused defaults): 256/256 greedy agreement, KL mean 3.7e-12 nats, max
+- Teacher-forced kernel-configuration comparison (`tests/gpu_qwen4_teacher.py`,
+  256 deterministic positions, the same build with control
+  `QK_FLASH_FUSE=0 QK_MOE_GU=v1` versus the fused defaults): 256/256 greedy
+  agreement, KL mean 3.7e-12 nats, max
   2.4e-11, largest logit relative RMS 2.2e-6
   (`bench/results-halo-only-teacher-control-vs-fused.json`).
 
 Changes measured: the HC low-rank down projection now applies the silu
 epilogue in the GEMV (specialization constants on `gemv_q5_k`/`gemv_q6_k`,
-two dispatches per HC module removed), the GDN step computes its per-head
+one separate SiLU dispatch removed per HC module: two per layer plus the
+output head, 97 total), the GDN step computes its per-head
 decay/beta in place (`qwen4_gdn_step_p`, one dispatch per GDN layer removed),
 and the routed and shared expert gate/up kernels read their Q5_K blocks as
 32-bit words with vec4 activations (`moe_gateup_q5k_v2`, `moe_shared_q5k_v2`).
@@ -863,19 +886,33 @@ Prefix-level serial GPU time per token (4 layers, every dispatch fenced,
 alternating runs): fused+v2 2.474/2.478 ms, control 2.522/2.523 ms, fusions
 alone 2.511 ms, v2 alone 2.501 ms.
 
-Matched production A/B (HTTP, profiling off, fresh server per configuration,
-two repetitions each; `bench/results-halo-only-fusion-ab-bench32.jsonl`):
+Production A/B (HTTP, profiling off, fresh server per configuration, controls
+then candidate, two repetitions of three prefill workloads each;
+`bench/results-halo-only-fusion-ab-bench32.jsonl`). Each workload is preceded
+by the same 35-token counting prompt with a reset context and 96 generated
+tokens. Warm decode is the median of the five streams after the first stream
+on each server; it is not decode at a 512- or 2048-token context. All twelve
+streams produced identical, coherent counting prefixes.
 
-| Configuration | Decode tok/s (35-token prompt / after 512) | 512 distinct | 2048 distinct | 512 uniform |
-| --- | --- | --- | --- | --- |
-| Controls (`QK_FLASH_FUSE=0 QK_MOE_GU=v1`) rep 1 / rep 2 | 32.3 / 32.9 and 32.9 / 33.0 | 3.09 / 3.10 s | 13.19 / 12.90 s | 2.99 / 2.90 s |
-| Fused defaults rep 1 / rep 2 | 32.9 / 33.2 and 33.4 / 33.3 | 3.03 / 3.03 s | 13.23 / 12.98 s | 2.99 / 2.98 s |
+| Configuration | First stream tok/s | Warm decode median tok/s | 512 distinct, reps 1 / 2 | 2048 distinct, reps 1 / 2 | 512 uniform, reps 1 / 2 |
+| --- | --- | --- | --- | --- | --- |
+| Controls (`QK_FLASH_FUSE=0 QK_MOE_GU=v1`) | 32.28 | 32.92 | 3.09 / 3.10 s | 13.19 / 12.90 s | 2.99 / 2.90 s |
+| Fused defaults | 32.95 | 33.35 | 3.03 / 3.03 s | 13.23 / 12.98 s | 2.99 / 2.98 s |
 
-The fused build is 1-2% faster on decode and 512-token prefill and
-indistinguishable elsewhere; with identical logits to 2.2e-6 it stays the
-default, labeled as a small gain. The exclusive decode profile of the fused
-build (every dispatch fenced, so about 0.5 ms above production; 24 tokens,
-`bench/results-halo-only-decode-profile-fused.txt`) is 31.1 ms GPU per token:
+Warm decode improved 1.30% in this A/B; the 256-position comparison above
+also bounds the observed numerical change. The 512-token prefill times are
+slightly lower, but the batch kernels were unchanged and the other prefill
+cases show no consistent gain; do not generalize that small difference.
+This is a short-context result from one control/candidate ordering, not a
+statistical guarantee for every workload or a long-context decode benchmark.
+
+The fused build's instrumented decode profile (24 tokens after 64 distinct
+prompt tokens, replay off, every dispatch fenced;
+`bench/results-halo-only-decode-profile-fused.txt`) is 31.1 ms GPU per token.
+Its timestamps attribute each fenced interval to one dispatch, including
+associated synchronization. Those fences change scheduling, so this is a
+bottleneck profile, not production throughput or a measured fixed profiling
+overhead. The rows are:
 dense Q5_K GEMVs 9.4 ms (375 dispatches), routed expert gate/up 5.4 ms,
 Q6_K GEMVs 4.5 ms (49 dispatches, byte loads), routed Q8_0 down 2.3 ms, Q5_1
 down 1.6 ms, router logits 1.4 ms, HC-up Q5_1 GEMVs 1.4 ms, GDN step 1.2 ms,

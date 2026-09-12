@@ -1,4 +1,4 @@
-{"note": "fused build, single device; records from the 21:00 window"}
+{"note": "Build 0453754 candidate on 2026-09-11, single STRIX_HALO device, full and batched parity at context 8192 with 16 teacher-forced positions. Records from verification job blrbde512, before the production API A/B. Original unverified clock-time annotation removed; numerical records below are unchanged."}
 {"loaded": "0:48", "device": "STRIX_HALO", "seconds": 100.50115260999883}
 {"step": 0, "split_relative_rms": null, "logit_relative_rms": 1.0208765676884265e-06, "logit_max_abs": 1.2159347534179688e-05, "native_argmax": 36, "reference_argmax": 36, "seconds": 0.052912651997758076}
 {"step": 1, "split_relative_rms": null, "logit_relative_rms": 1.4101524528092023e-06, "logit_max_abs": 2.384185791015625e-05, "native_argmax": 248046, "reference_argmax": 248046, "seconds": 0.03630928300117375}

@@ -1,0 +1,23 @@
+Build 0453754 candidate, 2026-09-11, single STRIX_HALO device.
+Verbatim prefix-result excerpt from verification job blrbde512.
+The later restore/API failure in that job is not covered by this excerpt;
+successful production/API verification is recorded separately in the fused
+HTTP, gateway and proxy result files after job bynq83dzi restored the model.
+
+== build libqk + qk (fusions, expert v2, profiling fences)
+build rc=0
+== prefix oracle + batch check (4 layers, new build, fuse on, expert v2)
+native layers 0:4 (16 steps) vs F32 reference: relative_rms=4.76632e-07 max_abs=2.08616e-07 -> PASS
+worst frame relative_rms=5.82667e-07; reset exact
+batch check whole            frames=128 worst_frame_relative_rms=2.41e-06 median=1.42e-06 frames>1e-2=0 max_abs=4.47e-07 -> PASS
+batch check mixed 5+1+7+3    frames=128 worst_frame_relative_rms=1.69e-06 median=1e-06 frames>1e-2=0 max_abs=3.73e-07 -> PASS
+batch check batch then serial frames=128 worst_frame_relative_rms=2.05e-06 median=8.69e-07 frames>1e-2=0 max_abs=4.47e-07 -> PASS
+== prefix oracle with fusions OFF and expert v1 (control)
+native layers 0:4 (16 steps) vs F32 reference: relative_rms=4.80133e-07 max_abs=1.78814e-07 -> PASS
+== prefix-level serial GPU time per token (4 layers, exclusive profile), alternating
+fuse=1 expert=v2 serial_gpu_ms_per_token(4 layers, mean of last 12)=2.474
+fuse=0 expert=v1 serial_gpu_ms_per_token(4 layers, mean of last 12)=2.522
+fuse=1 expert=v2 serial_gpu_ms_per_token(4 layers, mean of last 12)=2.478
+fuse=0 expert=v1 serial_gpu_ms_per_token(4 layers, mean of last 12)=2.523
+fuse=1 expert=v1 serial_gpu_ms_per_token(4 layers, mean of last 12)=2.511
+fuse=0 expert=v2 serial_gpu_ms_per_token(4 layers, mean of last 12)=2.501
