@@ -1,9 +1,10 @@
 # Halo vector-LDS F32 batched attention
 
-Status, 2026-09-12: **96 operator checks and the same-build full-model
-replay comparison passed bit-exactly. No API speed claim or default
-promotion.** Review follow-up adds direct prefill-output and partial-prefix
-checks; see [follow-up results](RESULTS-halo-review-followup.md).
+Status, 2026-09-12: **operator, full-model and partial-prefill checks pass
+bit-exactly. A repeated API pair shows 20% lower median 16K first-token
+latency but 4.5% slower decode; no default promotion.** See the
+[follow-up results](RESULTS-halo-review-followup.md) for full ranges, raw
+evidence and the remaining reverse-order check.
 `QK_FLASH_ATTN_BATCH=vec4` selects the new path on Strix Halo only. Unset it,
 or use `baseline`, for the unchanged default. Cooperative-matrix selection
 takes precedence. GEMM and single-position decode choices are independent;
@@ -124,6 +125,7 @@ and readbacks. It is not an API throughput measurement.
 The same-build baseline control ran 12:45:08–12:54:21 UTC, exiting zero with
 no memory abort or library change. Its replay body took 444.375 seconds;
 neither combined replay-body time is an API throughput measurement. The HTTP
-suite and repeated request-level A/B remain required. Original manifests,
+suite and repeated request-level A/B subsequently completed in the linked
+follow-up; reverse-order measurement remains outstanding. Original manifests,
 logs, controller records and auditor are in `/home/ryan/qk-vec4-checks-fdyHmg/`.
 Defaults remain unchanged throughout validation.

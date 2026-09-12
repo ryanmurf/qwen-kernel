@@ -1,0 +1,897 @@
+{
+  "unit": "qk-root-api-batch-vec4-r3-9b80ae57.service",
+  "started_utc": "2026-09-12T15:54:37.955733+00:00",
+  "before": {
+    "admitted": true,
+    "reasons": [],
+    "available_kib": 28698992,
+    "anonymous_kib": 1628648,
+    "shared_kib": 156,
+    "swap_used_kib": 2200624,
+    "anonymous_shared_and_swap_kib": 3829428,
+    "minimum_available_gib": 24,
+    "maximum_other_memory_gib": 12
+  },
+  "batch_attention_policy": "vec4",
+  "attention_mode": "serial",
+  "library_sha256": "0b3efa4732d1dad9b2ebdbc7fc2688a6501a32672a146953654739ad3cd3bdd3",
+  "source_sha256": {
+    "/home/ryan/qk-review-followup-8dzGtw/run-api-batch.py": "127a182e17d5b643013029035622daac850880df48d601d21582706270ba268c",
+    "/home/ryan/qk-vec4-checks-fdyHmg/run-check.py": "7a87acbcb8b7caa6011f0897860bc93dd8a7dec4a579c41456759bbd9e2798d0",
+    "/home/ryan/qk-review-followup-8dzGtw/model-run.py": "920a2aaa2e53bb099c13296ad386a40eced8b7feed67ffbb70c9f71d2c48d11b",
+    "/home/ryan/qk-review-followup-8dzGtw/operators.py": "b2b0863e14af9aff4b750f8456c020342c6816d362c5fecf40aacb90436f725e",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/bench/compare_native_batch_attention.py": "b17fcf101cb73298006aebfd470e5e77a98cb30900eeb80596e1049d729a269a",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/bench/compare_native_attention.py": "3b2663190d5c81bb9fca096045cbd6ac7df3211fe65944bcaa1849f2ced027f6",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/tests/gpu_qwen4_prefill_gate.py": "dbb9ca19faa709de98e761da0cd769377cde052e7ac42a90bc7d26b4fb2b9687",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/tests/gpu_qwen4_attn_split.py": "16629a7dad1c1bec8597920bbfc97a7f7049880f8681c2cd6b39cfb8e23ae194",
+    "/home/ryan/qk-ordered-checks-gzorn5/run-api-ab.py": "7b3008c88e18d2ac05cb0faa67b75dc5bd9333896742ab4868fd24eb5d347851",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/tests/native_flash_http.py": "ff4951660c34728923c8e530df79a4b9afc3eec320da6e9d5273db0253442e35",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/bench/prefill_matrix.py": "fe08d077535d959f841f2d35d009d791a6dc1455c718d5c852534b2bb4249a66",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/deploy/run-native-flash-trial.sh": "17177b6d334fd497b0709529a66e35db9fd276022f30b9bae29eedee9d267861",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/deploy/release-model-cache.py": "23427f8489194962e24ec9f229c85d141d2c22797581e2e390c6fd790d57df13",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/deploy/check-model-headroom.py": "be2fc8a565f2f38de7bd55ce312bbcf365e83752907219327a7733d75dab8644",
+    "/home/ryan/qk-vec4-checks-fdyHmg/c-long-gate.json": "84a85bc2422835d65c9fc3c55016a4a4e0fb5ae9c7c927419d782e981e66be14",
+    "/home/ryan/qk-review-followup-8dzGtw/prefill-vec4-gate.json": "cdbea34fad93af8d568f5f2d5cc3a3860479eb3a0559913455b454cc64da887a",
+    "/home/ryan/qk-review-followup-8dzGtw/prefill-build.json": "0349d836c7189653c1d8fc02367b133a5d62386439b53ec3bab10eca7ef42423",
+    "/home/ryan/qk-review-followup-8dzGtw/prefill-baseline.f32.json": "a91c84ff7158321f5083d99a32bb9e10d859aaa36171d74273e9541f642f3f09",
+    "/home/ryan/qk-review-followup-8dzGtw/prefill-vec4.f32.json": "3895a28946a135ef70cd69f3c73b2ca273af4795da471022f5d36093f027dbf0",
+    "/home/ryan/qk-review-followup-8dzGtw/prefill-baseline-cf15f101.controller.json": "c207b82e1acea03c89ef08f42968d8c4946b3c2fc447c2a5c004beae7f012e45",
+    "/home/ryan/qk-review-followup-8dzGtw/prefill-vec4-785d66c3.controller.json": "fb068631af04e8242dc57d0841400793cc1b1539d92e57ac8c9f8ced7594a451"
+  },
+  "observed_swap_peak_bytes": 0,
+  "server_command": [
+    "systemd-run",
+    "--user",
+    "--pipe",
+    "--wait",
+    "--collect",
+    "--quiet",
+    "--unit=qk-root-api-batch-vec4-r3-9b80ae57.service",
+    "-p",
+    "MemoryHigh=24G",
+    "-p",
+    "MemoryMax=32G",
+    "-p",
+    "MemorySwapMax=512M",
+    "-p",
+    "NoNewPrivileges=yes",
+    "-p",
+    "LimitCORE=0",
+    "-p",
+    "WorkingDirectory=/home/ryan/IdeaProjects/qwen-kernel-strix-halo",
+    "/usr/bin/env",
+    "-i",
+    "PATH=/usr/bin:/bin",
+    "LANG=C.UTF-8",
+    "XDG_RUNTIME_DIR=/run/user/1000",
+    "XDG_CACHE_HOME=/home/ryan/.cache",
+    "QK_ATTN_DECODE=serial",
+    "QK_FLASH_GEMM=baseline",
+    "QK_FLASH_ATTN_BATCH=vec4",
+    "QK_ATTN_CHUNK=256",
+    "QK_PLE_PREFETCH=0",
+    "QK_PLE_ROW_PREFETCH=1",
+    "QK_FLASH_COOPMAT=0",
+    "QK_PREFILL_CHUNK=512",
+    "/usr/bin/bash",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/deploy/run-native-flash-trial.sh",
+    "single",
+    "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "32768"
+  ],
+  "after_targeted_cache_release": {
+    "admitted": true,
+    "reasons": [],
+    "available_kib": 28694896,
+    "anonymous_kib": 1630696,
+    "shared_kib": 156,
+    "swap_used_kib": 2200624,
+    "anonymous_shared_and_swap_kib": 3831476,
+    "minimum_available_gib": 24,
+    "maximum_other_memory_gib": 12
+  },
+  "telemetry": [
+    {
+      "utc": "2026-09-12T15:55:08.116488+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 894Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz *",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "40000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "25094000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:55:38.164773+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 689Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "38000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "20044000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:56:08.222107+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 829Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz *",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "38000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "31083000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:56:10.743151+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 932Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz *",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "39000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "35058000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:56:31.782378+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2493Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "47000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "73057000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:57:01.829512+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2885Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "67000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "97034000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:57:31.876953+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2885Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "96048000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:58:01.936452+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2885Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "72000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "95035000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:58:31.994294+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2890Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "72000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "94021000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:59:02.047928+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2894Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "95076000"
+      }
+    },
+    {
+      "utc": "2026-09-12T15:59:32.092542+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2869Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "96005000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:00:02.140368+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2883Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "96017000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:00:32.196165+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2892Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "94045000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:01:02.250796+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2891Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "89038000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:01:32.312475+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2888Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "97044000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:02:02.358416+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2891Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "89013000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:02:32.404907+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2882Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "76000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "95096000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:03:02.464561+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2894Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "93015000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:03:32.525299+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2884Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "72000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "72096000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:04:02.572845+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2893Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "94005000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:04:32.625818+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2894Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "89054000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:05:02.681391+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2882Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "93076000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:05:32.740117+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2887Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "89069000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:06:02.799827+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2887Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "76000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "96095000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:06:32.840580+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2882Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "76000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "95092000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:07:02.893205+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2889Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "87070000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:07:32.950077+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2896Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "85008000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:08:03.008638+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2891Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "86071000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:08:33.057073+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2879Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "96033000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:09:03.102460+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2886Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "94074000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:09:33.148686+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2884Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "87040000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:10:03.209070+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2892Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "70000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "80027000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:10:33.268786+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2885Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "69000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "84078000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:11:03.323831+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2896Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "68000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "77099000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:11:33.391206+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2892Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "94042000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:12:03.449567+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2895Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "94009000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:12:33.500814+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2893Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "71000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "85063000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:13:03.548206+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2898Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "71000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "81014000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:13:33.590527+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2894Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "70000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "79094000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:14:03.645031+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2895Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "70000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "80006000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:14:33.709435+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2886Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "76000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "96000000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:15:03.769173+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2891Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "90052000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:15:33.815099+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2882Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "76000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "89097000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:16:03.868839+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2883Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "73000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "81083000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:16:33.925686+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2895Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "69000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "79000000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:17:03.992719+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2891Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "70000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "87028000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:17:34.047520+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2893Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "95041000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:18:04.089287+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2895Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "72000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "87093000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:18:34.133408+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2898Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "70000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "84009000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:19:04.184206+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2887Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "69000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "86077000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:19:34.239104+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2894Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "69000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "81067000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:20:04.291119+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2888Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "92071000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:20:34.331798+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2895Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "94010000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:21:04.379759+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2892Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "75000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "86082000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:21:34.432041+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2894Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "74000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "86096000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:22:04.486655+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 2893Mhz *\n2: 2900Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "69000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "80026000"
+      }
+    },
+    {
+      "utc": "2026-09-12T16:22:34.546071+00:00",
+      "readings": {
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_sclk": "0: 600Mhz \n1: 1100Mhz \n2: 2900Mhz *",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/pp_dpm_fclk": "0: 400Mhz \n1: 1000Mhz \n2: 1200Mhz \n3: 1400Mhz \n4: 1600Mhz \n5: 1700Mhz \n6: 1850Mhz \n7: 2000Mhz",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/temp1_input": "61000",
+        "/sys/bus/pci/devices/0000:c1:00.0/hwmon/hwmon7/power1_average": "61048000"
+      }
+    }
+  ],
+  "devices_after_load": {
+    "447": {
+      "drm-driver": "amdgpu",
+      "drm-client-id": "447",
+      "drm-pdev": "0000:c1:00.0",
+      "drm-total-cpu": "0",
+      "drm-shared-cpu": "0",
+      "drm-resident-cpu": "0",
+      "drm-purgeable-cpu": "0",
+      "drm-total-gtt": "22956376 KiB",
+      "drm-shared-gtt": "0",
+      "drm-resident-gtt": "93411368 KiB",
+      "drm-purgeable-gtt": "0",
+      "drm-total-vram": "72268212 KiB",
+      "drm-shared-vram": "0",
+      "drm-resident-vram": "1813220 KiB",
+      "drm-purgeable-vram": "2816 KiB",
+      "drm-total-gds": "0",
+      "drm-shared-gds": "0",
+      "drm-resident-gds": "0",
+      "drm-purgeable-gds": "0",
+      "drm-total-gws": "0",
+      "drm-shared-gws": "0",
+      "drm-resident-gws": "0",
+      "drm-purgeable-gws": "0",
+      "drm-total-oa": "0",
+      "drm-shared-oa": "0",
+      "drm-resident-oa": "0",
+      "drm-purgeable-oa": "0",
+      "drm-total-doorbell": "0",
+      "drm-shared-doorbell": "0",
+      "drm-resident-doorbell": "0",
+      "drm-purgeable-doorbell": "0",
+      "drm-total-mmioremap": "0",
+      "drm-shared-mmioremap": "0",
+      "drm-resident-mmioremap": "0",
+      "drm-purgeable-mmioremap": "0",
+      "drm-memory-vram": "1813220 KiB",
+      "drm-memory-gtt": "93411368 KiB",
+      "drm-memory-cpu": "0 KiB",
+      "drm-engine-gfx": "2571192693 ns"
+    },
+    "448": {
+      "drm-driver": "amdgpu",
+      "drm-client-id": "448",
+      "drm-pdev": "0000:68:00.0",
+      "drm-total-cpu": "0",
+      "drm-shared-cpu": "0",
+      "drm-resident-cpu": "0",
+      "drm-purgeable-cpu": "0",
+      "drm-total-gtt": "2 MiB",
+      "drm-shared-gtt": "0",
+      "drm-resident-gtt": "2 MiB",
+      "drm-purgeable-gtt": "0",
+      "drm-total-vram": "12 KiB",
+      "drm-shared-vram": "0",
+      "drm-resident-vram": "12 KiB",
+      "drm-purgeable-vram": "0",
+      "drm-total-gds": "0",
+      "drm-shared-gds": "0",
+      "drm-resident-gds": "0",
+      "drm-purgeable-gds": "0",
+      "drm-total-gws": "0",
+      "drm-shared-gws": "0",
+      "drm-resident-gws": "0",
+      "drm-purgeable-gws": "0",
+      "drm-total-oa": "0",
+      "drm-shared-oa": "0",
+      "drm-resident-oa": "0",
+      "drm-purgeable-oa": "0",
+      "drm-total-doorbell": "0",
+      "drm-shared-doorbell": "0",
+      "drm-resident-doorbell": "0",
+      "drm-purgeable-doorbell": "0",
+      "drm-total-mmioremap": "0",
+      "drm-shared-mmioremap": "0",
+      "drm-resident-mmioremap": "0",
+      "drm-purgeable-mmioremap": "0",
+      "drm-memory-vram": "12 KiB",
+      "drm-memory-gtt": "2048 KiB",
+      "drm-memory-cpu": "0 KiB"
+    }
+  },
+  "http_command": [
+    "/usr/bin/python3",
+    "-E",
+    "tests/native_flash_http.py",
+    "--url",
+    "http://127.0.0.1:8194"
+  ],
+  "http_returncode": 0,
+  "http_passed": [
+    "claude_stream",
+    "claude_text",
+    "claude_tool_roundtrip",
+    "claude_xml_tool",
+    "concurrent_isolation",
+    "invalid_token",
+    "prefill_cancel_then_request",
+    "teacher_forced_http"
+  ],
+  "benchmark_command": [
+    "/usr/bin/python3",
+    "-E",
+    "bench/prefill_matrix.py",
+    "run",
+    "--url",
+    "http://127.0.0.1:8194",
+    "--backend",
+    "native-batch-ab-vec4-0b3efa47",
+    "--model-id",
+    "Qwen3.8-Flash-Next-Uncensored-Q5_K_M",
+    "--fixture",
+    "/home/ryan/qk-prefill-matrix-eyUgzZ/shared-fixture.json",
+    "--sizes",
+    "128",
+    "512",
+    "2048",
+    "8192",
+    "16384",
+    "--context",
+    "32768",
+    "--decode-tokens",
+    "128",
+    "--repetitions",
+    "3",
+    "--metadata",
+    "/home/ryan/qk-review-followup-8dzGtw/api-batch-vec4-r3-9b80ae57.metadata.json",
+    "--confirm-exclusive",
+    "--output",
+    "/home/ryan/qk-review-followup-8dzGtw/api-batch-vec4-r3-9b80ae57.jsonl"
+  ],
+  "benchmark_returncode": 0,
+  "devices_after_benchmark": {
+    "447": {
+      "drm-driver": "amdgpu",
+      "drm-client-id": "447",
+      "drm-pdev": "0000:c1:00.0",
+      "drm-total-cpu": "0",
+      "drm-shared-cpu": "0",
+      "drm-resident-cpu": "0",
+      "drm-purgeable-cpu": "0",
+      "drm-total-gtt": "22956616 KiB",
+      "drm-shared-gtt": "0",
+      "drm-resident-gtt": "93411608 KiB",
+      "drm-purgeable-gtt": "0",
+      "drm-total-vram": "72268212 KiB",
+      "drm-shared-vram": "0",
+      "drm-resident-vram": "1813220 KiB",
+      "drm-purgeable-vram": "2816 KiB",
+      "drm-total-gds": "0",
+      "drm-shared-gds": "0",
+      "drm-resident-gds": "0",
+      "drm-purgeable-gds": "0",
+      "drm-total-gws": "0",
+      "drm-shared-gws": "0",
+      "drm-resident-gws": "0",
+      "drm-purgeable-gws": "0",
+      "drm-total-oa": "0",
+      "drm-shared-oa": "0",
+      "drm-resident-oa": "0",
+      "drm-purgeable-oa": "0",
+      "drm-total-doorbell": "0",
+      "drm-shared-doorbell": "0",
+      "drm-resident-doorbell": "0",
+      "drm-purgeable-doorbell": "0",
+      "drm-total-mmioremap": "0",
+      "drm-shared-mmioremap": "0",
+      "drm-resident-mmioremap": "0",
+      "drm-purgeable-mmioremap": "0",
+      "drm-memory-vram": "1813220 KiB",
+      "drm-memory-gtt": "93411608 KiB",
+      "drm-memory-cpu": "0 KiB",
+      "drm-engine-gfx": "1579397564099 ns"
+    },
+    "448": {
+      "drm-driver": "amdgpu",
+      "drm-client-id": "448",
+      "drm-pdev": "0000:68:00.0",
+      "drm-total-cpu": "0",
+      "drm-shared-cpu": "0",
+      "drm-resident-cpu": "0",
+      "drm-purgeable-cpu": "0",
+      "drm-total-gtt": "2 MiB",
+      "drm-shared-gtt": "0",
+      "drm-resident-gtt": "2 MiB",
+      "drm-purgeable-gtt": "0",
+      "drm-total-vram": "12 KiB",
+      "drm-shared-vram": "0",
+      "drm-resident-vram": "12 KiB",
+      "drm-purgeable-vram": "0",
+      "drm-total-gds": "0",
+      "drm-shared-gds": "0",
+      "drm-resident-gds": "0",
+      "drm-purgeable-gds": "0",
+      "drm-total-gws": "0",
+      "drm-shared-gws": "0",
+      "drm-resident-gws": "0",
+      "drm-purgeable-gws": "0",
+      "drm-total-oa": "0",
+      "drm-shared-oa": "0",
+      "drm-resident-oa": "0",
+      "drm-purgeable-oa": "0",
+      "drm-total-doorbell": "0",
+      "drm-shared-doorbell": "0",
+      "drm-resident-doorbell": "0",
+      "drm-purgeable-doorbell": "0",
+      "drm-total-mmioremap": "0",
+      "drm-shared-mmioremap": "0",
+      "drm-resident-mmioremap": "0",
+      "drm-purgeable-mmioremap": "0",
+      "drm-memory-vram": "12 KiB",
+      "drm-memory-gtt": "2048 KiB",
+      "drm-memory-cpu": "0 KiB"
+    }
+  },
+  "stop_returncode": 0,
+  "server_returncode": 0,
+  "error": null,
+  "ended_utc": "2026-09-12T16:22:35.417176+00:00",
+  "after": {
+    "admitted": true,
+    "reasons": [],
+    "available_kib": 28213832,
+    "anonymous_kib": 1559220,
+    "shared_kib": 80,
+    "swap_used_kib": 2324168,
+    "anonymous_shared_and_swap_kib": 3883468,
+    "minimum_available_gib": 24,
+    "maximum_other_memory_gib": 12
+  },
+  "library_unchanged": true
+}

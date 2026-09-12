@@ -1,0 +1,227 @@
+{
+  "comparison_valid": true,
+  "outputs_match": true,
+  "scope": "matched recorded API runs; not broad quality or statistical significance",
+  "exploratory": false,
+  "rows": [
+    {
+      "prompt_tokens": 128,
+      "samples_per_mode": 3,
+      "prefill_plus_one_token_seconds": {
+        "baseline": {
+          "median": 1.2132244630047353,
+          "min": 1.2085433379979804,
+          "max": 1.2598026289924746
+        },
+        "vec4": {
+          "median": 1.218449246007367,
+          "min": 1.2097769749962026,
+          "max": 1.2532771330006653
+        },
+        "vec4_over_baseline": 1.0043065262545825
+      },
+      "ttft_seconds": {
+        "baseline": {
+          "median": 1.21264238099684,
+          "min": 1.2075188489980064,
+          "max": 1.227559607999865
+        },
+        "vec4": {
+          "median": 1.2127636280056322,
+          "min": 1.206846585002495,
+          "max": 1.2222386860084953
+        },
+        "vec4_over_baseline": 1.0000999857919302
+      },
+      "decode_tokens_per_second": {
+        "baseline": {
+          "median": 32.67549205136401,
+          "min": 32.58757547824615,
+          "max": 32.83059795600883
+        },
+        "vec4": {
+          "median": 32.66380559786508,
+          "min": 32.425088047211794,
+          "max": 32.710550820220334
+        },
+        "vec4_over_baseline": 0.9996423480484835
+      }
+    },
+    {
+      "prompt_tokens": 512,
+      "samples_per_mode": 3,
+      "prefill_plus_one_token_seconds": {
+        "baseline": {
+          "median": 3.2929687830037437,
+          "min": 3.285695703001693,
+          "max": 3.3748079750075703
+        },
+        "vec4": {
+          "median": 3.2256555820058566,
+          "min": 3.208892238995759,
+          "max": 3.2959270029969048
+        },
+        "vec4_over_baseline": 0.9795585061889089
+      },
+      "ttft_seconds": {
+        "baseline": {
+          "median": 3.29349661199376,
+          "min": 3.2732688519899966,
+          "max": 3.2971086609904887
+        },
+        "vec4": {
+          "median": 3.2062853270035703,
+          "min": 3.1774834059906425,
+          "max": 3.247550072002923
+        },
+        "vec4_over_baseline": 0.9735201534221725
+      },
+      "decode_tokens_per_second": {
+        "baseline": {
+          "median": 30.535628983134526,
+          "min": 30.489543036658564,
+          "max": 30.53719934774429
+        },
+        "vec4": {
+          "median": 30.41617671684127,
+          "min": 30.403886982304094,
+          "max": 30.507199110720553
+        },
+        "vec4_over_baseline": 0.996088101988689
+      }
+    },
+    {
+      "prompt_tokens": 2048,
+      "samples_per_mode": 3,
+      "prefill_plus_one_token_seconds": {
+        "baseline": {
+          "median": 13.88084676300059,
+          "min": 13.800629622011911,
+          "max": 14.113219037011731
+        },
+        "vec4": {
+          "median": 13.415591391007183,
+          "min": 13.369541171996389,
+          "max": 13.419308652009931
+        },
+        "vec4_over_baseline": 0.9664822053051154
+      },
+      "ttft_seconds": {
+        "baseline": {
+          "median": 13.847455807001097,
+          "min": 13.723792698001489,
+          "max": 13.90339751499414
+        },
+        "vec4": {
+          "median": 13.285311671992531,
+          "min": 13.267761541006621,
+          "max": 13.322781768001732
+        },
+        "vec4_over_baseline": 0.9594045185741374
+      },
+      "decode_tokens_per_second": {
+        "baseline": {
+          "median": 23.301685585177875,
+          "min": 23.030112796394178,
+          "max": 23.312368149251075
+        },
+        "vec4": {
+          "median": 23.1180490247494,
+          "min": 23.025114875366103,
+          "max": 23.22812736977995
+        },
+        "vec4_over_baseline": 0.9921191726771352
+      }
+    },
+    {
+      "prompt_tokens": 8192,
+      "samples_per_mode": 3,
+      "prefill_plus_one_token_seconds": {
+        "baseline": {
+          "median": 71.97307276399806,
+          "min": 71.79039492699667,
+          "max": 72.93031222600257
+        },
+        "vec4": {
+          "median": 62.308974963991204,
+          "min": 61.95842970800004,
+          "max": 62.877145053003915
+        },
+        "vec4_over_baseline": 0.8657262024688631
+      },
+      "ttft_seconds": {
+        "baseline": {
+          "median": 72.18018352499348,
+          "min": 71.88348286699329,
+          "max": 72.35928915299883
+        },
+        "vec4": {
+          "median": 62.64164462398912,
+          "min": 62.44651771200006,
+          "max": 62.70189543599554
+        },
+        "vec4_over_baseline": 0.8678510023779381
+      },
+      "decode_tokens_per_second": {
+        "baseline": {
+          "median": 11.38924631195918,
+          "min": 11.165479406618287,
+          "max": 11.742592954672334
+        },
+        "vec4": {
+          "median": 11.588504185562462,
+          "min": 10.568726827943657,
+          "max": 11.615965009599492
+        },
+        "vec4_over_baseline": 1.0174952642295612
+      }
+    },
+    {
+      "prompt_tokens": 16384,
+      "samples_per_mode": 3,
+      "prefill_plus_one_token_seconds": {
+        "baseline": {
+          "median": 200.32367430999875,
+          "min": 199.9184855670028,
+          "max": 202.08234891400207
+        },
+        "vec4": {
+          "median": 158.19406222899852,
+          "min": 157.12228234000213,
+          "max": 159.50279733999923
+        },
+        "vec4_over_baseline": 0.7896922956005434
+      },
+      "ttft_seconds": {
+        "baseline": {
+          "median": 198.9908574900037,
+          "min": 197.29661988199223,
+          "max": 199.64681357699737
+        },
+        "vec4": {
+          "median": 159.24473387599573,
+          "min": 157.05320313500124,
+          "max": 159.50560308499553
+        },
+        "vec4_over_baseline": 0.8002615591723624
+      },
+      "decode_tokens_per_second": {
+        "baseline": {
+          "median": 7.189753947046305,
+          "min": 7.121729591937527,
+          "max": 7.2699615412242515
+        },
+        "vec4": {
+          "median": 6.868359743959235,
+          "min": 6.567587062925503,
+          "max": 7.07370301764351
+        },
+        "vec4_over_baseline": 0.9552983029107547
+      }
+    }
+  ],
+  "experiment": "halo-vec4-api-v1",
+  "long_gate_sha256": "84a85bc2422835d65c9fc3c55016a4a4e0fb5ae9c7c927419d782e981e66be14",
+  "prefill_gate_sha256": "cdbea34fad93af8d568f5f2d5cc3a3860479eb3a0559913455b454cc64da887a",
+  "default_promotion": false
+}

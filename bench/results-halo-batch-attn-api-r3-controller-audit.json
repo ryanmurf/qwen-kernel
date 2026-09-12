@@ -1,0 +1,45 @@
+{
+  "result": "PASS",
+  "experiment": "halo-vec4-api-v1",
+  "completed_cells_per_mode": 30,
+  "frozen_identities_still_match": true,
+  "controller_and_matrix_launches_match": true,
+  "recorded_server_drm_halo_compute_only": true,
+  "controller_exit_and_own_stop_pass": true,
+  "order": ["baseline", "vec4"],
+  "reverse_order_measured": false,
+  "default_promotion": false,
+  "telemetry_scope": "Coarse samples include load, HTTP and benchmark; not per-cell attribution or evidence of a slowdown cause.",
+  "runs": [
+    {
+      "policy": "baseline",
+      "controller": "results-halo-batch-attn-api-baseline-r3-controller.json",
+      "controller_sha256": "be6fe9ba12d332745eaceb8fa226d7641ffc6b8972ea3af9360300aac42b9165",
+      "matrix": "results-halo-batch-attn-api-baseline-r3-0b3efa47.jsonl",
+      "matrix_sha256": "63a2673f85b8d8ba276026aad3823cf30a698e3c0361c3333085c4f64e74d450",
+      "started_utc": "2026-09-12T15:21:23.145677+00:00",
+      "ended_utc": "2026-09-12T15:54:11.310368+00:00",
+      "observed_swap_peak_bytes": 0,
+      "telemetry": {
+        "temperature_c": {"samples": 66, "min": 34.0, "median": 68.0, "max": 74.0},
+        "power_w": {"samples": 66, "min": 24.05, "median": 82.042, "max": 95.072},
+        "active_gpu_clock_mhz": {"samples": 66, "min": 869, "median": 2892.0, "max": 2900}
+      }
+    },
+    {
+      "policy": "vec4",
+      "controller": "results-halo-batch-attn-api-vec4-r3-controller.json",
+      "controller_sha256": "a3d9654136987c5de99e523423c0c440dab8343472c43c2dd2bcdfb8004c7aeb",
+      "matrix": "results-halo-batch-attn-api-vec4-r3-0b3efa47.jsonl",
+      "matrix_sha256": "d9bc7163d47a8be0f39f059fb9abaa26a4ff3324a17d711fec045cc1156c66bf",
+      "started_utc": "2026-09-12T15:54:37.955733+00:00",
+      "ended_utc": "2026-09-12T16:22:35.417176+00:00",
+      "observed_swap_peak_bytes": 0,
+      "telemetry": {
+        "temperature_c": {"samples": 57, "min": 38.0, "median": 73.0, "max": 76.0},
+        "power_w": {"samples": 57, "min": 20.044, "median": 89.013, "max": 97.044},
+        "active_gpu_clock_mhz": {"samples": 57, "min": 689, "median": 2891, "max": 2900}
+      }
+    }
+  ]
+}
