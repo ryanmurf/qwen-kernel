@@ -138,3 +138,18 @@ CPU-only harness tests:
 ```bash
 python3 -m unittest discover -s tests -p test_prefill_matrix.py -v
 ```
+
+For the same-build native serial/ordered experiment, audit a completed pair:
+
+```bash
+python3 bench/compare_native_attention.py serial.jsonl ordered.jsonl
+python3 -m unittest discover -s tests -p test_compare_native_attention.py -v
+```
+
+This requires the mode-observed metadata from the isolated API controller.
+It checks complete matching cells, bound metadata, normalized launch/environment
+identity, exact output counts, coherent counting, and matching prompt/output
+hashes. Different model, shaders, precision, or cache procedure are refused.
+It reports median/min/max and ordered/serial ratios; one sample is explicitly
+exploratory. It audits recorded runs, not live GPU placement, and neither the
+counting test nor repetition alone establishes broad quality or significance.
