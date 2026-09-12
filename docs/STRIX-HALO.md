@@ -709,9 +709,10 @@ tensors (type 2, heap 0, HOST_VISIBLE|HOST_COHERENT; headroom 34.2), MemTotal
 121.2 GiB, reserve 12 GiB. (The parity harnesses load at context 8192, where
 the KV allowance is smaller: 67.92 GiB of weights stay device-local and 20.80
 GiB in 34 tensors spill.) Load takes 73-105 s; Halo GTT reads 91.4 GiB
-afterwards and the unit's
-own cgroup stays under 1 GiB because each uploaded tensor's file pages are
-dropped as it goes. The driver's retained page pool (67.5 GiB before the
+afterwards; the unit's own cgroup was 0.67 GiB with a 1.32 GiB peak on
+the served instance (root's reading), not a bound: each uploaded tensor's
+file pages are dropped as it goes and the on-demand PLE rows are charged to
+it, so it grows with the working set up to the unit's 24G/32G limits. The driver's retained page pool (67.5 GiB before the
 first load, read from `ttm_page_pool` by root) is reused by the allocations,
 which is why MemFree only moves a few GiB per load.
 
