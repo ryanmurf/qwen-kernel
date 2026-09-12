@@ -1,0 +1,72 @@
+#version 450
+
+// Keep fa_attn_srv's exact max/sum trees, tile order and per-dimension
+// multiply-add sequence. Independent output-dimension stripes run in
+// separate workgroups; they duplicate softmax work but never merge partial
+// output sums. This is not split-K: it must reproduce the serial shader.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint DIMS = 64u;
+layout(std430, binding = 0) readonly buffer S { float scores[]; };
+layout(std430, binding = 1) readonly buffer V { float vc[]; };
+layout(std430, binding = 2) readonly buffer QF { float qfull[]; };
+layout(std430, binding = 3) writeonly buffer A { float att[]; };
+layout(std430, binding = 4) readonly buffer Pos { uint slotPos[]; };
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+} pc;
+shared float sc[256];
+shared float red[256];
+shared float m;
+shared float l;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d0 = gl_WorkGroupID.y * DIMS;
+    uint t = gl_LocalInvocationID.x;
+    uint rq = gl_WorkGroupID.z;
+    uint n = slotPos[rq] + 1u;
+    uint kv = h / (pc.hQ / pc.hKV);
+    uint kvo = rq * pc.hKV * pc.tmax * pc.dh;
+    uint qfo = rq * pc.hQ * 2u * pc.dh;
+    uint qho = rq * pc.hQ * pc.dh;
+    uint d = d0 + t;
+    if (t == 0u) { m = -3.4e38; l = 0.0; }
+    barrier();
+    float acc = 0.0;
+    for (uint p0 = 0u; p0 < n; p0 += 256u) {
+        uint ts = min(256u, n - p0);
+        if (t < ts) sc[t] = scores[(rq * pc.hQ + h) * pc.tmax + p0 + t];
+        barrier();
+        red[t] = t < ts ? sc[t] : -3.4e38;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] = max(red[t], red[t + s]);
+            barrier();
+        }
+        float oldm = m;
+        float newm = max(oldm, red[0]);
+        float corr = exp(oldm - newm);
+        acc *= corr;
+        if (t < ts) sc[t] = exp(sc[t] - newm);
+        if (t == 0u) l *= corr;
+        barrier();
+        red[t] = t < ts ? sc[t] : 0.0;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] += red[t + s];
+            barrier();
+        }
+        if (t < DIMS && d < pc.dh) {
+            for (uint j = 0u; j < ts; ++j)
+                acc += sc[j] * vc[kvo + (kv * pc.tmax + p0 + j) * pc.dh + d];
+        }
+        if (t == 0u) { l += red[0]; m = newm; }
+        barrier();
+    }
+    if (t < DIMS && d < pc.dh) {
+        float o = acc / l;
+        float g = qfull[qfo + h * 2u * pc.dh + pc.dh + d];
+        att[qho + h * pc.dh + d] = o * (1.0 / (1.0 + exp(-g)));
+    }
+}

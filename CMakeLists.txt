@@ -75,7 +75,8 @@ set(SHADERS qwen4_ple_conv qwen4_silu qwen4_gdn_params moe_gateup_q5k moe_shared
     moe_down_q8_coopmat rmsnorm dn_ab dn_conv dn_qknorm dn_step dn_step_reg dn_step_gate dn_gate
     add_rmsnorm add_rmsnorm_route vec_add fa_prep fa_attn argmax1 argmax2 embed_q6k add_rms3
     add_rms3_grouped moe_down_q8b moe_down_q8b_32 dn_convn fa_prep_srv fa_attn_srv fa_attn_srv_split
-    fa_attn_srv_split_gqa fa_attn_srv_reduce gemm_q8_0 gemm_q8_0_coopmat gemm_q8_0_coopmat2
+    fa_attn_srv_split_gqa fa_attn_srv_reduce fa_score_srv fa_score_srv_tiled fa_value_srv_ordered
+    gemm_q8_0 gemm_q8_0_coopmat gemm_q8_0_coopmat2
     gemm_q8_0_coopmat2_bm64 gemm_q8_0_coopmat_split fa_prep_batch fa_attn_batch
     fa_attn_batch_coopmat fa_attn_batch_coopmat2 dn_ab_batch dn_conv_batch dn_step_batch
     dn_step_batch_split dn_step_batch_cols dn_gate_batch gemv_q4_0 gemma4_embed gemma4_embed_batch

@@ -1,0 +1,48 @@
+#version 450
+
+// Coalesced K loads plus GQA reuse, preserving each Q.K dot's d=0..dh-1
+// operation order. A block handles 32 keys and GROUP adjacent query heads
+// belonging to ONE KV head. Host must require GROUP divides hQ/hKV.
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint GROUP = 12u;
+layout(std430, binding = 0) readonly buffer Q { float qhat[]; };
+layout(std430, binding = 1) readonly buffer K { float kc[]; };
+layout(std430, binding = 2) writeonly buffer S { float scores[]; };
+layout(std430, binding = 3) readonly buffer Pos { uint slotPos[]; };
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+} pc;
+const uint KEYS = 32u;
+shared float q[12][257];
+shared float k[32][257];
+
+void main() {
+    uint p0 = gl_WorkGroupID.x * KEYS;
+    uint h0 = gl_WorkGroupID.y * GROUP;
+    uint rq = gl_WorkGroupID.z;
+    uint t = gl_LocalInvocationID.x;
+    uint n = slotPos[rq] + 1u;
+    if (p0 >= n || h0 >= pc.hQ) return;
+    uint liveKeys = min(KEYS, n - p0);
+    uint kv = h0 / (pc.hQ / pc.hKV);
+    uint qho = rq * pc.hQ * pc.dh;
+    uint kvo = rq * pc.hKV * pc.tmax * pc.dh;
+    for (uint x = t; x < GROUP * pc.dh; x += 256u) {
+        uint h = x / pc.dh, d = x % pc.dh;
+        q[h][d] = qhat[qho + (h0 + h) * pc.dh + d];
+    }
+    for (uint x = t; x < liveKeys * pc.dh; x += 256u) {
+        uint key = x / pc.dh, d = x % pc.dh;
+        k[key][d] = kc[kvo + (kv * pc.tmax + p0 + key) * pc.dh + d];
+    }
+    barrier();
+    float qs = inversesqrt(float(pc.dh));
+    for (uint x = t; x < GROUP * KEYS; x += 256u) {
+        uint h = x / KEYS, key = x % KEYS;
+        if (key >= liveKeys) continue;
+        float score = 0.0;
+        for (uint d = 0u; d < pc.dh; ++d) score += q[h][d] * k[key][d];
+        scores[(rq * pc.hQ + h0 + h) * pc.tmax + p0 + key] = score * qs;
+    }
+}

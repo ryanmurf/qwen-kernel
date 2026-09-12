@@ -1,0 +1,37 @@
+#version 450
+
+// Parallelize Q.K score tiles without changing each dot product's order.
+// Values are stored at the same F32 rounding point as fa_attn_srv's shared
+// sc[] assignment. fa_value_srv_ordered preserves the original online
+// softmax and per-dimension V accumulation order across ALL key tiles.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Q { float qhat[]; };
+layout(std430, binding = 1) readonly buffer K { float kc[]; };
+layout(std430, binding = 2) writeonly buffer S { float scores[]; };
+layout(std430, binding = 3) readonly buffer Pos { uint slotPos[]; };
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+} pc;
+shared float q[256];
+
+void main() {
+    uint tile = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint rq = gl_WorkGroupID.z;
+    uint t = gl_LocalInvocationID.x;
+    uint n = slotPos[rq] + 1u;
+    uint p0 = tile * 256u;
+    if (p0 >= n) return;
+    uint qho = rq * pc.hQ * pc.dh;
+    if (t < pc.dh) q[t] = qhat[qho + h * pc.dh + t];
+    barrier();
+    if (p0 + t >= n) return;
+    uint kv = h / (pc.hQ / pc.hKV);
+    uint kvo = rq * pc.hKV * pc.tmax * pc.dh;
+    uint base = kvo + (kv * pc.tmax + p0 + t) * pc.dh;
+    float score = 0.0;
+    for (uint j = 0u; j < pc.dh; ++j) score += q[j] * kc[base + j];
+    float qs = inversesqrt(float(pc.dh));
+    scores[(rq * pc.hQ + h) * pc.tmax + p0 + t] = score * qs;
+}

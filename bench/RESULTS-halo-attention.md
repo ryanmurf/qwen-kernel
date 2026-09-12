@@ -72,3 +72,73 @@ Next: capture layer boundaries at the first divergence and check the
 attention operator independently before trying another split strategy.
 Retain the failed data; do not promote this configuration based on the
 short tests or a favorable throughput-only result.
+
+## Traced cause and replacement candidate (2026-09-12 UTC)
+
+The focused trace now localizes the divergence. Both modes replayed their
+own uninstrumented logits bit-for-bit through tail index 49; enabling layer
+taps at indices 48 and 49 did not change either result. Each trace contains
+1304 captured files. At index 48, every captured layer boundary differs by
+less than 1e-4 relative RMS (worst 7.0e-6). At index 49 / position 16433,
+layer 41's FFN input differs by 3.862e-6, while its FFN output jumps to
+0.252153 relative RMS. Earlier boundaries remain close.
+
+Replaying the unchanged GPU router/selector on those captured FFN inputs
+with the actual layer-41 F32 weights confirms the discrete change:
+
+- Serial top ten: 59, 433, 331, 496, 55, 445, 217, 294, 42, **84**.
+- Split top ten: 59, 433, 331, 496, 55, 445, 217, 294, 42, **404**.
+- The serial margin between experts 84 and 404 is 2.38418579e-7 (one F32
+  ULP at these logits); split favors 404 by 3.09944153e-6. Both actual GPU
+  selections agree with the sorted GPU router logits.
+
+Thus small upstream attention differences cross an expert-selection
+boundary. This is not evidence of a reset failure or a broken selector.
+The input/hash metadata, raw router logits and selection results are in
+`/home/ryan/qk-root-checks-ZU4evg/h1-router*`; complete trace inventories and
+per-layer comparisons are preserved there too.
+
+### Operator timing, not model throughput
+
+An independent synthetic test checks serial, split-K, GQA-grouped split-K,
+and accumulation-preserving score/value kernels against a CPU FP64
+reference. It tests 1, 255, 256, 257, 1025, 16433, 32768, then 127 keys;
+the decreasing final length and NaN-poisoned unused KV/partials help catch
+stale or out-of-bounds live-context reads. All 144 cells passed. Every
+accumulation-preserving output was also bit-for-bit equal to serial.
+
+The native-memory run used the same allocator preference as Qwen4Graph:
+type 0 / heap 1 / DEVICE_LOCAL, not the earlier mapped type 3. Uploads and
+readbacks sit outside the GPU timestamp interval. Numbers below are one
+fixed-order sweep, eight timed repetitions per cell, not a multi-run median.
+
+| Keys | Original serial | Ordered Q-group 12 / dimension stripe 128 | GQA4 split, chunk 32 |
+| ---: | ---: | ---: | ---: |
+| 16433 | 5.898 ms | 5.343 ms | 1.330 ms |
+| 32768 | 11.733 ms | 10.603 ms | 2.774 ms |
+
+The ordered variant reduces this operator time by about 9–10% while keeping
+the tested serial outputs exact. It stages coalesced K tiles in shared
+memory, reuses each tile across the 12 Q heads sharing a KV head, and keeps
+the original dot, online-softmax, and per-dimension V accumulation order.
+An initial uncoalesced score kernel was slower and is retained only as a
+diagnostic control. GQA4/chunk32 is substantially faster in isolation but
+does not promise serial-exact outputs; it needs its own full-model quality
+evaluation. Neither timing is a claim of full-model speed or broad quality.
+
+Raw native-memory data and build/shader hashes:
+[results-halo-attention-operator-local.json](results-halo-attention-operator-local.json).
+`tests/halo_attn_operator.cpp` builds as a standalone executable against
+this repository's Vulkan helpers; set `QK_SHADER_DIR` and
+`QK_OPERATOR_DEVICE_LOCAL=1` and run only in an exclusive Halo window.
+`tests/halo_router_replay.cpp` replays only the captured router inputs and
+~5 MiB of router weights, without loading the full model onto the GPU.
+
+`QK_ATTN_DECODE=ordered` is now wired as an **opt-in** replacement candidate
+with a 3 MiB score buffer at context32768. Serial remains the default.
+The full-model 16-position F32 oracle, mixed/whole prefill, batch-to-decode
+handoff and exact-reset checks passed with library SHA256
+`ef562d291d37e0780d431442722a41f1c8d60e9d30ebc1991c0ad032444f8299`.
+Worst final-logit RMS across the four oracle scenarios was 1.284e-6, with
+no argmax mismatches. Long replay and API performance checks are still
+pending; these short and synthetic checks do not establish those results.

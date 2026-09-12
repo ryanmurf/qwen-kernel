@@ -123,6 +123,12 @@ def manifest(mode, **over):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_ordered_candidate_and_mode_knob_binding(self):
+        self.assertEqual(mod.manifest_problems(manifest("serial"), manifest("ordered")), [])
+        b = manifest("ordered")
+        b["knobs"]["QK_ATTN_DECODE"] = "split"
+        self.assertTrue(any("disagrees" in p for p in mod.manifest_problems(manifest("serial"), b)))
+
     def test_mode_runtime_and_greedy_differences_are_accepted(self):
         self.assertEqual(mod.manifest_problems(manifest("serial"), manifest("split", seconds=99.0, greedy_after_tail=[6])), [])
 

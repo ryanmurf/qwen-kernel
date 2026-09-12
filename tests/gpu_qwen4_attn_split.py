@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Serial versus split-K decode attention on a long actual-model prompt (dedicated GPU window).
+"""Serial versus candidate decode attention on a long model prompt (dedicated GPU window).
 
-The decode-attention mode (QK_ATTN_DECODE=serial|split) is fixed per engine
+The decode-attention mode (QK_ATTN_DECODE=serial|split|ordered) is fixed per engine
 process, so the comparison runs as three steps on the single device:
 
   generate  --ids-out IDS [--tokens N | --fixture JSON --size N | --ids-file FILE]
@@ -13,7 +13,7 @@ process, so the comparison runs as three steps on the single device:
       With --fixture, --teacher-tail M appends M deterministic ids after
       the exact N-token benchmark prompt. Dump with --tail M to test the
       prefill-to-decode transition at that prompt length (not N-M).
-  dump      --mode serial|split --ids IDS --out DUMP [--tail M] [--ctx C]
+  dump      --mode serial|split|ordered --ids IDS --out DUMP [--tail M] [--ctx C]
       Engine in the requested mode with a forced F32 environment (coopmat 0,
       table warming 0, profiling/timing/taps cleared; every QK_* knob in
       effect is recorded). Captures the clean first-position row from a fresh
@@ -27,7 +27,7 @@ process, so the comparison runs as three steps on the single device:
       DUMP.json (manifest bound to the dump by its sha256: ids hash, every
       GGUF shard's identity, library hash, hash of every shader, context,
       tail, knobs, check results). Outputs are created exclusively.
-  compare   SERIAL_DUMP SPLIT_DUMP [--rms-bound 1e-5] [--allow-argmax-flips 0]
+  compare   SERIAL_DUMP CANDIDATE_DUMP [--rms-bound 1e-5] [--allow-argmax-flips 0]
       Strict gate: both manifests must exist with every required key, match
       their dumps' sha256, report passed reset/repeat checks, and agree on
       every identity key except the mode; every row must be finite; the
@@ -36,7 +36,8 @@ process, so the comparison runs as three steps on the single device:
       ending in "result": "PASS" or "FAIL" and exits non-zero on FAIL.
 
 Both dumps must come from the same build and IDS file. This is a
-kernel-change check (F32 association order differs), not an oracle test."""
+kernel-change check, not an oracle test. Split-K changes F32 association;
+ordered attention instead preserves the original accumulation sequence."""
 import argparse
 import ctypes as C
 import hashlib
@@ -114,8 +115,11 @@ def manifest_problems(a, b):
     ka, kb = dict(a["knobs"]), dict(b["knobs"])
     ka.pop("QK_ATTN_DECODE", None); kb.pop("QK_ATTN_DECODE", None)
     if ka != kb: bad.append("knobs")
-    if a["mode"] != "serial" or b["mode"] != "split": bad.append("modes must be serial then split")
+    if a["mode"] != "serial" or b["mode"] not in ("split", "ordered"):
+        bad.append("modes must be serial then split or ordered")
     for tag, mf in (("serial", a), ("split", b)):
+        if mf["knobs"].get("QK_ATTN_DECODE") != mf["mode"]:
+            bad.append(f"{tag} mode disagrees with QK_ATTN_DECODE")
         if not (mf["reset_exact"] is True and mf["repeat_exact"] is True): bad.append(f"{tag} dump did not pass its reset/repeat checks")
     return bad
 
@@ -295,7 +299,7 @@ def dump(args):
     if not (1 <= m <= min(n - 1, 512)): raise SystemExit("--tail must be 1..min(N-1, 512)")
     ctx = args.ctx or (n + 8)
     if ctx < n + 1 or ctx > 32768: raise SystemExit("--ctx must cover N+1 positions and stay <= 32768")
-    if args.mode not in ("serial", "split"): raise SystemExit("--mode serial|split")
+    if args.mode not in ("serial", "split", "ordered"): raise SystemExit("--mode serial|split|ordered")
     if os.path.exists(args.out) or os.path.exists(args.out + ".json"): raise SystemExit("output exists; refusing to overwrite")
     identity = {"ids_sha256": file_sha256(args.ids), "model": model_identity(args.model), "library_sha256": file_sha256(args.library)}
     lib = load_lib(args.library); knobs = prepare_env(args.device, args.mode)
