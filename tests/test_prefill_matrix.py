@@ -7,6 +7,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -23,7 +24,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.append((self.path, body))
         if self.path == "/tokenize":
-            result = {"tokens": [1] if body["add_special"] else [2]}
+            result = {"tokens": list(range(200)) if body["add_special"] else [2]}
         elif not body["stream"]:
             result = {"tokens": [7], "timings": {"prompt_n": len(body["prompt"]), "prompt_ms": 0}}
         else:
@@ -146,6 +147,75 @@ class MatrixTests(unittest.TestCase):
     def test_deterministic_corpus(self):
         self.assertEqual(matrix.corpus(1000), matrix.corpus(1000))
         self.assertGreaterEqual(len(matrix.corpus(1000)), 1000)
+
+    def run_args(self, directory):
+        directory = Path(directory)
+        fixture = {"version": 1, "model_id": "test", "sizes": [64, 128],
+                   "source_text": "records", "suffix_text": "count",
+                   "source_ids": list(range(200)), "suffix_ids": [2]}
+        fixture["sha256"] = matrix.digest(fixture)
+        path = directory/"fixture.json"
+        path.write_text(json.dumps(fixture))
+        return argparse.Namespace(fixture=str(path), url=self.url, backend="fake",
+            model_id="test", output=str(directory/"results.jsonl"), metadata=None,
+            confirm_exclusive=True, context=1024, decode_tokens=4, repetitions=2,
+            sizes=None, timeout=5)
+
+    def test_complete_http_matrix_and_exclusive_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.run_args(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                matrix.run(args)
+            rows = [json.loads(line) for line in Path(args.output).read_text().splitlines()]
+            self.assertEqual(rows[0]["type"], "run_start")
+            self.assertEqual(rows[-1]["type"], "run_complete")
+            self.assertEqual(len(rows), 10)
+            measured = rows[1:-1]
+            self.assertEqual({(r["type"], r["prompt_tokens"], r["repetition"]) for r in measured},
+                {(kind, n, rep) for kind in ("prefill", "decode")
+                 for n in (64, 128) for rep in (1, 2)})
+            before = Path(args.output).read_bytes()
+            with self.assertRaises(FileExistsError), contextlib.redirect_stdout(io.StringIO()):
+                matrix.run(args)
+            self.assertEqual(Path(args.output).read_bytes(), before)
+
+    def test_failed_request_has_error_but_no_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.run_args(directory)
+            with patch.object(matrix, "measure_stream", side_effect=ValueError("broken stream")):
+                with self.assertRaisesRegex(ValueError, "broken stream"), contextlib.redirect_stdout(io.StringIO()):
+                    matrix.run(args)
+            rows = [json.loads(line) for line in Path(args.output).read_text().splitlines()]
+            self.assertEqual([r["type"] for r in rows], ["run_start", "prefill", "run_error"])
+            with self.assertRaisesRegex(ValueError, "no completed runs"):
+                self.summarize(rows)
+
+    def test_tokenizer_mismatch_refuses_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.run_args(directory)
+            with patch.object(matrix, "tokenize", return_value=[99]):
+                with self.assertRaisesRegex(ValueError, "tokenizer mismatch"):
+                    matrix.run(args)
+            self.assertFalse(Path(args.output).exists())
+
+    def test_stream_requires_final_and_counts_tokens_not_events(self):
+        def check(items):
+            with patch.object(matrix, "post", return_value=contextlib.nullcontext(None)):
+                with patch.object(matrix, "sse", return_value=iter(items)):
+                    return matrix.measure_stream(self.url, [1], 3, 5)
+        with self.assertRaisesRegex(ValueError, "final stop record"):
+            check([{"tokens": [1], "content": "1"}])
+        with self.assertRaisesRegex(ValueError, "stream error"):
+            check([{"error": "failure"}])
+        uncounted = check([{"content": "1, "}, {"content": "2"}, {"stop": True}])
+        self.assertIsNone(uncounted["decode_tokens_per_second"])
+        self.assertFalse(uncounted["exact_output_length"])
+        grouped = check([{"tokens": [1, 2], "content": "1, "},
+                         {"tokens": [3], "content": "2"}, {"stop": True}])
+        self.assertEqual(grouped["streamed_tokens"], 3)
+        self.assertEqual(grouped["events"], 2)
+        self.assertTrue(grouped["exact_output_length"])
+        self.assertTrue(grouped["coherent_counting_prefix"])
 
 
 if __name__ == "__main__":
