@@ -53,12 +53,8 @@ if ss -H -ltn 'sport = :8193' | grep -q .; then
     echo 'port 8193 is already in use' >&2; exit 1
 fi
 python3 "$root/deploy/release-model-cache.py" "$model"
-available_kib=$(awk '$1=="MemAvailable:" {print $2}' /proc/meminfo)
-anonymous_kib=$(awk '$1=="AnonPages:" || $1=="Shmem:" {n+=$2} END {print n}' /proc/meminfo)
-if ! [[ "$available_kib" =~ ^[0-9]+$ && "$anonymous_kib" =~ ^[0-9]+$ ]] || \
-    (( available_kib < 24*1024*1024 || anonymous_kib > 20*1024*1024 )); then
-    echo 'insufficient memory headroom for the comparison load' >&2; exit 1
-fi
+python3 "$root/deploy/check-model-headroom.py" \
+    --minimum-available-gib 24 --maximum-other-memory-gib 12
 
 # No inherited model/device/profiler knobs or credentials in this process.
 # Keep the normal Mesa disk cache; no OS-wide cache flushing is performed.

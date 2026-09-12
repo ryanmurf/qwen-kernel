@@ -93,6 +93,12 @@ It verifies the Halo-only `GGML_VK_VISIBLE_DEVICES` selection as well as
 `--device`, keeping ggml's host-staging allocator off the external GPU.
 Those limits do **not** cap all GPU GTT: monitor host memory and the journal
 during loading. It does not stop existing services or wait for readiness.
+The read-only `deploy/check-model-headroom.py` preflight requires at least
+24 GiB MemAvailable and conservatively budgets other jobs' anonymous/shared
+RAM plus used swap at no more than 12 GiB. Use it before native full-model
+tests too, after confirming all previous model processes exited. Releasing
+unused GPU pages must not hide a large job that still owns RAM or swap.
+This is a launch snapshot, not a reservation against later allocations.
 Check `/health`, the actual device-buffer/offload log, the process environment
 and correct output before running the matrix. Stop the printed comparison
 unit and verify drained memory before restoring the native service. Never
