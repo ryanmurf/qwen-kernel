@@ -1,9 +1,11 @@
 # Halo-only decode-attention experiment
 
-Status (2026-09-12 UTC): **split-K with chunk 256 failed the long-context
-numerical gate. It is not approved as a serving default.** Unset
-`QK_ATTN_DECODE`, or set it to `serial`, for the existing path. No speedup
-is claimed. Batched prefill is unchanged by this experiment.
+Status (2026-09-12 UTC): **ordered attention passed the same-build 16K
+prefix plus 128-position replay bit-for-bit. API performance is not yet
+established; serial remains the serving default.** Split-K with chunk 256
+failed the long-context numerical gate and remains unapproved. Unset
+`QK_ATTN_DECODE`, or set it to `serial`, for the existing path. No model
+speedup is claimed. Batched prefill is unchanged by this experiment.
 
 The opt-in `QK_ATTN_DECODE=split` path uses the existing F32 split/reduce
 shaders with 24 query heads, 2 KV heads, head width 256, and a fixed dispatch
@@ -42,10 +44,10 @@ The first 49 tail rows stayed below the RMS bound. The first large change
 appeared at tail index 49 (zero-based input position 16433): relative RMS
 0.0310883. The only greedy flip was at tail index 70 / position 16454:
 serial token 290, split token 470. The serial logit margin between those
-choices was 0.0528975; split favored its choice by 0.0604277. An abrupt
-change after small rounding differences is consistent with a discrete
-expert-routing change, but layer-level evidence is still needed to
-establish the cause. Reset success does not establish cross-mode accuracy.
+choices was 0.0528975; split favored its choice by 0.0604277. The focused
+layer trace and router replay below establish an expert-selection change
+after small upstream rounding differences. Reset success alone does not
+establish cross-mode accuracy.
 
 Raw gate record: [results-halo-split-attn-long-gate.json](results-halo-split-attn-long-gate.json).
 The full ~123 MiB-per-mode logit dumps, model/shader manifests, launch logs,
@@ -68,10 +70,9 @@ Do not build or change shaders between dumps. Confirm actual native mode
 announcements and compare the ABI greedy IDs to the saved rows as well as
 running the helper's numerical comparison.
 
-Next: capture layer boundaries at the first divergence and check the
-attention operator independently before trying another split strategy.
-Retain the failed data; do not promote this configuration based on the
-short tests or a favorable throughput-only result.
+The layer-boundary capture and independent attention-operator checks are
+now complete, as described below. Retain the failed data; do not promote
+split-K/chunk256 based on its short tests or a throughput-only result.
 
 ## Traced cause and replacement candidate (2026-09-12 UTC)
 
@@ -140,5 +141,36 @@ The full-model 16-position F32 oracle, mixed/whole prefill, batch-to-decode
 handoff and exact-reset checks passed with library SHA256
 `ef562d291d37e0780d431442722a41f1c8d60e9d30ebc1991c0ad032444f8299`.
 Worst final-logit RMS across the four oracle scenarios was 1.284e-6, with
-no argmax mismatches. Long replay and API performance checks are still
-pending; these short and synthetic checks do not establish those results.
+no argmax mismatches.
+
+### Same-build ordered long-context gate
+
+The serial and ordered runs now both completed successfully on that same
+library and the same 177 shader binaries. Each used the exact 16384-token
+shared prompt followed by all 128 teacher positions, then reset and
+repeated the complete prefix and tail. Both passed exact reset and repeat
+checks, with no memory-watchdog abort. The observed backend announcements
+were `serial` and `ordered-F32`; normalized launch commands matched apart
+from mode, output path, and transient unit name.
+
+All 129 saved rows (one clean row plus 128 tail rows), each with 248320 F32
+logits, are **byte-for-byte identical**. Both 128133120-byte dumps have
+SHA256 `3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01`.
+Every ABI-returned greedy ID agrees with its saved row's argmax, and all
+128 agree across modes. Maximum relative RMS and KL are zero; the existing
+1e-5 RMS / zero-flip gate was not relaxed. This includes the position that
+failed in the split-K experiment.
+
+Raw gate record:
+[results-halo-ordered-attn-long-gate.json](results-halo-ordered-attn-long-gate.json).
+The generic comparison helper retains legacy `split` / `greedy_split`
+field names for its candidate; the bound mode evidence identifies this
+candidate as **ordered**, not split-K. Full dumps, manifests, logs, and
+controller records are in `/home/ryan/qk-ordered-checks-gzorn5/`.
+
+The long test bodies took 423.90 s serial and 420.98 s ordered, excluding
+load. These include two prefills, two tails, and readbacks; they are not
+isolated decode throughput and do not establish a serving speedup.
+Request-level A/B testing is next, including the HTTP/Claude-tool suite
+and identical-token 128/8192/16384 prompt-length measurements. The passing
+replay is evidence for this workload, not a broad quality evaluation.
