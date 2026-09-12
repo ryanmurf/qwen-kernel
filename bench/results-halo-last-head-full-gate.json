@@ -1,0 +1,11 @@
+{
+  "result": "PASS",
+  "full_model": true,
+  "cases": 15,
+  "compared_logit_rows": 498,
+  "unique_baseline_rows": 166,
+  "library_sha256": "068369b87806608ed7d00efb2b72d3bd3e0f19abfd0ed67d7f452b8e952d8931",
+  "fixture_sha256": "a37dfebb993cab5cf754a0d63a31875df93d106e61f6351273ad91d427942fc7",
+  "http_validation": false,
+  "gate_sha256": "647d55c88268859df01e43c3805e127a8c7d3a0cc94a51d43bde10333286fa6c"
+}

@@ -1,10 +1,16 @@
 # Native Flash: opt-in last-output prefill
 
-September 12, 2026, Max. Implemented and validated on the **last two layers
-plus output head**, not the entire model. No serving-default promotion.
-Full-model serving remains offline because the unchanged 24 GiB admission
-guard rejects the host's approximately 20.6 GiB available RAM. The separately
-requested bounded unused-TTM cleanup has not been approved or performed.
+Update, September 12 at 21:55 UTC: the [full-model exact-logit gate](results-halo-last-head-full-gate.json)
+has now passed all 498 cross-policy/reset comparisons. HTTP A/B is in
+progress; no end-to-end speedup or serving promotion is claimed yet. The
+earlier admission block below is historical; resource cleanup was approved.
+
+The original September 12, 2026 experiment on Max, documented below, used
+the **last two layers plus output head**, not the entire model. At that
+point, the unchanged 24 GiB admission guard rejected approximately 20.6 GiB
+available RAM and unused-TTM cleanup was awaiting approval. That historical
+block is resolved; the full-model validation above supersedes it. Serving
+remains paused specifically for the exclusive HTTP comparison.
 
 ## Change
 
@@ -83,7 +89,8 @@ dumps. Final gate cgroup peak was 918,581,248 bytes; swap peak was zero and
 all memory-event counters were zero. Cgroup memory is **not** the complete
 GPU allocation accounting. All test processes exited successfully. No
 driver/kernel/clock/power changes, global cache flush, GPU reset, TTM shrink
-or model replacement occurred. The full-model admission guard was not lowered.
+or model replacement occurred during this partial-stage experiment. The
+full-model admission guard was not lowered.
 
 ## Evidence and reproduction
 
@@ -101,7 +108,8 @@ New native library SHA256:
 New release server SHA256:
 `10bf29d115627fdf35a9305e0e2e1a9de1dea5a6bd8357627aad0c051fa1925a`.
 Both are private experiment builds; `build-halo` baseline binaries remain
-untouched. The new server has not been paired with a full native model yet.
+untouched. The new server is now being tested with the complete native model
+in the separate full-model HTTP campaign.
 
 Offline check, no GPU or model load:
 
@@ -122,8 +130,7 @@ this approximately 5 GiB partial-stage load; the harness enforces these
 conditions. Run `--reference-only` against the preserved library separately,
 and `--profile-only` with `QK_FLASH_PROFILE=2` separately. Never overlap them.
 
-Next gate before promotion: restore sufficient host memory with explicit
-approval, run the full 48-layer model on both policies, verify teacher-forced
-logits and real HTTP/Claude streaming, sampling, cancellation and isolation,
-then run the matched fresh/repeat/follow-up prefill matrix. Keep the flag
-off until those end-to-end correctness and performance gates pass.
+Remaining gate before promotion: finish the matched full-model HTTP campaign
+on both policies, including Claude/tool streaming, seeded sampling, cancellation,
+isolation and the fresh-KV prefill matrix. Full 48-layer logit/reset parity
+has passed; it is not by itself an HTTP performance result.

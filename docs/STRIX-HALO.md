@@ -1,15 +1,16 @@
 # Strix Halo native Flash Next port
 
-September 12 status: the new `QK_FLASH_PREFILL_LAST=1` local-prefill
-optimization is **opt-in and partial-stage validated only**. It skips
-unused vocabulary tiles without changing the final tile's arithmetic or
-the existing all-ID ABI. The final two layers plus head measured 322.64
-to 154.85 ms at 512 rows; this is not a whole-model speedup claim. See
-[the gate, measurements and rollout requirements](../bench/RESULTS-halo-last-head.md).
-Full-model serving is currently offline: the unchanged 24 GiB launch guard
-rejects approximately 20.6 GiB available RAM after the Nathanw campaign;
-bounded unused-TTM cleanup still needs explicit approval. No cleanup or
-serving-default promotion was performed for this optimization.
+September 12 status: `QK_FLASH_PREFILL_LAST=1` is still opt-in, but its
+[full 48-layer exact-logit gate now passes](../bench/results-halo-last-head-full-gate.json):
+498 cross-policy/reset comparisons, including long-context continuations.
+The same-final-tile optimization preserves the existing all-ID ABI. The
+[earlier two-layer result](../bench/RESULTS-halo-last-head.md) is not a
+whole-model speedup claim. Matched full-model HTTP benchmarks are in
+progress; no serving-default promotion has happened. Production routing on
+8091 remains paused for exclusive tests on loopback8194. Bounded unused-TTM
+cleanup has now been explicitly approved; the 24 GiB launch guard remains
+unchanged. Initial available memory had already recovered enough to admit
+the full-model gate without any shrink calls.
 
 Validated milestone `0453754`, 2026-09-11: **the native engine served port
 8091 from the Strix Halo iGPU alone** (all 48 layers plus the
@@ -33,6 +34,25 @@ been installed or executed.
 The earlier two-GPU split (Halo 0:37 + XTX 37:48) remains available as an
 explicit `MODE=split` of the restore helper and its measurements stay below
 for reference; they are not Halo-only results.
+
+## Performance research leads
+
+- [pwilkin/llama.cpp](https://github.com/pwilkin/llama.cpp) — recorded at the
+  user's request on 2026-09-12 as possible inspiration for further Halo
+  optimization. This is a research lead, not a validated performance result
+  or a selected replacement backend. Remote branch tips inspected that day:
+  [`strix-halo` at f5daaa3](https://github.com/pwilkin/llama.cpp/commit/f5daaa3cfa6358e5dd398911ec741813745a5440)
+  and [`strix-halo-for-halobox` at 27fd0cf](https://github.com/pwilkin/llama.cpp/commit/27fd0cf2cd068447f4e0b530f258be6349661420).
+  The latter describes AMD prefill work under `ggml-cuda`: BF16 WMMA GEMM,
+  PLE/GDN convolution, gated normalization, expert reduction and bounded
+  routing scratch. These are leads for a Vulkan implementation, not drop-in
+  shaders; BF16 arithmetic belongs to a separately validated precision tier.
+  Its commit notes also flag tensor-pointer lifetime hazards in optional
+  marking features, and shadow-weight eligibility/cleanup fixes worth
+  reviewing before reuse. Inspect the actual implementation and test any
+  candidate with our correctness gates and matched full-model benchmarks.
+  No code from this fork has been imported or run for this entry; the ongoing
+  last-output prefill A/B remains unchanged.
 
 ## Current target
 

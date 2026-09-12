@@ -1,0 +1,15 @@
+{
+  "scope": "sampled full-model last-head gate; observer begins during loading",
+  "observer_sha256": "16c51a01a2d827ff304dffee0fe3fd5294200553948ca51e032428cc9221b82c",
+  "samples": 462,
+  "duration_seconds": 1387.1435850480048,
+  "minimum_available_gib": 26.090057373046875,
+  "maximum_temperature_c": 72.0,
+  "cgroup_peak_bytes": 1361502208,
+  "cgroup_swap_peak_bytes": 0,
+  "memory_events_all_zero": true,
+  "watchdog_violations": 0,
+  "model_exit_code": 0,
+  "observer_exit_code": 0,
+  "gate_sha256": "647d55c88268859df01e43c3805e127a8c7d3a0cc94a51d43bde10333286fa6c"
+}
