@@ -14,6 +14,7 @@
 #      GPU process is stuck, or a GPU still holds memory;
 #   2. release the model shards' page cache (targeted fadvise) so the driver
 #      does not have to allocate next to tens of GiB of resident cache;
+#      require host headroom, including RAM/swap still owned by other jobs;
 #   3. (split) XTX worker, wait for this invocation's "listening" line;
 #   4. server on HTTP loopback 8194, wait for a 200 /health with status ok;
 #      with WARM=1 (split only) the unit gets 52G/58G limits and warms the
@@ -94,6 +95,11 @@ if [[ "$mode" == split ]] && (( $(mib $xtx/mem_info_vram_used) > 2048 )); then e
 echo "pre-load: $(state)"
 python3 "$root/deploy/release-model-cache.py" "$model" | tail -1
 echo "after cache release: $(state)"
+# Retained, unused TTM pages may be reusable, but another job's anonymous
+# RAM or swap is not free capacity for the ~90 GiB single-Halo model.
+# This is a read-only admission snapshot, not a reservation against jobs
+# that start allocating after launch. A rejection starts no model units.
+python3 "$root/deploy/check-model-headroom.py"
 if (( $(kb MemFree) < 30*1048576 )); then
     echo "warning: MemFree below 30 GiB before the Halo load; the driver reuses its retained pool but this is not guaranteed" >&2
 fi
@@ -125,7 +131,7 @@ server_started=$(date +%s)
 # byte-addressed expert kernels), QK_GDN_STEP (v1). Profiling variables are
 # deliberately NOT forwarded: HTTP measurements run with profiling off.
 extra=()
-for knob in QK_FLASH_BATCH QK_PLE_ROW_PREFETCH QK_FLASH_COOPMAT QK_FLASH_FUSE QK_MOE_GU QK_GDN_STEP QK_Q51_GEMV QK_MOE_DOWN QK_Q6K_GEMV; do
+for knob in QK_FLASH_BATCH QK_PLE_ROW_PREFETCH QK_FLASH_COOPMAT QK_FLASH_FUSE QK_MOE_GU QK_GDN_STEP QK_Q51_GEMV QK_MOE_DOWN QK_Q6K_GEMV QK_ATTN_DECODE QK_ATTN_CHUNK; do
     if [[ -n "${!knob:-}" ]]; then extra+=("--setenv=$knob=${!knob}"); fi
 done
 start_unit qwen-native-flash-server32 -p MemoryHigh=$high -p MemoryMax=$max -p MemorySwapMax=512M \

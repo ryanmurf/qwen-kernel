@@ -4208,7 +4208,7 @@ bool qk_engine::open(const char* path, const qk_config& cfg, char* err, size_t e
             qwen4=std::make_unique<Qwen4Graph>(c,g,lFirst,lEnd,nCtx,96ull<<30,lastStage());
             qwen4->open();
         } catch (const std::exception& error) { return fail(error.what()); }
-        fprintf(stderr,"native Flash experimental stage [%u,%u), context=%u, residual=10240, one sequence, batch rows %u; MTP/snapshots disabled\n",lFirst,lEnd,nCtx,qwen4->batchCapacity());
+        fprintf(stderr,"native Flash experimental stage [%u,%u), context=%u, residual=10240, one sequence, batch rows %u, decode attention %s; MTP/snapshots disabled\n",lFirst,lEnd,nCtx,qwen4->batchCapacity(),qwen4->decodeAttention());
         return true;
     }
     initVk(c, "libqk");  // shader dir resolved via QK_SHADER_DIR

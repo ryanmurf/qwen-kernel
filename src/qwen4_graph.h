@@ -36,6 +36,38 @@ class Qwen4Graph {
     std::set<std::string> hostHeapTensors;
     int hostHeapType = -1;
     size_t systemReserveBytes = 0;
+    // Opt-in split-K decode attention (QK_ATTN_DECODE=split; default serial,
+    // QK_ATTN_DECODE=serial or unset is the rollback). fa_attn_srv_split runs
+    // splitMax x 24 workgroups, each walking one QK_ATTN_CHUNK-key range of
+    // the live context and writing an unnormalized partial (acc[dh], m, l);
+    // fa_attn_srv_reduce merges the live partials per head and applies the
+    // sigmoid output gate exactly as fa_attn_srv does. Everything stays F32;
+    // the merge changes the softmax association order, so results are
+    // F32-close to the serial kernel, not bit-identical. The dispatch count
+    // is fixed at splitMax (workgroups past the live length exit before
+    // touching memory), which keeps the replayed command buffer valid.
+    // Only the single-position decode path uses it; batched prefill keeps
+    // fa_attn_batch. Shape contract (checked by validateLayer): 24 query
+    // heads, 2 KV heads, head width 256, KV rows [kv][tmax][256].
+    bool attnSplit = false;
+    uint32_t attnChunk = 256, attnSplitMax = 0;
+    static constexpr uint32_t attnHeads = 24, attnKvHeads = 2, attnDh = 256;
+    void configureDecodeAttention() {
+        if (const char* v = getenv("QK_ATTN_DECODE")) {
+            if (!strcmp(v,"split")) attnSplit = true;
+            else if (strcmp(v,"serial")) throw std::runtime_error("QK_ATTN_DECODE must be serial or split");
+        }
+        if (const char* v = getenv("QK_ATTN_CHUNK")) {
+            char* end = nullptr; long x = strtol(v,&end,10);
+            if (end == v || *end || x < 16 || x > 1024) throw std::runtime_error("QK_ATTN_CHUNK must be an integer 16..1024");
+            attnChunk = (uint32_t)x;
+        }
+        attnSplitMax = (capacity + attnChunk - 1) / attnChunk;
+        if (attnSplit && attnSplitMax > c.props.limits.maxComputeWorkGroupCount[0])
+            throw std::runtime_error("QK_ATTN_CHUNK too small for this context: split count exceeds the device workgroup limit");
+    }
+    // Partial buffer: [head][split][dh + 2] floats (3.17 MB at 32768 context, chunk 256).
+    size_t attnSplitScratchBytes() const { return attnSplit ? size_t(attnHeads) * attnSplitMax * (attnDh + 2) * 4 : 0; }
     static uint64_t memTotalBytes() {
         FILE* f = fopen("/proc/meminfo","r"); if (!f) return 0;
         char line[256]; unsigned long long kb = 0; bool found = false;
@@ -493,10 +525,20 @@ class Qwen4Graph {
         project(w("attn_q.weight"),"$mixed","$fa_qfull",false);
         project(w("attn_k.weight"),"$mixed","$fa_k",false);
         project(w("attn_v.weight"),"$mixed","$fa_v");
-        struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; } pc{0,capacity,256,64,24,2,eps,1e7f};
+        struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; } pc{0,capacity,attnDh,64,attnHeads,attnKvHeads,eps,1e7f};
         emit("fa_prep_srv.spv",{"$fa_qfull","$fa_k","$fa_v",w("attn_q_norm.weight"),w("attn_k_norm.weight"),
              "$fa_qhat",state("kcache"),state("vcache"),"$rope","$position"},pc,28);
-        emit("fa_attn_srv.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att","$position"},pc,24);
+        if (attnSplit) {
+            // Push constants extend the serial layout by {splitMax, chunk}
+            // (fa_attn_srv_split / fa_attn_srv_reduce PC: pos, tmax, dh, nRot,
+            // hQ, hKV, eps, freqBase, splitMax, chunk). Grid: x = split, y = head.
+            struct { uint32_t pos,tmax,dh,nrot,hq,hkv; float eps,base; uint32_t splitMax,chunk; }
+                spc{0,capacity,attnDh,64,attnHeads,attnKvHeads,eps,1e7f,attnSplitMax,attnChunk};
+            launch("fa_attn_srv_split.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_part","$position"},spc,attnSplitMax,attnHeads,1,0);
+            emit("fa_attn_srv_reduce.spv",{"$fa_part","$fa_qfull","$att","$position"},spc,attnHeads);
+        } else {
+            emit("fa_attn_srv.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att","$position"},pc,attnHeads);
+        }
         tap("attn_gated","$att");
         project(w("attn_output.weight"),"$att","$block");
     }
@@ -672,6 +714,7 @@ public:
         : c(context), g(model), firstLayer(first), lastLayer(end-1), capacity(ctx), weightLimit(budget), withHead(head), servingBudget(true) {}
     uint32_t currentPosition() const { return position; }
     uint32_t batchCapacity() const { return batchCap; }
+    const char* decodeAttention() const { return attnSplit ? "split-K" : "serial"; }
     const std::vector<float>& lastLogits() const { return logits; }
     ~Qwen4Graph() {
         pleStop = true;
@@ -726,7 +769,8 @@ public:
             if (bytes>weightLimit-totalWeightBytes) throw std::runtime_error("native head weight budget exceeded");
             totalWeightBytes+=bytes;
         }
-        // Fail fast on bad prefetch settings before any weight upload.
+        // Fail fast on bad prefetch and attention settings before any weight upload.
+        configureDecodeAttention();
         if (const char* v = getenv("QK_PLE_PREFETCH"); v && strcmp(v,"0") && strcmp(v,"1"))
             throw std::runtime_error("QK_PLE_PREFETCH must be 0 or 1");
         if (const char* floorEnv = getenv("QK_PLE_PREFETCH_FLOOR_GIB")) {
@@ -757,6 +801,7 @@ public:
             uint64_t fixed=(256ull<<20);
             for (layer=firstLayer; layer<=lastLayer; ++layer)
                 fixed+=layer%4==3 ? 2ull*2*capacity*256*4 : (48ull*128*128+10240*3)*4;
+            if (lastLayer >= 3) fixed+=attnSplitScratchBytes();  // split-K partial buffer (0 when serial)
             VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
             VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
             props.pNext=&budget; vkGetPhysicalDeviceMemoryProperties2(c.phys,&props);
@@ -883,6 +928,7 @@ public:
         }
         if (lastLayer >= 3) {
             allocateRows("$fa_qfull",12288*4,rows); allocateRows("$fa_k",512*4,rows); allocateRows("$fa_v",512*4,rows); allocateRows("$fa_qhat",6144*4,rows);
+            if (attnSplit) allocate("$fa_part",attnSplitScratchBytes());  // [24][splitMax][258] partials
             auto& rope = allocate("$rope",capacity*64*4);
             std::vector<float> values(capacity*64);
             for (uint32_t pos=0; pos<capacity; ++pos) for (uint32_t j=0; j<32; ++j) {
