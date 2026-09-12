@@ -1,0 +1,67 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Word-addressed twin of gemv_q5_1.comp: a Q5_1 block is 24 bytes = six
+// dwords (d|m halves, qh word, four qs words), so each lane reads six words
+// and eight vec4 activations per block instead of 24 byte loads. Result is
+// d*sum(q*x) + m*sum(x) per block (F32-close, not bit-identical, to the
+// byte-addressed kernel, which remains the v1 path: QK_Q51_GEMV=v1). Same
+// bindings, push constants, TPR specialization and batch (z) semantics.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+layout(std430, binding = 0) readonly buffer W { uint w32[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+shared float partial[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, lane = tid % TPR;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row = wg * (256u / TPR) + tid / TPR;
+    uint batch = gl_WorkGroupID.z;
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint blocks = pc.K / 32u;
+        for (uint block = lane; block < blocks; block += TPR) {
+            uint base = (row * blocks + block) * 6u;
+            vec2 dm = unpackHalf2x16(w32[base]);
+            uint qh = w32[base + 1u];
+            uint xo = (batch * pc.K + block * 32u) / 4u;
+            float s = 0.0, xs = 0.0;
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                uint qs = w32[base + 2u + j];
+                vec4 xl = x4[xo + j], xh = x4[xo + 4u + j];
+                uint e = 4u * j;  // low nibbles are elements e..e+3, high nibbles e+16..e+19
+                vec4 ql = vec4(float((qs & 15u) | (((qh >> e) & 1u) << 4u)),
+                               float(((qs >> 8u) & 15u) | (((qh >> (e + 1u)) & 1u) << 4u)),
+                               float(((qs >> 16u) & 15u) | (((qh >> (e + 2u)) & 1u) << 4u)),
+                               float(((qs >> 24u) & 15u) | (((qh >> (e + 3u)) & 1u) << 4u)));
+                vec4 qhv = vec4(float(((qs >> 4u) & 15u) | (((qh >> (e + 16u)) & 1u) << 4u)),
+                                float(((qs >> 12u) & 15u) | (((qh >> (e + 17u)) & 1u) << 4u)),
+                                float(((qs >> 20u) & 15u) | (((qh >> (e + 18u)) & 1u) << 4u)),
+                                float(((qs >> 28u) & 15u) | (((qh >> (e + 19u)) & 1u) << 4u)));
+                s += dot(ql, xl) + dot(qhv, xh);
+                xs += xl.x + xl.y + xl.z + xl.w + xh.x + xh.y + xh.z + xh.w;
+            }
+            acc += dm.x * s + dm.y * xs;
+        }
+    }
+    if (TPR >= gl_SubgroupSize) {
+        float v = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u) partial[tid / gl_SubgroupSize] = v;
+        barrier();
+        if (lane == 0u && row < pc.M) {
+            float sum = 0.0;
+            uint waves = TPR / gl_SubgroupSize, base = (tid / TPR) * waves;
+            for (uint i = 0u; i < waves; ++i) sum += partial[base + i];
+            y[batch * pc.M + row] = sum;
+        }
+    } else {
+        for (uint s = TPR / 2u; s > 0u; s >>= 1u) acc += subgroupShuffleXor(acc, s);
+        if (lane == 0u && row < pc.M) y[batch * pc.M + row] = acc;
+    }
+}

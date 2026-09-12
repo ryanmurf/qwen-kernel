@@ -282,6 +282,15 @@ class Qwen4Graph {
     // Word-addressed routed/shared expert gate-up kernels (QK_MOE_GU=v1 keeps
     // the byte-addressed originals for A/B).
     bool expertV1() const { static const bool v1 = [] { const char* v = getenv("QK_MOE_GU"); return v && !strcmp(v,"v1"); }(); return v1; }
+    // Word-addressed Q5_1 GEMV / expert-down and Q6_K GEMV variants (opt-in;
+    // see the measurements below).
+    // Measured 2026-09-11 on Halo: the Q6_K word variant is 40-50% slower
+    // (misaligned 210-byte blocks), the Q5_1 variants are within 1% of the
+    // byte-addressed kernels, so v1 stays the default for all three and
+    // QK_Q51_GEMV=v2 / QK_MOE_DOWN=v2 / QK_Q6K_GEMV=v2 opt into the variants.
+    bool q51V1() const { static const bool v1 = [] { const char* v = getenv("QK_Q51_GEMV"); return !(v && !strcmp(v,"v2")); }(); return v1; }
+    bool moeDownV1() const { static const bool v1 = [] { const char* v = getenv("QK_MOE_DOWN"); return !(v && !strcmp(v,"v2")); }(); return v1; }
+    bool q6kV1() const { static const bool v1 = [] { const char* v = getenv("QK_Q6K_GEMV"); return !(v && !strcmp(v,"v2")); }(); return v1; }
     // HC down projection writing silu(sum/scale) directly: returns false when
     // the weight format has no fused variant (caller then takes the two-dispatch path).
     bool projectSilu(const std::string& weight, const std::string& input, const std::string& output, float scale) {
@@ -296,7 +305,7 @@ class Qwen4Graph {
         struct { uint32_t m,k; } pc{m,k};
         const uint32_t groups = (m + 256/tpr - 1) / (256/tpr);
         if (tensor->type == GGML_Q5_K) { launchSpecs("gemv_q5_k.spv", {weight,input,output}, pc, groups, 1, 1, {tpr, 1u, floatBits(scale)}); return true; }
-        if (tensor->type == GGML_Q6_K) { launchSpecs("gemv_q6_k.spv", {weight,input,output}, pc, groups, 1, 1, {tpr, 0u, 1u, floatBits(scale)}); return true; }
+        if (tensor->type == GGML_Q6_K) { launchSpecs(q6kV1() ? "gemv_q6_k.spv" : "gemv_q6_k_v2.spv", {weight,input,output}, pc, groups, 1, 1, {tpr, 0u, 1u, floatBits(scale)}); return true; }
         return false;
     }
     // Folded one-dimensional launch (kernels index wg = y*numX + x) with an
@@ -317,8 +326,8 @@ class Qwen4Graph {
         uint32_t units;
         switch (tensor->type) {
             case GGML_Q5_K: shader = "gemv_q5_k.spv"; units = k/32; break;
-            case GGML_Q5_1: shader = "gemv_q5_1.spv"; units = k/32; break;
-            case GGML_Q6_K: shader = "gemv_q6_k.spv"; units = k/32; break;
+            case GGML_Q5_1: shader = q51V1() ? "gemv_q5_1.spv" : "gemv_q5_1_v2.spv"; units = k/32; break;
+            case GGML_Q6_K: shader = q6kV1() ? "gemv_q6_k.spv" : "gemv_q6_k_v2.spv"; units = k/32; break;
             case GGML_Q8_0: shader = "gemv_q8_0.spv"; units = k/32; break;
             default: throw std::runtime_error("unsupported projection format: " + weight);
         }
@@ -843,11 +852,13 @@ public:
         VK_CHECK(vkMapMemory(c.dev, staging.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
         for (layer=firstLayer; layer<=lastLayer; ++layer) for (const auto& [name,tensor] : g.tensors()) if (name.compare(0,w("").size(),w("")) == 0) {
             if (!tensor.nbytes) throw std::runtime_error("unknown tensor layout: " + name);
-            auto& b = allocate(name,tensor.nbytes); upload(b,tensor.data,tensor.nbytes); releaseUploaded(tensor);
+            // Weight buffers are rounded up to whole dwords so word-addressed
+            // kernels reading the last block stay inside the descriptor range.
+            auto& b = allocate(name,(tensor.nbytes+3)&~size_t(3)); upload(b,tensor.data,tensor.nbytes); releaseUploaded(tensor);
         }
         if (withHead) {
             for (const auto& name : {"output_hc_norm.weight","output_hc_down.weight","output_hc_up.weight","output.weight"}) {
-                const auto* tensor=g.find(name); auto& b=allocate(name,tensor->nbytes); upload(b,tensor->data,tensor->nbytes); releaseUploaded(*tensor);
+                const auto* tensor=g.find(name); auto& b=allocate(name,(tensor->nbytes+3)&~size_t(3)); upload(b,tensor->data,tensor->nbytes); releaseUploaded(*tensor);
             }
             allocateRows("$output_logits",logits.size()*4,batchCap ? headTile : 1);
         }
@@ -1069,8 +1080,8 @@ public:
         emit("moe_select_256.spv",{"$logits",w("ffn_gate_inp_shexp.weight"),"$mixed","$sel"},moe,1);
         emit(expertV1() ? "moe_gateup_q5k.spv" : "moe_gateup_q5k_v2.spv",{w("ffn_gate_exps.weight"),w("ffn_up_exps.weight"),"$mixed","$sel","$ffh"},moe,used*ff,halo&&!downQ51?128:64,1,false);
         emit(expertV1() ? "moe_shared_q5k.spv" : "moe_shared_q5k_v2.spv",{w("ffn_gate_shexp.weight"),w("ffn_up_shexp.weight"),"$mixed","$ffh"},moe,ff,halo&&!downQ51?128:64);
-        emit(downQ51?"moe_down_q5_1.spv":"moe_down_q8_routed.spv",{w("ffn_down_exps.weight"),"$ffh","$sel","$block"},moe,n,halo?128:256);
-        emit(sharedQ51?"moe_down_shared_q5_1.spv":"moe_down_q8.spv",{w("ffn_down_shexp.weight"),"$ffh","$sel","$block"},moe,n,sharedQ51?64:0);
+        emit(downQ51?(moeDownV1()?"moe_down_q5_1.spv":"moe_down_q5_1_v2.spv"):"moe_down_q8_routed.spv",{w("ffn_down_exps.weight"),"$ffh","$sel","$block"},moe,n,halo?128:256);
+        emit(sharedQ51?(moeDownV1()?"moe_down_shared_q5_1.spv":"moe_down_shared_q5_1_v2.spv"):"moe_down_q8.spv",{w("ffn_down_shexp.weight"),"$ffh","$sel","$block"},moe,n,sharedQ51?64:0);
         tap("ffn_out", "$block");
         hcCombine("$residual","$hidden");
         }

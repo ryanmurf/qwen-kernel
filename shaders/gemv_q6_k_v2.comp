@@ -1,0 +1,102 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Dword-addressed twin of gemv_q6_k.comp. Q6_K blocks are 210 bytes, so a
+// block starts on a 2-byte boundary; every needed byte run (16 ql bytes,
+// 16 qh bytes, one scale, the f16 d) is fetched as whole dwords from the
+// containing 4-byte words and shifted into place, replacing 35 byte loads
+// per 16-element group with about 12 word loads. Same math and reduction
+// order as gemv_q6_k (q values and per-group d*sc*sum), same bindings and
+// specialization; the epilogue constants match too. QK_Q6K_GEMV=v1 keeps
+// the byte-addressed kernel.
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint TPR = 256u;
+layout(constant_id = 1) const uint Q6_SUPERBLOCKS_PER_ROW = 0u;
+layout(constant_id = 2) const uint SILU_EPILOGUE = 0u;
+layout(constant_id = 3) const float SILU_SCALE = 1.0;
+float epilogue(float v) { if (SILU_EPILOGUE != 0u) { v *= SILU_SCALE; return v / (1.0 + exp(-v)); } return v; }
+
+layout(std430, binding = 0) readonly buffer BufW { uint w32[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { uint M; uint K; } pc;
+shared float partial[256];
+
+// Four consecutive bytes at byte offset o (any alignment), packed little-endian.
+uint bytes4(uint o) {
+    uint w = w32[o >> 2u];
+    uint sh = (o & 3u) * 8u;
+    if (sh == 0u) return w;
+    return (w >> sh) | (w32[(o >> 2u) + 1u] << (32u - sh));
+}
+uint byte1(uint o) { return (w32[o >> 2u] >> ((o & 3u) * 8u)) & 255u; }
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;
+    uint rq   = gl_WorkGroupID.z;
+    uint xo2  = rq * pc.K;
+    uint lane = tid % TPR;
+    uint wg   = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint row  = wg * (256u / TPR) + tid / TPR;
+
+    float acc = 0.0;
+    if (row < pc.M) {
+        uint kb = Q6_SUPERBLOCKS_PER_ROW != 0u ? Q6_SUPERBLOCKS_PER_ROW : pc.K / 256u;
+        uint ng = kb * 16u;
+        uint base = row * kb;
+        for (uint g = lane; g < ng; g += TPR) {
+            uint b  = g >> 4u;
+            uint gg = g & 15u;
+            uint h  = gg >> 3u;
+            uint r  = (gg & 7u) >> 1u;
+            uint is = gg & 1u;
+            uint blk = (base + b) * 210u;            // byte offset of the block (always even)
+            // f16 d occupies bytes 208..209: 2-byte aligned, so it lies inside
+            // ONE dword; extract from that word only (a 4-byte helper would read
+            // past the buffer end on the last block).
+            uint dOff = blk + 208u;
+            uint dword = (w32[dOff >> 2u] >> ((dOff & 3u) * 8u)) & 0xffffu;
+            float d  = unpackHalf2x16(dword).x;
+            float sc = float(int(byte1(blk + 192u + h * 8u + r * 2u + is) << 24u) >> 24u);
+            uint qlBase = blk + h * 64u + (r & 1u) * 32u + is * 16u;
+            uint qhBase = blk + 128u + h * 32u + is * 16u;
+            uint shift  = r * 2u;
+            bool hi     = r >= 2u;
+            uint xoff   = b * 256u + gg * 16u;
+            float s = 0.0;
+            [[unroll]] for (uint q4 = 0u; q4 < 4u; ++q4) {
+                uint qlw = bytes4(qlBase + 4u * q4), qhw = bytes4(qhBase + 4u * q4);
+                [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+                    uint qlv = (qlw >> (8u * k)) & 255u, qhv = (qhw >> (8u * k)) & 255u;
+                    uint lo  = hi ? (qlv >> 4u) : (qlv & 0xFu);
+                    int  q   = int(lo | (((qhv >> shift) & 3u) << 4u)) - 32;
+                    s += float(q) * x[xo2 + xoff + 4u * q4 + k];
+                }
+            }
+            acc += d * sc * s;
+        }
+    }
+    if (TPR >= gl_SubgroupSize) {
+        float v = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u) partial[tid / gl_SubgroupSize] = v;
+        barrier();
+        if (lane == 0u && row < pc.M) {
+            uint waves = TPR / gl_SubgroupSize;
+            uint base = (tid / TPR) * waves;
+            float s2 = 0.0;
+            for (uint i = 0u; i < waves; ++i) s2 += partial[base + i];
+            y[rq * pc.M + row] = epilogue(s2);
+        }
+    } else {
+        partial[tid] = acc;
+        barrier();
+        for (uint s2 = TPR / 2u; s2 > 0u; s2 >>= 1u) {
+            if (lane < s2) partial[tid] += partial[tid + s2];
+            barrier();
+        }
+        if (lane == 0u && row < pc.M) y[rq * pc.M + row] = epilogue(partial[tid]);
+    }
+}

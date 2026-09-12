@@ -930,3 +930,67 @@ down, the loopback proxy on 8092 returns a malformed HTTP status line
 (`BadStatusLine` in the client) instead of a clean 502; that is an existing
 error-path protocol issue of the proxy, not a model result, and it is not
 counted as passed API verification.
+
+### Word-addressed Q5_1 and Q6_K variants: rejected as defaults (2026-09-11)
+
+Following the exclusive decode profile, word-addressed twins of the Q6_K
+GEMV (`gemv_q6_k_v2`, 210-byte blocks fetched as containing dwords), the
+Q5_1 GEMV (`gemv_q5_1_v2`, six dwords per 24-byte block) and the routed and
+shared Q5_1 expert down kernels (`moe_down_q5_1_v2`,
+`moe_down_shared_q5_1_v2`) were written and gated. Measurements on the Halo
+(`bench/results-halo-only-q6q51-experiment.txt`), alternating byte-addressed
+v1 against v2 with the actual memory type printed:
+
+| Kernel / shape | v1 | v2 |
+| --- | --- | --- |
+| Q5_1 GEMV 10240x320 (HC up) | 12.5-12.6 us | 12.3-12.4 us |
+| Q5_1 GEMV 320x10240 | 12.4-12.6 us | 12.4-12.5 us |
+| Q6_K GEMV 10240x2560 | 92.4-95.1 us | 139.6-139.9 us |
+| Q6_K GEMV 2560x6144 | 55.6-56.4 us | 76.0-76.2 us |
+| Q6_K GEMV 320x10240 | 13.3-13.4 us | 18.1-18.5 us |
+| Layer-6 expert chain with Q5_1 down (actual weights) | 186.1-187.3 us | 189.8-189.9 us |
+| 4-layer prefix serial GPU time per token, all three v2 | 2.478-2.480 ms | 2.636-2.650 ms |
+
+The Q6_K variant is 40-50% slower (the 2-byte block misalignment turns most
+loads into two-word fetches plus shifts) and the Q5_1 variants are within
+1% either way, so all three stay off: the byte-addressed kernels remain the
+defaults and `QK_Q51_GEMV=v2`, `QK_MOE_DOWN=v2`, `QK_Q6K_GEMV=v2` opt into
+the variants for reference. Review found that the first `gemv_q6_k_v2`
+fetched the block's f16 scale with a four-byte helper that could read one
+word past the buffer on the last block of a tensor; it now extracts the
+2-byte-aligned half from its single containing word, weight buffers are
+rounded up to whole dwords, and the fixed variant passes the operator check
+at odd block counts (7x256, 9x512, 65x2560). The variants are numerically
+F32-close to the originals (all-v2 build: full-model oracle parity PASS,
+teacher-forced comparison against the served kernels 256/256 greedy, KL max
+5.4e-11).
+
+Two process notes from this experiment: the chain's "controls" restore
+actually served the all-v2 build because the helper did not yet forward the
+three new knobs (it does now, and it prints the unit's actual environment
+after start, which the operator should check against the intended
+configuration), and the chain was interrupted before its production A/B, so
+no production rows exist for these variants; they were rejected on the
+isolated and prefix-level measurements above.
+
+### Served baseline after the experiment (2026-09-11)
+
+The stack serving 8091 now runs the code defaults (fused decode path,
+word-addressed Q5_K expert gate/up, byte-addressed Q5_1/Q6_K/Q8 kernels, PLE
+row prefetch), rebuilt and restored in a dedicated window: 4-layer prefix
+oracle 4.77e-7 PASS, prefix batch check PASS, the served process's real
+environment read from `/proc/PID/environ` (`QK_PLE_PREFETCH=0
+QK_FLASH_COOPMAT=0`, no v2 knobs), all eight API checks on 8194, the gateway
+suite on 8091 and the 8092 proxy checks. Two repetitions (Halo only, ctx
+32768, no table warming; `bench/results-halo-only-baseline-bench32.jsonl`):
+decode 33.3 tok/s, 512 distinct tokens 3.05-3.08 s, 2048 distinct tokens
+13.1-13.2 s, 512 uniform 2.93 s. GPU experiments are paused here pending the
+multi-prefill backend comparison (`bench/prefill_matrix.py`, root-owned).
+For a Halo-only llama.cpp comparison the local fork's single-device recipe
+(`deploy/run-qwen-next-trial.sh halo` in the original worktree: `--device
+<STRIX_HALO> --split-mode none --fit-target 16384 -ngl 99 -fa on -b 2048 -ub
+1024 --load-mode mmap`, MTP draft, Jinja, xhigh) would need the fork's
+`GGML_VK_ALLOW_SYSMEM_FALLBACK=1` to exceed the 70.7 GiB device-local heap,
+a memory-limited unit, the shard-cache release before launch, no concurrent
+GPU load, and its output quality checked first (the fast configuration
+produced malformed counting output on 2026-09-10).

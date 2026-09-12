@@ -1,0 +1,55 @@
+# Halo-only word-addressed Q5_1 / Q6_K experiment, 2026-09-11 (rejected as defaults)
+# Device STRIX_HALO only; microbench 64 MiB rotation, 200 iterations, alternating; prefix = 4 layers, every dispatch fenced.
+# NOTE: the 'production A/B' step of this chain never completed and its 'v1 controls' restore actually ran all-v2 (knobs not forwarded); no production rows are recorded.
+== microbench (Halo, 64 MiB rotation, 200 iters, alternating v1/v2, actual memory type printed)
+q5_1 M=10240 K=320 v1: gpu:     12.6 us/iter err=0.00016 PASS
+q5_1 M=10240 K=320 v2: gpu:     12.4 us/iter err=0.000176 PASS
+q5_1 M=10240 K=320 v1: gpu:     12.5 us/iter err=0.00016 PASS
+q5_1 M=10240 K=320 v2: gpu:     12.3 us/iter err=0.000176 PASS
+q5_1 M=320 K=10240 v1: gpu:     12.6 us/iter err=9.84e-06 PASS
+q5_1 M=320 K=10240 v2: gpu:     12.5 us/iter err=7.48e-06 PASS
+q5_1 M=320 K=10240 v1: gpu:     12.4 us/iter err=9.84e-06 PASS
+q5_1 M=320 K=10240 v2: gpu:     12.4 us/iter err=7.48e-06 PASS
+q6_k M=10240 K=2560 v1: gpu:     92.4 us/iter err=0.000184 PASS
+q6_k M=10240 K=2560 v2: gpu:    139.9 us/iter err=0.000184 PASS
+q6_k M=10240 K=2560 v1: gpu:     95.1 us/iter err=0.000184 PASS
+q6_k M=10240 K=2560 v2: gpu:    139.6 us/iter err=0.000184 PASS
+q6_k M=2560 K=6144 v1: gpu:     55.6 us/iter err=9.98e-05 PASS
+q6_k M=2560 K=6144 v2: gpu:     76.2 us/iter err=9.98e-05 PASS
+q6_k M=2560 K=6144 v1: gpu:     56.4 us/iter err=9.98e-05 PASS
+q6_k M=2560 K=6144 v2: gpu:     76.0 us/iter err=9.98e-05 PASS
+q6_k M=320 K=10240 v1: gpu:     13.4 us/iter err=3.22e-06 PASS
+q6_k M=320 K=10240 v2: gpu:     18.1 us/iter err=3.22e-06 PASS
+q6_k M=320 K=10240 v1: gpu:     13.3 us/iter err=3.22e-06 PASS
+q6_k M=320 K=10240 v2: gpu:     18.5 us/iter err=3.22e-06 PASS
+== actual-weight MoE layer 6 (Q5_1 down) alternating
+moe layer6 down=v1: gpu:    187.3 µs/layer-moe max_rel_err = 4.75e-05 PASS
+moe layer6 down=v2: gpu:    189.8 µs/layer-moe max_rel_err = 3.79e-05 PASS
+moe layer6 down=v1: gpu:    186.1 µs/layer-moe max_rel_err = 4.75e-05 PASS
+moe layer6 down=v2: gpu:    189.9 µs/layer-moe max_rel_err = 3.79e-05 PASS
+== build libqk (v2 defaults)
+build rc=0
+== prefix oracle: v2 defaults, then v1 controls
+native layers 0:4 (16 steps) vs F32 reference: relative_rms=6.02297e-07 max_abs=2.08616e-07 -> PASS
+native layers 0:4 (16 steps) vs F32 reference: relative_rms=4.76632e-07 max_abs=2.08616e-07 -> PASS
+batch check whole            frames=64 worst_frame_relative_rms=2.22e-06 median=1.33e-06 frames>1e-2=0 max_abs=4.77e-07 -> PASS
+== prefix serial GPU ms/token (4 layers, fenced), alternating v2/v1
+v2: 2.650 ms
+v1: 2.478 ms
+v2: 2.636 ms
+v1: 2.480 ms
+drained: halo_gtt=148MiB MemFree=18G
+(dmesg check done)
+== full parity + teacher compare (v2 build defaults)
+full rc=0
+{"full_model_parity": "PASS", "frames": 16, "reset_exact": true, "single_device": "STRIX_HALO"}
+drained: halo_gtt=148MiB MemFree=29G
+{"dumped": 256, "out": "/home/ryan/.claude-max/jobs/153a1101/tmp/bench/teacher-v2.f32", "serial_seconds": 8.738399262001622, "tokens_per_second": 29.295983431793953}
+dump v2 rc=0
+{"positions": 256, "argmax_agree": 256, "kl_mean_nats": 5.199785021766122e-12, "kl_median_nats": 3.6019433615805195e-12, "kl_p99_nats": 2.2561944157931438e-11, "kl_max_nats": 5.375272306368314e-11, "relative_rms_max": 5.0458478978757444e-06, "first_position_kl_above_1e-4": null, "control": "/home/ry
+drained: halo_gtt=148MiB MemFree=29G
+(dmesg check done)
+# teacher-forced control (byte-addressed Q5_1/Q6_K, fused, expert v2) versus all-v2:
+{"positions": 256, "argmax_agree": 256, "kl_mean_nats": 5.199785021766122e-12, "kl_median_nats": 3.6019433615805195e-12, "kl_p99_nats": 2.2561944157931438e-11, "kl_max_nats": 5.375272306368314e-11, "relative_rms_max": 5.0458478978757444e-06, "first_position_kl_above_1e-4": null, "control": "/home/ryan/.claude-max/jobs/153a1101/tmp/bench/teacher-control.f32", "candidate": "/home/ryan/.claude-max/jobs/153a1101/tmp/bench/teacher-v2.f32"}
+# full-model oracle on the all-v2 build:
+{"full_model_parity": "PASS", "frames": 16, "reset_exact": true, "single_device": "STRIX_HALO"}
