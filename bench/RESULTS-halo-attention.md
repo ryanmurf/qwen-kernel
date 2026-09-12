@@ -1,8 +1,8 @@
 # Halo-only decode-attention experiment
 
 Status (2026-09-12 UTC): **ordered attention passed the same-build 16K
-prefix plus 128-position replay bit-for-bit. API performance is not yet
-established; serial remains the serving default.** Split-K with chunk 256
+prefix plus 128-position replay bit-for-bit, but its first API A/B did not
+show a speed win; serial remains the serving default.** Split-K with chunk 256
 failed the long-context numerical gate and remains unapproved. Unset
 `QK_ATTN_DECODE`, or set it to `serial`, for the existing path. No model
 speedup is claimed. Batched prefill is unchanged by this experiment.
@@ -171,6 +171,44 @@ controller records are in `/home/ryan/qk-ordered-checks-gzorn5/`.
 The long test bodies took 423.90 s serial and 420.98 s ordered, excluding
 load. These include two prefills, two tails, and readbacks; they are not
 isolated decode throughput and do not establish a serving speedup.
-Request-level A/B testing is next, including the HTTP/Claude-tool suite
-and identical-token 128/8192/16384 prompt-length measurements. The passing
-replay is evidence for this workload, not a broad quality evaluation.
+The passing replay is evidence for this workload, not a broad quality
+evaluation. Request-level results follow.
+
+### First request-level A/B: no demonstrated speed win
+
+Both same-build, F32/no-MTP modes passed all eight HTTP checks: known token
+outputs, Claude text, XML tool call, tool-result round trip, Claude streaming,
+prefill cancellation, concurrent-request isolation, and invalid-token rejection.
+Both counting streams were coherent. Cancellation took 4.432 s serial and
+4.382 s ordered, inside the existing 5 s limit but with limited margin.
+
+The shared-fixture matrix ran serial first (06:10–06:21 UTC), then ordered
+(06:22–06:34 UTC), one repetition per size and 128 output tokens. Both
+controllers completed cleanly without watchdog aborts. Model, library,
+shaders, precision, context, cache procedure, launch settings and prompts
+matched, apart from attention mode and process/unit identity. All output
+lengths, text hashes, and token hashes matched. Sampled per-process DRM
+counters showed model compute only on Halo; the external card retained only
+12 KiB VRAM / 2 MiB GTT enumeration buffers, with no engine work recorded.
+
+| Prompt tokens | Serial prefill + 1 (s) | Ordered prefill + 1 (s) | Serial decode (tok/s) | Ordered decode (tok/s) | Decode change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 1.243 | 1.244 | 32.39 | 32.66 | +0.8% |
+| 8192 | 68.75 | 69.35 | 13.85 | 13.34 | −3.7% |
+| 16384 | 192.31 | 194.57 | 8.73 | 7.85 | −10.0% |
+
+At 16K, streaming TTFT was 190.50 s serial / 196.88 s ordered. These are
+request-level wall-clock measurements, not isolated GPU prefill times.
+The two modes use identical batched-prefill kernels; their prefill variation
+also cautions against attributing every timing difference to attention.
+This single serial-then-ordered pass is exploratory, not a stable-effect
+estimate. It does not reproduce the synthetic operator's apparent speedup
+at request level, and does **not justify promoting ordered attention**.
+Keep serial as default and retain ordered only as an experimental option.
+
+Raw data: [serial](results-halo-attention-api-serial-ef562d29.jsonl),
+[ordered](results-halo-attention-api-ordered-ef562d29.jsonl). The private
+controller, HTTP and server logs remain in `/home/ryan/qk-ordered-checks-gzorn5/`.
+Re-audit with `bench/compare_native_attention.py SERIAL_JSONL ORDERED_JSONL`.
+The existing three-repetition native and llama.cpp matrices remain separate
+baselines; do not silently pool these runs or precision tiers.
