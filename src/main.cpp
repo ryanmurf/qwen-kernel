@@ -65,7 +65,9 @@ struct Buf {
     VkBuffer       buf = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkDeviceSize   size = 0;
-    bool           deviceLocal = false;
+    bool           deviceLocal = false;      // actual DEVICE_LOCAL property of the chosen type
+    uint32_t       memType = UINT32_MAX;     // actual memory type index used
+    uint32_t       heap = UINT32_MAX;        // its heap index
 };
 
 struct VkCtx {
@@ -105,8 +107,13 @@ static uint32_t findMemType(const VkPhysicalDeviceMemoryProperties& mp,
     return UINT32_MAX;
 }
 
+// forceType >= 0 pins the allocation to that memory type index (no fallback:
+// an unusable or failed forced type is fatal), so placement experiments and
+// planned heap placement never silently land elsewhere. The returned Buf
+// records the memory type, heap and actual DEVICE_LOCAL property that were
+// used; callers that require device-local memory check deviceLocal.
 static Buf createBuf(VkCtx& c, VkDeviceSize size, VkBufferUsageFlags usage,
-                     bool preferDevice) {
+                     bool preferDevice, int forceType = -1) {
     Buf b;
     b.size = size;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -122,24 +129,54 @@ static Buf createBuf(VkCtx& c, VkDeviceSize size, VkBufferUsageFlags usage,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
-    mai.memoryTypeIndex = findMemType(
-        c.mp, req.memoryTypeBits,
-        preferDevice ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : hostFlags);
-
-    VkResult r = mai.memoryTypeIndex == UINT32_MAX
-                     ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                     : vkAllocateMemory(c.dev, &mai, nullptr, &b.mem);
-    b.deviceLocal = preferDevice;
-    if (r != VK_SUCCESS && preferDevice) {
-        fprintf(stderr, "note: device-local alloc failed (%zu MiB), using host-visible\n",
-                (size_t)(size >> 20));
-        mai.memoryTypeIndex = findMemType(c.mp, req.memoryTypeBits, hostFlags);
-        b.deviceLocal = false;
+    VkResult r;
+    if (forceType >= 0) {
+        if (forceType >= (int)c.mp.memoryTypeCount || !(req.memoryTypeBits & (1u << forceType))) {
+            vkDestroyBuffer(c.dev, b.buf, nullptr);
+            throw std::runtime_error("forced memory type " + std::to_string(forceType) + " is not usable for this buffer");
+        }
+        mai.memoryTypeIndex = (uint32_t)forceType;
         r = vkAllocateMemory(c.dev, &mai, nullptr, &b.mem);
+        if (r != VK_SUCCESS) {
+            vkDestroyBuffer(c.dev, b.buf, nullptr);
+            throw std::runtime_error("forced memory type " + std::to_string(forceType) + " allocation of " +
+                                     std::to_string((size_t)(size >> 20)) + " MiB failed (VkResult " + std::to_string((int)r) + ")");
+        }
+    } else {
+        mai.memoryTypeIndex = findMemType(
+            c.mp, req.memoryTypeBits,
+            preferDevice ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : hostFlags);
+        r = mai.memoryTypeIndex == UINT32_MAX
+                ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                : vkAllocateMemory(c.dev, &mai, nullptr, &b.mem);
+        if (r != VK_SUCCESS && preferDevice) {
+            fprintf(stderr, "note: device-local alloc failed (%zu MiB), using host-visible\n",
+                    (size_t)(size >> 20));
+            mai.memoryTypeIndex = findMemType(c.mp, req.memoryTypeBits, hostFlags);
+            r = vkAllocateMemory(c.dev, &mai, nullptr, &b.mem);
+        }
+        VK_CHECK(r);
     }
-    VK_CHECK(r);
+    b.memType = mai.memoryTypeIndex;
+    b.heap = c.mp.memoryTypes[b.memType].heapIndex;
+    b.deviceLocal = (c.mp.memoryTypes[b.memType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     VK_CHECK(vkBindBufferMemory(c.dev, b.buf, b.mem, 0));
     return b;
+}
+
+// Human-readable memory type description for logs: "type 2 heap 0 [HV|HC]".
+static std::string memTypeDesc(const VkCtx& c, uint32_t type) {
+    if (type >= c.mp.memoryTypeCount) return "type ? (unallocated)";
+    VkMemoryPropertyFlags f = c.mp.memoryTypes[type].propertyFlags;
+    std::string s = "type " + std::to_string(type) + " heap " + std::to_string(c.mp.memoryTypes[type].heapIndex) + " [";
+    if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) s += "DL|";
+    if (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) s += "HV|";
+    if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) s += "HC|";
+    if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) s += "HCACHED|";
+    if (f & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD) s += "DEVCOH|";
+    if (f & VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD) s += "DEVUNC|";
+    if (s.back() == '|') s.pop_back();
+    return s + "]";
 }
 
 static void destroyBuf(VkCtx& c, Buf& b) {
@@ -582,8 +619,21 @@ static bool runGemv(VkCtx& c, const char* spvName, const void* wBytes,
                bytes / double(1 << 20), (unsigned long long)weightOffset,
                (unsigned long long)c.importAlignment);
     } else {
+        // QK_WEIGHT_MEMTYPE=<index>: placement probe for THIS weight buffer
+        // only (activations and staging keep their usual types). The actual
+        // type/heap/properties used are printed with the result.
+        int forceType = -1;
+        if (const char* e = getenv("QK_WEIGHT_MEMTYPE")) {
+            char* end = nullptr; long idx = strtol(e, &end, 10);
+            if (end == e || *end || idx < 0 || idx >= (long)c.mp.memoryTypeCount) {
+                fprintf(stderr, "QK_WEIGHT_MEMTYPE=%s is not a memory type index\n", e);
+                return false;
+            }
+            forceType = (int)idx;
+        }
         bW = createBuf(c, residentWSize,
-                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, forceType);
+        printf("weights: %s%s\n", memTypeDesc(c, bW.memType).c_str(), forceType >= 0 ? " (forced)" : "");
     }
     Buf bX = createBuf(c, sizeX,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);

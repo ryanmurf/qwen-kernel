@@ -1,0 +1,27 @@
+{"note": "Halo-only (STRIX_HALO 0000:c1:00.0, all 48 layers + head), Qwen3.8 Flash Next Q5_K_M, ctx 8192, F32 tier, prefetch 0, cold tables, 2026-09-11 ~20:20 MDT"}
+{"loaded": "0:48", "device": "STRIX_HALO", "seconds": 104.45734099199763}
+{"step": 0, "split_relative_rms": null, "logit_relative_rms": 1.0011819385743878e-06, "logit_max_abs": 1.0967254638671875e-05, "native_argmax": 36, "reference_argmax": 36, "seconds": 0.05759959800343495}
+{"step": 1, "split_relative_rms": null, "logit_relative_rms": 1.152682568788869e-06, "logit_max_abs": 1.621246337890625e-05, "native_argmax": 248046, "reference_argmax": 248046, "seconds": 0.04669500399904791}
+{"step": 2, "split_relative_rms": null, "logit_relative_rms": 1.3288455902217664e-06, "logit_max_abs": 1.9431114196777344e-05, "native_argmax": 201, "reference_argmax": 201, "seconds": 0.04620238899951801}
+{"step": 3, "split_relative_rms": null, "logit_relative_rms": 1.2690311237140187e-06, "logit_max_abs": 1.52587890625e-05, "native_argmax": 202, "reference_argmax": 202, "seconds": 0.045231686999613885}
+{"step": 4, "split_relative_rms": null, "logit_relative_rms": 8.593259918368601e-07, "logit_max_abs": 1.1682510375976562e-05, "native_argmax": 203, "reference_argmax": 203, "seconds": 0.046696236000570934}
+{"step": 5, "split_relative_rms": null, "logit_relative_rms": 8.61906278280368e-07, "logit_max_abs": 1.0967254638671875e-05, "native_argmax": 204, "reference_argmax": 204, "seconds": 0.04627943400555523}
+{"step": 6, "split_relative_rms": null, "logit_relative_rms": 9.855747557327197e-07, "logit_max_abs": 1.239776611328125e-05, "native_argmax": 205, "reference_argmax": 205, "seconds": 0.04662637400178937}
+{"step": 7, "split_relative_rms": null, "logit_relative_rms": 8.465792966466857e-07, "logit_max_abs": 1.1920928955078125e-05, "native_argmax": 206, "reference_argmax": 206, "seconds": 0.054443625995190814}
+{"step": 8, "split_relative_rms": null, "logit_relative_rms": 1.0411538089799485e-06, "logit_max_abs": 1.1682510375976562e-05, "native_argmax": 207, "reference_argmax": 207, "seconds": 0.047407319994817954}
+{"step": 9, "split_relative_rms": null, "logit_relative_rms": 1.0866869766638086e-06, "logit_max_abs": 1.3232231140136719e-05, "native_argmax": 208, "reference_argmax": 208, "seconds": 0.05035962100373581}
+{"step": 10, "split_relative_rms": null, "logit_relative_rms": 9.289635381892841e-07, "logit_max_abs": 1.33514404296875e-05, "native_argmax": 209, "reference_argmax": 209, "seconds": 0.04695411000284366}
+{"step": 11, "split_relative_rms": null, "logit_relative_rms": 9.405107461285209e-07, "logit_max_abs": 1.1652708053588867e-05, "native_argmax": 210, "reference_argmax": 210, "seconds": 0.04779170199617511}
+{"step": 12, "split_relative_rms": null, "logit_relative_rms": 9.694802792019317e-07, "logit_max_abs": 1.1712312698364258e-05, "native_argmax": 211, "reference_argmax": 211, "seconds": 0.051172927996958606}
+{"step": 13, "split_relative_rms": null, "logit_relative_rms": 9.764303538361098e-07, "logit_max_abs": 1.2934207916259766e-05, "native_argmax": 271, "reference_argmax": 271, "seconds": 0.04830831100116484}
+{"step": 14, "split_relative_rms": null, "logit_relative_rms": 1.072309605380592e-06, "logit_max_abs": 1.2516975402832031e-05, "native_argmax": 213, "reference_argmax": 213, "seconds": 0.047857825993560255}
+{"step": 15, "split_relative_rms": null, "logit_relative_rms": 1.0518565024465208e-06, "logit_max_abs": 1.4066696166992188e-05, "native_argmax": 271, "reference_argmax": 271, "seconds": 0.04712224499962758}
+{"full_model_parity": "PASS", "frames": 16, "reset_exact": true, "single_device": "STRIX_HALO"}
+{"replay_vs_record": "bit-exact", "frames": 16}
+{"trial": 0, "replay": 0, "tokens": 16, "seconds": 0.5296944699948654, "tokens_per_second": 30.20609220284119}
+{"trial": 1, "replay": 1, "tokens": 16, "seconds": 0.4967399849992944, "tokens_per_second": 32.21001023306535}
+{"trial": 2, "replay": 1, "tokens": 16, "seconds": 0.4907893569979933, "tokens_per_second": 32.60054394387656}
+{"trial": 3, "replay": 0, "tokens": 16, "seconds": 0.5296995820026495, "tokens_per_second": 30.205800690852666}
+{"trial": 4, "replay": 0, "tokens": 16, "seconds": 0.5336475699950824, "tokens_per_second": 29.982334596122005}
+{"trial": 5, "replay": 1, "tokens": 16, "seconds": 0.4954683479954838, "tokens_per_second": 32.29267836125395}
+{"placement": "native placement: device-local 69.102 GiB (weights 67.916 + state/scratch 0.735 + batch 0.452, headroom 69.400), host heap 20.801 GiB in 34 expert tensors (headroom 34.200, type 2 heap 0 [HV|HC]); system MemTotal 121.2 GiB, MemAvailable 49.0 GiB, reserve 12.0 GiB"}

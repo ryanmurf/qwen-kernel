@@ -4,6 +4,7 @@
 #include <atomic>
 #include <memory>
 #include <numeric>
+#include <set>
 #include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -27,6 +28,32 @@ class Qwen4Graph {
     std::atomic<bool> pleStop{false};
     struct PageRange { uintptr_t start; size_t bytes; };
     std::vector<PageRange> pleKeep;  // table ranges made resident; paged out on close
+    // Two-heap placement (single-device serving on a UMA part): tensors named
+    // here are allocated from the host-visible heap (hostHeapType) instead of
+    // device-local memory. Everything else, including all activations, KV and
+    // recurrent state, stays device-local. systemReserveBytes is the
+    // MemAvailable floor enforced after every uploaded tensor (0 = unchecked).
+    std::set<std::string> hostHeapTensors;
+    int hostHeapType = -1;
+    size_t systemReserveBytes = 0;
+    static uint64_t memTotalBytes() {
+        FILE* f = fopen("/proc/meminfo","r"); if (!f) return 0;
+        char line[256]; unsigned long long kb = 0; bool found = false;
+        while (fgets(line,sizeof line,f)) if (sscanf(line,"MemTotal: %llu kB",&kb) == 1) { found = true; break; }
+        fclose(f); return found ? (uint64_t)kb*1024 : 0;
+    }
+    // Drop an uploaded tensor's file pages from the page cache (the GPU copy is
+    // the working copy) and enforce the system-memory reserve, failing closed
+    // before the next allocation rather than after the node is exhausted.
+    void releaseUploaded(const GgufTensor& t) {
+        if (!servingBudget) return;
+        const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+        const uintptr_t start = (uintptr_t)t.data & ~(uintptr_t)(page-1);
+        const size_t bytes = ((uintptr_t)t.data + t.nbytes + page-1 & ~(uintptr_t)(page-1)) - start;
+        madvise((void*)start, bytes, MADV_PAGEOUT);
+        if (systemReserveBytes && memAvailableBytes() < systemReserveBytes)
+            throw std::runtime_error("MemAvailable fell below QK_SYSTEM_RESERVE_GIB during the weight upload; load aborted (fail closed)");
+    }
     // Fails CLOSED: an unreadable or unparsable /proc/meminfo reports 0 bytes
     // available, which stops the readahead rather than letting it run blind.
     static size_t memAvailableBytes() {
@@ -108,9 +135,14 @@ class Qwen4Graph {
     }
     Buf& allocate(const std::string& name, size_t bytes) {
         auto [it, inserted] = buffers.emplace(name, Buf{});
+        const bool hostHeap = hostHeapTensors.count(name) != 0;
         if (inserted) it->second = createBuf(c, bytes,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
-        if (!it->second.deviceLocal) throw std::runtime_error("native graph refuses host-memory spill: " + name);
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            !hostHeap, hostHeap ? hostHeapType : -1);
+        // Unplanned spill (the driver falling back to host memory) is still an
+        // error; planned host-heap placement must land on exactly the planned type.
+        if (!hostHeap && !it->second.deviceLocal) throw std::runtime_error("native graph refuses host-memory spill: " + name);
+        if (hostHeap && it->second.memType != (uint32_t)hostHeapType) throw std::runtime_error("planned host-heap placement failed: " + name);
         if (it->second.size != bytes) throw std::runtime_error("buffer shape changed: " + name);
         return it->second;
     }
@@ -640,23 +672,105 @@ public:
         } else batchCap=std::min(512u,(capacity+63)/64*64);
         if (servingBudget) {
             if (!c.memoryBudget) throw std::runtime_error("native serving requires Vulkan memory-budget reporting");
-            uint64_t need=totalWeightBytes+(256ull<<20); // staging, scratch, descriptors and allocation padding
+            auto gib = [&](const char* env, double def, double lo, double hi) {
+                const char* v = getenv(env); if (!v) return def;
+                char* end = nullptr; double x = strtod(v,&end);
+                if (end == v || *end || !std::isfinite(x) || x < lo || x > hi)
+                    throw std::runtime_error(std::string(env) + " must be a number in the accepted range");
+                return x;
+            };
+            // Device-local needs besides weights: staging/scratch/descriptor
+            // allowance, KV and recurrent state; batch rows are added below.
+            uint64_t fixed=(256ull<<20);
             for (layer=firstLayer; layer<=lastLayer; ++layer)
-                need+=layer%4==3 ? 2ull*2*capacity*256*4 : (48ull*128*128+10240*3)*4;
+                fixed+=layer%4==3 ? 2ull*2*capacity*256*4 : (48ull*128*128+10240*3)*4;
             VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
             VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
             props.pNext=&budget; vkGetPhysicalDeviceMemoryProperties2(c.phys,&props);
-            uint32_t type=findMemType(c.mp,UINT32_MAX,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (type==UINT32_MAX) throw std::runtime_error("no device-local memory type");
-            uint32_t heap=c.mp.memoryTypes[type].heapIndex;
-            uint64_t free=budget.heapBudget[heap]>budget.heapUsage[heap] ? budget.heapBudget[heap]-budget.heapUsage[heap] : 0;
-            while (batchCap && need+batchBytes(batchCap)>free) {
-                printf("native batch %u rows (%.3f GiB) exceeds the device headroom; halving\n",batchCap,batchBytes(batchCap)/double(1ull<<30));
+            auto headroom = [&](uint32_t heap) {
+                return budget.heapBudget[heap] > budget.heapUsage[heap] ? budget.heapBudget[heap]-budget.heapUsage[heap] : 0ull; };
+            const uint32_t deviceType=findMemType(c.mp,UINT32_MAX,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (deviceType==UINT32_MAX) throw std::runtime_error("no device-local memory type");
+            const uint32_t deviceHeap=c.mp.memoryTypes[deviceType].heapIndex;
+            // Per-heap margin for the driver's own and the compositor's
+            // allocations (QK_HEAP_MARGIN_GIB, default 1); the system reserve is
+            // a MemAvailable floor enforced during upload (QK_SYSTEM_RESERVE_GIB,
+            // default 12, 0 disables). Neither is a guarantee of driver
+            // allocation success; they bound the plan and fail it closed.
+            const uint64_t margin=(uint64_t)(gib("QK_HEAP_MARGIN_GIB",1.0,0.0,64.0)*double(1ull<<30));
+            systemReserveBytes=(size_t)(gib("QK_SYSTEM_RESERVE_GIB",12.0,0.0,1024.0)*double(1ull<<30));
+            uint64_t deviceFree=headroom(deviceHeap); deviceFree=deviceFree>margin ? deviceFree-margin : 0;
+            // Host-heap spill (QK_HOST_HEAP=1, default) uses the first
+            // host-visible, host-coherent, non-device-local type: measured on
+            // this part at 2-7% more GPU read time than device-local, so only
+            // the routed expert tensors (10 of 512 read per token) spill, in
+            // reverse layer order, and only as much as needed.
+            // QK_HOST_HEAP=0|1; unset means on for integrated (UMA) devices
+            // only, so discrete cards keep their device-local-only default.
+            const bool hostHeapAllowed = [&] {
+                const char* v=getenv("QK_HOST_HEAP");
+                if (!v) return c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+                if (!strcmp(v,"0")) return false;
+                if (!strcmp(v,"1")) return true;
+                throw std::runtime_error("QK_HOST_HEAP must be 0 or 1");
+            }();
+            uint64_t hostFree=0; uint32_t hostHeap=UINT32_MAX;
+            for (uint32_t t=0; t<c.mp.memoryTypeCount && hostHeapAllowed; ++t) {
+                VkMemoryPropertyFlags f=c.mp.memoryTypes[t].propertyFlags;
+                if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+                    !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) || c.mp.memoryTypes[t].heapIndex==deviceHeap) continue;
+                hostHeapType=(int)t; hostHeap=c.mp.memoryTypes[t].heapIndex; break;
+            }
+            if (hostHeapType>=0) { hostFree=headroom(hostHeap); hostFree=hostFree>margin ? hostFree-margin : 0; }
+            uint64_t deviceWeights=0, hostWeights=0;
+            auto plan = [&]() {
+                hostHeapTensors.clear(); deviceWeights=totalWeightBytes; hostWeights=0;
+                const uint64_t nonWeight=fixed+batchBytes(batchCap);
+                const uint64_t deviceForWeights=deviceFree>nonWeight ? deviceFree-nonWeight : 0;
+                if (deviceWeights<=deviceForWeights) return true;
+                uint64_t needSpill=deviceWeights-deviceForWeights;
+                for (int l=(int)lastLayer; l>=(int)firstLayer && needSpill; --l)
+                    for (const char* kind : {"ffn_down_exps.weight","ffn_up_exps.weight","ffn_gate_exps.weight"}) {
+                        if (!needSpill) break;
+                        const std::string name="blk."+std::to_string(l)+"."+kind;
+                        const auto* t=g.find(name); if (!t) continue;
+                        hostHeapTensors.insert(name); hostWeights+=t->nbytes; deviceWeights-=t->nbytes;
+                        needSpill = needSpill>t->nbytes ? needSpill-t->nbytes : 0;
+                    }
+                return needSpill==0 && hostWeights<=hostFree;
+            };
+            while (!plan() && batchCap) {
+                printf("native placement does not fit with %u batch rows (%.3f GiB); halving\n",batchCap,batchBytes(batchCap)/double(1ull<<30));
                 batchCap = batchCap>64 ? batchCap/2/64*64 : 0;
             }
-            need+=batchBytes(batchCap);
-            printf("native memory estimate %.3f GiB (batch rows %u); reported heap headroom %.3f GiB\n",need/double(1ull<<30),batchCap,free/double(1ull<<30));
-            if (need>free) throw std::runtime_error("insufficient device budget: unload the other model or reduce the native stage/context");
+            const uint64_t deviceNeed=deviceWeights+fixed+batchBytes(batchCap);
+            const uint64_t total=deviceNeed+hostWeights;
+            const uint64_t memTotal=memTotalBytes(), memAvail=memAvailableBytes();
+            printf("native placement: device-local %.3f GiB (weights %.3f + state/scratch %.3f + batch %.3f, headroom %.3f), host heap %.3f GiB in %zu expert tensors (headroom %.3f, %s); system MemTotal %.1f GiB, MemAvailable %.1f GiB, reserve %.1f GiB\n",
+                   deviceNeed/double(1ull<<30),deviceWeights/double(1ull<<30),fixed/double(1ull<<30),batchBytes(batchCap)/double(1ull<<30),deviceFree/double(1ull<<30),
+                   hostWeights/double(1ull<<30),hostHeapTensors.size(),hostFree/double(1ull<<30),
+                   hostHeapType>=0 ? memTypeDesc(c,(uint32_t)hostHeapType).c_str() : "spill disabled",
+                   memTotal/double(1ull<<30),memAvail/double(1ull<<30),systemReserveBytes/double(1ull<<30));
+            if (!plan()) throw std::runtime_error("insufficient device budget: the model does not fit the device-local heap plus the host heap within their budgets");
+            // Physical-memory gate, fail closed: /proc/meminfo must be readable,
+            // the plan plus the reserve must fit MemTotal, and MemAvailable must
+            // already clear the reserve before the first allocation. (Pages
+            // retained in the driver's pool are reused by the allocations and
+            // are not counted here; the per-upload check catches the rest.)
+            if (!memTotal || !memAvail) throw std::runtime_error("cannot read MemTotal/MemAvailable; refusing to plan GPU allocations blind");
+            if (total+systemReserveBytes>memTotal)
+                throw std::runtime_error("insufficient system memory: planned GPU allocations plus the reserve exceed MemTotal");
+            if (memAvail<systemReserveBytes)
+                throw std::runtime_error("MemAvailable is already below QK_SYSTEM_RESERVE_GIB; refusing to load");
+            // Table warming (QK_PLE_PREFETCH=1) adds the lookup tables to the
+            // resident footprint; reject it up front when that cannot fit.
+            if (const char* v=getenv("QK_PLE_PREFETCH"); v && !strcmp(v,"1")) {
+                uint64_t tables=0;
+                for (const auto& [name,tensor] : g.tensors())
+                    if (name=="token_embd.weight" || (firstLayer==0 && lastLayer>=1 && name=="per_layer_token_embd.weight")) tables+=tensor.nbytes;
+                if (total+tables+systemReserveBytes>memTotal)
+                    throw std::runtime_error("QK_PLE_PREFETCH=1 rejected: GPU allocations plus the lookup tables plus the reserve exceed MemTotal; run with QK_PLE_PREFETCH=0");
+            }
         }
         printf("prefix weights: %.3f GiB; staging: 16 MiB; PLE table stays mapped\n",totalWeightBytes/double(1ull<<30));
         // Readback goes through this buffer: a host-cached type keeps the CPU
@@ -665,11 +779,11 @@ public:
         VK_CHECK(vkMapMemory(c.dev, staging.mem, 0, VK_WHOLE_SIZE, 0, &mapped));
         for (layer=firstLayer; layer<=lastLayer; ++layer) for (const auto& [name,tensor] : g.tensors()) if (name.compare(0,w("").size(),w("")) == 0) {
             if (!tensor.nbytes) throw std::runtime_error("unknown tensor layout: " + name);
-            auto& b = allocate(name,tensor.nbytes); upload(b,tensor.data,tensor.nbytes);
+            auto& b = allocate(name,tensor.nbytes); upload(b,tensor.data,tensor.nbytes); releaseUploaded(tensor);
         }
         if (withHead) {
             for (const auto& name : {"output_hc_norm.weight","output_hc_down.weight","output_hc_up.weight","output.weight"}) {
-                const auto* tensor=g.find(name); auto& b=allocate(name,tensor->nbytes); upload(b,tensor->data,tensor->nbytes);
+                const auto* tensor=g.find(name); auto& b=allocate(name,tensor->nbytes); upload(b,tensor->data,tensor->nbytes); releaseUploaded(*tensor);
             }
             allocateRows("$output_logits",logits.size()*4,batchCap ? headTile : 1);
         }
@@ -717,14 +831,15 @@ public:
         // for the tables the CPU reads per token: the 35.763 GiB PLE table and
         // the token embedding, which are then read ahead and touched so every
         // per-token row lookup is a memory read instead of an NVMe page fault.
-        // QK_PLE_PREFETCH=0 disables this; the service memory limit must leave
-        // room for those tables' page cache.
+        // The service memory limit must leave room for those tables' page cache.
         // QK_PLE_PREFETCH_FLOOR_GIB (default 16) stops the readahead while
         // MemAvailable is below that floor: the GPU driver allocates system
         // memory for the Halo stage and fails outright (not by reclaiming
         // cache) when the node runs out, which took down the display session
         // once on 2026-09-11 during concurrent GPU testing.
-        if (const char* v = getenv("QK_PLE_PREFETCH"); !v || strcmp(v,"0")) {
+        // Opt-in only (QK_PLE_PREFETCH=1): the plan above already rejected it
+        // when the tables cannot fit beside the GPU allocations.
+        if (const char* v = getenv("QK_PLE_PREFETCH"); v && !strcmp(v,"1")) {
             std::vector<PageRange> release, keep;
             const size_t page = (size_t)sysconf(_SC_PAGESIZE);
             auto range = [&](const GgufTensor& t) {

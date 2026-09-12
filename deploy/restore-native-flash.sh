@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Safe (re)start of the native Flash Next split on Max as transient user units.
 #
-#   deploy/restore-native-flash.sh MODEL.gguf [CONTEXT=32768] [WARM=0|1]
+#   deploy/restore-native-flash.sh MODEL.gguf [CONTEXT=32768] [WARM=0|1] [MODE=split|single]
+#
+# MODE=single runs every layer and the head on the Strix Halo iGPU alone
+# (two-heap placement inside libqk, --local-driver); no XTX unit is started
+# and WARM must stay 0 there (the 36 GiB table warm does not fit beside the
+# 90 GiB single-device model).
 #
 # Order and checks (see docs/STRIX-HALO.md, memory plan and incident notes):
 #   1. refuse while any qk/server process runs or a GPU still holds memory;
@@ -18,6 +23,9 @@ set -euo pipefail
 model=${1:?usage: restore-native-flash.sh MODEL.gguf [CONTEXT] [WARM]}
 context=${2:-32768}
 warm=${3:-0}
+mode=${4:-split}
+[[ "$mode" == split || "$mode" == single ]] || { echo 'MODE must be split or single' >&2; exit 2; }
+if [[ "$mode" == single && "$warm" == 1 ]]; then echo 'WARM=1 is not supported in single mode' >&2; exit 2; fi
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 router=/home/ryan/IdeaProjects/qwen-kernel/deploy/prefill-router.py
 halo=/sys/bus/pci/devices/0000:c1:00.0
@@ -48,20 +56,26 @@ if (( $(kb MemFree) < 30*1048576 )); then
     echo "warning: MemFree below 30 GiB before the Halo load; the driver reuses its retained pool but this is not guaranteed" >&2
 fi
 
-systemd-run --user --unit=qwen-native-flash-worker32 -p MemoryHigh=12G -p MemoryMax=20G -p MemorySwapMax=512M \
-    -p NoNewPrivileges=yes -p LimitCORE=0 /usr/bin/bash "$root/deploy/run-native-flash-trial.sh" worker "$model" "$context"
-for _ in $(seq 1 60); do
-    sleep 3
-    journalctl --user -u qwen-native-flash-worker32 --no-pager -n 5 | grep -q 'listening on' && break
-    systemctl --user is-active --quiet qwen-native-flash-worker32 || { echo 'worker failed' >&2; exit 1; }
-done
-echo "worker up: $(state)"
+if [[ "$mode" == split ]]; then
+    systemd-run --user --unit=qwen-native-flash-worker32 -p MemoryHigh=12G -p MemoryMax=20G -p MemorySwapMax=512M \
+        -p NoNewPrivileges=yes -p LimitCORE=0 /usr/bin/bash "$root/deploy/run-native-flash-trial.sh" worker "$model" "$context"
+    for _ in $(seq 1 60); do
+        sleep 3
+        journalctl --user -u qwen-native-flash-worker32 --no-pager -n 5 | grep -q 'listening on' && break
+        systemctl --user is-active --quiet qwen-native-flash-worker32 || { echo 'worker failed' >&2; exit 1; }
+    done
+    echo "worker up: $(state)"
+fi
 
-if [[ "$warm" == 1 ]]; then high=52G; max=58G; else high=16G; max=24G; fi
+# Single mode: the process itself stays small (uploaded weight pages are
+# dropped as they go); the limit mostly bounds the on-demand PLE row page
+# cache charged to the unit, so it is a working-set cap, not a weight budget.
+if [[ "$mode" == single ]]; then high=24G; max=32G;
+elif [[ "$warm" == 1 ]]; then high=52G; max=58G; else high=16G; max=24G; fi
 server_started=$(date +%s)
 systemd-run --user --unit=qwen-native-flash-server32 -p MemoryHigh=$high -p MemoryMax=$max -p MemorySwapMax=512M \
     -p NoNewPrivileges=yes -p LimitCORE=0 --setenv=QK_PLE_PREFETCH="$warm" \
-    /usr/bin/bash "$root/deploy/run-native-flash-trial.sh" server "$model" "$context"
+    /usr/bin/bash "$root/deploy/run-native-flash-trial.sh" "$([[ "$mode" == single ]] && echo single || echo server)" "$model" "$context"
 for _ in $(seq 1 100); do
     sleep 3
     curl -s -m 2 http://127.0.0.1:8194/health | grep -q ok && break
