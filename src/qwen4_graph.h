@@ -3,6 +3,7 @@
 #include "qwen4_ple.h"
 #include "qwen4_gemm_policy.h"
 #include "qwen4_attn_policy.h"
+#include "qwen4_head_policy.h"
 #include <atomic>
 #include <memory>
 #include <numeric>
@@ -115,7 +116,7 @@ class Qwen4Graph {
     // rowBytes keeps the single-token size for the debug taps.
     uint32_t batchCap = 0;
     std::map<std::string, size_t> rowBytes;
-    static constexpr uint32_t headTile = 64;
+    static constexpr uint32_t headTile = qwen4HeadTile;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // QK_FLASH_PROFILE=1: per-dispatch GPU timestamps aggregated by shader.
     VkQueryPool profileQuery = VK_NULL_HANDLE;
@@ -684,14 +685,21 @@ class Qwen4Graph {
         struct { uint32_t n,used; } comb{n,used};
         emit("qwen4_moe_combine.spv",{"$routed","$shared_out","$sel","$block"},comb,(n+255)/256,0,T);
     }
-    void headBatch(uint32_t T) {
+    void headBatch(uint32_t T, bool lastOnly = false) {
         hcMixBatch("head","$hidden",T,true);
-        for (uint32_t g0 = 0; g0 < T; g0 += headTile) {
+        for (uint32_t g0 = qwen4HeadFirstTile(T,lastOnly); g0 < T; g0 += headTile) {
             const uint32_t rows = std::min(headTile, T-g0);
             projectBatch("output.weight","$mixed","$output_logits",rows,n,g0*n,0,0);
             struct { uint32_t vocab,T,idOff; } am{(uint32_t)logits.size(),rows,g0};
             emit("qwen4_argmax.spv",{"$output_logits","$ids"},am,rows);
         }
+    }
+    void downloadBatchHead(uint32_t T, uint32_t* idsOut, bool lastOnly) {
+        download(buffers.at("$ids"),lastOnly ? size_t(T-1)*4 : 0,
+                 idsOut,size_t(lastOnly ? 1 : T)*4);
+        const uint32_t last = (T-1) % headTile;
+        download(buffers.at("$output_logits"),size_t(last)*logits.size()*4,logits.data(),logits.size()*4);
+        for (float value:logits) if (!std::isfinite(value)) throw std::runtime_error("nonfinite native logits");
     }
     size_t batchBytes(uint32_t rows) const {
         size_t per = size_t(n)*hc*4*6 + size_t(n)*4*3 + (lowPad*2 + hc + 48*2 + 96)*4 + 6144ull*4*2;
@@ -1231,9 +1239,12 @@ public:
     // position to idsOut and keeps the final position's full logits. State
     // (conv window, GDN state, KV rows, PLE history) continues exactly as the
     // serial path would have left it, so decode can follow without a reset.
+    // lastOnly explicitly opts into one final ID, preserving the final head
+    // tile and full logits while skipping preceding vocabulary tiles.
     void forwardBatch(const uint32_t* tokens, const float* residualIn, uint32_t T, bool reset,
-                      float* hiddenOut, uint32_t* idsOut) {
+                      float* hiddenOut, uint32_t* idsOut, bool lastOnly = false) {
         if (!batchCap || T < 1 || T > batchCap) throw std::runtime_error("native batch size unsupported");
+        if (lastOnly && !withHead) throw std::runtime_error("last-output batch requires the head stage");
         if (withHead ? !idsOut : !hiddenOut) throw std::runtime_error("native batch output missing");
         if (reset) { position = 0; tokenHistory.clear(); }
         if (position + T > capacity) throw std::runtime_error("native graph context capacity exceeded");
@@ -1305,13 +1316,10 @@ public:
                 submit(); begin(); barrier(); sinceFlush = 0;
             }
         }
-        if (withHead) headBatch(T);
+        if (withHead) headBatch(T,lastOnly);
         submit();
         if (withHead) {
-            download(buffers.at("$ids"),0,idsOut,size_t(T)*4);
-            const uint32_t last = (T-1) % headTile;
-            download(buffers.at("$output_logits"),size_t(last)*logits.size()*4,logits.data(),logits.size()*4);
-            for (float value:logits) if (!std::isfinite(value)) throw std::runtime_error("nonfinite native logits");
+            downloadBatchHead(T,idsOut,lastOnly);
         } else download(buffers.at("$hidden"),0,hiddenOut,hidden.size()*4);
         position += T; tokenHistory = history;
         if (profileQuery) { char what[64]; snprintf(what,sizeof what,"batched forward, %u tokens",T); printProfile(what); }

@@ -101,6 +101,17 @@ int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
                  const float *hidden_in, uint32_t n, uint32_t base,
                  float *hidden_out, uint32_t *ids_out);
 
+/* Optional last-output prefill ABI. Same input/state semantics as stage_run,
+ * but last_id holds ONE u32: the prediction after base+n-1. Final full
+ * logits/top-k remain available. Never use this for per-position verification.
+ * Currently native Flash head stages only; -7 means unsupported and guarantees
+ * no state mutation, permitting fallback to stage_run. Other negative codes
+ * are errors, not permission to retry a possibly partially executed request.
+ * The existing all-ID stage_run contract is unchanged. */
+int qk_stage_run_last(qk_engine *e, uint32_t slot, const uint32_t *toks,
+                      const float *hidden_in, uint32_t n, uint32_t base,
+                      uint32_t *last_id);
+
 /* After a last-stage qk_stage_run: copy out the top-k (ids, logits) of the
  * FINAL position's logit row, descending (1 <= k <= 256). This is the
  * sampling hook — the driver samples from these candidates and feeds its

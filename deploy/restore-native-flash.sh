@@ -128,11 +128,12 @@ server_started=$(date +%s)
 # caller's environment (systemd units do not inherit it): QK_FLASH_BATCH (0 =
 # serial prefill), QK_PLE_ROW_PREFETCH (0 = no per-row prefetch),
 # QK_FLASH_COOPMAT, QK_FLASH_GEMM (compact), QK_FLASH_ATTN_BATCH (vec4),
+# QK_FLASH_PREFILL_LAST (1 = opt-in last-output local prefill; default off),
 # QK_FLASH_FUSE (0 = separate dispatches), QK_MOE_GU (v1 =
 # byte-addressed expert kernels), QK_GDN_STEP (v1). Profiling variables are
 # deliberately NOT forwarded: HTTP measurements run with profiling off.
 extra=()
-for knob in QK_FLASH_BATCH QK_PLE_ROW_PREFETCH QK_FLASH_COOPMAT QK_FLASH_GEMM QK_FLASH_ATTN_BATCH QK_FLASH_FUSE QK_MOE_GU QK_GDN_STEP QK_Q51_GEMV QK_MOE_DOWN QK_Q6K_GEMV QK_ATTN_DECODE QK_ATTN_CHUNK; do
+for knob in QK_FLASH_BATCH QK_PLE_ROW_PREFETCH QK_FLASH_COOPMAT QK_FLASH_GEMM QK_FLASH_ATTN_BATCH QK_FLASH_PREFILL_LAST QK_FLASH_FUSE QK_MOE_GU QK_GDN_STEP QK_Q51_GEMV QK_MOE_DOWN QK_Q6K_GEMV QK_ATTN_DECODE QK_ATTN_CHUNK; do
     if [[ -n "${!knob:-}" ]]; then extra+=("--setenv=$knob=${!knob}"); fi
 done
 start_unit qwen-native-flash-server32 -p MemoryHigh=$high -p MemoryMax=$max -p MemorySwapMax=512M \

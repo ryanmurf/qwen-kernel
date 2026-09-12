@@ -1,5 +1,16 @@
 # Strix Halo native Flash Next port
 
+September 12 status: the new `QK_FLASH_PREFILL_LAST=1` local-prefill
+optimization is **opt-in and partial-stage validated only**. It skips
+unused vocabulary tiles without changing the final tile's arithmetic or
+the existing all-ID ABI. The final two layers plus head measured 322.64
+to 154.85 ms at 512 rows; this is not a whole-model speedup claim. See
+[the gate, measurements and rollout requirements](../bench/RESULTS-halo-last-head.md).
+Full-model serving is currently offline: the unchanged 24 GiB launch guard
+rejects approximately 20.6 GiB available RAM after the Nathanw campaign;
+bounded unused-TTM cleanup still needs explicit approval. No cleanup or
+serving-default promotion was performed for this optimization.
+
 Validated milestone `0453754`, 2026-09-11: **the native engine served port
 8091 from the Strix Halo iGPU alone** (all 48 layers plus the
 head on 0000:c1:00.0; the XTX holds no weights and does no compute; Vulkan

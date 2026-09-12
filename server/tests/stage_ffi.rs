@@ -38,6 +38,52 @@ fn stage_chain_matches_serial_rule() {
     full.stage_run(0, Some(&prompt), None, 0, None, Some(&mut ids))
         .unwrap();
     assert_eq!(ids[2], lcg(11));
+    assert_eq!(ids, prompt.map(lcg), "existing ABI must return every ID");
+    // This stub predates the optional last-output symbol: exercise the
+    // backwards-compatible fallback and validation before invoking C.
+    assert_eq!(
+        full.stage_run_last(0, Some(&prompt), None, 0).unwrap(),
+        ids[2]
+    );
+    assert_eq!(
+        full.stage_run_last(0, Some(&[ids[2]]), None, 3).unwrap(),
+        lcg(ids[2])
+    );
+    assert!(full.stage_run_last(0, Some(&[]), None, 0).is_err());
+    assert!(
+        full.stage_run_last(0, Some(&prompt), None, u32::MAX)
+            .is_err()
+    );
+    assert!(full.stage_run_last(0, None, Some(&[1.0; 3]), 0).is_err());
+
+    // New ABI present: success and unsupported fallback agree; other failures
+    // must not replay an operation that might already have changed KV state.
+    let mut new = Engine::open(
+        Path::new(env!("QK_STUB_LAST_LIB")),
+        Path::new("/dev/null"),
+        CFG,
+    )
+    .unwrap();
+    assert_eq!(
+        new.stage_run_last(0, Some(&prompt), None, 0).unwrap(),
+        ids[2]
+    );
+    let mut top_ids = [0; 4];
+    let mut top_vals = [0.0; 4];
+    new.stage_topk(4, &mut top_ids, &mut top_vals).unwrap();
+    assert_eq!(top_ids[0], ids[2]);
+    unsafe { std::env::set_var("QK_STUB_LAST_RC", "-7") };
+    assert_eq!(
+        new.stage_run_last(0, Some(&prompt), None, 0).unwrap(),
+        ids[2]
+    );
+    unsafe { std::env::set_var("QK_STUB_LAST_RC", "-6") };
+    assert!(new.stage_run_last(0, Some(&prompt), None, 0).is_err());
+    unsafe { std::env::remove_var("QK_STUB_LAST_RC") };
+    assert_eq!(
+        new.stage_run_last(0, Some(&prompt), None, 0).unwrap(),
+        ids[2]
+    );
 
     // Mis-sized / mis-shaped calls are rejected before reaching C.
     let mut short = [0u32; 2];
@@ -45,7 +91,10 @@ fn stage_chain_matches_serial_rule() {
         full.stage_run(0, Some(&prompt), None, 0, None, Some(&mut short))
             .is_err()
     );
-    assert!(full.stage_run(0, None, None, 0, None, Some(&mut ids)).is_err());
+    assert!(
+        full.stage_run(0, None, None, 0, None, Some(&mut ids))
+            .is_err()
+    );
 
     // Split pair: layers [0,20) then [20,40).
     unsafe { std::env::set_var("QK_LAYERS", "0:20") };
@@ -56,6 +105,7 @@ fn stage_chain_matches_serial_rule() {
     let i1 = s1.stage_info().unwrap();
     let i2 = s2.stage_info().unwrap();
     assert!(i1.is_first() && !i1.is_last() && i1.is_split());
+    assert!(s1.stage_run_last(0, Some(&prompt), None, 0).is_err());
     assert!(!i2.is_first() && i2.is_last() && i2.is_split());
 
     // The serial decode API is rejected on split engines (rc -5).
@@ -72,6 +122,7 @@ fn stage_chain_matches_serial_rule() {
         .unwrap();
     let mut expect = lcg(11);
     assert_eq!(pids[prompt.len() - 1], expect);
+    assert_eq!(s2.stage_run_last(0, None, Some(&hid), 0).unwrap(), expect);
     let mut next = expect;
     for pos in prompt.len() as u32..prompt.len() as u32 + 5 {
         let tok = [next];

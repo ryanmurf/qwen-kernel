@@ -423,6 +423,7 @@ impl Downstream {
         topk: u32,
         hidden: &mut Vec<f32>,
         n_embd: usize,
+        last_only: bool,
     ) -> anyhow::Result<()> {
         match self {
             Self::Remote(link) => {
@@ -439,8 +440,20 @@ impl Downstream {
                 link.send_run(slot, base, hidden, topk)
             }
             Self::Local(pipe) => {
-                let mut ids = vec![0u32; toks.len()];
-                engine.stage_run(slot, Some(toks), None, base, None, Some(ids.as_mut_slice()))?;
+                let ids = if last_only {
+                    vec![engine.stage_run_last(slot, Some(toks), None, base)?]
+                } else {
+                    let mut ids = vec![0u32; toks.len()];
+                    engine.stage_run(
+                        slot,
+                        Some(toks),
+                        None,
+                        base,
+                        None,
+                        Some(ids.as_mut_slice()),
+                    )?;
+                    ids
+                };
                 let mut cands = Vec::new();
                 if topk > 0 {
                     let mut cid = vec![0u32; topk as usize];
@@ -623,6 +636,10 @@ pub fn run_split_engine_thread(
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|n| (1..=512).contains(n))
         .unwrap_or(CHUNK as u32);
+    // Experimental, local prefill only. Remote frames and decode keep their
+    // all-ID contract; Phase::Prefilling consumes only ids.last().
+    let prefill_last = std::env::var("QK_FLASH_PREFILL_LAST").as_deref() == Ok("1");
+    tracing::info!(prefill_last, "local last-output prefill request policy");
     let eos = head.eos_token();
     let n_embd = link.as_ref().map_or(0, |l| l.n_embd);
     let mut down = match link {
@@ -731,6 +748,7 @@ pub fn run_split_engine_thread(
                             topk,
                             &mut hidden,
                             n_embd,
+                            false,
                         );
                         match ok {
                             Ok(()) => sent.push((slot, 0)),
@@ -749,7 +767,11 @@ pub fn run_split_engine_thread(
                             } else {
                                 np
                             };
-                            let cap = if shared { chunk_cap(shared).min(prefill_cap) } else { prefill_cap };
+                            let cap = if shared {
+                                chunk_cap(shared).min(prefill_cap)
+                            } else {
+                                prefill_cap
+                            };
                             let n = cap.min(stop - p.done);
                             if n == 0 {
                                 break; // waiting on the snapshot barrier below
@@ -768,6 +790,7 @@ pub fn run_split_engine_thread(
                                 topk,
                                 &mut hidden,
                                 n_embd,
+                                prefill_last,
                             );
                             match ok {
                                 Ok(()) => {

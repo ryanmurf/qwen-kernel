@@ -3948,7 +3948,7 @@ struct qk_engine {
     // chunked at maxB; ids in / hidden out on the first stage, hidden in / ids
     // out on the last. base==0 resets the slot.
     int stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
-                 uint32_t base, float* hiddenOut, uint32_t* idsOut);
+                 uint32_t base, float* hiddenOut, uint32_t* idsOut, bool lastOnly = false);
     // Top-k (ids, logits) of the final position's row after a last-stage
     // stageRun — the split driver's sampling hook (see qk_stage_topk in qk.h).
     int stageTopK(uint32_t k, uint32_t* idsOut, float* valsOut);
@@ -5926,7 +5926,10 @@ void qk_engine::prefillBatchLast(const uint32_t* toks, uint32_t n, uint32_t slot
 }
 
 int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hiddenIn, uint32_t n,
-                        uint32_t base, float* hiddenOut, uint32_t* idsOut) {
+                        uint32_t base, float* hiddenOut, uint32_t* idsOut, bool lastOnly) {
+    // Explicitly unsupported before touching state: callers may fall back to
+    // the all-ID ABI only for this code, never after an execution failure.
+    if (lastOnly && (!qwen4 || !lastStage())) return -7;
     if (slot >= nSlots || n < 1 || (size_t)base + n > nCtx) return -1;
     if (firstStage() ? (!toks || hiddenIn != nullptr) : !hiddenIn) return -2;
     if (lastStage() ? !idsOut : !hiddenOut) return -3;
@@ -5942,13 +5945,14 @@ int qk_engine::stageRun(uint32_t slot, const uint32_t* toks, const float* hidden
                 const uint32_t cn=std::min(n-i,std::max(cap,1u));
                 if (cn>1) {
                     qwen4->forwardBatch(firstStage()?toks+i:nullptr,hiddenIn?hiddenIn+(size_t)i*10240:nullptr,cn,base+i==0,
-                                        lastStage()?nullptr:hiddenOut+(size_t)i*10240,lastStage()?idsOut+i:nullptr);
+                                        lastStage()?nullptr:hiddenOut+(size_t)i*10240,
+                                        lastStage()?idsOut+(lastOnly?0:i):nullptr,lastOnly);
                 } else {
                     auto hidden=qwen4->forward(firstStage()?toks[i]:0,base+i==0,
                         hiddenIn?hiddenIn+(size_t)i*10240:nullptr);
                     if (lastStage()) {
                         const auto& logits=qwen4->lastLogits();
-                        idsOut[i]=(uint32_t)(std::max_element(logits.begin(),logits.end())-logits.begin());
+                        idsOut[lastOnly?0:i]=(uint32_t)(std::max_element(logits.begin(),logits.end())-logits.begin());
                     } else memcpy(hiddenOut+(size_t)i*10240,hidden.data(),10240*4);
                 }
                 i+=cn;
@@ -6093,6 +6097,13 @@ int qk_stage_run(qk_engine* e, uint32_t slot, const uint32_t* toks, const float*
                  uint32_t n, uint32_t base, float* hidden_out, uint32_t* ids_out) {
     if (!e) return -1;
     return e->stageRun(slot, toks, hidden_in, n, base, hidden_out, ids_out);
+}
+
+__attribute__((visibility("default")))
+int qk_stage_run_last(qk_engine* e, uint32_t slot, const uint32_t* toks, const float* hidden_in,
+                     uint32_t n, uint32_t base, uint32_t* last_id) {
+    if (!e) return -1;
+    return e->stageRun(slot,toks,hidden_in,n,base,nullptr,last_id,true);
 }
 
 __attribute__((visibility("default")))

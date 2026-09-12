@@ -1,0 +1,67 @@
+{
+  "result": "PASS",
+  "full_model_validation": false,
+  "default_promotion": false,
+  "parity_sizes": [
+    1,
+    2,
+    63,
+    64,
+    65,
+    127,
+    128,
+    129,
+    309,
+    511,
+    512,
+    513,
+    1024
+  ],
+  "exact_final_logit_rows": 52,
+  "old_abi_exact_id_buffers": 52,
+  "reference_extra_shaders": [
+    "gemv_q6_k_v1.spv",
+    "moe_down_q8_routed_v1.spv"
+  ],
+  "library_sha256": "068369b87806608ed7d00efb2b72d3bd3e0f19abfd0ed67d7f452b8e952d8931",
+  "reference_library_sha256": "0b3efa4732d1dad9b2ebdbc7fc2688a6501a32672a146953654739ad3cd3bdd3",
+  "harness_sha256": "6564e852b466faf7d61323d7f0398f15c0e6ee96c4499e015251cabadc9aa2f4",
+  "timings_partial_stage_only": [
+    {
+      "rows": 128,
+      "all_median": 0.1040857070038328,
+      "last_median": 0.08245186100248247,
+      "speedup": 1.2623815367939235
+    },
+    {
+      "rows": 512,
+      "all_median": 0.322643789499125,
+      "last_median": 0.15485474200249882,
+      "speedup": 2.0835254079201437
+    },
+    {
+      "rows": 1024,
+      "all_median": 0.6539885720048915,
+      "last_median": 0.31838633499864955,
+      "speedup": 2.0540723646561823
+    }
+  ],
+  "profile_diagnostic_only": [
+    {
+      "last_only": false,
+      "vocabulary_tiles": 8,
+      "vocabulary_and_argmax_ms": 199.48870000000002
+    },
+    {
+      "last_only": true,
+      "vocabulary_tiles": 1,
+      "vocabulary_and_argmax_ms": 21.635
+    }
+  ],
+  "evidence_sha256": {
+    "results-halo-last-head.jsonl": "6c1ec36b2096b09514dd9502f2d8eb0d197cca0033df1bfdb5638ea2c99b0913",
+    "results-halo-last-head-reference.jsonl": "ba30355dc9498bab25798438902491f3fafe898bb1409a9a0adaa7609a8f1143",
+    "results-halo-last-head-profile.jsonl": "02d92cfbd64795134e48862aa1c9012b026c085dad67d6cf718b665d7b8f4cbb",
+    "results-halo-last-head-profile.log": "f5cc2296015c52c5e9c3488c63cb70955e4ce151522694c530bc4abcd57576af"
+  }
+}

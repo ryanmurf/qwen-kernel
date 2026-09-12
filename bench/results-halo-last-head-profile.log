@@ -1,0 +1,204 @@
+vk device 0: AMD Radeon RX 7900 XTX (RADV NAVI31) [0000:68:00.0] vram=24560 MiB
+vk device 1: Radeon 8060S Graphics (RADV STRIX_HALO) [0000:c1:00.0] vram=72362 MiB (not discrete)
+vk device 2: llvmpipe (LLVM 21.1.8, 256 bits) [?] vram=124123 MiB (not discrete)
+native Flash experimental stage [46,48), context=2048, residual=10240, one sequence, batch rows 512, decode attention serial; MTP/snapshots disabled
+native Flash prefill GEMM policy: baseline
+native Flash prefill attention policy: baseline
+[last-head profile] last_only=False rows=512
+[flash raw] 0001 qwen4_hc.spv                          257.9 us
+[flash raw] 0002 qwen4_gemm_q5k.spv                   1789.8 us
+[flash raw] 0003 qwen4_silu.spv                          4.4 us
+[flash raw] 0004 qwen4_gemm_q5_1.spv                   923.3 us
+[flash raw] 0005 qwen4_gemm_q5k.spv                   1791.9 us
+[flash raw] 0006 qwen4_hc.spv                          189.9 us
+[flash raw] 0007 qwen4_gemm_q6k.spv                   6846.0 us
+[flash raw] 0008 qwen4_gemm_q5k.spv                   3868.6 us
+[flash raw] 0009 qwen4_gemm_q5k.spv                    343.3 us
+[flash raw] 0010 qwen4_gemm_q5k.spv                    342.9 us
+[flash raw] 0011 qwen4_gdn_params.spv                    2.8 us
+[flash raw] 0012 qwen4_gdn_conv_batch.spv              142.6 us
+[flash raw] 0013 qwen4_gdn_step_batch.spv             1705.8 us
+[flash raw] 0014 qwen4_gemm_q5k.spv                   4058.7 us
+[flash raw] 0015 qwen4_hc.spv                          162.6 us
+[flash raw] 0016 qwen4_hc.spv                          225.7 us
+[flash raw] 0017 qwen4_gemm_q6k.spv                   1752.4 us
+[flash raw] 0018 qwen4_silu.spv                          3.4 us
+[flash raw] 0019 qwen4_gemm_q5_1.spv                   916.3 us
+[flash raw] 0020 qwen4_gemm_q5k.spv                   1799.8 us
+[flash raw] 0021 qwen4_hc.spv                          180.3 us
+[flash raw] 0022 moe_logits_gemm.spv                   240.8 us
+[flash raw] 0023 moe_select_256.spv                     41.7 us
+[flash raw] 0024 moe_group_pairs.spv                    45.7 us
+[flash raw] 0025 qwen4_moe_gateup_tiled.spv          19488.1 us
+[flash raw] 0026 qwen4_gemm_q5k.spv                    440.4 us
+[flash raw] 0027 qwen4_gemm_q5k.spv                    362.1 us
+[flash raw] 0028 qwen4_silu_mul.spv                      5.2 us
+[flash raw] 0029 qwen4_gemm_q8_0.spv                   415.1 us
+[flash raw] 0030 qwen4_moe_down_tiled_q8.spv          9667.6 us
+[flash raw] 0031 qwen4_moe_combine.spv                 272.8 us
+[flash raw] 0032 qwen4_hc.spv                          148.8 us
+[flash raw] 0033 qwen4_hc.spv                          224.8 us
+[flash raw] 0034 qwen4_gemm_q5k.spv                   1721.3 us
+[flash raw] 0035 qwen4_silu.spv                          3.8 us
+[flash raw] 0036 qwen4_gemm_q5_1.spv                   904.5 us
+[flash raw] 0037 qwen4_gemm_q5k.spv                   1746.3 us
+[flash raw] 0038 qwen4_hc.spv                          180.9 us
+[flash raw] 0039 qwen4_gemm_q5k.spv                   7432.0 us
+[flash raw] 0040 qwen4_gemm_q5k.spv                    442.9 us
+[flash raw] 0041 qwen4_gemm_q6k.spv                    373.5 us
+[flash raw] 0042 fa_prep_batch.spv                     171.2 us
+[flash raw] 0043 fa_attn_batch.spv                    6130.9 us
+[flash raw] 0044 qwen4_gemm_q5k.spv                   3872.2 us
+[flash raw] 0045 qwen4_hc.spv                          161.9 us
+[flash raw] 0046 qwen4_hc.spv                          230.9 us
+[flash raw] 0047 qwen4_gemm_q6k.spv                   1775.5 us
+[flash raw] 0048 qwen4_silu.spv                          3.4 us
+[flash raw] 0049 qwen4_gemm_q5_1.spv                   945.1 us
+[flash raw] 0050 qwen4_gemm_q5k.spv                   2138.2 us
+[flash raw] 0051 qwen4_hc.spv                          822.7 us
+[flash raw] 0052 moe_logits_gemm.spv                   445.0 us
+[flash raw] 0053 moe_select_256.spv                     82.0 us
+[flash raw] 0054 moe_group_pairs.spv                    37.5 us
+[flash raw] 0055 qwen4_moe_gateup_tiled.spv          22532.3 us
+[flash raw] 0056 qwen4_gemm_q5k.spv                    458.9 us
+[flash raw] 0057 qwen4_gemm_q5k.spv                    362.8 us
+[flash raw] 0058 qwen4_silu_mul.spv                      5.4 us
+[flash raw] 0059 qwen4_gemm_q8_0.spv                   402.2 us
+[flash raw] 0060 qwen4_moe_down_tiled_q8.spv          9893.6 us
+[flash raw] 0061 qwen4_moe_combine.spv                 262.4 us
+[flash raw] 0062 qwen4_hc.spv                          150.1 us
+[flash raw] 0063 qwen4_hc.spv                          227.9 us
+[flash raw] 0064 qwen4_gemm_q5k.spv                   1672.7 us
+[flash raw] 0065 qwen4_silu.spv                          3.5 us
+[flash raw] 0066 qwen4_gemm_q5_1.spv                   936.6 us
+[flash raw] 0067 qwen4_hc.spv                          251.1 us
+[flash raw] 0068 qwen4_gemm_q6k.spv                  23197.5 us
+[flash raw] 0069 qwen4_argmax.spv                     1470.4 us
+[flash raw] 0070 qwen4_gemm_q6k.spv                  23966.7 us
+[flash raw] 0071 qwen4_argmax.spv                      392.5 us
+[flash raw] 0072 qwen4_gemm_q6k.spv                  20821.7 us
+[flash raw] 0073 qwen4_argmax.spv                      399.4 us
+[flash raw] 0074 qwen4_gemm_q6k.spv                  25318.1 us
+[flash raw] 0075 qwen4_argmax.spv                     1495.2 us
+[flash raw] 0076 qwen4_gemm_q6k.spv                  26798.5 us
+[flash raw] 0077 qwen4_argmax.spv                      403.0 us
+[flash raw] 0078 qwen4_gemm_q6k.spv                  25837.0 us
+[flash raw] 0079 qwen4_argmax.spv                     1462.7 us
+[flash raw] 0080 qwen4_gemm_q6k.spv                  24056.7 us
+[flash raw] 0081 qwen4_argmax.spv                      398.4 us
+[flash raw] 0082 qwen4_gemm_q6k.spv                  23073.9 us
+[flash raw] 0083 qwen4_argmax.spv                      397.0 us
+[flash profile] batched forward, 512 tokens: 324.931 ms GPU
+[flash profile]   qwen4_gemm_q6k.spv                   203.817 ms  62.7% (12 dispatches, 16984.8 us each)
+[flash profile]   qwen4_moe_gateup_tiled.spv            42.020 ms  12.9% (2 dispatches, 21010.2 us each)
+[flash profile]   qwen4_gemm_q5k.spv                    34.645 ms  10.7% (18 dispatches, 1924.7 us each)
+[flash profile]   qwen4_moe_down_tiled_q8.spv           19.561 ms   6.0% (2 dispatches, 9780.6 us each)
+[flash profile]   qwen4_argmax.spv                       6.419 ms   2.0% (8 dispatches, 802.3 us each)
+[flash profile]   fa_attn_batch.spv                      6.131 ms   1.9% (1 dispatches, 6130.9 us each)
+[flash profile]   qwen4_gemm_q5_1.spv                    4.626 ms   1.4% (5 dispatches, 925.2 us each)
+[flash profile]   qwen4_hc.spv                           3.416 ms   1.1% (14 dispatches, 244.0 us each)
+[flash profile]   qwen4_gdn_step_batch.spv               1.706 ms   0.5% (1 dispatches, 1705.8 us each)
+[flash profile]   qwen4_gemm_q8_0.spv                    0.817 ms   0.3% (2 dispatches, 408.7 us each)
+[flash profile]   moe_logits_gemm.spv                    0.686 ms   0.2% (2 dispatches, 342.9 us each)
+[flash profile]   qwen4_moe_combine.spv                  0.535 ms   0.2% (2 dispatches, 267.6 us each)
+[flash profile]   fa_prep_batch.spv                      0.171 ms   0.1% (1 dispatches, 171.2 us each)
+[flash profile]   qwen4_gdn_conv_batch.spv               0.143 ms   0.0% (1 dispatches, 142.6 us each)
+[flash profile]   moe_select_256.spv                     0.124 ms   0.0% (2 dispatches, 61.8 us each)
+[flash profile]   moe_group_pairs.spv                    0.083 ms   0.0% (2 dispatches, 41.6 us each)
+[flash profile]   qwen4_silu.spv                         0.018 ms   0.0% (5 dispatches, 3.7 us each)
+[flash profile]   qwen4_silu_mul.spv                     0.011 ms   0.0% (2 dispatches, 5.3 us each)
+[flash profile]   qwen4_gdn_params.spv                   0.003 ms   0.0% (1 dispatches, 2.8 us each)
+[last-head profile] last_only=True rows=512
+[flash raw] 0001 qwen4_hc.spv                          324.7 us
+[flash raw] 0002 qwen4_gemm_q5k.spv                   1859.1 us
+[flash raw] 0003 qwen4_silu.spv                          4.2 us
+[flash raw] 0004 qwen4_gemm_q5_1.spv                   913.3 us
+[flash raw] 0005 qwen4_gemm_q5k.spv                   1759.7 us
+[flash raw] 0006 qwen4_hc.spv                          182.7 us
+[flash raw] 0007 qwen4_gemm_q6k.spv                   6762.5 us
+[flash raw] 0008 qwen4_gemm_q5k.spv                   3820.7 us
+[flash raw] 0009 qwen4_gemm_q5k.spv                    352.8 us
+[flash raw] 0010 qwen4_gemm_q5k.spv                    341.1 us
+[flash raw] 0011 qwen4_gdn_params.spv                    2.6 us
+[flash raw] 0012 qwen4_gdn_conv_batch.spv              143.1 us
+[flash raw] 0013 qwen4_gdn_step_batch.spv             1714.1 us
+[flash raw] 0014 qwen4_gemm_q5k.spv                   3941.9 us
+[flash raw] 0015 qwen4_hc.spv                          164.9 us
+[flash raw] 0016 qwen4_hc.spv                          236.4 us
+[flash raw] 0017 qwen4_gemm_q6k.spv                   1745.4 us
+[flash raw] 0018 qwen4_silu.spv                          3.2 us
+[flash raw] 0019 qwen4_gemm_q5_1.spv                   895.4 us
+[flash raw] 0020 qwen4_gemm_q5k.spv                   1749.8 us
+[flash raw] 0021 qwen4_hc.spv                          181.1 us
+[flash raw] 0022 moe_logits_gemm.spv                   236.0 us
+[flash raw] 0023 moe_select_256.spv                     38.8 us
+[flash raw] 0024 moe_group_pairs.spv                    34.4 us
+[flash raw] 0025 qwen4_moe_gateup_tiled.spv          20416.6 us
+[flash raw] 0026 qwen4_gemm_q5k.spv                    465.8 us
+[flash raw] 0027 qwen4_gemm_q5k.spv                    371.1 us
+[flash raw] 0028 qwen4_silu_mul.spv                      5.5 us
+[flash raw] 0029 qwen4_gemm_q8_0.spv                   394.8 us
+[flash raw] 0030 qwen4_moe_down_tiled_q8.spv          9649.9 us
+[flash raw] 0031 qwen4_moe_combine.spv                 268.3 us
+[flash raw] 0032 qwen4_hc.spv                          147.8 us
+[flash raw] 0033 qwen4_hc.spv                          222.3 us
+[flash raw] 0034 qwen4_gemm_q5k.spv                   1671.5 us
+[flash raw] 0035 qwen4_silu.spv                          3.4 us
+[flash raw] 0036 qwen4_gemm_q5_1.spv                   902.4 us
+[flash raw] 0037 qwen4_gemm_q5k.spv                   1845.0 us
+[flash raw] 0038 qwen4_hc.spv                          182.1 us
+[flash raw] 0039 qwen4_gemm_q5k.spv                   7437.0 us
+[flash raw] 0040 qwen4_gemm_q5k.spv                    452.6 us
+[flash raw] 0041 qwen4_gemm_q6k.spv                    377.3 us
+[flash raw] 0042 fa_prep_batch.spv                     167.6 us
+[flash raw] 0043 fa_attn_batch.spv                    6218.4 us
+[flash raw] 0044 qwen4_gemm_q5k.spv                   3883.5 us
+[flash raw] 0045 qwen4_hc.spv                          162.3 us
+[flash raw] 0046 qwen4_hc.spv                          231.8 us
+[flash raw] 0047 qwen4_gemm_q6k.spv                   1718.6 us
+[flash raw] 0048 qwen4_silu.spv                          3.4 us
+[flash raw] 0049 qwen4_gemm_q5_1.spv                   913.1 us
+[flash raw] 0050 qwen4_gemm_q5k.spv                   1777.2 us
+[flash raw] 0051 qwen4_hc.spv                          180.3 us
+[flash raw] 0052 moe_logits_gemm.spv                   241.2 us
+[flash raw] 0053 moe_select_256.spv                     41.8 us
+[flash raw] 0054 moe_group_pairs.spv                    34.8 us
+[flash raw] 0055 qwen4_moe_gateup_tiled.spv          20934.2 us
+[flash raw] 0056 qwen4_gemm_q5k.spv                    463.4 us
+[flash raw] 0057 qwen4_gemm_q5k.spv                    368.8 us
+[flash raw] 0058 qwen4_silu_mul.spv                      5.7 us
+[flash raw] 0059 qwen4_gemm_q8_0.spv                   417.7 us
+[flash raw] 0060 qwen4_moe_down_tiled_q8.spv          9913.0 us
+[flash raw] 0061 qwen4_moe_combine.spv                 263.2 us
+[flash raw] 0062 qwen4_hc.spv                          148.3 us
+[flash raw] 0063 qwen4_hc.spv                          224.9 us
+[flash raw] 0064 qwen4_gemm_q5k.spv                   1727.8 us
+[flash raw] 0065 qwen4_silu.spv                          3.6 us
+[flash raw] 0066 qwen4_gemm_q5_1.spv                   904.6 us
+[flash raw] 0067 qwen4_hc.spv                          251.2 us
+[flash raw] 0068 qwen4_gemm_q6k.spv                  21234.2 us
+[flash raw] 0069 qwen4_argmax.spv                      400.8 us
+[flash profile] batched forward, 512 tokens: 145.057 ms GPU
+[flash profile]   qwen4_moe_gateup_tiled.spv            41.351 ms  28.5% (2 dispatches, 20675.4 us each)
+[flash profile]   qwen4_gemm_q5k.spv                    34.289 ms  23.6% (18 dispatches, 1904.9 us each)
+[flash profile]   qwen4_gemm_q6k.spv                    31.838 ms  21.9% (5 dispatches, 6367.6 us each)
+[flash profile]   qwen4_moe_down_tiled_q8.spv           19.563 ms  13.5% (2 dispatches, 9781.4 us each)
+[flash profile]   fa_attn_batch.spv                      6.218 ms   4.3% (1 dispatches, 6218.4 us each)
+[flash profile]   qwen4_gemm_q5_1.spv                    4.529 ms   3.1% (5 dispatches, 905.7 us each)
+[flash profile]   qwen4_hc.spv                           2.841 ms   2.0% (14 dispatches, 202.9 us each)
+[flash profile]   qwen4_gdn_step_batch.spv               1.714 ms   1.2% (1 dispatches, 1714.1 us each)
+[flash profile]   qwen4_gemm_q8_0.spv                    0.813 ms   0.6% (2 dispatches, 406.3 us each)
+[flash profile]   qwen4_moe_combine.spv                  0.531 ms   0.4% (2 dispatches, 265.7 us each)
+[flash profile]   moe_logits_gemm.spv                    0.477 ms   0.3% (2 dispatches, 238.6 us each)
+[flash profile]   qwen4_argmax.spv                       0.401 ms   0.3% (1 dispatches, 400.8 us each)
+[flash profile]   fa_prep_batch.spv                      0.168 ms   0.1% (1 dispatches, 167.6 us each)
+[flash profile]   qwen4_gdn_conv_batch.spv               0.143 ms   0.1% (1 dispatches, 143.1 us each)
+[flash profile]   moe_select_256.spv                     0.081 ms   0.1% (2 dispatches, 40.3 us each)
+[flash profile]   moe_group_pairs.spv                    0.069 ms   0.0% (2 dispatches, 34.6 us each)
+[flash profile]   qwen4_silu.spv                         0.018 ms   0.0% (5 dispatches, 3.6 us each)
+[flash profile]   qwen4_silu_mul.spv                     0.011 ms   0.0% (2 dispatches, 5.6 us each)
+[flash profile]   qwen4_gdn_params.spv                   0.003 ms   0.0% (1 dispatches, 2.6 us each)
+device: Radeon 8060S Graphics (RADV STRIX_HALO) [0000:c1:00.0]
+cooperative matrix: KHR f16acc=yes f32acc=yes shape=16x16x16 subgroup=64
+native placement: device-local 5.016 GiB (weights 4.410 + state/scratch 0.261 + batch 0.345, headroom 69.405), host heap 0.000 GiB in 0 expert tensors (headroom 34.203, type 2 heap 0 [HV|HC]); system MemTotal 121.2 GiB, MemAvailable 20.7 GiB, reserve 12.0 GiB
+prefix weights: 4.410 GiB; staging: 16 MiB; PLE table stays mapped

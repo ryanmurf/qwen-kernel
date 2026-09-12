@@ -134,6 +134,25 @@ int qk_stage_run(qk_engine *e, uint32_t slot, const uint32_t *toks,
     return 0;
 }
 
+#ifdef QK_STUB_LAST_OUTPUT
+/* Separate fixture: the ordinary stub intentionally lacks this optional ABI.
+ * Error injection verifies that only unsupported (-7) permits fallback. */
+int qk_stage_run_last(qk_engine *e, uint32_t slot, const uint32_t *toks,
+                     const float *hidden_in, uint32_t n, uint32_t base,
+                     uint32_t *last_id) {
+    const char *rc = getenv("QK_STUB_LAST_RC");
+    if (rc && atoi(rc)) return atoi(rc);
+    if (!e || !last_id || !n || n > e->cfg.n_ctx) return -1;
+    if (e->l_end != QK_NLAYER) return -7;
+    uint32_t *ids = malloc((size_t)n * sizeof(*ids));
+    if (!ids) return -6;
+    int result = qk_stage_run(e, slot, toks, hidden_in, n, base, NULL, ids);
+    if (!result) *last_id = ids[n - 1];
+    free(ids);
+    return result;
+}
+#endif
+
 /* Sampling hook (qk_stage_topk). Mirrors the engine's contract: the top-k of
  * the FINAL position's row, descending, only on an engine that owns the lm
  * head — which INCLUDES an unsplit one (`lastStage()` is `l_end == n_layer`),

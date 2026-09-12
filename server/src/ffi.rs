@@ -43,6 +43,16 @@ type QkStageTopK = unsafe extern "C" fn(
     *mut f32, // vals (k out, the logits)
 ) -> c_int;
 
+type QkStageRunLast = unsafe extern "C" fn(
+    *mut QkEngineOpaque,
+    u32,
+    *const u32,
+    *const f32,
+    u32,
+    u32,
+    *mut u32,
+) -> c_int;
+
 type QkStateOp = unsafe extern "C" fn(*mut QkEngineOpaque, u32, u32, u32) -> c_int;
 
 /// Pipeline-split ABI (engine ≥ 240c63e). Resolved as a group; `None` on
@@ -56,6 +66,7 @@ struct StageSymbols {
     /// The sampling hook. Resolved on its own because it landed after the rest
     /// of the group, and because a library may serve greedy without it.
     stage_topk: Option<QkStageTopK>,
+    stage_run_last: Option<QkStageRunLast>,
 }
 
 /// Snapshot ABI (engine ≥ #30): driver-managed state save/load for split
@@ -147,6 +158,7 @@ impl Engine {
                         n_layer: *layers,
                         n_embd: *embd,
                         stage_topk: lib.get(b"qk_stage_topk\0").ok().map(|s| *s),
+                        stage_run_last: lib.get(b"qk_stage_run_last\0").ok().map(|s| *s),
                     }),
                     _ => None,
                 }
@@ -330,6 +342,55 @@ impl Engine {
             bail!("qk_stage_run failed with code {rc}");
         }
         Ok(())
+    }
+
+    /// Last-output prefill, with compatibility fallback when the optional
+    /// symbol is absent or explicitly returns -7 (unsupported, no mutation).
+    /// Never retry any other error: a failed forward may have advanced state.
+    pub fn stage_run_last(
+        &mut self,
+        slot: u32,
+        toks: Option<&[u32]>,
+        hidden_in: Option<&[f32]>,
+        base: u32,
+    ) -> Result<u32> {
+        let info = self.stage_info().context("no stage ABI")?;
+        if info.end != info.n_layer {
+            bail!("stage_run_last requires the head stage");
+        }
+        let row = info.n_embd as usize;
+        let n = match (toks, hidden_in) {
+            (Some(t), None) => t.len(),
+            (None, Some(h)) if row > 0 && h.len() % row == 0 => h.len() / row,
+            _ => bail!("stage_run_last: need exactly one input with whole rows"),
+        };
+        let n = u32::try_from(n).context("stage_run_last: batch too long")?;
+        if n == 0 || base.checked_add(n).is_none_or(|end| end > self.n_ctx()) {
+            bail!("stage_run_last: empty batch or context overflow");
+        }
+        if let Some(run) = self.syms.stage.as_ref().and_then(|s| s.stage_run_last) {
+            let mut id = 0;
+            let rc = unsafe {
+                run(
+                    self.raw,
+                    slot,
+                    toks.map_or(std::ptr::null(), <[u32]>::as_ptr),
+                    hidden_in.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                    n,
+                    base,
+                    &mut id,
+                )
+            };
+            if rc == 0 {
+                return Ok(id);
+            }
+            if rc != -7 {
+                bail!("qk_stage_run_last failed with code {rc}");
+            }
+        }
+        let mut ids = vec![0; n as usize];
+        self.stage_run(slot, toks, hidden_in, base, None, Some(&mut ids))?;
+        Ok(ids[n as usize - 1])
     }
 
     /// Top-k (id, logit) of the FINAL position's row from the most recent

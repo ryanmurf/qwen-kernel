@@ -28,8 +28,12 @@ fn lcg(prev: u32) -> u32 {
 }
 
 fn start(local_driver: bool) -> EngineThread {
+    start_with_library(local_driver, env!("QK_STUB_LIB"))
+}
+
+fn start_with_library(local_driver: bool, library: &str) -> EngineThread {
     EngineThread::start(
-        Path::new(env!("QK_STUB_LIB")),
+        Path::new(library),
         Path::new("/dev/null"),
         CFG,
         None,
@@ -115,4 +119,29 @@ fn local_driver_matches_greedy_and_can_sample() {
     // Every pick must still come from the candidate set the engine offered
     // (rank 0..=3 of that position), not from nowhere.
     local.shutdown();
+
+    // Only this test mutates the process environment; this integration file
+    // has one test. Exercise both the new ABI and missing-symbol fallback,
+    // including multiple prefill frames, sampled final logits and reset.
+    unsafe { std::env::set_var("QK_FLASH_PREFILL_LAST", "1") };
+    let long: Vec<u32> = (1..=309).collect();
+    for library in [env!("QK_STUB_LIB"), env!("QK_STUB_LAST_LIB")] {
+        let last = start_with_library(true, library);
+        for prompt in [prompt.clone(), long.clone(), long.clone()] {
+            let (tokens, finish) = run(&last, &sem, prompt.clone(), 6, Sampling::GREEDY);
+            assert!(matches!(finish, Ok(FinishReason::Limit)), "{finish:?}");
+            assert_eq!(tokens[0], lcg(*prompt.last().unwrap()));
+            for pair in tokens.windows(2) {
+                assert_eq!(pair[1], lcg(pair[0]));
+            }
+        }
+        let (tokens, finish) = run(&last, &sem, prompt.clone(), 24, hot);
+        assert!(matches!(finish, Ok(FinishReason::Limit)), "{finish:?}");
+        assert_eq!(
+            tokens, sampled,
+            "last-output policy changed sampled continuation"
+        );
+        last.shutdown();
+    }
+    unsafe { std::env::remove_var("QK_FLASH_PREFILL_LAST") };
 }
