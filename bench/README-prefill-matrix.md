@@ -11,6 +11,8 @@ Default prompt sizes are **128, 512, 2048, 8192, and 16384 tokens**, with
 context accommodates this matrix. Larger matrices can be prepared explicitly,
 but must fit the tested backend's context and memory budget.
 
+User-supplied comparison links are saved in [REFERENCES.md](REFERENCES.md).
+
 ## What is measured
 
 - **Prefill plus one token:** end-to-end wall time for a non-streaming request
