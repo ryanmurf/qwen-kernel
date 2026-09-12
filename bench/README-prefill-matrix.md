@@ -67,6 +67,33 @@ fixture, context and output count, a distinct backend label, its direct URL,
 and a new output filename. The “recipe” backend must be identified before
 its result can be labeled accurately. No result is fabricated for it.
 
+On Max, `deploy/start-llama-prefill-halo.sh` provides explicit, single-Halo
+presets for the installed llama.cpp fork:
+
+```bash
+# Only after stopping/draining the native server and its router:
+bash deploy/start-llama-prefill-halo.sh fast 32768
+```
+
+`fast` uses F16 KV and flash attention without MTP. `f32` disables F16,
+quantized-input MMVQ and flash attention, with F32 KV and no MTP. `mtp` uses
+F16/flash attention and the installed shared MTP draft plus image projector.
+These are distinct configurations, not assumed to be quality-equivalent.
+All use `-b 2048 -ub 1024`, explicit full GPU offload and `--fit off` to avoid
+automatic placement/context changes. They are comparison presets, not a
+claim to reproduce the user's unidentified “recipe” exactly.
+
+The launcher refuses active model services/processes, undrained Halo GTT,
+an occupied port, or insufficient host headroom. It releases only the named
+model shards' file cache and starts a **loopback-only** transient service on
+8193 with an 8 GiB memory-high / 12 GiB memory-max process/page-cache cap.
+Those limits do **not** cap all GPU GTT: monitor host memory and the journal
+during loading. It does not stop existing services or wait for readiness.
+Check `/health`, the actual device-buffer/offload log, the process environment
+and correct output before running the matrix. Stop the printed comparison
+unit and verify drained memory before restoring the native service. Never
+rebuild binaries or shader files that a live native server is using.
+
 Record the exact model shards/quantization, backend revision, launch flags,
 device placement, KV types, flash-attention mode, prefill batch sizes, MTP
 state and relevant environment in the metadata JSON. Never put credentials
