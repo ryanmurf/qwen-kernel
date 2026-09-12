@@ -89,6 +89,8 @@ The launcher refuses active model services/processes, undrained Halo GTT,
 an occupied port, or insufficient host headroom. It releases only the named
 model shards' file cache and starts a **loopback-only** transient service on
 8193 with an 8 GiB memory-high / 12 GiB memory-max process/page-cache cap.
+It verifies the Halo-only `GGML_VK_VISIBLE_DEVICES` selection as well as
+`--device`, keeping ggml's host-staging allocator off the external GPU.
 Those limits do **not** cap all GPU GTT: monitor host memory and the journal
 during loading. It does not stop existing services or wait for readiness.
 Check `/health`, the actual device-buffer/offload log, the process environment

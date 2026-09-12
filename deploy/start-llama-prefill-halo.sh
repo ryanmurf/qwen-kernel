@@ -71,6 +71,17 @@ if (( ${#matches[@]} != 1 )); then
 fi
 device=${matches[0]}
 printf '%s\n' "$devices"
+# Limit ggml's visible backends too: its default host-staging allocator can
+# otherwise choose the enumerated XTX even when all model ops target Halo.
+# Validate the physical-index interpretation before loading any weights.
+clean_env+=(GGML_VK_VISIBLE_DEVICES="${device#Vulkan}")
+visible=$("${clean_env[@]}" "$binary" --list-devices 2>&1)
+mapfile -t selected < <(printf '%s\n' "$visible" | sed -n 's/^[[:space:]]*\(Vulkan[0-9][0-9]*:.*\)$/\1/p')
+if (( ${#selected[@]} != 1 )) || [[ "${selected[0]}" != *STRIX_HALO* ]]; then
+    echo 'filtered physical device is not uniquely Halo; refusing model load' >&2; exit 1
+fi
+device=${selected[0]%%:*}
+printf '%s\n' "$visible"
 kv=f16; flash=on
 extra=(--spec-type none)
 if [[ "$mode" == f32 ]]; then
