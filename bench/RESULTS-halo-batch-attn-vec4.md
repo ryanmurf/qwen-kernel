@@ -1,7 +1,8 @@
 # Halo vector-LDS F32 batched attention
 
-Status, 2026-09-12 12:39 UTC: **96 operator checks passed; full-model replay
-is running. No model-throughput claim or default promotion.**
+Status, 2026-09-12 12:45 UTC: **96 operator checks passed; the candidate's
+full-model replay completed and matches the previous baseline exactly.
+Same-build control is running. No API speed claim or default promotion.**
 `QK_FLASH_ATTN_BATCH=vec4` selects the new path on Strix Halo only. Unset it,
 or use `baseline`, for the unchanged default. Cooperative-matrix selection
 takes precedence. GEMM and single-position decode choices are independent;
@@ -92,10 +93,22 @@ host-memory/DRM watchdog. Never run this harness alongside a serving model.
 
 ## Pending full-model gate
 
-The integrated vec4 replay uses the existing exact 16K prompt plus 128
-teacher positions, context 32768, all 48 layers, reset and full repeat.
-The unchanged serial decode and baseline GEMM isolate this candidate.
-Its same-build baseline control and strict full-logit comparison remain
-required, followed by the HTTP suite and repeated request-level A/B.
-Neither a kernel microbenchmark nor the replay's combined body duration
-is an API speed result. Defaults remain unchanged throughout validation.
+The integrated vec4 replay completed at 12:44:05 UTC after starting at
+12:36:35. It used the existing exact 16K prompt plus 128 teacher positions,
+context 32768 and all 48 layers. Reset and a complete repeated prefix/tail
+were exact; the controller exited zero without a memory abort or library
+change. Logs confirm actual QB8 dispatch. Serial decode and baseline GEMM
+isolate this candidate.
+
+The complete 128,133,120-byte logit dump is byte-identical (`cmp` and SHA-256)
+to the previous build's baseline. Both hashes are
+`3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01`.
+This is **preliminary cross-build evidence**, not yet the same-build gate.
+The replay body took 356.646 seconds, including two prefills, two tails
+and readbacks. It is not an API throughput measurement.
+
+The same-build baseline control started at 12:45:08 UTC. Its completion
+and strict paired full-logit audit remain required, followed by the HTTP
+suite and repeated request-level A/B. Original manifests, logs, controller
+records and the prepared auditor are in `/home/ryan/qk-vec4-checks-fdyHmg/`.
+Defaults remain unchanged throughout validation.
