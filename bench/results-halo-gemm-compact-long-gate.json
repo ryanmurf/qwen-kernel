@@ -1,0 +1,52 @@
+{
+  "result": "PASS",
+  "gemm_bit_exact": true,
+  "library_sha256": "2edd589b4f36595ea8619606750dbd35560b2d4950d9f6f87774bcf2d8f745b2",
+  "helper_sha256": "16629a7dad1c1bec8597920bbfc97a7f7049880f8681c2cd6b39cfb8e23ae194",
+  "paired_commands_match": true,
+  "paired_manifest_identity_match": true,
+  "ids_sha256": "da6ddd28f7b015b9010fe8bd7a820ef16efe1f33ad6dcb602ac90db7060ec185",
+  "numerical_gate": {
+    "tail_positions": 128,
+    "argmax_agree": 128,
+    "argmax_flips": 0,
+    "kl_mean_nats": 0.0,
+    "kl_median_nats": 0.0,
+    "kl_p99_nats": 0.0,
+    "kl_max_nats": 0.0,
+    "relative_rms_max": 0.0,
+    "clean_first_row_relative_rms": 0.0,
+    "clean_first_row_equal": true,
+    "rms_bound": 1e-05,
+    "allowed_flips": 0,
+    "result": "PASS"
+  },
+  "evidence": [
+    {
+      "policy": "baseline",
+      "attention": "native Flash experimental stage [0,48), context=32768, residual=10240, one sequence, batch rows 512, decode attention serial; MTP/snapshots disabled",
+      "gemm_policy": "native Flash prefill GEMM policy: baseline",
+      "compact_dispatch_evidence": [],
+      "abi_greedy_agree": 128,
+      "unit": "qk-root-b-long-baseline-5491c7ce.service",
+      "dump_sha256": "3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01",
+      "manifest_sha256": "bffc742caef9bde1991c5e6dfd3429b85dd5feaa5f5bebb0964da167d72dd798",
+      "controller_sha256": "36129cbc9f4d8bad83895b852296b4136702d6db297b98e577f81b1679b513ea",
+      "log_sha256": "19fc266a9932088c10615ffa6c1041c9325a4faf58367d32741b2a3ddf3347fd"
+    },
+    {
+      "policy": "compact",
+      "attention": "native Flash experimental stage [0,48), context=32768, residual=10240, one sequence, batch rows 512, decode attention serial; MTP/snapshots disabled",
+      "gemm_policy": "native Flash prefill GEMM policy: compact-F32 (shape-selected; coopmat takes precedence)",
+      "compact_dispatch_evidence": [
+        "native compact GEMM first dispatch: qwen4_gemm_compact_q5_1.spv M=10240 K=320 rows=512"
+      ],
+      "abi_greedy_agree": 128,
+      "unit": "qk-root-a-long-compact-7f4ef800.service",
+      "dump_sha256": "3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01",
+      "manifest_sha256": "7f6a493afe731aabd245448f194427eb18a674f363150b5babb5fdf4ff303d6b",
+      "controller_sha256": "6d4ad2e144f551cfd810d631247784ea96ca2aabd9d1387ad961de0a57dfc974",
+      "log_sha256": "59c3f12903158589d543c6f08fb343a2e6706d08b4017dba286bfb9dfe48fc98"
+    }
+  ]
+}

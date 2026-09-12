@@ -1,7 +1,7 @@
 # Halo scalar-F32 prefill GEMM experiment
 
-Status, 2026-09-12 UTC: **operator checks passed; integrated full-model and
-API checks are pending.** `QK_FLASH_GEMM=compact` is opt-in. Unset it, or
+Status, 2026-09-12 12:08 UTC: **operator and same-build full-model checks
+passed; matched API checks are running.** `QK_FLASH_GEMM=compact` is opt-in. Unset it, or
 set `baseline`, for the unchanged default. Decode attention remains serial;
 the ordered-attention API experiment did not establish a speed win.
 
@@ -96,7 +96,42 @@ The public harness uses the integrated shader filenames with the same
 binary contents. Original runs and diagnostic binaries are preserved in
 the private experiment directory. Do not run this alongside a serving model.
 
-Next gate: same-build baseline/compact full-model replay with exact shared
-16K prefix, all 128 teacher positions, reset and complete repeat; then the
-HTTP/Claude-tool suite and request-level prefill A/B. Until those establish
-correctness and a model-level benefit, keep `baseline` as the serving default.
+## Integrated full-model gate
+
+The same-build compact and baseline replays completed successfully, each
+with the exact shared 16,384-token prefix plus 128 teacher positions at
+context 32,768. Both reset/repeated the entire prefix and tail exactly.
+Attention remained serial, with scalar F32 prefill, F32 KV and no MTP.
+The only launch/configuration difference was `QK_FLASH_GEMM`.
+
+All 129 saved full-vocabulary logit rows were **byte-identical**, not merely
+within tolerance. All 128 ABI-level greedy IDs agreed with the saved row
+argmaxes; maximum relative RMS and KL were zero. The pre-existing numerical
+helper and its `1e-5` RMS / zero-flip gate were unchanged. Both complete
+128,133,120-byte dumps have SHA-256
+`3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01`.
+
+The audited library SHA-256 is
+`2edd589b4f36595ea8619606750dbd35560b2d4950d9f6f87774bcf2d8f745b2`;
+all 181 shader hashes match between manifests and the frozen build. Logs
+confirm baseline dispatch in the control and an actual compact Q5_1
+M=10240/K=320/512-row dispatch in the candidate. Neither run hit the memory
+watchdog. The dump also matches the prior serial-attention build, but that
+cross-build observation is separate from this matched-build gate.
+
+Compact ran 06:53:03–07:01:31 UTC; baseline 07:04:22–07:13:47 UTC on
+2026-09-12. Their replay body times were 416.444 and 459.113 seconds,
+respectively. Those include two prefills, two tails, and readbacks, and
+are **not** an API throughput benchmark or an established speedup.
+
+The [raw gate](results-halo-gemm-compact-long-gate.json) binds controller,
+manifest and log hashes. Original logs/dumps and the strict pair auditor
+are preserved in `/home/ryan/qk-compact-checks-RvIhNE/`.
+
+Next gate: the HTTP/Claude-tool suite and request-level prefill A/B at
+128, 512, 2048, 8192 and 16384 tokens with 128-token generation. Both modes
+use the same build, serial attention, precision and fixture. The read-only
+`compare_native_gemm.py` auditor requires complete matched workloads,
+identical outputs, the bound bit-exact gate and explicit actual GEMM
+dispatch evidence. Until repeated API measurements establish a model-level
+benefit, keep `baseline` as the serving default.

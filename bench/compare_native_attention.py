@@ -53,7 +53,7 @@ def normalized_metadata(metadata, mode):
     return value
 
 
-def audit(rows, mode):
+def audit(rows, mode, *, normalize=normalized_metadata):
     require(len(rows) >= 4 and rows[0]["type"] == "run_start"
             and rows[-1]["type"] == "run_complete", "incomplete run")
     header = rows[0]
@@ -61,7 +61,7 @@ def audit(rows, mode):
             "invalid repetition count")
     require(all(type(n) is int and n > 0 for n in header["sizes"]), "invalid prompt sizes")
     require(header["config_sha256"] == digest(header["metadata"]), "metadata hash mismatch")
-    normalized = normalized_metadata(header["metadata"], mode)
+    normalized = normalize(header["metadata"], mode)
     wanted = [(kind, size, rep) for size in header["sizes"]
               for rep in range(1, header["repetitions"] + 1) for kind in ("prefill", "decode")]
     require(wanted and len(wanted) == len(set(wanted)), "empty or duplicate declared cells")
@@ -94,10 +94,12 @@ def audit(rows, mode):
     return header, normalized, cells
 
 
-def compare(serial, ordered):
-    ah, am, ac = audit(serial, "serial")
-    bh, bm, bc = audit(ordered, "ordered")
-    require(am == bm, "server configurations differ beyond attention mode/run identity")
+def compare_modes(first, second, *, modes, normalize):
+    """Shared workload/output audit; caller explicitly supplies mode validation."""
+    a_mode, b_mode = modes
+    ah, am, ac = audit(first, a_mode, normalize=normalize)
+    bh, bm, bc = audit(second, b_mode, normalize=normalize)
+    require(am == bm, "server configurations differ beyond selected mode/run identity")
     for key in ("model_id", "fixture_sha256", "context", "requested_output_tokens",
                 "sizes", "repetitions", "cache_procedure", "host", "url"):
         require(ah[key] == bh[key], f"paired workload differs: {key}")
@@ -116,13 +118,18 @@ def compare(serial, ordered):
             av = [r[field] for key, r in ac.items() if key[:2] == (kind, size)]
             bv = [r[field] for key, r in bc.items() if key[:2] == (kind, size)]
             sa, sb = statistics.median(av), statistics.median(bv)
-            metrics[field] = {"serial": {"median": sa, "min": min(av), "max": max(av)},
-                              "ordered": {"median": sb, "min": min(bv), "max": max(bv)},
-                              "ordered_over_serial": sb / sa}
+            metrics[field] = {a_mode: {"median": sa, "min": min(av), "max": max(av)},
+                              b_mode: {"median": sb, "min": min(bv), "max": max(bv)},
+                              f"{b_mode}_over_{a_mode}": sb / sa}
         result.append({"prompt_tokens": size, "samples_per_mode": ah["repetitions"], **metrics})
     return {"comparison_valid": True, "outputs_match": True,
             "scope": "matched recorded API runs; not broad quality or statistical significance",
             "exploratory": ah["repetitions"] == 1, "rows": result}
+
+
+def compare(serial, ordered):
+    return compare_modes(serial, ordered, modes=("serial", "ordered"),
+                         normalize=normalized_metadata)
 
 
 def main():
