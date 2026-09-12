@@ -1,7 +1,8 @@
 # Halo scalar-F32 prefill GEMM experiment
 
-Status, 2026-09-12 12:08 UTC: **operator and same-build full-model checks
-passed; matched API checks are running.** `QK_FLASH_GEMM=compact` is opt-in. Unset it, or
+Status, 2026-09-12 12:29 UTC: **operator, same-build full-model and HTTP checks
+passed; the first matched API pair is complete. No default promotion.**
+`QK_FLASH_GEMM=compact` is opt-in. Unset it, or
 set `baseline`, for the unchanged default. Decode attention remains serial;
 the ordered-attention API experiment did not establish a speed win.
 
@@ -128,10 +129,67 @@ The [raw gate](results-halo-gemm-compact-long-gate.json) binds controller,
 manifest and log hashes. Original logs/dumps and the strict pair auditor
 are preserved in `/home/ryan/qk-compact-checks-RvIhNE/`.
 
-Next gate: the HTTP/Claude-tool suite and request-level prefill A/B at
-128, 512, 2048, 8192 and 16384 tokens with 128-token generation. Both modes
-use the same build, serial attention, precision and fixture. The read-only
-`compare_native_gemm.py` auditor requires complete matched workloads,
-identical outputs, the bound bit-exact gate and explicit actual GEMM
-dispatch evidence. Until repeated API measurements establish a model-level
-benefit, keep `baseline` as the serving default.
+## First matched API pair — exploratory, not promoted
+
+Both isolated loopback servers passed all eight HTTP checks: teacher IDs,
+Claude text/tool calls/tool round trips/SSE, cancellation, concurrent-request
+isolation, and invalid-token rejection. Cancellation recovery was 4.584 s
+baseline and 4.235 s compact against the unchanged 5 s bound. These checks
+and a coherent counting continuation are not a broad model-quality eval.
+
+Both matrices used the same model/build/181 shaders, serial attention,
+scalar F32 prefill, F32 KV, context 32768, one slot, chunk 512, no MTP, exact
+shared fixture and 128 generated tokens. The controller checked the actual
+environment and native announcements; compact's first observed dispatch
+was Q5_1 M10240/K320 with 309 rows during the HTTP suite. Targeted shard
+fadvise preceded each load; request prefix caching was disabled. The
+same-prompt one-token probe precedes the separate streaming request.
+
+One sample per cell, baseline followed by compact:
+
+| Prompt tokens | Baseline probe (s) | Compact probe (s) | Baseline TTFT (s) | Compact TTFT (s) | Baseline decode (tok/s) | Compact decode (tok/s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 1.254 | 1.218 | 1.225 | 1.186 | 32.445 | 32.447 |
+| 512 | 3.274 | 2.981 | 3.270 | 2.948 | 30.517 | 30.498 |
+| 2048 | 13.845 | 12.973 | 13.350 | 12.756 | 23.404 | 23.277 |
+| 8192 | 70.956 | 68.743 | 70.756 | 68.330 | 11.988 | 11.191 |
+| 16384 | 197.701 | 194.688 | 196.555 | 196.734 | 8.734 | 7.085 |
+
+The probe includes prefill **plus one generated token** and wall-clock API
+overhead; it is not an isolated GPU timer. Native `prompt_ms=0` is a
+placeholder and is not used. The probe reductions are 1.5–8.9% in this pair,
+but 16K streaming TTFT did not improve, and compact's observed 16K decode
+rate was 18.9% lower. This knob changes prefill GEMM, not the serial decode
+kernels. The pair does not identify the cause of the decode difference or
+establish a repeatable net speed benefit. **Keep baseline as the default**;
+repeat/reverse-order measurements are needed before promotion.
+
+All five prefill outputs and all five 128-token continuations matched
+exactly between modes; prompt/token counts and output hashes passed the
+strict read-only comparator. Both controllers exited cleanly with no
+memory watchdog abort, no library/shader/source change, and 0 observed bytes
+of unit swap at the sampled checkpoints. DRM audits showed Halo compute
+only; the XTX retained only enumeration buffers, with no engine activity.
+
+Raw files:
+[baseline](results-halo-gemm-api-baseline-2edd589b.jsonl),
+[compact](results-halo-gemm-api-compact-2edd589b.jsonl).
+Reproduce the read-only audit:
+
+```bash
+python3 -E bench/compare_native_gemm.py \
+  bench/results-halo-gemm-api-baseline-2edd589b.jsonl \
+  bench/results-halo-gemm-api-compact-2edd589b.jsonl \
+  --gate bench/results-halo-gemm-compact-long-gate.json
+```
+
+Private evidence directory: `/home/ryan/qk-compact-checks-RvIhNE/`.
+Baseline controller `api-gemm-baseline-r1-8ee3303c.controller.json` ran
+12:04:23–12:16:13 UTC, SHA-256
+`a59a64898a63a7232480836b8f9871d3320cf839e0116b0eaeb6ede028b557e7`.
+Compact controller `api-gemm-compact-r1-af8f969c.controller.json` ran
+12:16:25–12:28:08 UTC, SHA-256
+`77cf7b3987958a55fc7936b2c027879e54024ba50d3d3cc14cff00ae8782011f`.
+HTTP/server logs are preserved alongside them. The public run headers bind
+the exact model, server, library, shaders, controller/test/launcher sources,
+actual environment and bit-exact full-model gate.
