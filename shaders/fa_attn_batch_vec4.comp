@@ -1,0 +1,150 @@
+#version 450
+
+// Batched-prefill attention, vector-LDS query-blocked edition. Each workgroup
+// is (head, block of QB=8 chunk queries) and scans the K/V cache ONCE for
+// the whole block: K tiles staged through LDS, V rows read coalesced from
+// global, per-query online softmax. The naive predecessor gave every query
+// its own workgroup, so a 128-query chunk re-read the entire K/V 128 times
+// per head (~33 GB/s effective at 10k base); this reads it once per block —
+// q-heads share each kv head according to pc.hQ / pc.hKV.
+//
+// Host contract: gl_WorkGroupID.z indexes query BLOCKS (zdim =
+// ceil(tile/QB)), query-tile offsets (pc.qbase) are QB-aligned, and pc.Tn
+// bounds the chunk — overhanging queries in the last block are masked here.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQH { float qhat[]; };
+layout(std430, binding = 1) readonly  buffer BufKC { float kc[]; };
+layout(std430, binding = 2) readonly  buffer BufVC { float vc[]; };
+layout(std430, binding = 3) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 4) writeonly buffer BufA  { float att[]; };
+
+layout(push_constant) uniform PC {
+    // Host field order: tmax, dh, nRot, hQ, hKV, eps, freqBase, base, Tn, qbase.
+    uint tmax; uint dh; uint nRot; uint hQ;
+    uint hKV; float eps; float freqBase; uint base;
+    uint Tn; uint qbase;
+} pc;
+
+const uint QB = 8u;  // matches the opt-in native host dispatch
+const uint TK = 16u;  // keys per LDS tile
+
+// Opt-in native DH=256 kernel: 65 vec4s = 260 floats per row.
+// Preserve d-order; no reduction tree or lower precision. Must gate bit-exactness.
+shared vec4 qs[QB][65];
+shared vec4 ks[TK][65];
+shared float sc[QB][TK];   // per-tile scores, then exp'd probabilities
+shared float mi[QB];       // running max
+shared float li[QB];       // running denominator
+shared float corr[QB];     // exp(old_m - new_m) for this tile
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint t   = gl_LocalInvocationID.x;
+    uint dh  = pc.dh;
+    uint blk = pc.qbase + gl_WorkGroupID.z * QB;  // first chunk-query of the block
+    uint kv  = h / (pc.hQ / pc.hKV);
+
+    // Cooperative Q-block load: thread t moves qhat[(blk+i)*hQ*dh + h*dh + d]
+    // for its strip of (i, d). Rows past Tn stay unread garbage — every use
+    // below is per-query and their outputs are never written.
+    for (uint x = t; x < QB * (dh / 4u); x += 256u) {
+        uint i = x / (dh / 4u), d = x % (dh / 4u);
+        if (blk + i < pc.Tn) {
+            uint o = (blk + i) * pc.hQ * dh + h * dh + 4u * d;
+            qs[i][d] = vec4(qhat[o], qhat[o+1u], qhat[o+2u], qhat[o+3u]);
+        }
+    }
+    if (t < QB) {
+        mi[t] = -3.4e38;
+        li[t] = 0.0;
+    }
+    float acc[QB];
+    for (uint i = 0u; i < QB; ++i) acc[i] = 0.0;
+    barrier();
+
+    uint nq = min(QB, pc.Tn - min(blk, pc.Tn));          // live queries in block
+    if (nq == 0u) return;                                 // whole block past Tn
+    uint nkMax = pc.base + blk + nq;                      // keys for the LAST query
+    float scale = inversesqrt(float(dh));
+
+    for (uint p0 = 0u; p0 < nkMax; p0 += TK) {
+        uint ts = min(TK, nkMax - p0);
+
+        // Stage the K tile (coalesced: consecutive threads, consecutive floats).
+        for (uint x = t; x < ts * (dh / 4u); x += 256u) {
+            uint j = x / (dh / 4u), d = x % (dh / 4u);
+            uint o = (kv * pc.tmax + (p0 + j)) * dh + 4u * d;
+            ks[j][d] = vec4(kc[o], kc[o+1u], kc[o+2u], kc[o+3u]);
+        }
+        barrier();
+
+        // Scores: one thread per (query i, key j) pair; d-order matches the
+        // old kernel's dot. Causal mask: key p0+j is visible to query i iff
+        // p0+j <= base+blk+i.
+        {
+            uint i = t / TK, j = t % TK;
+            if (i < QB) {
+                float s = -3.4e38;
+                if (j < ts && i < nq && p0 + j <= pc.base + blk + i) {
+                    s = 0.0;
+                    for (uint d = 0u; d < dh / 4u; ++d) {
+                        vec4 q = qs[i][d], k = ks[j][d];
+                        s += q.x * k.x;
+                        s += q.y * k.y;
+                        s += q.z * k.z;
+                        s += q.w * k.w;
+                    }
+                    s *= scale;
+                }
+                sc[i][j] = s;
+            }
+        }
+        barrier();
+
+        // Per-query online-softmax bookkeeping (serial over TK — deterministic).
+        if (t < QB) {
+            uint i = t;
+            float rowmax = -3.4e38;
+            for (uint j = 0u; j < ts; ++j) rowmax = max(rowmax, sc[i][j]);
+            float newm = max(mi[i], rowmax);
+            corr[i] = exp(mi[i] - newm);
+            mi[i] = newm;
+        }
+        barrier();
+        {
+            uint i = t / TK, j = t % TK;
+            if (i < QB && j < ts)
+                sc[i][j] = sc[i][j] <= -3.0e38 ? 0.0 : exp(sc[i][j] - mi[i]);
+        }
+        barrier();
+        if (t < QB) {
+            uint i = t;
+            float sum = 0.0;
+            for (uint j = 0u; j < ts; ++j) sum += sc[i][j];
+            li[i] = li[i] * corr[i] + sum;
+        }
+        barrier();
+
+        // V accumulation: thread t owns dim t; V rows read once per block,
+        // coalesced across lanes, shared by all queries.
+        if (t < dh) {
+            for (uint i = 0u; i < nq; ++i) acc[i] *= corr[i];
+            for (uint j = 0u; j < ts; ++j) {
+                float v = vc[(kv * pc.tmax + (p0 + j)) * dh + t];
+                for (uint i = 0u; i < nq; ++i) acc[i] += sc[i][j] * v;
+            }
+        }
+        barrier();  // sc/ks reused next tile
+    }
+
+    if (t < dh) {
+        for (uint i = 0u; i < nq; ++i) {
+            uint n = blk + i;
+            float o = acc[i] / li[i];
+            float g = qfull[n * pc.hQ * 2u * dh + h * 2u * dh + dh + t];
+            att[n * pc.hQ * dh + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+        }
+    }
+}

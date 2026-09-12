@@ -15,6 +15,8 @@ if(BUILD_TESTING)
     add_test(NAME gguf-metadata COMMAND test-gguf-metadata)
     add_executable(test-qwen4-gemm-policy tests/test_qwen4_gemm_policy.cpp)
     add_test(NAME qwen4-gemm-policy COMMAND test-qwen4-gemm-policy)
+    add_executable(test-qwen4-attn-policy tests/test_qwen4_attn_policy.cpp)
+    add_test(NAME qwen4-attn-policy COMMAND test-qwen4-attn-policy)
 endif()
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -81,7 +83,7 @@ set(SHADERS qwen4_gemm_compact_q5k qwen4_gemm_compact_q6k qwen4_gemm_compact_q8_
     fa_attn_srv_split_gqa fa_attn_srv_reduce fa_score_srv fa_score_srv_tiled fa_value_srv_ordered
     gemm_q8_0 gemm_q8_0_coopmat gemm_q8_0_coopmat2
     gemm_q8_0_coopmat2_bm64 gemm_q8_0_coopmat_split fa_prep_batch fa_attn_batch
-    fa_attn_batch_coopmat fa_attn_batch_coopmat2 dn_ab_batch dn_conv_batch dn_step_batch
+    fa_attn_batch_vec4 fa_attn_batch_coopmat fa_attn_batch_coopmat2 dn_ab_batch dn_conv_batch dn_step_batch
     dn_step_batch_split dn_step_batch_cols dn_gate_batch gemv_q4_0 gemma4_embed gemma4_embed_batch
     gemma4_rms gemma4_elementwise gemma4_post_attention_fused gemma4_router gemma4_router_batch
     gemma4_select gemma4_select_batch gemma4_quant_q8 gemma4_gemv_q4_q8 gemma4_gemv_q4_f32

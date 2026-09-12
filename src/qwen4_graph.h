@@ -2,6 +2,7 @@
 // kernels as the experimental split-stage adapter, with a small weight budget.
 #include "qwen4_ple.h"
 #include "qwen4_gemm_policy.h"
+#include "qwen4_attn_policy.h"
 #include <atomic>
 #include <memory>
 #include <numeric>
@@ -52,9 +53,13 @@ class Qwen4Graph {
     // heads, 2 KV heads, head width 256, KV rows [kv][tmax][256].
     bool attnSplit = false, attnOrdered = false;
     bool gemmCompact = false, gemmCompactObserved = false;
+    bool attnBatchVec4 = false, attnBatchVec4Observed = false;
     uint32_t attnChunk = 256, attnSplitMax = 0;
     static constexpr uint32_t attnHeads = 24, attnKvHeads = 2, attnDh = 256;
     void configureDecodeAttention() {
+        attnBatchVec4 = qwen4Vec4AttentionRequested(getenv("QK_FLASH_ATTN_BATCH"));
+        if (attnBatchVec4 && (c.props.vendorID != 0x1002 || c.props.deviceID != 0x1586))
+            throw std::runtime_error("vec4 native batch attention is currently validated only on Strix Halo");
         gemmCompact = qwen4CompactGemmRequested(getenv("QK_FLASH_GEMM"));
         if (gemmCompact && (c.props.vendorID != 0x1002 || c.props.deviceID != 0x1586))
             throw std::runtime_error("compact native GEMM is currently validated only on Strix Halo");
@@ -618,10 +623,18 @@ class Qwen4Graph {
         qt = std::min(qt, T); qt = std::max(16u, qt - qt % 16u);
         const char* coopEnv = getenv("QK_FLASH_COOPMAT");
         const bool coopAttn = coopEnv && strcmp(coopEnv,"0") && c.cooperativeMatrix && c.cooperativeMatrixF32Acc && c.subgroupSize == 64;
+        const uint32_t qb = qwen4AttentionQueryBlock(attnBatchVec4,coopAttn);
+        const char* shader = coopAttn ? "fa_attn_batch_coopmat.spv" :
+                             (attnBatchVec4 ? "fa_attn_batch_vec4.spv" : "fa_attn_batch.spv");
         for (uint32_t qo = 0; qo < T; qo += qt) {
             uint32_t tile = std::min(qt, T - qo);
             pc.qbase = qo;
-            emit(coopAttn ? "fa_attn_batch_coopmat.spv" : "fa_attn_batch.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att"},pc,24,0,(tile+15)/16);
+            if (attnBatchVec4 && !coopAttn && !attnBatchVec4Observed) {
+                fprintf(stderr,"native vec4 batch attention first dispatch: %s base=%u rows=%u qbase=%u tile=%u QB=%u\n",
+                        shader,base,T,qo,tile,qb);
+                attnBatchVec4Observed = true;
+            }
+            emit(shader,{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att"},pc,24,0,(tile+qb-1)/qb);
         }
         projectBatch(w("attn_output.weight"),"$att","$block",T);
     }
@@ -740,6 +753,7 @@ public:
     uint32_t batchCapacity() const { return batchCap; }
     const char* decodeAttention() const { return attnOrdered ? "ordered-F32" : (attnSplit ? "split-K" : "serial"); }
     const char* prefillGemm() const { return gemmCompact ? "compact-F32 (shape-selected; coopmat takes precedence)" : "baseline"; }
+    const char* prefillAttention() const { return attnBatchVec4 ? "vec4-F32-QB8 (coopmat takes precedence)" : "baseline"; }
     const std::vector<float>& lastLogits() const { return logits; }
     ~Qwen4Graph() {
         pleStop = true;
