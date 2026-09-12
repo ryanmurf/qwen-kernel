@@ -1,0 +1,30 @@
+{
+  "paired_commands_match": true,
+  "build_sha256": "0349d836c7189653c1d8fc02367b133a5d62386439b53ec3bab10eca7ef42423",
+  "controllers": [
+    {
+      "unit": "qk-root-prefill-baseline-cf15f101.service",
+      "policy": "baseline",
+      "returncode": 0,
+      "error": null,
+      "identities_unchanged": true,
+      "manifest_sha256": "a91c84ff7158321f5083d99a32bb9e10d859aaa36171d74273e9541f642f3f09",
+      "log_sha256": "d2ecc3987180a1669ebac1763a72b04d5e9e625737a5afe39886a8a8c8f6f57e",
+      "actual_vec4_dispatch": [],
+      "actual_compact_dispatch": []
+    },
+    {
+      "unit": "qk-root-prefill-vec4-785d66c3.service",
+      "policy": "vec4",
+      "returncode": 0,
+      "error": null,
+      "identities_unchanged": true,
+      "manifest_sha256": "3895a28946a135ef70cd69f3c73b2ca273af4795da471022f5d36093f027dbf0",
+      "log_sha256": "03c23a3ae3a934934177ea76a073bfbce069249b9dd6ef61222fded4e5c02e1a",
+      "actual_vec4_dispatch": [
+        "native vec4 batch attention first dispatch: fa_attn_batch_vec4.spv base=0 rows=512 qbase=0 tile=512 QB=8"
+      ],
+      "actual_compact_dispatch": []
+    }
+  ]
+}

@@ -1,8 +1,9 @@
 # Halo vector-LDS F32 batched attention
 
-Status, 2026-09-12 12:45 UTC: **96 operator checks passed; the candidate's
-full-model replay completed and matches the previous baseline exactly.
-Same-build control is running. No API speed claim or default promotion.**
+Status, 2026-09-12: **96 operator checks and the same-build full-model
+replay comparison passed bit-exactly. No API speed claim or default
+promotion.** Review follow-up adds direct prefill-output and partial-prefix
+checks; see [follow-up results](RESULTS-halo-review-followup.md).
 `QK_FLASH_ATTN_BATCH=vec4` selects the new path on Strix Halo only. Unset it,
 or use `baseline`, for the unchanged default. Cooperative-matrix selection
 takes precedence. GEMM and single-position decode choices are independent;
@@ -60,6 +61,13 @@ operator speed ratios must not be presented as API/model speed ratios.
 The preceding compact-GEMM and ordered-decode experiments demonstrate why
 operator timing alone is insufficient for default promotion.
 
+The combined ratio contains two changes. At base 15872/query offset 0,
+baseline to vec4/QB16 is 1.73x, and QB16 to QB8 adds 1.13x. At base 32256/
+offset 0 those factors are 1.63x and 1.16x. QB8 doubles the query workgroup
+count and approximately doubles logical KV reads at long prefixes. Physical
+DRAM traffic was not measured; caches and causal lengths matter. Re-measure
+at the deployed context rather than extrapolating the isolated ratio.
+
 ## Reproduction and build identity
 
 [Raw cells, controller and build/source hashes](results-halo-batch-attn-vec4.json).
@@ -74,8 +82,10 @@ has library SHA-256
 Five CTests, including the new opt-in/query-block policy test, pass; the
 unchanged full-model numerical helper's 31 CPU tests also pass.
 
-The public harness changes only include paths and the integrated QB8 shader
-filename from the tested private harness. In an **exclusive, drained Halo
+The original public harness changed only include paths and the integrated
+QB8 shader filename. Review follow-up also re-poisons output between warm-up
+and timing; the updated harness passed all 96 cases in a separate run.
+In an **exclusive, drained Halo
 window**, prepare a fresh private output directory with these commands
 (replace `/path/to/operator-dir` with that directory):
 
@@ -91,7 +101,7 @@ The private run also validated all three SPVs with `spirv-val`, enforced
 1 GiB/2 GiB cgroup memory high/max with zero allowed swap, and used a live
 host-memory/DRM watchdog. Never run this harness alongside a serving model.
 
-## Pending full-model gate
+## Completed same-build full-model gate
 
 The integrated vec4 replay completed at 12:44:05 UTC after starting at
 12:36:35. It used the existing exact 16K prompt plus 128 teacher positions,
@@ -100,15 +110,20 @@ were exact; the controller exited zero without a memory abort or library
 change. Logs confirm actual QB8 dispatch. Serial decode and baseline GEMM
 isolate this candidate.
 
-The complete 128,133,120-byte logit dump is byte-identical (`cmp` and SHA-256)
-to the previous build's baseline. Both hashes are
+The complete 128,133,120-byte logit dump is byte-identical to both the
+previous baseline and the new same-build baseline. Both hashes are
 `3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01`.
-This is **preliminary cross-build evidence**, not yet the same-build gate.
+The strict [same-build audit](results-halo-batch-attn-vec4-long-gate.json)
+passed: all 129 saved full-vocabulary rows are identical, all 128 ABI greedy
+IDs match, and both runs passed complete reset/repeat checks. These rows are
+the clean single-position row and decode tail; they do not directly check
+prefill-boundary logits, which is addressed by the new follow-up harness.
 The replay body took 356.646 seconds, including two prefills, two tails
 and readbacks. It is not an API throughput measurement.
 
-The same-build baseline control started at 12:45:08 UTC. Its completion
-and strict paired full-logit audit remain required, followed by the HTTP
-suite and repeated request-level A/B. Original manifests, logs, controller
-records and the prepared auditor are in `/home/ryan/qk-vec4-checks-fdyHmg/`.
+The same-build baseline control ran 12:45:08–12:54:21 UTC, exiting zero with
+no memory abort or library change. Its replay body took 444.375 seconds;
+neither combined replay-body time is an API throughput measurement. The HTTP
+suite and repeated request-level A/B remain required. Original manifests,
+logs, controller records and auditor are in `/home/ryan/qk-vec4-checks-fdyHmg/`.
 Defaults remain unchanged throughout validation.

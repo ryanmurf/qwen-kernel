@@ -1,0 +1,52 @@
+{
+  "result": "PASS",
+  "batch_attention_bit_exact": true,
+  "library_sha256": "0b3efa4732d1dad9b2ebdbc7fc2688a6501a32672a146953654739ad3cd3bdd3",
+  "helper_sha256": "16629a7dad1c1bec8597920bbfc97a7f7049880f8681c2cd6b39cfb8e23ae194",
+  "paired_commands_match": true,
+  "paired_manifest_identity_match": true,
+  "ids_sha256": "da6ddd28f7b015b9010fe8bd7a820ef16efe1f33ad6dcb602ac90db7060ec185",
+  "numerical_gate": {
+    "tail_positions": 128,
+    "argmax_agree": 128,
+    "argmax_flips": 0,
+    "kl_mean_nats": 0.0,
+    "kl_median_nats": 0.0,
+    "kl_p99_nats": 0.0,
+    "kl_max_nats": 0.0,
+    "relative_rms_max": 0.0,
+    "clean_first_row_relative_rms": 0.0,
+    "clean_first_row_equal": true,
+    "rms_bound": 1e-05,
+    "allowed_flips": 0,
+    "result": "PASS"
+  },
+  "evidence": [
+    {
+      "policy": "baseline",
+      "attention": "native Flash experimental stage [0,48), context=32768, residual=10240, one sequence, batch rows 512, decode attention serial; MTP/snapshots disabled",
+      "batch_attention_policy": "native Flash prefill attention policy: baseline",
+      "vec4_dispatch_evidence": [],
+      "abi_greedy_agree": 128,
+      "unit": "qk-root-b-long-baseline-9e95cd43.service",
+      "dump_sha256": "3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01",
+      "manifest_sha256": "159288caf894ef1d1dc115fa97f5f1fd60db178e3009b66c204f41dfc3d611d3",
+      "controller_sha256": "bca54ba1fc8705cb8594af9700dcb28c232aca2f21c159a9394293211f0f7c77",
+      "log_sha256": "5330cd69f9e2ba2db834b028000c0db599d3d54a2fba8f84fa5aa4278e205807"
+    },
+    {
+      "policy": "vec4",
+      "attention": "native Flash experimental stage [0,48), context=32768, residual=10240, one sequence, batch rows 512, decode attention serial; MTP/snapshots disabled",
+      "batch_attention_policy": "native Flash prefill attention policy: vec4-F32-QB8 (coopmat takes precedence)",
+      "vec4_dispatch_evidence": [
+        "native vec4 batch attention first dispatch: fa_attn_batch_vec4.spv base=0 rows=512 qbase=0 tile=512 QB=8"
+      ],
+      "abi_greedy_agree": 128,
+      "unit": "qk-root-a-long-vec4-241b35d7.service",
+      "dump_sha256": "3042e28a258ee2bca38ee1d9ee2e39cc68bb584d92ce42076dc7378f41852a01",
+      "manifest_sha256": "08733f05c2e678d8cedcefe7723fe8f146aa7e929cf8396b81325f2d92bdffeb",
+      "controller_sha256": "b8fc1c5399b40a19307262e3e1a83da621815d59584d01609a2c53f21502dbae",
+      "log_sha256": "3e82901c550b4d49b162705c5b65f6efc41ee15b68d1a6e3b34de4263f2e472f"
+    }
+  ]
+}

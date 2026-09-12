@@ -219,6 +219,29 @@ list(APPEND SPV_FILES ${GEMMA4_COOPMAT_PROFILE_SPV})
 
 add_custom_target(shaders ALL DEPENDS ${SPV_FILES})
 
+# Compile-only opt-in targets: GPU execution must use an exclusive Halo
+# window and memory/device guards. Never register these with ordinary CTest.
+option(QK_HALO_OPERATOR_TESTS "Build isolated Strix Halo GPU operator harnesses" OFF)
+if(QK_HALO_OPERATOR_TESTS)
+    find_package(Threads REQUIRED)
+    foreach(test_name IN ITEMS gemm_model_shapes batch_attn_operator)
+        add_executable(halo_${test_name} EXCLUDE_FROM_ALL tests/halo_${test_name}.cpp)
+        target_link_libraries(halo_${test_name} PRIVATE Vulkan::Vulkan Threads::Threads)
+        target_compile_options(halo_${test_name} PRIVATE -O2)
+        add_dependencies(halo_${test_name} shaders)
+    endforeach()
+    set(HALO_QB16_SPV ${CMAKE_BINARY_DIR}/shaders/fa_attn_batch_vec4_q16.spv)
+    add_custom_command(OUTPUT ${HALO_QB16_SPV}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${GLSLC} -O --target-env=vulkan1.2 -DTEST_QB=16
+                ${CMAKE_SOURCE_DIR}/tests/fa_attn_batch_vec4_experiment.comp
+                -o ${HALO_QB16_SPV}
+        DEPENDS ${CMAKE_SOURCE_DIR}/tests/fa_attn_batch_vec4_experiment.comp
+        VERBATIM)
+    add_custom_target(halo_operator_shaders DEPENDS ${HALO_QB16_SPV})
+    add_dependencies(halo_batch_attn_operator halo_operator_shaders)
+endif()
+
 add_executable(qk src/main.cpp)
 target_link_libraries(qk PRIVATE Vulkan::Vulkan)
 add_dependencies(qk shaders)

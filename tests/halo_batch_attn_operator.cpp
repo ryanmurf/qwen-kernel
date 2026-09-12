@@ -135,6 +135,7 @@ int main(int argc, char** argv) {
                 auto emit=[&]{kernel.dispatch(pc,heads,1,(test.tile+qb-1)/qb);};
                 std::fill(output.ptr,output.ptr+outFloats,poison);
                 timed(c,1,emit);
+                std::fill(output.ptr,output.ptr+outFloats,poison);
                 const double us=timed(c,repeats,emit);
                 pass&=check(test,output.ptr,original,gold,poison,
                             mode==0?"baseline":(mode==1?"vec4-q16":"vec4-q8"),order++,us);

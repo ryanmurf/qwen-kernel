@@ -45,7 +45,7 @@ def normalized_metadata(metadata, policy):
     if policy == 'baseline':
         require(dispatch == [], 'baseline unexpectedly dispatched compact GEMM')
     else:
-        # PLE is the first eligible projection in this model and HTTP suite.
+        # The HC up projection is first eligible in this model/HTTP suite.
         require(len(dispatch) == 1 and isinstance(dispatch[0], str), 'missing/duplicate compact dispatch')
         match = re.fullmatch(r'native compact GEMM first dispatch: qwen4_gemm_compact_q5_1\.spv M=10240 K=320 rows=(\d+)', dispatch[0])
         require(match is not None and 64 <= int(match[1]) <= 512, 'unexpected compact dispatch shape')

@@ -111,7 +111,9 @@ int main(int argc,char**argv) {
         {0,320,10240},{0,4,10240},{0,6144,2560},{0,48,2560},
         {1,512,2560},{1,320,10240},{1,10240,2560},
         {2,2560,640},{3,10240,320}};
-    for(auto shape:shapes) for(uint32_t N:{64u,128u,256u,512u}) {
+    // 65 exercises a one-token final tile; 309 is an observed HTTP dispatch.
+    // Retain the original four sizes and their deterministic input seeds.
+    for(auto shape:shapes) for(uint32_t N:{64u,65u,128u,256u,309u,512u}) {
         uint32_t fmt=shape[0],M=shape[1],K=shape[2];
         switch(fmt) {
             case 0: pass &= test<block_q5_K>(c,fmt,M,K,N,reps); break;
