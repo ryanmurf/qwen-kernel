@@ -13,6 +13,8 @@ if(BUILD_TESTING)
     add_test(NAME qwen4-ple COMMAND test-qwen4-ple)
     add_executable(test-gguf-metadata tests/test_gguf_metadata.cpp)
     add_test(NAME gguf-metadata COMMAND test-gguf-metadata)
+    add_executable(test-qwen4-gemm-policy tests/test_qwen4_gemm_policy.cpp)
+    add_test(NAME qwen4-gemm-policy COMMAND test-qwen4-gemm-policy)
 endif()
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -66,7 +68,8 @@ if(BUILD_TESTING AND QK_LLAMA_REFERENCE_ROOT)
         "-Wl,--end-group" Vulkan::Vulkan OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS} pthread)
 endif()
 
-set(SHADERS qwen4_ple_conv qwen4_silu qwen4_gdn_params moe_gateup_q5k moe_shared_q5k moe_down_q8_routed qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
+set(SHADERS qwen4_gemm_compact_q5k qwen4_gemm_compact_q6k qwen4_gemm_compact_q8_0 qwen4_gemm_compact_q5_1
+    qwen4_ple_conv qwen4_silu qwen4_gdn_params moe_gateup_q5k moe_shared_q5k moe_down_q8_routed qwen4_hc gemv_f16 gemv_q8_0 gemv_q5_1 gemv_q5_k gemv_q6_k gemv_iq4_xs gemv_iq3_xxs moe_logits moe_logits_gemm
     moe_route_select moe_route_select_hier moe_select moe_select_256 moe_group_pairs moe_gateup_iq3
     moe_gateup_iq3_rowtile moe_gateup_iq3_grouped moe_gateup_iq3_grouped_rowtile moe_gateup_q8
     moe_gateup_q8_64 moe_down_iq4 moe_down_iq4_grouped moe_down_iq4_grouped_rowtile moe_down_q6k
@@ -110,7 +113,9 @@ foreach(s ${SHADERS})
     if(s STREQUAL "moe_down_q5_1" OR s STREQUAL "moe_down_shared_q5_1")
         list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/moe_down_q5_1_impl.glsl)
     endif()
-    if(s MATCHES "^qwen4_gemm_coop_")
+    if(s MATCHES "^qwen4_gemm_compact_")
+        list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/qwen4_gemm_compact_impl.glsl ${CMAKE_SOURCE_DIR}/shaders/qwen4_gemm_dequant.glsl)
+    elseif(s MATCHES "^qwen4_gemm_coop_")
         list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/qwen4_gemm_coop_impl.glsl ${CMAKE_SOURCE_DIR}/shaders/qwen4_gemm_dequant.glsl)
     elseif(s MATCHES "^qwen4_gemm_skinny_")
         list(APPEND EXTRA_SHADER_DEPS ${CMAKE_SOURCE_DIR}/shaders/qwen4_gemm_skinny_impl.glsl ${CMAKE_SOURCE_DIR}/shaders/qwen4_gemm_dequant.glsl)

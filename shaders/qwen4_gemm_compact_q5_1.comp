@@ -1,0 +1,5 @@
+#version 460
+#define QFMT 3
+#define TUNE_BK 32
+#define TUNE_REUSE 1
+#include "qwen4_gemm_compact_impl.glsl"

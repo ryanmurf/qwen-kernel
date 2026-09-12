@@ -1,6 +1,7 @@
 // Single-sequence native qwen4exp graph. Prefix correctness tests use the same
 // kernels as the experimental split-stage adapter, with a small weight budget.
 #include "qwen4_ple.h"
+#include "qwen4_gemm_policy.h"
 #include <atomic>
 #include <memory>
 #include <numeric>
@@ -50,9 +51,13 @@ class Qwen4Graph {
     // fa_attn_batch. Shape contract (checked by validateLayer): 24 query
     // heads, 2 KV heads, head width 256, KV rows [kv][tmax][256].
     bool attnSplit = false, attnOrdered = false;
+    bool gemmCompact = false, gemmCompactObserved = false;
     uint32_t attnChunk = 256, attnSplitMax = 0;
     static constexpr uint32_t attnHeads = 24, attnKvHeads = 2, attnDh = 256;
     void configureDecodeAttention() {
+        gemmCompact = qwen4CompactGemmRequested(getenv("QK_FLASH_GEMM"));
+        if (gemmCompact && (c.props.vendorID != 0x1002 || c.props.deviceID != 0x1586))
+            throw std::runtime_error("compact native GEMM is currently validated only on Strix Halo");
         if (const char* v = getenv("QK_ATTN_DECODE")) {
             if (!strcmp(v,"split")) attnSplit = true;
             else if (!strcmp(v,"ordered")) attnOrdered = true;
@@ -458,16 +463,21 @@ class Qwen4Graph {
         const bool coop = coopWanted && c.cooperativeMatrix && c.cooperativeMatrixF32Acc && c.subgroupSize == 64 &&
                           (m % 128 == 0 || yStride >= mPad) &&
                           buffers.at(output).size >= (size_t(yOff) + size_t((T + 63) / 64 * 64 - 1)*yStride + mPad)*4ull;
+        const bool compact = gemmCompact && !coop && qwen4CompactGemmShape(tensor->type,m,k,T);
         const char* shader;
         switch (tensor->type) {
-            case GGML_Q5_K: shader = coop ? "qwen4_gemm_coop_q5k.spv" : "qwen4_gemm_q5k.spv"; break;
-            case GGML_Q6_K: shader = coop ? "qwen4_gemm_coop_q6k.spv" : "qwen4_gemm_q6k.spv"; break;
-            case GGML_Q8_0: shader = coop ? "qwen4_gemm_coop_q8_0.spv" : "qwen4_gemm_q8_0.spv"; break;
-            case GGML_Q5_1: shader = coop ? "qwen4_gemm_coop_q5_1.spv" : "qwen4_gemm_q5_1.spv"; break;
+            case GGML_Q5_K: shader = coop ? "qwen4_gemm_coop_q5k.spv" : compact ? "qwen4_gemm_compact_q5k.spv" : "qwen4_gemm_q5k.spv"; break;
+            case GGML_Q6_K: shader = coop ? "qwen4_gemm_coop_q6k.spv" : compact ? "qwen4_gemm_compact_q6k.spv" : "qwen4_gemm_q6k.spv"; break;
+            case GGML_Q8_0: shader = coop ? "qwen4_gemm_coop_q8_0.spv" : compact ? "qwen4_gemm_compact_q8_0.spv" : "qwen4_gemm_q8_0.spv"; break;
+            case GGML_Q5_1: shader = coop ? "qwen4_gemm_coop_q5_1.spv" : compact ? "qwen4_gemm_compact_q5_1.spv" : "qwen4_gemm_q5_1.spv"; break;
             default: throw std::runtime_error("unsupported batched projection format: " + weight);
         }
         if (k % 64 || ((tensor->type == GGML_Q5_K || tensor->type == GGML_Q6_K) && k % 256))
             throw std::runtime_error("batched projection needs K%64 (K%256 for K-quants): " + weight);
+        if (compact && !gemmCompactObserved) {
+            fprintf(stderr,"native compact GEMM first dispatch: %s M=%u K=%u rows=%u\n",shader,m,k,T);
+            gemmCompactObserved = true;
+        }
         struct { uint32_t m,k,n,xs,xo,ys,yo; } pc{m,k,T,xStride,xOff,yStride,yOff};
         launch(shader, {weight,input,output}, pc, (m + 127) / 128, 1, (T + 63) / 64, 0, fence);
     }
@@ -729,6 +739,7 @@ public:
     uint32_t currentPosition() const { return position; }
     uint32_t batchCapacity() const { return batchCap; }
     const char* decodeAttention() const { return attnOrdered ? "ordered-F32" : (attnSplit ? "split-K" : "serial"); }
+    const char* prefillGemm() const { return gemmCompact ? "compact-F32 (shape-selected; coopmat takes precedence)" : "baseline"; }
     const std::vector<float>& lastLogits() const { return logits; }
     ~Qwen4Graph() {
         pleStop = true;
