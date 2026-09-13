@@ -1,5 +1,12 @@
 # Strix Halo native Flash Next port
 
+September 13: the [combined-prefill/profile campaign](../bench/RESULTS-halo-combined-profile.md)
+is in progress with serving paused for exclusive GPU tests. It holds precision
+and binaries fixed, adds long-context full-model profiling and tests all/last/
+vec4/combined in both launch orders, including512-token answers. No new
+performance result or default change is claimed until the complete audit.
+The September12 deployment below is the verified fallback.
+
 September 12 status: **Halo-only serving is restored on 8091**, with
 `QK_FLASH_PREFILL_LAST=1` explicitly enabled in the current transient server.
 The source-level default remains off. The [full-model campaign](../bench/RESULTS-halo-last-head-full.md)

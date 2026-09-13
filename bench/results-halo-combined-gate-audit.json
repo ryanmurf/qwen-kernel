@@ -1,0 +1,27 @@
+{
+  "result": "PASS",
+  "cases": 15,
+  "compared_full_vocabulary_rows": 664,
+  "unique_reference_rows": 166,
+  "bit_exact": true,
+  "reference_kind": "same-library frozen baseline attention",
+  "resources": {
+    "result": "PASS",
+    "samples": 427,
+    "maximum_gap_seconds": 3.0301224690047093,
+    "minimum_available_gib": 25.95208740234375,
+    "maximum_temperature_c": 75.0,
+    "memory_peak_bytes": 1363632128,
+    "swap_peak_bytes": 0,
+    "memory_events": {
+      "low": 0,
+      "high": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0,
+      "oom_group_kill": 0,
+      "sock_throttled": 0
+    },
+    "caveat": "Sampled model-process DRM only; cgroups exclude some GPU allocations."
+  }
+}
