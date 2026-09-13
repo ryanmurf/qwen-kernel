@@ -1,0 +1,17 @@
+{
+  "start_utc": "2026-09-13T11:59:19.036904+00:00",
+  "order": [
+    "all",
+    "last",
+    "vec4",
+    "combined",
+    "combined",
+    "vec4",
+    "last",
+    "all"
+  ],
+  "starting_configuration": "last",
+  "error": "CalledProcessError: Command '['/usr/bin/python3', '-E', 'bench/audit_native_flash_campaign.py', 'http', '/home/ryan/qk-combined-profile-kGqp5a']' returned non-zero exit status 1.",
+  "restored": true,
+  "end_utc": "2026-09-13T14:00:23.317227+00:00"
+}

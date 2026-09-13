@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline combined-prefill gate, instrumented profile and HTTP campaign audits."""
 import argparse
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -140,7 +141,39 @@ def validate_profile(rows, log):
                 caveat='Instrumented fenced GPU intervals, not uninstrumented API throughput; category labels group shader names.')
 
 
-def validate_resources(controller, rows, stage=False):
+def validate_stop_evidence(controller, receipt):
+    """Confirm a planned stop when sampling ended at systemd's transition.
+
+    The original observer exits on stop-sigterm. Do not manufacture a final
+    sample: require the contemporaneous successful supervisor job instead.
+    These supplemental records never change inference/performance thresholds.
+    """
+    complete = receipt['completed_sample']
+    require(complete['stage']=='completed' and complete['unit']['SubState']=='running' and
+            complete['unit']['MainPID']==controller['final_unit']['MainPID'], 'wrong completed-work sample')
+    events = receipt['journal']
+    ids = ('de5b426a63be47a7b6ac3eaac82e2f6f', '9d1aaa27d60140bd96365438aad20286',
+           'ae8f7b866b0347b9af31fe1c80b127c0')
+    require(len(events)==3 and tuple(r['MESSAGE_ID'] for r in events)==ids, 'missing/extra shutdown journal events')
+    require(all(r['USER_UNIT']==controller['unit']+'.service' and r['_COMM']=='systemd'
+                for r in events), 'wrong supervisor/unit')
+    require(len({r['_BOOT_ID'] for r in events})==len({r['_PID'] for r in events})==1,
+            'mixed supervisor/boot')
+    start, done, memory = events
+    require(start['JOB_TYPE']==done['JOB_TYPE']=='stop' and start['JOB_ID']==done['JOB_ID']
+            and done['JOB_RESULT']=='done', 'stop job did not succeed')
+    t0, t1 = (int(r['__REALTIME_TIMESTAMP'])/1e6 for r in (start,done))
+    work = datetime.fromisoformat(complete['utc']).timestamp()
+    end = datetime.fromisoformat(controller['end_utc']).timestamp()
+    require(work<=t0<t1<=end and t1-t0<=45 and end-t1<=20, 'stop not bound to completed controlled run')
+    peak, swap = int(memory['MEMORY_PEAK']), int(memory['MEMORY_SWAP_PEAK'])
+    require(peak>=int(controller['final_unit']['MemoryPeak']) and peak<=32*2**30 and 0<=swap<=512*2**20,
+            'supervisor resource peak invalid')
+    return dict(evidence='successful contemporaneous systemd stop job',unit=controller['unit'],
+                job_id=start['JOB_ID'],stop_seconds=t1-t0,memory_peak_bytes=peak,swap_peak_bytes=swap)
+
+
+def validate_resources(controller, rows, stage=False, stop_evidence=None):
     require(controller['error'] is None and controller['identities_unchanged'] is True,'controller failed')
     require(controller['stop_returncode']==controller['observer_returncode']==0,'unclean stop/observer')
     admission = controller['admission']
@@ -149,8 +182,15 @@ def validate_resources(controller, rows, stage=False):
     require(len(rows)>1 and 0<=rows[0]['elapsed']<15,'missing resource coverage')
     gaps = [b['elapsed']-a['elapsed'] for a,b in zip(rows,rows[1:])]
     require(all(math.isfinite(x) and 0<x<=15 for x in gaps),'resource sample gap')
-    require(rows[-1]['properties']['SubState'] in ('dead','exited') and
-            rows[-1]['properties']['ExecMainStatus']=='0','missing clean observed exit')
+    terminal = rows[-1]['properties']
+    stop = None
+    if terminal['SubState']=='stop-sigterm' and not stage:
+        require(stop_evidence is not None and terminal['MainPID']==controller['final_unit']['MainPID'],
+                'missing supervisor evidence for observed stop transition')
+        stop = validate_stop_evidence(controller,stop_evidence)
+    else:
+        require(terminal['SubState'] in ('dead','exited'),'missing clean observed exit')
+    require(terminal['ExecMainStatus']=='0','nonzero observed exit status')
     pids = set()
     temperatures, peaks, swaps = [], [], []
     events = {}
@@ -178,6 +218,9 @@ def validate_resources(controller, rows, stage=False):
                 require(memory_bytes(device['drm-memory-vram'])<=2**20 and
                         memory_bytes(device['drm-memory-gtt'])<=8*2**20,'external GPU weights')
     require(len(pids)==1 and halo and peaks and swaps,'missing/stale process observations')
+    if stop:
+        peaks.append(stop['memory_peak_bytes'])
+        swaps.append(stop['swap_peak_bytes'])
     require(max(peaks)<=32*2**30 and max(swaps)<=512*2**20,'cgroup cap exceeded')
     require(all(events.get(k,0)==0 for k in ('max','oom','oom_kill')),'hard memory events')
     if not stage:
@@ -189,6 +232,7 @@ def validate_resources(controller, rows, stage=False):
                 minimum_available_gib=min(r['memory']['MemAvailable'] for r in rows)/2**30,
                 maximum_temperature_c=max(temperatures)/1000,memory_peak_bytes=max(peaks),
                 swap_peak_bytes=max(swaps),memory_events=events,
+                supervisor_stop_evidence=stop,
                 caveat='Sampled model-process DRM only; cgroups exclude some GPU allocations.')
 
 
@@ -212,7 +256,16 @@ def validate_http(folder):
         prefix = folder/f'http-{index:02d}-{mode}'
         ctrl = json.loads(Path(str(prefix)+'.controller.json').read_text())
         require(ctrl['launch_index']==index and ctrl['mode']==mode and ctrl['order']==ORDER,'wrong launch order')
-        resources.append(validate_resources(ctrl,read(str(prefix)+'.observer.jsonl')))
+        stop_evidence = None
+        evidence_path = Path(str(prefix)+'.stop-evidence.json')
+        if evidence_path.exists():
+            stop_evidence = json.loads(evidence_path.read_text())
+            log_path = Path(str(prefix)+'-run.controller.log')
+            require(sha(log_path)==stop_evidence['controller_log_sha256'],'completed-work log changed')
+            samples = [json.loads(line) for line in log_path.read_text().splitlines() if line.startswith('{')]
+            require([r for r in samples if r.get('stage')=='completed']==[stop_evidence['completed_sample']],
+                    'completed-work sample differs from original log')
+        resources.append(validate_resources(ctrl,read(str(prefix)+'.observer.jsonl'),stop_evidence=stop_evidence))
         env = {**full.ENV,'QK_SHADER_DIR':str(Path('/home/ryan/qk-last-head-IIfPmw/build/shaders')),
                'QK_REASONING_EFFORT':'xhigh','QK_PREFILL_CHUNK':'512',
                'QK_FLASH_PREFILL_LAST':'1' if mode in ('last','combined') else '0',

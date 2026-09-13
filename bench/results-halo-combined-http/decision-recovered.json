@@ -1,0 +1,33 @@
+{
+  "configuration": "combined",
+  "combined_promoted": true,
+  "combined_over_last_ratios": {
+    "128": {
+      "ttft_seconds": 0.9953166631624671,
+      "decode_tokens_per_second": 0.9962931594558276,
+      "stream_total_seconds": 1.0017618530906083
+    },
+    "512": {
+      "ttft_seconds": 0.9780558418766193,
+      "decode_tokens_per_second": 0.998606070964142,
+      "stream_total_seconds": 0.9914785671781015
+    },
+    "2048": {
+      "ttft_seconds": 0.950150718614998,
+      "decode_tokens_per_second": 0.9917184227573822,
+      "stream_total_seconds": 0.9671519147293446
+    },
+    "8192": {
+      "ttft_seconds": 0.8590948688184509,
+      "decode_tokens_per_second": 1.0307322335792608,
+      "stream_total_seconds": 0.8749935232070595
+    },
+    "16384": {
+      "ttft_seconds": 0.7734370840607925,
+      "decode_tokens_per_second": 0.9776705925355187,
+      "stream_total_seconds": 0.8400470721572968
+    }
+  },
+  "criteria": "16K median TTFT >=10% lower, total512-output >=5% lower, decode loss <=3%; no tested median total >3% slower",
+  "caveat": "Two launches per mode; preserve source defaults, explicit deployment opt-in only."
+}

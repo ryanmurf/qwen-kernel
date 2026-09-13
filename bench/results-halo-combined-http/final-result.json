@@ -1,0 +1,35 @@
+{
+  "start_utc": "2026-09-13T14:06:26.389933+00:00",
+  "full_model_candidate": false,
+  "default_promotion": false,
+  "controller_sha256": "15c807aeccdc423ffb24d4110e7941b17ebbe9460200048b7d314b3a39463b76",
+  "supplemental_http_recovery": {
+    "result": "PASS",
+    "issue": "Observer stopped at planned stop-sigterm in launches 6 and 7; contemporaneous successful systemd stop jobs complete the shutdown evidence.",
+    "original_failure_preserved": true,
+    "performance_criteria_unchanged": true,
+    "original_error": "CalledProcessError: Command '['/usr/bin/python3', '-E', 'bench/audit_native_flash_campaign.py', 'http', '/home/ryan/qk-combined-profile-kGqp5a']' returned non-zero exit status 1.",
+    "files": {
+      "/home/ryan/qk-combined-profile-kGqp5a/chain.result.json": "bed9b75587b70a3c67f3be894c6b8ec47e3465e287d41aa314e1efb1689779db",
+      "/home/ryan/qk-combined-profile-kGqp5a/decision.json": "31057609337d2f469e05a7b8dda99e97cea3673c3551a83ff749c4207068792c",
+      "/home/ryan/qk-combined-profile-kGqp5a/followup/result.json": "8eb69a0096512a5724471895921bce21404488f5c565afec2dfd450ea0643992",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-recovered.audit.json": "416aef051ed207685fee6c029e9c273d8529783e5247901b06c63671e26a918f",
+      "/home/ryan/qk-combined-profile-kGqp5a/decision-recovered.json": "b6cd55009786927c9c49281d40ba10dd5f306c2c52dfbf7737519174578c38a6",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-06-last.stop-evidence.json": "8228e279be1fdf653e7d09f5b3a9a80db7be3bd76c9f5cf1fc99599e21941d31",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-07-all.stop-evidence.json": "2a78a2cdfc56e97016b35188e8f2962ec159e8cc2622c1f5d606752bd1c3b7aa",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-06-last-run.controller.log": "69bbd10409f579ba895b30dc6501a5cdd074119f56962052f9b0b12779bd6191",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-07-all-run.controller.log": "f177f7dc13e7e4742d9e5dfa8949d6e5cbaefb3d732ec2e887dd12ff652bbaed",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-06-last.controller.json": "ce178572892545c149f5bccec17ef76b5e0d3f1330544cfb8a7a47498c90e8bb",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-07-all.controller.json": "f12b3a24349d4d7b98f554df4ce42c52c5c63482a32930319d9b3b0279432546",
+      "/home/ryan/qk-combined-profile-kGqp5a/http-build.json": "fad21ef63fa0e54b04b267c5c2eacb6ae51dea2e2c8ae18a4d46ea73876123cc",
+      "/home/ryan/qk-combined-profile-kGqp5a/recovery.py": "6a295ef4bab84b88b718b67bc6da232948951cad93d055a73599ffaf96dbe70b",
+      "/home/ryan/qk-combined-profile-kGqp5a/chain.py": "c3b154412402cdc4fb31af79c94225e0ab591bdf938335e65ecc82d6d4d12866",
+      "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/bench/audit_native_flash_campaign.py": "b6f750f4fed6bb4ebef54e0ab060737bd0dac867d6d96865715a4e230eb814d7"
+    },
+    "preceding_receipt": "recovery.json retained; first verifier compared integer dictionary keys with their JSON string form."
+  },
+  "operator_result": "PASS",
+  "error": null,
+  "restored": true,
+  "end_utc": "2026-09-13T14:15:18.466964+00:00"
+}

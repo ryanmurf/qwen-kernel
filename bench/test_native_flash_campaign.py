@@ -193,6 +193,43 @@ class CampaignAuditTest(unittest.TestCase):
                         audit.validate_http(folder)
                 write(path,saved,True)
 
+    def test_recorded_stop_transition_requires_supervisor_evidence(self):
+        folder=Path('/home/ryan/qk-combined-profile-kGqp5a')
+        if not (folder/'http-07-all.stop-evidence.json').exists():
+            self.skipTest('private stop-transition fixture unavailable')
+        for name in ('http-06-last','http-07-all'):
+            controller=json.loads((folder/(name+'.controller.json')).read_text())
+            rows=audit.read(folder/(name+'.observer.jsonl'))
+            evidence=json.loads((folder/(name+'.stop-evidence.json')).read_text())
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    audit.validate_resources(controller,rows)
+                result=audit.validate_resources(controller,rows,stop_evidence=evidence)
+                self.assertEqual(result['result'],'PASS')
+                self.assertEqual(result['swap_peak_bytes'],0)
+                self.assertIn('systemd',result['supervisor_stop_evidence']['evidence'])
+                with self.assertRaises(ValueError):
+                    audit.validate_resources(controller,rows,True,evidence)
+            corruptions=[
+                lambda e:e['journal'].pop(),
+                lambda e:e['journal'][1].update(JOB_RESULT='failed'),
+                lambda e:e['journal'][1].update(JOB_ID='wrong'),
+                lambda e:e['journal'][1].update(USER_UNIT='other.service'),
+                lambda e:e['journal'][1].update(_COMM='not-systemd'),
+                lambda e:e['journal'][1].update(_BOOT_ID='other-boot'),
+                lambda e:e['journal'][1].update(__REALTIME_TIMESTAMP='1'),
+                lambda e:e['journal'][2].update(MEMORY_PEAK=str(33*2**30)),
+                lambda e:e['journal'][2].update(MEMORY_SWAP_PEAK=str(2**30)),
+                lambda e:e['completed_sample']['unit'].update(MainPID='99999'),
+                lambda e:e['completed_sample'].update(stage='still-running'),
+                lambda e:e['completed_sample'].update(utc='2099-01-01T00:00:00+00:00'),
+            ]
+            for index,mutate in enumerate(corruptions):
+                bad=copy.deepcopy(evidence)
+                mutate(bad)
+                with self.subTest(name=name,corruption=index),self.assertRaises(ValueError):
+                    audit.validate_resources(controller,rows,stop_evidence=bad)
+
 
 if __name__=='__main__':
     unittest.main()

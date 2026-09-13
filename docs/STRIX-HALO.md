@@ -1,11 +1,27 @@
 # Strix Halo native Flash Next port
 
-September 13: the [combined-prefill/profile campaign](../bench/RESULTS-halo-combined-profile.md)
-is in progress with serving paused for exclusive GPU tests. It holds precision
-and binaries fixed, adds long-context full-model profiling and tests all/last/
-vec4/combined in both launch orders, including512-token answers. No new
-performance result or default change is claimed until the complete audit.
-The September12 deployment below is the verified fallback.
+September 13: **combined prefill is enabled and serving is restored on the
+existing ports**. The [eight-launch campaign](../bench/RESULTS-halo-combined-profile.md)
+keeps binaries/precision fixed and validates last-output + vec4 attention
+against the previously deployed last-output-only configuration. At 16K input /
+512 output, median first-token latency falls 198.10→153.22 s (22.7%) and total
+stream time 270.37→227.12 s (16.0%); decode falls 7.07→6.92 tok/s (2.2%), inside
+the predeclared 3% bound. Two launches per configuration, ranges and unscored
+code probes are retained in the report; this is not a universal speed claim.
+All 664 full-vocabulary gate rows match the frozen baseline exactly. The
+corrected HTTP/resource audit passes all 8 launches / 80 counting cells / 16 code
+probes. Its initial stop-transition audit failure and successful supplemental
+systemd shutdown evidence are preserved, with no threshold relaxation.
+
+The [restoration receipt](../bench/results-halo-combined-restored.json)
+verifies direct API 8194 / gateway 8091 / Claude proxy 8092, the installed bytes, protections
+and a five-minute window with zero model cgroup swap or memory events. Live
+opt-ins are `QK_FLASH_PREFILL_LAST=1`, `QK_FLASH_ATTN_BATCH=vec4`; F32, baseline
+GEMM, serial decode, context 32768, chunk 512 and one slot remain unchanged.
+Source defaults and boot behavior are unchanged. An additional persistent-K
+layout experiment passed operator correctness but was slower; its native
+draft was not built, merged or deployed. The September 12 configuration below
+remains the verified fallback.
 
 September 12 status: **Halo-only serving is restored on 8091**, with
 `QK_FLASH_PREFILL_LAST=1` explicitly enabled in the current transient server.

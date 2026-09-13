@@ -1,0 +1,2 @@
+{"test": "proxy_claude_text", "result": "PASS", "text": "\n\nREADY", "usage": {"input_tokens": 60, "output_tokens": 18}}
+{"test": "proxy_claude_stream", "result": "PASS", "text": "\n\nREADY", "events": 7}

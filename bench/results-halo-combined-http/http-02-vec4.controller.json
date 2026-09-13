@@ -1,0 +1,1194 @@
+{
+  "unit": "qk-native-campaign-http-02-vec4-kGqp5a",
+  "mode": "vec4",
+  "launch_index": 2,
+  "order": [
+    "all",
+    "last",
+    "vec4",
+    "combined",
+    "combined",
+    "vec4",
+    "last",
+    "all"
+  ],
+  "start_utc": "2026-09-13T12:42:59.493475+00:00",
+  "full_gate_sha256": "7bda5cbb18b890e9ca863ee897428e9fc8f464d2a2e159586bf8937d06349818",
+  "build_sha256": "fad21ef63fa0e54b04b267c5c2eacb6ae51dea2e2c8ae18a4d46ea73876123cc",
+  "samples": [
+    {
+      "utc": "2026-09-13T12:42:59.697184+00:00",
+      "stage": "loading",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 29380812,
+        "anonymous_kib": 1937184,
+        "shared_kib": 392,
+        "swap_used_kib": 2423208,
+        "anonymous_shared_and_swap_kib": 4360784,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "5210112",
+        "MemoryPeak": "5210112",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:43:19.729450+00:00",
+      "stage": "loading",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 29075856,
+        "anonymous_kib": 2044368,
+        "shared_kib": 388,
+        "swap_used_kib": 2423188,
+        "anonymous_shared_and_swap_kib": 4467944,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "749068288",
+        "MemoryPeak": "1125576704",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:43:39.769565+00:00",
+      "stage": "loading",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 28840880,
+        "anonymous_kib": 2039676,
+        "shared_kib": 388,
+        "swap_used_kib": 2422996,
+        "anonymous_shared_and_swap_kib": 4463060,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "536391680",
+        "MemoryPeak": "1241653248",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:43:59.798844+00:00",
+      "stage": "loading",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 28353120,
+        "anonymous_kib": 2023532,
+        "shared_kib": 388,
+        "swap_used_kib": 2422880,
+        "anonymous_shared_and_swap_kib": 4446800,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "738545664",
+        "MemoryPeak": "1355862016",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:44:19.825185+00:00",
+      "stage": "loading",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 32348852,
+        "anonymous_kib": 1973784,
+        "shared_kib": 364,
+        "swap_used_kib": 2469244,
+        "anonymous_shared_and_swap_kib": 4443392,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "406732800",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:44:31.361652+00:00",
+      "stage": "http",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27567040,
+        "anonymous_kib": 1852412,
+        "shared_kib": 356,
+        "swap_used_kib": 2575504,
+        "anonymous_shared_and_swap_kib": 4428272,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "417386496",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:44:51.382086+00:00",
+      "stage": "http",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27487776,
+        "anonymous_kib": 1877776,
+        "shared_kib": 348,
+        "swap_used_kib": 2574620,
+        "anonymous_shared_and_swap_kib": 4452744,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "512643072",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:45:00.975264+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27483000,
+        "anonymous_kib": 1888788,
+        "shared_kib": 348,
+        "swap_used_kib": 2574620,
+        "anonymous_shared_and_swap_kib": 4463756,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "561131520",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:45:20.995484+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27451404,
+        "anonymous_kib": 1920456,
+        "shared_kib": 348,
+        "swap_used_kib": 2574276,
+        "anonymous_shared_and_swap_kib": 4495080,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "571990016",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:45:41.017729+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27443260,
+        "anonymous_kib": 1912876,
+        "shared_kib": 348,
+        "swap_used_kib": 2574268,
+        "anonymous_shared_and_swap_kib": 4487492,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "625569792",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:46:01.036908+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27442412,
+        "anonymous_kib": 1910256,
+        "shared_kib": 348,
+        "swap_used_kib": 2574228,
+        "anonymous_shared_and_swap_kib": 4484832,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "626982912",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:46:21.055401+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27425232,
+        "anonymous_kib": 1903452,
+        "shared_kib": 348,
+        "swap_used_kib": 2574212,
+        "anonymous_shared_and_swap_kib": 4478012,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "685469696",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:46:41.072001+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27433028,
+        "anonymous_kib": 1904184,
+        "shared_kib": 348,
+        "swap_used_kib": 2574180,
+        "anonymous_shared_and_swap_kib": 4478712,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "727212032",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:47:01.090597+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27412040,
+        "anonymous_kib": 1915808,
+        "shared_kib": 348,
+        "swap_used_kib": 2574112,
+        "anonymous_shared_and_swap_kib": 4490268,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "740818944",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:47:21.109254+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27411416,
+        "anonymous_kib": 1916452,
+        "shared_kib": 348,
+        "swap_used_kib": 2574112,
+        "anonymous_shared_and_swap_kib": 4490912,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "740814848",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:47:41.128857+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27412104,
+        "anonymous_kib": 1913304,
+        "shared_kib": 348,
+        "swap_used_kib": 2574100,
+        "anonymous_shared_and_swap_kib": 4487752,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "740814848",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:48:01.151679+00:00",
+      "stage": "short_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27435020,
+        "anonymous_kib": 1907524,
+        "shared_kib": 348,
+        "swap_used_kib": 2574100,
+        "anonymous_shared_and_swap_kib": 4481972,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "741306368",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:48:06.164925+00:00",
+      "stage": "short_audit",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27445640,
+        "anonymous_kib": 1903928,
+        "shared_kib": 348,
+        "swap_used_kib": 2574100,
+        "anonymous_shared_and_swap_kib": 4478376,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "741130240",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:48:06.671650+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27450228,
+        "anonymous_kib": 1904892,
+        "shared_kib": 348,
+        "swap_used_kib": 2574100,
+        "anonymous_shared_and_swap_kib": 4479340,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "741060608",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:48:26.694040+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27406360,
+        "anonymous_kib": 1927788,
+        "shared_kib": 348,
+        "swap_used_kib": 2574076,
+        "anonymous_shared_and_swap_kib": 4502212,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "740880384",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:48:46.721058+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27419596,
+        "anonymous_kib": 1918384,
+        "shared_kib": 348,
+        "swap_used_kib": 2574068,
+        "anonymous_shared_and_swap_kib": 4492800,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "740876288",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:49:06.744847+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27397372,
+        "anonymous_kib": 1938456,
+        "shared_kib": 348,
+        "swap_used_kib": 2574020,
+        "anonymous_shared_and_swap_kib": 4512824,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "741105664",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:49:26.770085+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27411888,
+        "anonymous_kib": 1922956,
+        "shared_kib": 348,
+        "swap_used_kib": 2574020,
+        "anonymous_shared_and_swap_kib": 4497324,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "768589824",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:49:46.790724+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27415460,
+        "anonymous_kib": 1921248,
+        "shared_kib": 348,
+        "swap_used_kib": 2573996,
+        "anonymous_shared_and_swap_kib": 4495592,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "787558400",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:50:06.812570+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27420368,
+        "anonymous_kib": 1915608,
+        "shared_kib": 348,
+        "swap_used_kib": 2573988,
+        "anonymous_shared_and_swap_kib": 4489944,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "809230336",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:50:26.830151+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27421148,
+        "anonymous_kib": 1913364,
+        "shared_kib": 348,
+        "swap_used_kib": 2573988,
+        "anonymous_shared_and_swap_kib": 4487700,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "823250944",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:50:46.850017+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27406820,
+        "anonymous_kib": 1923936,
+        "shared_kib": 352,
+        "swap_used_kib": 2573872,
+        "anonymous_shared_and_swap_kib": 4498160,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832782336",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:51:06.869743+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27391548,
+        "anonymous_kib": 1939764,
+        "shared_kib": 348,
+        "swap_used_kib": 2573828,
+        "anonymous_shared_and_swap_kib": 4513940,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832520192",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:51:26.890510+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27408952,
+        "anonymous_kib": 1922304,
+        "shared_kib": 348,
+        "swap_used_kib": 2573812,
+        "anonymous_shared_and_swap_kib": 4496464,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832520192",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:51:46.914552+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27392504,
+        "anonymous_kib": 1934448,
+        "shared_kib": 348,
+        "swap_used_kib": 2573800,
+        "anonymous_shared_and_swap_kib": 4508596,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832520192",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:52:06.936041+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27388992,
+        "anonymous_kib": 1932908,
+        "shared_kib": 348,
+        "swap_used_kib": 2573792,
+        "anonymous_shared_and_swap_kib": 4507048,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832520192",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:52:26.963407+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27395816,
+        "anonymous_kib": 1930100,
+        "shared_kib": 348,
+        "swap_used_kib": 2573792,
+        "anonymous_shared_and_swap_kib": 4504240,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832520192",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:52:46.987741+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27399856,
+        "anonymous_kib": 1928432,
+        "shared_kib": 348,
+        "swap_used_kib": 2573772,
+        "anonymous_shared_and_swap_kib": 4502552,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832516096",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:53:07.008579+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27402528,
+        "anonymous_kib": 1925900,
+        "shared_kib": 348,
+        "swap_used_kib": 2573732,
+        "anonymous_shared_and_swap_kib": 4499980,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832516096",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:53:27.032325+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27403656,
+        "anonymous_kib": 1926832,
+        "shared_kib": 348,
+        "swap_used_kib": 2573320,
+        "anonymous_shared_and_swap_kib": 4500500,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "833048576",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:53:47.053957+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27394528,
+        "anonymous_kib": 1927316,
+        "shared_kib": 348,
+        "swap_used_kib": 2573296,
+        "anonymous_shared_and_swap_kib": 4500960,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832741376",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:54:07.077267+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27397348,
+        "anonymous_kib": 1930244,
+        "shared_kib": 348,
+        "swap_used_kib": 2573204,
+        "anonymous_shared_and_swap_kib": 4503796,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832782336",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:54:27.098208+00:00",
+      "stage": "long_benchmark",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27378448,
+        "anonymous_kib": 1942608,
+        "shared_kib": 348,
+        "swap_used_kib": 2572948,
+        "anonymous_shared_and_swap_kib": 4515904,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832782336",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:54:37.113474+00:00",
+      "stage": "long_audit",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27383048,
+        "anonymous_kib": 1945940,
+        "shared_kib": 348,
+        "swap_used_kib": 2572940,
+        "anonymous_shared_and_swap_kib": 4519228,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832524288",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:54:37.621747+00:00",
+      "stage": "code",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27383868,
+        "anonymous_kib": 1946212,
+        "shared_kib": 348,
+        "swap_used_kib": 2572940,
+        "anonymous_shared_and_swap_kib": 4519500,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "832516096",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:54:57.641057+00:00",
+      "stage": "code",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27374816,
+        "anonymous_kib": 1946152,
+        "shared_kib": 348,
+        "swap_used_kib": 2572900,
+        "anonymous_shared_and_swap_kib": 4519400,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "921526272",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    },
+    {
+      "utc": "2026-09-13T12:55:05.178350+00:00",
+      "stage": "completed",
+      "memory": {
+        "admitted": true,
+        "reasons": [],
+        "available_kib": 27390408,
+        "anonymous_kib": 1936628,
+        "shared_kib": 348,
+        "swap_used_kib": 2572884,
+        "anonymous_shared_and_swap_kib": 4509860,
+        "minimum_available_gib": 8,
+        "maximum_other_memory_gib": 12
+      },
+      "unit": {
+        "SubState": "running",
+        "MainPID": "1110784",
+        "ExecMainStatus": "0",
+        "MemoryCurrent": "935776256",
+        "MemoryPeak": "1432899584",
+        "MemorySwapPeak": "0"
+      }
+    }
+  ],
+  "default_promotion": false,
+  "server_command": [
+    "systemd-run",
+    "--user",
+    "--service-type=exec",
+    "--unit=qk-native-campaign-http-02-vec4-kGqp5a",
+    "-p",
+    "MemoryHigh=24G",
+    "-p",
+    "MemoryMax=32G",
+    "-p",
+    "MemorySwapMax=512M",
+    "-p",
+    "NoNewPrivileges=yes",
+    "-p",
+    "LimitCORE=0",
+    "-p",
+    "RuntimeMaxSec=5400",
+    "-p",
+    "RemainAfterExit=yes",
+    "-p",
+    "StandardOutput=append:/home/ryan/qk-combined-profile-kGqp5a/http-02-vec4.server.log",
+    "-p",
+    "StandardError=append:/home/ryan/qk-combined-profile-kGqp5a/http-02-vec4.server.log",
+    "/usr/bin/env",
+    "-i",
+    "PATH=/usr/bin:/bin",
+    "LANG=C.UTF-8",
+    "QK_NATIVE_FLASH=1",
+    "QK_DEVICE_PCI=0000:c1:00.0",
+    "QK_FLASH_BATCH=512",
+    "QK_FLASH_COOPMAT=0",
+    "QK_FLASH_GEMM=baseline",
+    "QK_FLASH_ATTN_BATCH=vec4",
+    "QK_ATTN_DECODE=serial",
+    "QK_PLE_PREFETCH=0",
+    "QK_SHADER_DIR=/home/ryan/qk-last-head-IIfPmw/build/shaders",
+    "QK_PREFILL_CHUNK=512",
+    "QK_REASONING_EFFORT=xhigh",
+    "QK_FLASH_PREFILL_LAST=0",
+    "/home/ryan/qk-last-head-IIfPmw/rust-release/release/server",
+    "--model",
+    "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "--engine-lib",
+    "/home/ryan/qk-last-head-IIfPmw/build/libqk.so",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8194",
+    "--slots",
+    "1",
+    "--ctx",
+    "32768",
+    "--chunk",
+    "1",
+    "--queue",
+    "4",
+    "--local-driver",
+    "--chat-template",
+    "auto"
+  ],
+  "cleanup": {
+    "before": {
+      "available_kib": 28296936,
+      "pool_pages": 23352461
+    },
+    "after": {
+      "available_kib": 29362004,
+      "pool_pages": 23087114
+    },
+    "calls": 370,
+    "reported_pages_freed": 265347,
+    "seconds": 0.027745589992264286,
+    "target_reached": true
+  },
+  "admission": {
+    "admitted": true,
+    "reasons": [],
+    "available_kib": 29386936,
+    "anonymous_kib": 1935040,
+    "shared_kib": 380,
+    "swap_used_kib": 2423208,
+    "anonymous_shared_and_swap_kib": 4358628,
+    "minimum_available_gib": 24,
+    "maximum_other_memory_gib": 12
+  },
+  "actual_environment": {
+    "QK_NATIVE_FLASH": "1",
+    "QK_DEVICE_PCI": "0000:c1:00.0",
+    "QK_FLASH_BATCH": "512",
+    "QK_FLASH_COOPMAT": "0",
+    "QK_FLASH_GEMM": "baseline",
+    "QK_FLASH_ATTN_BATCH": "vec4",
+    "QK_ATTN_DECODE": "serial",
+    "QK_PLE_PREFETCH": "0",
+    "QK_SHADER_DIR": "/home/ryan/qk-last-head-IIfPmw/build/shaders",
+    "QK_PREFILL_CHUNK": "512",
+    "QK_REASONING_EFFORT": "xhigh",
+    "QK_FLASH_PREFILL_LAST": "0"
+  },
+  "actual_command": [
+    "/home/ryan/qk-last-head-IIfPmw/rust-release/release/server",
+    "--model",
+    "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "--engine-lib",
+    "/home/ryan/qk-last-head-IIfPmw/build/libqk.so",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8194",
+    "--slots",
+    "1",
+    "--ctx",
+    "32768",
+    "--chunk",
+    "1",
+    "--queue",
+    "4",
+    "--local-driver",
+    "--chat-template",
+    "auto"
+  ],
+  "mapped_libraries": [
+    "/home/ryan/qk-last-head-IIfPmw/build/libqk.so",
+    "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so"
+  ],
+  "ready_utc": "2026-09-13T12:44:31.357613+00:00",
+  "http_returncode": 0,
+  "sampled_token_sha256": "b08998c9155b00944a60d13b8917847dde3f4afd214ae27fadeb2701aa90953d",
+  "short_benchmark_command": [
+    "/usr/bin/python3",
+    "-E",
+    "bench/prefill_matrix.py",
+    "run",
+    "--url",
+    "http://127.0.0.1:8194",
+    "--backend",
+    "native-combined-02-vec4",
+    "--model-id",
+    "Qwen3.8-Flash-Next-Uncensored-Q5_K_M",
+    "--fixture",
+    "/home/ryan/qk-prefill-matrix-eyUgzZ/shared-fixture.json",
+    "--metadata",
+    "/home/ryan/qk-combined-profile-kGqp5a/http-02-vec4.metadata.json",
+    "--output",
+    "/home/ryan/qk-combined-profile-kGqp5a/http-02-vec4.short.jsonl",
+    "--context",
+    "32768",
+    "--repetitions",
+    "1",
+    "--decode-tokens",
+    "128",
+    "--sizes",
+    "128",
+    "512",
+    "2048",
+    "8192",
+    "--confirm-exclusive",
+    "--timeout",
+    "600"
+  ],
+  "short_benchmark_returncode": 0,
+  "short_audit_returncode": 0,
+  "long_benchmark_command": [
+    "/usr/bin/python3",
+    "-E",
+    "bench/prefill_matrix.py",
+    "run",
+    "--url",
+    "http://127.0.0.1:8194",
+    "--backend",
+    "native-combined-02-vec4",
+    "--model-id",
+    "Qwen3.8-Flash-Next-Uncensored-Q5_K_M",
+    "--fixture",
+    "/home/ryan/qk-prefill-matrix-eyUgzZ/shared-fixture.json",
+    "--metadata",
+    "/home/ryan/qk-combined-profile-kGqp5a/http-02-vec4.metadata.json",
+    "--output",
+    "/home/ryan/qk-combined-profile-kGqp5a/http-02-vec4.long.jsonl",
+    "--context",
+    "32768",
+    "--repetitions",
+    "1",
+    "--decode-tokens",
+    "512",
+    "--sizes",
+    "16384",
+    "--confirm-exclusive",
+    "--timeout",
+    "600"
+  ],
+  "long_benchmark_returncode": 0,
+  "long_audit_returncode": 0,
+  "code_returncode": 0,
+  "identities_unchanged": true,
+  "error": null,
+  "final_unit": {
+    "SubState": "running",
+    "MainPID": "1110784",
+    "ExecMainStatus": "0",
+    "MemoryCurrent": "935776256",
+    "MemoryPeak": "1432899584",
+    "MemorySwapPeak": "0"
+  },
+  "stop_returncode": 0,
+  "observer_returncode": 0,
+  "end_utc": "2026-09-13T12:55:08.126032+00:00"
+}
