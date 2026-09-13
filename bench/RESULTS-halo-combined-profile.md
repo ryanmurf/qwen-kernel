@@ -9,8 +9,8 @@ new campaign passes its declared promotion criteria.
 
 ## Frozen configuration and scope
 
-Same existing three-shard Qwen3.8-Flash-Next-Uncensored-Q5_K_M, all48layers and
-head on Halo PCI0000:c1:00.0. No XTX model work. Context32768, one slot,
+Same existing three-shard Qwen3.8-Flash-Next-Uncensored-Q5_K_M, all 48 layers and
+head on Halo PCI 0000:c1:00.0. No XTX model work. Context 32768, one slot,
 512-token prefill chunks, baseline F32 GEMM, serial decode, F32 KV, no MTP,
 snapshots, cooperative matrices or whole-table PLE warming. No runtime binary
 or shader change in this first phase.
@@ -20,21 +20,21 @@ Library SHA256:
 Server SHA256:
 `10bf29d115627fdf35a9305e0e2e1a9de1dea5a6bd8357627aad0c051fa1925a`.
 Private tested build `/home/ryan/qk-last-head-IIfPmw`; these are byte-identical
-to the installed library/server. The private180-shader set also exactly
+to the installed library/server. The private 180-shader set also exactly
 matches the preceding full-model gate. All selected files are frozen.
 
 ## Correctness protocol
 
 `native_flash_combined_gate.py` runs vec4 attention with all-ID / last-output /
-last-output / all-ID policies, resetting at each pass. All15cases from the
-preceding baseline-attention gate are retained:13short/boundary cases,
-8501positions and16693positions including309teacher-input positions after
-the8K/16K benchmark prefixes, then32serial teacher positions perlongcase.
-Every512-position prefill boundary and partial boundary is checked.
+last-output / all-ID policies, resetting at each pass. All 15 cases from the
+preceding baseline-attention gate are retained:13 short/boundary cases,
+8,501 positions and16,693 positions including 309 teacher-input positions after
+the 8K/16K benchmark prefixes, then 32 serial teacher positions per long case.
+Every 512-position prefill boundary and partial boundary is checked.
 
-All664full-vocabulary rows must match the frozen **same-library** baseline
-hashes, covering166distinct baseline rows. Each live row also checks finite
-logits, independent top20/greedy ordering and output canaries. This establishes
+All 664 full-vocabulary rows must match the frozen **same-library** baseline
+hashes, covering 166 distinct baseline rows. Each live row also checks finite
+logits, independent top-20/greedy ordering and output canaries. This establishes
 cross-configuration equivalence on these inputs, not a new external quality
 oracle. Prior evidence is read-only and its library/model/shaders/fixture are
 checked before it can serve as the reference.
@@ -47,10 +47,10 @@ zero memory events. [Raw gate](results-halo-combined-gate.jsonl),
 
 ## Full-model profiling protocol
 
-`native_flash_long_profile.py` profiles the entire2K/8K/16K prefill and16greedy
+`native_flash_long_profile.py` profiles the entire 2K/8K/16K prefill and 16 greedy
 decode positions at each depth, with last-output enabled via the ABI and
-baseline attention. It records100step markers. The native profiler fences
-everydispatch and disables replay; per-shader GPU attribution is therefore
+baseline attention. It records 100 step markers. The native profiler fences
+every dispatch and disables replay; per-shader GPU attribution is therefore
 **instrumented**, not production throughput. Wall time and GPU intervals are
 kept separate. Dense-projection attribution includes the vocabulary head;
 shader categories do not magically separate every semantic operator.
@@ -97,20 +97,20 @@ Eight separate model launches:
 | 6 | 1 | baseline | last |
 | 7 | 0 | baseline | all |
 
-Perlaunch, the unchanged HTTP/Claude/tool/cancellation/isolation suite runs
-first, followed by two identical seeded32-output samples. The exact shared
-fixture then runs128/512/2048/8192input with128output, and16384input with512output.
+Per launch, the unchanged HTTP/Claude/tool/cancellation/isolation suite runs
+first, followed by two identical seeded 32-output samples. The exact shared
+fixture then runs 128/512/2048/8192 input with 128 output, and 16384 input with 512 output.
 Each stream follows a separate one-output probe. Thus there are two independent
-launch observations per configuration/cell. Everyrequest has fresh KV; file/PLE
+launch observations per configuration/cell. Every request has fresh KV; file/PLE
 caches are not flushed between requests. Actual environment, executable,
 mapped library and runtime policy announcements are checked.
 
-Two additional256-token-budget code-review streams exercise a Python LRU cache
+Two additional 256-token-budget code-review streams exercise a Python LRU cache
 and the actual Vulkan attention source. Natural early EOS is retained, output
 counts/hashes are checked across configurations, and generated code is never
 executed. These are unscored workload probes, not proof of general coding quality.
 
-All80counting cells,16code probes and seeded outputs must pass cross-launch
+All 80 counting cells, 16 code probes and seeded outputs must pass cross-launch
 checks. Reverse launch order mitigates monotonic drift but does not eliminate
 all carry-over effects. Two launches per mode are not a universal speed estimate.
 
@@ -120,22 +120,22 @@ Compare combined with the currently deployed **last-output + baseline
 attention**, using this campaign only. Promote combined as an explicit transient
 serving opt-in only if all correctness/API/resource audits pass and:
 
-- Median16K first-token latency is at least10% lower.
-- Median16K total512-output stream is at least5% lower.
-- Median16K decode loses no more than3%.
-- No tested median total stream is more than3% slower.
+- Median 16K first-token latency is at least 10% lower.
+- Median 16K total 512-output stream is at least 5% lower.
+- Median 16K decode loses no more than 3%.
+- No tested median total stream is more than 3% slower.
 
-Otherwise restore the original last-output1/baseline-attention configuration.
+Otherwise restore the original last-output 1/baseline-attention configuration.
 Source defaults remain unchanged. The decision is scoped to these workloads.
 
 ## Safety and offline audits
 
-24GiB available-RAM admission and12GiB other-anonymous/shared/swap budget are
-unchanged. Model cgroups use24/32GiB high/max,512MiB swap cap, NoNewPrivileges,
-coresdisabled and bounded runtimes. A3-second observer stops only its named
-test unit on availableRAM<8GiB, temperature>=93C, hard memory/OOM events or
-non-Halo compute/model allocation. Cgroups omit someGPUallocations; sampled
-model-process DRM is not proof of whole-host exclusivity at everyinstant.
+24 GiB available-RAM admission and 12 GiB other-anonymous/shared/swap budget are
+unchanged. Model cgroups use24/32 GiB high/max,512 MiB swap cap, NoNewPrivileges,
+cores disabled and bounded runtimes. A 3-second observer stops only its named
+test unit on available RAM < 8 GiB, temperature >= 93 C, hard memory/OOM events or
+non-Halo compute/model allocation. Cgroups omit some GPU allocations; sampled
+model-process DRM is not proof of whole-host exclusivity at every instant.
 
 One initial gate launch was refused while prior GPU memory was still draining;
 its failed admission receipt is preserved. Only the previously approved bounded
