@@ -1,7 +1,7 @@
 # Same-order decode load scheduling on Strix Halo
 
-September 13, 2026, Max. **In progress: full-model numerical gate and
-counterbalanced API comparison. No full-model speed claim yet.**
+September 13, 2026, Max. **Full-model numerical gate passed; counterbalanced
+API comparison in progress. No full-model speed claim yet.**
 
 Campaign: `/home/ryan/qk-decode-full-MFem1G`.
 The previous combined-prefill / serial-decode installation is the fallback.
@@ -71,6 +71,14 @@ receipts, including those failures, are retained; none was overwritten or
 treated as a successful full campaign. Model child hardening was unchanged.
 
 ## Full-model protocol
+
+Completed at 20:29 UTC: **664/664 full-vocabulary rows match exactly**.
+All 15 cases, four passes each, and clean closure passed. The resource
+audit retained 396 samples, maximum gap 3.023 seconds, minimum available
+RAM 26.003 GiB, maximum sampled temperature 78 C, cgroup peak
+1,364,393,984 bytes and zero recorded swap. No memory-high/max/OOM event
+was reported at closure. [Raw gate](results-halo-decode-loads/gate.jsonl),
+[controller and resource audit](results-halo-decode-loads/gate.controller.json).
 
 The exact-logit gate retains all 15 previous cases and all/last/last/all
 passes: 664 full-vocabulary rows, including every long-prefix chunk
