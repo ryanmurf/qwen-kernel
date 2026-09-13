@@ -1,0 +1,145 @@
+{
+  "result": "PASS",
+  "checked_utc": "2026-09-13T21:21:40.409509+00:00",
+  "units": {
+    "qwen-native-flash-server32": {
+      "ActiveState": "active",
+      "SubState": "running",
+      "FragmentPath": "/run/user/1000/systemd/transient/qwen-native-flash-server32.service",
+      "InvocationID": "15b125fd850449edab00cee3b3e1b592",
+      "MainPID": "2232073",
+      "MemoryPeak": "1446490112",
+      "MemorySwapPeak": "0",
+      "MemoryHigh": "25769803776",
+      "MemoryMax": "34359738368",
+      "MemorySwapMax": "536870912",
+      "LimitCORE": "0",
+      "NoNewPrivileges": "yes"
+    },
+    "qwen-native-flash-router": {
+      "ActiveState": "active",
+      "SubState": "running",
+      "FragmentPath": "/run/user/1000/systemd/transient/qwen-native-flash-router.service",
+      "InvocationID": "d05175fdd9c04e34aa199320a73a6275",
+      "MainPID": "2235098",
+      "MemoryPeak": "21929984",
+      "MemorySwapPeak": "0",
+      "MemoryHigh": "805306368",
+      "MemoryMax": "1073741824",
+      "MemorySwapMax": "infinity",
+      "LimitCORE": "0",
+      "NoNewPrivileges": "yes"
+    },
+    "claude-qwen-proxy": {
+      "ActiveState": "active",
+      "SubState": "running",
+      "FragmentPath": "/home/ryan/.config/systemd/user/claude-qwen-proxy.service",
+      "InvocationID": "5843b7a396a2483da370896f675f3535",
+      "MainPID": "3146",
+      "MemoryPeak": "15212544",
+      "MemorySwapPeak": "12247040",
+      "MemoryHigh": "infinity",
+      "MemoryMax": "infinity",
+      "MemorySwapMax": "infinity",
+      "LimitCORE": "infinity",
+      "NoNewPrivileges": "yes"
+    }
+  },
+  "actual_environment": {
+    "QK_FLASH_PREFILL_LAST": "1",
+    "QK_PREFILL_CHUNK": "512",
+    "QK_FLASH_BATCH": "512",
+    "QK_SHADER_DIR": "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/shaders",
+    "QK_FLASH_GEMM": "baseline",
+    "QK_FLASH_ATTN_BATCH": "vec4",
+    "QK_NATIVE_FLASH": "1",
+    "QK_REASONING_EFFORT": "xhigh",
+    "QK_PLE_PREFETCH": "0",
+    "QK_ATTN_DECODE": "serial",
+    "QK_FLASH_COOPMAT": "0",
+    "QK_DEVICE_NAME": "STRIX_HALO",
+    "QK_GGUF": "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf"
+  },
+  "server_command": [
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/rust/release/server",
+    "--model",
+    "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "--engine-lib",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/libqk.so",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8194",
+    "--slots",
+    "1",
+    "--ctx",
+    "32768",
+    "--chunk",
+    "1",
+    "--queue",
+    "4",
+    "--local-driver",
+    "--chat-template",
+    "auto"
+  ],
+  "library_sha256": "068369b87806608ed7d00efb2b72d3bd3e0f19abfd0ed67d7f452b8e952d8931",
+  "server_sha256": "10bf29d115627fdf35a9305e0e2e1a9de1dea5a6bd8357627aad0c051fa1925a",
+  "rollback_sha256": {
+    "libqk.so": "0b3efa4732d1dad9b2ebdbc7fc2688a6501a32672a146953654739ad3cd3bdd3",
+    "server": "aa497bdb0e6b8a70c8d9abe34f6956c91c04cc1ecd5bace53d9e493ce273ef9c"
+  },
+  "source_default_off": true,
+  "active_last_output_opt_in": true,
+  "deployment_decision": {
+    "loads_promoted": false,
+    "reason": "campaign failed",
+    "error": "RuntimeError: trial failed: {'name': 'http-2-loads', 'mode': 'loads', 'unit': 'qk-native-campaign-http-2-loads-MFem1G', 'start_utc': '2026-09-13T21:01:24.523790+00:00', 'default_promotion': False, 'cleanup': {'before': {'available_kib': 28188648, 'pool_pages': 23351154}, 'after': {'available_kib': 29360768, 'pool_pages': 23058679}, 'calls': 408, 'reported_pages_freed': 292475, 'seconds': 0.032229450007434934, 'target_reached': True}, 'admission': {'admitted': True, 'reasons': [], 'available_kib': 29370220, 'anonymous_kib': 1816856, 'shared_kib': 64, 'swap_used_kib': 3139136, 'anonymous_shared_and_swap_kib': 4956056, 'minimum_available_gib': 24, 'maximum_other_memory_gib': 12}, 'command': ['systemd-run', '--user', '--service-type=exec', '--unit=qk-native-campaign-http-2-loads-MFem1G', '-p', 'MemoryHigh=24G', '-p', 'MemoryMax=32G', '-p', 'MemorySwapMax=512M', '-p', 'NoNewPrivileges=yes', '-p', 'LimitCORE=0', '-p', 'RuntimeMaxSec=5400', '-p', 'RemainAfterExit=yes', '-p', 'StandardOutput=append:/home/ryan/qk-decode-full-MFem1G/http-2-loads.server.log', '-p', 'StandardError=append:/home/ryan/qk-decode-full-MFem1G/http-2-loads.log', '/usr/bin/env', '-i', 'PATH=/usr/bin:/bin', 'LANG=C.UTF-8', 'QK_NATIVE_FLASH=1', 'QK_DEVICE_PCI=0000:c1:00.0', 'QK_FLASH_BATCH=512', 'QK_FLASH_COOPMAT=0', 'QK_FLASH_GEMM=baseline', 'QK_FLASH_ATTN_BATCH=vec4', 'QK_ATTN_DECODE=loads', 'QK_PLE_PREFETCH=0', 'QK_SHADER_DIR=/home/ryan/qk-decode-full-MFem1G/build/shaders', 'QK_PREFILL_CHUNK=512', 'QK_REASONING_EFFORT=xhigh', 'QK_FLASH_PREFILL_LAST=1', '/home/ryan/qk-last-head-IIfPmw/rust-release/release/server', '--model', '/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf', '--engine-lib', '/home/ryan/qk-decode-full-MFem1G/build/libqk.so', '--host', '127.0.0.1', '--port', '8194', '--slots', '1', '--ctx', '32768', '--chunk', '1', '--queue', '4', '--local-driver', '--chat-template', 'auto'], 'expected_environment': {'QK_NATIVE_FLASH': '1', 'QK_DEVICE_PCI': '0000:c1:00.0', 'QK_FLASH_BATCH': '512', 'QK_FLASH_COOPMAT': '0', 'QK_FLASH_GEMM': 'baseline', 'QK_FLASH_ATTN_BATCH': 'vec4', 'QK_ATTN_DECODE': 'loads', 'QK_PLE_PREFETCH': '0', 'QK_SHADER_DIR': '/home/ryan/qk-decode-full-MFem1G/build/shaders', 'QK_PREFILL_CHUNK': '512', 'QK_REASONING_EFFORT': 'xhigh', 'QK_FLASH_PREFILL_LAST': '1'}, 'actual_environment': {'QK_NATIVE_FLASH': '1', 'QK_DEVICE_PCI': '0000:c1:00.0', 'QK_FLASH_BATCH': '512', 'QK_FLASH_COOPMAT': '0', 'QK_FLASH_GEMM': 'baseline', 'QK_FLASH_ATTN_BATCH': 'vec4', 'QK_ATTN_DECODE': 'loads', 'QK_PLE_PREFETCH': '0', 'QK_SHADER_DIR': '/home/ryan/qk-decode-full-MFem1G/build/shaders', 'QK_PREFILL_CHUNK': '512', 'QK_REASONING_EFFORT': 'xhigh', 'QK_FLASH_PREFILL_LAST': '1'}, 'mapped_libraries': ['/home/ryan/qk-decode-full-MFem1G/build/libqk.so', '/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so'], 'ready_utc': '2026-09-13T21:02:57.400914+00:00', 'sampled_hash': 'b08998c9155b00944a60d13b8917847dde3f4afd214ae27fadeb2701aa90953d', 'error': \"CalledProcessError: Command '['/usr/bin/python3', '-E', 'bench/native_decode_context_matrix.py', '--url', 'http://127.0.0.1:8194', '--fixture', '/home/ryan/qk-nathan075-b6cta3/fixture.json', '--output', '/home/ryan/qk-decode-full-MFem1G/http-2-loads.matrix.jsonl', '--mode', 'loads', '--launch', '2']' returned non-zero exit status 1.\", 'final_unit': {'SubState': 'running', 'MainPID': '2199557', 'ExecMainStatus': '0', 'MemoryCurrent': '492843008', 'MemoryPeak': '1428475904', 'MemorySwapPeak': '0'}, 'stop_returncode': 0, 'observer_returncode': 0, 'resource_error': 'ValueError: no clean observed shutdown', 'end_utc': '2026-09-13T21:14:36.422422+00:00'}"
+  },
+  "http_smoke": {
+    "8194": {
+      "result": "PASS",
+      "records": 9,
+      "sha256": "b31dba1a9b2737c42efbb3fc80fb745ae45050f6b90de534fae269ce3bbb371a"
+    },
+    "8091": {
+      "result": "PASS",
+      "records": 8,
+      "sha256": "db60ddd2260fbf30d4e2a2b1c1c082021b6e191de6904fd383ac44a09517de3b"
+    },
+    "8092": {
+      "result": "PASS",
+      "records": 2,
+      "sha256": "e8fb4172e9d0e501e3f0932d97fa567daff461824571579d0f75b43ac251194f"
+    }
+  },
+  "resource_observation": {
+    "samples": 100,
+    "seconds": 297.84285671901307,
+    "maximum_gap_seconds": 3.0151150680030696,
+    "minimum_available_gib": 26.03622055053711,
+    "maximum_gpu_temperature_c": 59.0,
+    "swap_peak_bytes": 0,
+    "memory_events_all_zero": true,
+    "external_gpu": {
+      "vram_peak_bytes": 12288,
+      "gtt_peak_bytes": 2097152
+    },
+    "sha256": "a4beaf7c6c6ce5b81666790751576ce9d26d9e1380bb385e8ddc0c20ef9efc98",
+    "observer_sha256": "f7d9c7277ca89bfb4f74486b000dfa56a4be33b8be670d827d678d625667c419"
+  },
+  "restore_cleanup": {
+    "before": {
+      "available_kib": 28279868,
+      "pool_pages": 23350930
+    },
+    "after": {
+      "available_kib": 29361812,
+      "pool_pages": 23080464
+    },
+    "calls": 377,
+    "reported_pages_freed": 270466,
+    "seconds": 0.027379687991924584,
+    "target_reached": true
+  },
+  "caveat": "Smoke checks, not benchmark cells; cgroup memory omits some GPU allocations."
+}

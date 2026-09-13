@@ -1,5 +1,23 @@
 # Strix Halo native Flash Next port
 
+September 13, 21:40 UTC: [expert-layout and CPU preparation probes](../bench/RESULTS-halo-expert-prep.md)
+completed with serving restored unchanged. Packed Q5_K expert layout improves
+most sampled gate/up cases; separate token-tile workgroups make the single
+hot-expert fixture 3.61–3.67x faster. Both 72-cell sweeps match baseline bits.
+Standalone AVX-512 preparation saves about 1.08 ms per 512-token warm slice,
+not seconds of model prefill. These are experimental operators, not deployed
+model throughput. Integration requires real routing histograms, compact
+work scheduling, decode-compatible weights and end-to-end validation.
+
+September 13, 21:21 UTC: the later [decode-load campaign](../bench/RESULTS-halo-decode-loads.md)
+passed its 664-row exact-logit gate and showed promising partial decode
+gains, but failed during its second 31K HTTP request with a gfx-ring timeout
+and device loss. It did **not** complete the counterbalanced comparison and
+the candidate was **not deployed**. The previous combined-prefill / serial-
+decode installation was restored and verified on 8194/8091/8092, including
+five minutes with zero model cgroup swap/memory events. Failure and restore
+receipts are preserved; numerical exactness alone is not serving stability.
+
 September 13: **combined prefill is enabled and serving is restored on the
 existing ports**. The [eight-launch campaign](../bench/RESULTS-halo-combined-profile.md)
 keeps binaries/precision fixed and validates last-output + vec4 attention

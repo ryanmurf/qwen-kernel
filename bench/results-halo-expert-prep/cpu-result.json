@@ -1,0 +1,76 @@
+{
+  "sources": {
+    "/home/ryan/qk-cpu-prep-repeat-YOjQvm/bench": "58c2c3a2f03173986b711dbdd79d24db72d2daeea46d0cd70c4521ee8fd8df6b",
+    "/home/ryan/qk-cpu-prep-repeat-YOjQvm/tokens.txt": "f54442657082a5191b4da1633d273b2943580d34be2ccf3a8a5665765c0bc14a",
+    "/home/ryan/qk-cpu-prep-repeat-YOjQvm/run.py": "4bcd1547b1779c1fccbec2f5748d66b5bd04e7ce2ecb6d10710650d1285a986b",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/tests/halo_cpu_prep.cpp": "7714ad296913848750d55251e6f86d61bf74cb0cc05a7f646b2fb540962ab53e",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/tests/halo_cpu_prep_simd.h": "ec19c2d8026b58f0063524236dd934237a33744008c4fa8f06533b04eb9a1aba",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/src/quants.h": "461ec06788356d2c9e7d39932e06c84d24a29a17330f3d8947c63969340321dd",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/src/qwen4_ple.h": "fdca33e93955e0ec345b6eeab315fdf2260eb9f103226afdcbf247e62572b54f"
+  },
+  "installed_before": {
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/libqk.so": "068369b87806608ed7d00efb2b72d3bd3e0f19abfd0ed67d7f452b8e952d8931",
+    "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/build-halo/rust/release/server": "10bf29d115627fdf35a9305e0e2e1a9de1dea5a6bd8357627aad0c051fa1925a"
+  },
+  "serving_before": {
+    "pid": "2232073",
+    "engines": {
+      "531": {
+        "drm-engine-gfx": "39856986194 ns"
+      },
+      "532": {}
+    }
+  },
+  "gpu_used": false,
+  "production_changed": false,
+  "protocol": "CPU-only, core 2 pinned; no file-cache flush; ABBAABBA warm preparation, page lookup separate",
+  "command": [
+    "systemd-run",
+    "--user",
+    "--service-type=exec",
+    "--unit=qk-cpu-prep-repeat-YOjQvm",
+    "-p",
+    "MemoryHigh=768M",
+    "-p",
+    "MemoryMax=1G",
+    "-p",
+    "MemorySwapMax=0",
+    "-p",
+    "NoNewPrivileges=yes",
+    "-p",
+    "LimitCORE=0",
+    "-p",
+    "RuntimeMaxSec=120",
+    "-p",
+    "RemainAfterExit=yes",
+    "-p",
+    "CPUAffinity=2",
+    "-p",
+    "StandardOutput=append:/home/ryan/qk-cpu-prep-repeat-YOjQvm/raw.jsonl",
+    "-p",
+    "StandardError=append:/home/ryan/qk-cpu-prep-repeat-YOjQvm/stderr.log",
+    "/home/ryan/qk-cpu-prep-repeat-YOjQvm/bench",
+    "/home/ryan/models/Qwen3.8-Flash-Next-Uncensored-Q5_K_M/Qwen3.8-Flash-Next-Uncensored-Q5_K_M-00001-of-00003.gguf",
+    "/home/ryan/qk-cpu-prep-repeat-YOjQvm/tokens.txt"
+  ],
+  "elapsed_seconds": 2.919821650022641,
+  "final_unit": {
+    "SubState": "exited",
+    "MainPID": "0",
+    "ExecMainStatus": "0",
+    "MemoryPeak": "260251648",
+    "MemorySwapPeak": "0",
+    "CPUUsageNSec": "2806587000"
+  },
+  "serving_after": {
+    "pid": "2232073",
+    "engines": {
+      "531": {
+        "drm-engine-gfx": "39856986194 ns"
+      },
+      "532": {}
+    }
+  },
+  "result": "PASS",
+  "raw_sha256": "d5a2287ae3e0a1beac6161a9e2efcb1bdf3e644525a941537547fc127b645577"
+}

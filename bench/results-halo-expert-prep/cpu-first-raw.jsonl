@@ -1,0 +1,30 @@
+{"type":"exact","format":"Q5_1","values":307200,"result":"PASS"}
+{"type":"exact","format":"Q5_K","values":2457600,"result":"PASS"}
+{"type":"lookup","tokens":128,"index_ms":0.005861,"prefetch_ms":14.851802,"gather_ms":3.213257,"hits":242,"misses":1806,"cache_state":"uncontrolled file cache, cumulative lookup cache"}
+{"type":"prep","tokens":128,"iteration":0,"mode":"portable","repeats":30,"ms":0.311423,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"prep","tokens":128,"iteration":1,"mode":"avx512","repeats":30,"ms":0.068080,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"prep","tokens":128,"iteration":2,"mode":"avx512","repeats":30,"ms":0.068068,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"prep","tokens":128,"iteration":3,"mode":"portable","repeats":30,"ms":0.310530,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"prep","tokens":128,"iteration":4,"mode":"portable","repeats":30,"ms":0.310344,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"prep","tokens":128,"iteration":5,"mode":"avx512","repeats":30,"ms":0.067370,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"prep","tokens":128,"iteration":6,"mode":"avx512","repeats":30,"ms":0.066675,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"prep","tokens":128,"iteration":7,"mode":"portable","repeats":30,"ms":0.306349,"output_fnv64":"f964a670ba58cc4f","result":"PASS"}
+{"type":"lookup","tokens":512,"index_ms":0.030788,"prefetch_ms":28.480614,"gather_ms":5.002625,"hits":4939,"misses":5301,"cache_state":"uncontrolled file cache, cumulative lookup cache"}
+{"type":"prep","tokens":512,"iteration":0,"mode":"portable","repeats":30,"ms":1.446049,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"prep","tokens":512,"iteration":1,"mode":"avx512","repeats":30,"ms":0.504791,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"prep","tokens":512,"iteration":2,"mode":"avx512","repeats":30,"ms":0.492105,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"prep","tokens":512,"iteration":3,"mode":"portable","repeats":30,"ms":1.407447,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"prep","tokens":512,"iteration":4,"mode":"portable","repeats":30,"ms":1.425626,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"prep","tokens":512,"iteration":5,"mode":"avx512","repeats":30,"ms":0.470569,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"prep","tokens":512,"iteration":6,"mode":"avx512","repeats":30,"ms":0.502197,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"prep","tokens":512,"iteration":7,"mode":"portable","repeats":30,"ms":1.414080,"output_fnv64":"f46b9488e13b1bd3","result":"PASS"}
+{"type":"lookup","tokens":2048,"index_ms":0.077055,"prefetch_ms":83.935274,"gather_ms":15.359999,"hits":21653,"misses":21355,"cache_state":"uncontrolled file cache, cumulative lookup cache"}
+{"type":"prep","tokens":2048,"iteration":0,"mode":"portable","repeats":30,"ms":7.595554,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"prep","tokens":2048,"iteration":1,"mode":"avx512","repeats":30,"ms":4.326927,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"prep","tokens":2048,"iteration":2,"mode":"avx512","repeats":30,"ms":4.305487,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"prep","tokens":2048,"iteration":3,"mode":"portable","repeats":30,"ms":7.601005,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"prep","tokens":2048,"iteration":4,"mode":"portable","repeats":30,"ms":7.557318,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"prep","tokens":2048,"iteration":5,"mode":"avx512","repeats":30,"ms":4.318775,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"prep","tokens":2048,"iteration":6,"mode":"avx512","repeats":30,"ms":4.300140,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"prep","tokens":2048,"iteration":7,"mode":"portable","repeats":30,"ms":7.580761,"output_fnv64":"b27e5525c439d5dd","result":"PASS"}
+{"type":"result","result":"PASS","gpu_used":false,"production_changed":false}

@@ -1,10 +1,51 @@
 # Same-order decode load scheduling on Strix Halo
 
-September 13, 2026, Max. **Full-model numerical gate passed; counterbalanced
-API comparison in progress. No full-model speed claim yet.**
+September 13, 2026, Max. **Numerical gate passed, but the HTTP campaign
+failed during the second 31K request. Candidate not deployed; previous
+serving restored and verified at 21:21 UTC.**
 
 Campaign: `/home/ryan/qk-decode-full-MFem1G`.
 The previous combined-prefill / serial-decode installation is the fallback.
+
+## Campaign failure and restoration
+
+The first serial and first loads launches completed all six HTTP sizes and
+API/code/resource checks. The second loads launch completed through 16K,
+then lost its GPU context during the 31K request at 21:14:35 UTC. The kernel
+log identifies a gfx_0.0.0 ring timeout in the test server and successful
+automatic ring recovery; RADV reported guilty-context hard recovery and
+`VK_ERROR_DEVICE_LOST`. The HTTP client received an incomplete stream.
+There was no completed second 31K result and the final serial launch was
+not attempted. The failed launch also lacks a clean observed shutdown.
+
+The candidate changes decode, while the server log has no completed 31K
+prefill marker. This suggests the failure occurred during prefill, but
+does not establish which shader, submission, driver or hardware condition
+caused it. The lack of a numerical mismatch or a memory watchdog alarm
+does not excuse the device loss. No promotion criterion was relaxed and
+no failed/missing result was filled in or rerun in place.
+
+The original fallback library remained installed. All restored API checks
+passed on 8194/8091/8092, followed by 100 resource samples over 297.84 s:
+minimum available RAM 26.036 GiB, maximum sampled temperature 59 C, zero
+model cgroup swap and zero memory events. The restored audit is PASS;
+the overall campaign remains failed, with `restored: true`.
+
+Preliminary first-pair decode rates (not counterbalanced final medians):
+
+| Input tokens | Serial, tok/s | Loads, tok/s |
+| ---: | ---: | ---: |
+| 128 | 32.83 | 33.19 |
+| 512 | 30.90 | 33.10 |
+| 2048 | 23.19 | 31.56 |
+| 8192 | 11.75 | 26.01 |
+| 16384 | 7.25 | 20.34 |
+| 31744 | 4.39 | 14.54 |
+
+Second loads observations at 8K/16K were 26.03/20.14 tok/s before the
+failure. These promising partial results do not establish serving stability
+or justify enabling the candidate. All private receipts remain under the
+campaign directory, including the incomplete matrix and error logs.
 
 ## Candidate
 

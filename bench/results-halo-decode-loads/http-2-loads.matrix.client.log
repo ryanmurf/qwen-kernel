@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/bench/native_decode_context_matrix.py", line 46, in <module>
+    if __name__=='__main__': main()
+                             ~~~~^^
+  File "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/bench/native_decode_context_matrix.py", line 38, in main
+    result=pm.measure_stream(args.url,prompt,count,1200)
+  File "/home/ryan/IdeaProjects/qwen-kernel-strix-halo/bench/prefill_matrix.py", line 215, in measure_stream
+    raise ValueError("stream ended without tokens or a final stop record")
+ValueError: stream ended without tokens or a final stop record

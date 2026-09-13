@@ -1,0 +1,9 @@
+vk device 0: AMD Radeon RX 7900 XTX (RADV NAVI31) [0000:68:00.0] vram=24560 MiB
+vk device 1: Radeon 8060S Graphics (RADV STRIX_HALO) [0000:c1:00.0] vram=72362 MiB (not discrete)
+vk device 2: llvmpipe (LLVM 21.1.8, 256 bits) [?] vram=124123 MiB (not discrete)
+native Flash experimental stage [0,48), context=32768, residual=10240, one sequence, batch rows 512, decode attention loads-F32-K4-V32; MTP/snapshots disabled
+native Flash prefill GEMM policy: baseline
+native Flash prefill attention policy: vec4-F32-QB8 (coopmat takes precedence)
+native vec4 batch attention first dispatch: fa_attn_batch_vec4.spv base=0 rows=16 qbase=0 tile=16 QB=8
+radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a hard recovery.
+/home/ryan/IdeaProjects/qwen-kernel-strix-halo/src/qwen4_graph.h:149: vkQueueSubmit(c.queue, 1, &info, VK_NULL_HANDLE) -> VkResult -4

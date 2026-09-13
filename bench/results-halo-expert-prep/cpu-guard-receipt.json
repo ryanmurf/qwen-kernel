@@ -1,0 +1,8 @@
+{
+  "result": "PASS",
+  "checked_utc": "2026-09-13 21:45:09 UTC",
+  "compile_command": "c++ -O1 -g -std=c++17 -ffp-contract=off -fsanitize=address,undefined tests/test_halo_cpu_prep_guards.cpp -o /home/ryan/qk-cpu-prep-repeat-YOjQvm/guard-asan",
+  "run_command": "/home/ryan/qk-cpu-prep-repeat-YOjQvm/guard-asan",
+  "stdout": "Q5_1/Q5_K protected-page tails, zero length and exact outputs: PASS\n",
+  "sha256": "2ecb7346a6883cc188e59a1fa2d9936d1c85e2ea76e7acb417a529972ad5905a  /home/ryan/qk-cpu-prep-repeat-YOjQvm/guard-asan\nca8eb81dbfbdadb3ef1d0d672dacf0b58cc254993d74e2fa061a681699cd282f  tests/test_halo_cpu_prep_guards.cpp\nec19c2d8026b58f0063524236dd934237a33744008c4fa8f06533b04eb9a1aba  tests/halo_cpu_prep_simd.h\n"
+}

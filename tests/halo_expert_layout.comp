@@ -1,0 +1,118 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Expert-major tiled gate/up for Q5_K routed experts. One workgroup owns a
+// 128-row tile of one expert and walks that expert's counting-sorted pairs in
+// groups of 16 tokens: per 32-wide K step every thread dequantizes one
+// (row, matrix) block into LDS once, then computes a 4-row x 2-token micro
+// tile for both matrices. Weights are read once per 16 tokens instead of once
+// per token. Host requires n_ff % 128 == 0 and n_embd % 32 == 0.
+
+layout(local_size_x = 256) in;
+
+struct block_q5_K { float16_t d, dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; };
+layout(std430, binding = 0) readonly buffer G { uint gw[]; };
+layout(std430, binding = 1) readonly buffer U { uint uw[]; };
+layout(std430, binding = 2) readonly buffer X { float x[]; };
+layout(std430, binding = 3) readonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 4) readonly buffer Pairs { uint pairs[]; };
+layout(std430, binding = 5) writeonly buffer H { float h[]; };
+layout(push_constant) uniform PC { uint n_embd; uint n_ff; uint n_expert; uint n_used; } pc;
+
+const uint BM = 128u, TN = 16u, BK = 32u, SK = BK + 1u;
+shared float Gsh[BM * SK];
+shared float Ush[BM * SK];
+shared float Xsh[TN * SK];
+shared uint tokTable[TN];
+shared uint slotTable[TN];
+
+// Index the selected weight buffer directly: copying a block struct through a
+// buffer select forces both blocks (or scratch memory) into registers.
+// Experimental packed-word layout. SOA=0 isolates word addressing from
+// SOA=1, which transposes 128-row weight tiles without expanding Q5_K.
+#ifndef SOA
+#define SOA 0
+#endif
+#if SOA
+#define WORD(BUF, B, W) BUF[(((B) / blocks) / BM) * blocks * 44u * BM + ((B) % blocks) * 44u * BM + (W) * BM + ((B) / blocks) % BM]
+#else
+#define WORD(BUF, B, W) BUF[(B) * 44u + (W)]
+#endif
+#define BYTE(BUF, B, O) ((WORD(BUF, B, (O) / 4u) >> (((O) % 4u) * 8u)) & 255u)
+#define DEQUANT32(BUF, OUT) { \
+    uint sc = g < 4u ? BYTE(BUF,b,4u+g) & 63u \
+        : (BYTE(BUF,b,8u+g) & 15u) | ((BYTE(BUF,b,g) >> 6u) << 4u); \
+    uint mn = g < 4u ? BYTE(BUF,b,8u+g) & 63u \
+        : (BYTE(BUF,b,8u+g) >> 4u) | ((BYTE(BUF,b,4u+g) >> 6u) << 4u); \
+    vec2 dm = unpackHalf2x16(WORD(BUF,b,0u)); \
+    float d = dm.x * float(sc), m = dm.y * float(mn); \
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) { \
+        uint lo = (BYTE(BUF,b,48u+(g/2u)*32u+i) >> ((g%2u)*4u)) & 15u; \
+        uint hi = (BYTE(BUF,b,16u+i) >> g) & 1u; \
+        OUT[dst+i] = d * float(lo+16u*hi)-m; \
+    } }
+
+void main() {
+    uint tile = gl_WorkGroupID.x;
+    uint eid = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (tile * BM >= pc.n_ff || eid >= pc.n_expert) return;
+    uint begin = offsets[eid], end = offsets[eid + 1u];
+    if (begin == end) return;
+
+    uint blocks = pc.n_embd / 256u;
+    bool gate = tid < 128u;
+    uint rowLocal = tid & 127u;
+    uint rowBlockBase = (eid * pc.n_ff + tile * BM + rowLocal) * blocks;
+    uint tr = tid >> 3;        // 0..31: rows tr*4 .. tr*4+3
+    uint tc = tid & 7u;        // 0..7: tokens tc*2, tc*2+1
+
+    for (uint p0 = begin; p0 < end; p0 += TN) {
+        uint np = min(TN, end - p0);
+        if (tid < TN) {
+            uint pair = tid < np ? pairs[p0 + tid] : 0u;
+            tokTable[tid] = pair >> 4u;
+            slotTable[tid] = pair & 15u;
+        }
+        float ag[4][2], au[4][2];
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) { ag[i][0] = 0.0; ag[i][1] = 0.0; au[i][0] = 0.0; au[i][1] = 0.0; }
+        barrier();
+        for (uint k0 = 0u; k0 < pc.n_embd; k0 += BK) {
+            uint c = k0 / 32u;
+            {
+                uint b = rowBlockBase + c / 8u, g = c % 8u, dst = rowLocal * SK;
+                if (gate) DEQUANT32(gw, Gsh) else DEQUANT32(uw, Ush)
+            }
+            for (uint idx = tid; idx < TN * BK; idx += 256u) {
+                uint tt = idx / BK, kk = idx - tt * BK;
+                Xsh[tt * SK + kk] = tt < np ? x[tokTable[tt] * pc.n_embd + k0 + kk] : 0.0;
+            }
+            barrier();
+            [[unroll]] for (uint kk = 0u; kk < BK; ++kk) {
+                float x0 = Xsh[(tc * 2u) * SK + kk], x1 = Xsh[(tc * 2u + 1u) * SK + kk];
+                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                    float gv = Gsh[(tr * 4u + i) * SK + kk];
+                    float uv = Ush[(tr * 4u + i) * SK + kk];
+                    ag[i][0] += gv * x0; ag[i][1] += gv * x1;
+                    au[i][0] += uv * x0; au[i][1] += uv * x1;
+                }
+            }
+            barrier();
+        }
+        [[unroll]] for (uint j = 0u; j < 2u; ++j) {
+            uint tt = tc * 2u + j;
+            if (tt < np) {
+                uint ho = (tokTable[tt] * (pc.n_used + 1u) + slotTable[tt]) * pc.n_ff + tile * BM + tr * 4u;
+                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                    float g = ag[i][j];
+                    h[ho + i] = (g / (1.0 + exp(-g))) * au[i][j];
+                }
+            }
+        }
+        barrier();
+    }
+}
