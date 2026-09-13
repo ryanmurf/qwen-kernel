@@ -1,0 +1,328 @@
+#version 450
+
+// Experimental same-order decode: vector K loads and preissued V loads.
+// No cache-layout, tile-size, softmax-tree, precision or summation-order change.
+// Compile-only/model-free until the full-model and API gates pass.
+#ifndef K_VEC4
+#define K_VEC4 1
+#endif
+#ifndef VALUE_UNROLL
+#define VALUE_UNROLL 8
+#endif
+#if VALUE_UNROLL != 1 && VALUE_UNROLL != 4 && VALUE_UNROLL != 8 && VALUE_UNROLL != 16 && VALUE_UNROLL != 32
+#error Unsupported VALUE_UNROLL
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BufQH { float qhat[]; };
+#if K_VEC4
+layout(std430, binding = 1) readonly buffer BufKC { vec4 kc4[]; };
+#else
+layout(std430, binding = 1) readonly buffer BufKC { float kc[]; };
+#endif
+layout(std430, binding = 2) readonly  buffer BufVC { float vc[]; };
+layout(std430, binding = 3) readonly  buffer BufQF { float qfull[]; };
+layout(std430, binding = 4) writeonly buffer BufA  { float att[]; };
+layout(std430, binding = 5) readonly  buffer BufPos { uint slotPos[]; };
+
+layout(push_constant) uniform PC {
+    uint pos; uint tmax; uint dh; uint nRot;
+    uint hQ; uint hKV; float eps; float freqBase;
+} pc;
+
+#if K_VEC4
+shared vec4 q4[64];
+#else
+shared float q[256];
+#endif
+shared float sc[256];
+shared float red[256];
+shared float m;
+shared float l;
+
+void main() {
+    uint h  = gl_WorkGroupID.x;
+    uint t  = gl_LocalInvocationID.x;
+    uint dh = pc.dh;
+    uint rq = gl_WorkGroupID.z;
+    uint n  = slotPos[rq] + 1u;
+    uint kv = h / (pc.hQ / pc.hKV);
+    uint qfo = rq * pc.hQ * 2u * dh;
+    uint kvo = rq * pc.hKV * pc.tmax * dh;
+    uint qho = rq * pc.hQ * dh;
+
+    #if K_VEC4
+    if (t < dh / 4u) {
+        uint o = qho + h * dh + t * 4u;
+        q4[t] = vec4(qhat[o], qhat[o+1u], qhat[o+2u], qhat[o+3u]);
+    }
+#else
+    if (t < dh) q[t] = qhat[qho + h * dh + t];
+#endif
+    if (t == 0u) {
+        m = -3.4e38;
+        l = 0.0;
+    }
+    barrier();
+
+    float qs = inversesqrt(float(dh));
+    float acc = 0.0;
+    for (uint p0 = 0u; p0 < n; p0 += 256u) {
+        uint ts = min(256u, n - p0);
+
+        if (t < ts) {
+            float score = 0.0;
+            uint base = kvo + (kv * pc.tmax + (p0 + t)) * dh;
+            #if K_VEC4
+            for (uint j = 0u; j < dh / 4u; ++j) {
+                vec4 a = q4[j], b = kc4[base / 4u + j];
+                score += a.x * b.x;
+                score += a.y * b.y;
+                score += a.z * b.z;
+                score += a.w * b.w;
+            }
+#else
+            for (uint j = 0u; j < dh; ++j) score += q[j] * kc[base + j];
+#endif
+            sc[t] = score * qs;
+        }
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : -3.4e38;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] = max(red[t], red[t + s]);
+            barrier();
+        }
+
+        float oldm = m;
+        float newm = max(oldm, red[0]);
+        float corr = exp(oldm - newm);
+
+        acc *= corr;
+        if (t < ts) sc[t] = exp(sc[t] - newm);
+        if (t == 0u) l *= corr;
+        barrier();
+
+        red[t] = (t < ts) ? sc[t] : 0.0;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (t < s) red[t] += red[t + s];
+            barrier();
+        }
+
+        if (t < dh) {
+            uint j = 0u;
+#if VALUE_UNROLL > 1
+            for (; j + VALUE_UNROLL <= ts; j += VALUE_UNROLL) {
+#if VALUE_UNROLL > 0
+                float v0 = vc[kvo + (kv * pc.tmax + p0 + j + 0u) * dh + t];
+#endif
+#if VALUE_UNROLL > 1
+                float v1 = vc[kvo + (kv * pc.tmax + p0 + j + 1u) * dh + t];
+#endif
+#if VALUE_UNROLL > 2
+                float v2 = vc[kvo + (kv * pc.tmax + p0 + j + 2u) * dh + t];
+#endif
+#if VALUE_UNROLL > 3
+                float v3 = vc[kvo + (kv * pc.tmax + p0 + j + 3u) * dh + t];
+#endif
+#if VALUE_UNROLL > 4
+                float v4 = vc[kvo + (kv * pc.tmax + p0 + j + 4u) * dh + t];
+#endif
+#if VALUE_UNROLL > 5
+                float v5 = vc[kvo + (kv * pc.tmax + p0 + j + 5u) * dh + t];
+#endif
+#if VALUE_UNROLL > 6
+                float v6 = vc[kvo + (kv * pc.tmax + p0 + j + 6u) * dh + t];
+#endif
+#if VALUE_UNROLL > 7
+                float v7 = vc[kvo + (kv * pc.tmax + p0 + j + 7u) * dh + t];
+#endif
+#if VALUE_UNROLL > 8
+                float v8 = vc[kvo + (kv * pc.tmax + p0 + j + 8u) * dh + t];
+#endif
+#if VALUE_UNROLL > 9
+                float v9 = vc[kvo + (kv * pc.tmax + p0 + j + 9u) * dh + t];
+#endif
+#if VALUE_UNROLL > 10
+                float v10 = vc[kvo + (kv * pc.tmax + p0 + j + 10u) * dh + t];
+#endif
+#if VALUE_UNROLL > 11
+                float v11 = vc[kvo + (kv * pc.tmax + p0 + j + 11u) * dh + t];
+#endif
+#if VALUE_UNROLL > 12
+                float v12 = vc[kvo + (kv * pc.tmax + p0 + j + 12u) * dh + t];
+#endif
+#if VALUE_UNROLL > 13
+                float v13 = vc[kvo + (kv * pc.tmax + p0 + j + 13u) * dh + t];
+#endif
+#if VALUE_UNROLL > 14
+                float v14 = vc[kvo + (kv * pc.tmax + p0 + j + 14u) * dh + t];
+#endif
+#if VALUE_UNROLL > 15
+                float v15 = vc[kvo + (kv * pc.tmax + p0 + j + 15u) * dh + t];
+#endif
+#if VALUE_UNROLL > 16
+                float v16 = vc[kvo + (kv * pc.tmax + p0 + j + 16u) * dh + t];
+#endif
+#if VALUE_UNROLL > 17
+                float v17 = vc[kvo + (kv * pc.tmax + p0 + j + 17u) * dh + t];
+#endif
+#if VALUE_UNROLL > 18
+                float v18 = vc[kvo + (kv * pc.tmax + p0 + j + 18u) * dh + t];
+#endif
+#if VALUE_UNROLL > 19
+                float v19 = vc[kvo + (kv * pc.tmax + p0 + j + 19u) * dh + t];
+#endif
+#if VALUE_UNROLL > 20
+                float v20 = vc[kvo + (kv * pc.tmax + p0 + j + 20u) * dh + t];
+#endif
+#if VALUE_UNROLL > 21
+                float v21 = vc[kvo + (kv * pc.tmax + p0 + j + 21u) * dh + t];
+#endif
+#if VALUE_UNROLL > 22
+                float v22 = vc[kvo + (kv * pc.tmax + p0 + j + 22u) * dh + t];
+#endif
+#if VALUE_UNROLL > 23
+                float v23 = vc[kvo + (kv * pc.tmax + p0 + j + 23u) * dh + t];
+#endif
+#if VALUE_UNROLL > 24
+                float v24 = vc[kvo + (kv * pc.tmax + p0 + j + 24u) * dh + t];
+#endif
+#if VALUE_UNROLL > 25
+                float v25 = vc[kvo + (kv * pc.tmax + p0 + j + 25u) * dh + t];
+#endif
+#if VALUE_UNROLL > 26
+                float v26 = vc[kvo + (kv * pc.tmax + p0 + j + 26u) * dh + t];
+#endif
+#if VALUE_UNROLL > 27
+                float v27 = vc[kvo + (kv * pc.tmax + p0 + j + 27u) * dh + t];
+#endif
+#if VALUE_UNROLL > 28
+                float v28 = vc[kvo + (kv * pc.tmax + p0 + j + 28u) * dh + t];
+#endif
+#if VALUE_UNROLL > 29
+                float v29 = vc[kvo + (kv * pc.tmax + p0 + j + 29u) * dh + t];
+#endif
+#if VALUE_UNROLL > 30
+                float v30 = vc[kvo + (kv * pc.tmax + p0 + j + 30u) * dh + t];
+#endif
+#if VALUE_UNROLL > 31
+                float v31 = vc[kvo + (kv * pc.tmax + p0 + j + 31u) * dh + t];
+#endif
+#if VALUE_UNROLL > 0
+                acc += sc[j + 0u] * v0;
+#endif
+#if VALUE_UNROLL > 1
+                acc += sc[j + 1u] * v1;
+#endif
+#if VALUE_UNROLL > 2
+                acc += sc[j + 2u] * v2;
+#endif
+#if VALUE_UNROLL > 3
+                acc += sc[j + 3u] * v3;
+#endif
+#if VALUE_UNROLL > 4
+                acc += sc[j + 4u] * v4;
+#endif
+#if VALUE_UNROLL > 5
+                acc += sc[j + 5u] * v5;
+#endif
+#if VALUE_UNROLL > 6
+                acc += sc[j + 6u] * v6;
+#endif
+#if VALUE_UNROLL > 7
+                acc += sc[j + 7u] * v7;
+#endif
+#if VALUE_UNROLL > 8
+                acc += sc[j + 8u] * v8;
+#endif
+#if VALUE_UNROLL > 9
+                acc += sc[j + 9u] * v9;
+#endif
+#if VALUE_UNROLL > 10
+                acc += sc[j + 10u] * v10;
+#endif
+#if VALUE_UNROLL > 11
+                acc += sc[j + 11u] * v11;
+#endif
+#if VALUE_UNROLL > 12
+                acc += sc[j + 12u] * v12;
+#endif
+#if VALUE_UNROLL > 13
+                acc += sc[j + 13u] * v13;
+#endif
+#if VALUE_UNROLL > 14
+                acc += sc[j + 14u] * v14;
+#endif
+#if VALUE_UNROLL > 15
+                acc += sc[j + 15u] * v15;
+#endif
+#if VALUE_UNROLL > 16
+                acc += sc[j + 16u] * v16;
+#endif
+#if VALUE_UNROLL > 17
+                acc += sc[j + 17u] * v17;
+#endif
+#if VALUE_UNROLL > 18
+                acc += sc[j + 18u] * v18;
+#endif
+#if VALUE_UNROLL > 19
+                acc += sc[j + 19u] * v19;
+#endif
+#if VALUE_UNROLL > 20
+                acc += sc[j + 20u] * v20;
+#endif
+#if VALUE_UNROLL > 21
+                acc += sc[j + 21u] * v21;
+#endif
+#if VALUE_UNROLL > 22
+                acc += sc[j + 22u] * v22;
+#endif
+#if VALUE_UNROLL > 23
+                acc += sc[j + 23u] * v23;
+#endif
+#if VALUE_UNROLL > 24
+                acc += sc[j + 24u] * v24;
+#endif
+#if VALUE_UNROLL > 25
+                acc += sc[j + 25u] * v25;
+#endif
+#if VALUE_UNROLL > 26
+                acc += sc[j + 26u] * v26;
+#endif
+#if VALUE_UNROLL > 27
+                acc += sc[j + 27u] * v27;
+#endif
+#if VALUE_UNROLL > 28
+                acc += sc[j + 28u] * v28;
+#endif
+#if VALUE_UNROLL > 29
+                acc += sc[j + 29u] * v29;
+#endif
+#if VALUE_UNROLL > 30
+                acc += sc[j + 30u] * v30;
+#endif
+#if VALUE_UNROLL > 31
+                acc += sc[j + 31u] * v31;
+#endif
+            }
+#endif
+            for (; j < ts; ++j)
+                acc += sc[j] * vc[kvo + (kv * pc.tmax + (p0 + j)) * dh + t];
+        }
+        if (t == 0u) {
+            l += red[0];
+            m = newm;
+        }
+        barrier();
+    }
+
+    if (t < dh) {
+        float o = acc / l;
+        float g = qfull[qfo + h * 2u * dh + dh + t];
+        att[qho + h * dh + t] = o * (1.0 / (1.0 + exp(-g)));
+    }
+}

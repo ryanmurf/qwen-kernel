@@ -52,7 +52,7 @@ class Qwen4Graph {
     // Only the single-position decode path uses it; batched prefill keeps
     // fa_attn_batch. Shape contract (checked by validateLayer): 24 query
     // heads, 2 KV heads, head width 256, KV rows [kv][tmax][256].
-    bool attnSplit = false, attnOrdered = false;
+    bool attnSplit = false, attnOrdered = false, attnLoads = false;
     bool gemmCompact = false, gemmCompactObserved = false;
     bool attnBatchVec4 = false, attnBatchVec4Observed = false;
     uint32_t attnChunk = 256, attnSplitMax = 0;
@@ -64,11 +64,12 @@ class Qwen4Graph {
         gemmCompact = qwen4CompactGemmRequested(getenv("QK_FLASH_GEMM"));
         if (gemmCompact && (c.props.vendorID != 0x1002 || c.props.deviceID != 0x1586))
             throw std::runtime_error("compact native GEMM is currently validated only on Strix Halo");
-        if (const char* v = getenv("QK_ATTN_DECODE")) {
-            if (!strcmp(v,"split")) attnSplit = true;
-            else if (!strcmp(v,"ordered")) attnOrdered = true;
-            else if (strcmp(v,"serial")) throw std::runtime_error("QK_ATTN_DECODE must be serial, split or ordered");
-        }
+        const auto decode = qwen4DecodeAttentionRequested(getenv("QK_ATTN_DECODE"));
+        attnSplit = decode == Qwen4DecodeAttention::Split;
+        attnOrdered = decode == Qwen4DecodeAttention::Ordered;
+        attnLoads = decode == Qwen4DecodeAttention::Loads;
+        if (attnLoads && !qwen4DecodeLoadsSupported(c.props.vendorID,c.props.deviceID,capacity))
+            throw std::runtime_error("loads decode is currently validated only on Strix Halo at context 1..32768");
         if (const char* v = getenv("QK_ATTN_CHUNK")) {
             char* end = nullptr; long x = strtol(v,&end,10);
             if (end == v || *end || x < 16 || x > 1024) throw std::runtime_error("QK_ATTN_CHUNK must be an integer 16..1024");
@@ -567,7 +568,11 @@ class Qwen4Graph {
             launch("fa_attn_srv_split.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_part","$position"},spc,attnSplitMax,attnHeads,1,0);
             emit("fa_attn_srv_reduce.spv",{"$fa_part","$fa_qfull","$att","$position"},spc,attnHeads);
         } else {
-            emit("fa_attn_srv.spv",{"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att","$position"},pc,attnHeads);
+            // Same cache, descriptors, dispatch grid and F32 operation order.
+            // Loads only changes K vectorization and V load scheduling; no
+            // partial-sum merge, extra scratch or replay invalidation.
+            emit(attnLoads ? "fa_attn_srv_loads.spv" : "fa_attn_srv.spv",
+                 {"$fa_qhat",state("kcache"),state("vcache"),"$fa_qfull","$att","$position"},pc,attnHeads);
         }
         tap("attn_gated","$att");
         project(w("attn_output.weight"),"$att","$block");
@@ -759,7 +764,7 @@ public:
         : c(context), g(model), firstLayer(first), lastLayer(end-1), capacity(ctx), weightLimit(budget), withHead(head), servingBudget(true) {}
     uint32_t currentPosition() const { return position; }
     uint32_t batchCapacity() const { return batchCap; }
-    const char* decodeAttention() const { return attnOrdered ? "ordered-F32" : (attnSplit ? "split-K" : "serial"); }
+    const char* decodeAttention() const { return attnLoads ? "loads-F32-K4-V32" : (attnOrdered ? "ordered-F32" : (attnSplit ? "split-K" : "serial")); }
     const char* prefillGemm() const { return gemmCompact ? "compact-F32 (shape-selected; coopmat takes precedence)" : "baseline"; }
     const char* prefillAttention() const { return attnBatchVec4 ? "vec4-F32-QB8 (coopmat takes precedence)" : "baseline"; }
     const std::vector<float>& lastLogits() const { return logits; }

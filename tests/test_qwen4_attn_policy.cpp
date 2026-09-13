@@ -7,6 +7,22 @@
 #include <initializer_list>
 
 int main() {
+    assert(qwen4DecodeAttentionRequested(nullptr)==Qwen4DecodeAttention::Serial);
+    assert(qwen4DecodeAttentionRequested("serial")==Qwen4DecodeAttention::Serial);
+    assert(qwen4DecodeAttentionRequested("split")==Qwen4DecodeAttention::Split);
+    assert(qwen4DecodeAttentionRequested("ordered")==Qwen4DecodeAttention::Ordered);
+    assert(qwen4DecodeAttentionRequested("loads")==Qwen4DecodeAttention::Loads);
+    for (const char* bad : {"", "0", "1", "Loads", "loads ", "vec4", "loads-f16"}) {
+        bool threw=false;
+        try { qwen4DecodeAttentionRequested(bad); } catch (const std::runtime_error&) { threw=true; }
+        assert(threw);
+    }
+    for (uint32_t capacity : {1u,128u,2048u,8192u,16384u,32768u})
+        assert(qwen4DecodeLoadsSupported(0x1002,0x1586,capacity));
+    assert(!qwen4DecodeLoadsSupported(0x1002,0x1586,0));
+    assert(!qwen4DecodeLoadsSupported(0x1002,0x1586,32769));
+    assert(!qwen4DecodeLoadsSupported(0x1002,0x744c,32768));
+    assert(!qwen4DecodeLoadsSupported(0x10de,0x1586,32768));
     assert(!qwen4Vec4AttentionRequested(nullptr));
     assert(!qwen4Vec4AttentionRequested("baseline"));
     assert(qwen4Vec4AttentionRequested("vec4"));
